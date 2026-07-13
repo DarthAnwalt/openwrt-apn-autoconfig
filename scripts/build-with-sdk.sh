@@ -48,8 +48,6 @@ cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 
 (
 	cd "$SDK_DIR"
-	./scripts/feeds update luci
-	./scripts/feeds install luci-base
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
 	make defconfig

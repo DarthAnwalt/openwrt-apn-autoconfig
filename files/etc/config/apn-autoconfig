@@ -1,6 +1,6 @@
 config apn_autoconfig 'main'
 	option interface 'wwan'
-	option sim_index '0'
+	option sim_index 'auto'
 	option device 'wwan0'
 	option database '/usr/share/apn-autoconfig/providers.tsv'
 	option cache_dir '/etc/apn-autoconfig/cache'

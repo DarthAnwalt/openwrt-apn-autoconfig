@@ -155,7 +155,7 @@ Default `/etc/config/apn-autoconfig`:
 ```text
 config apn_autoconfig 'main'
         option interface 'wwan'
-        option sim_index '0'
+        option sim_index 'auto'
         option device 'wwan0'
         option database '/usr/share/apn-autoconfig/providers.tsv'
         option cache_dir '/etc/apn-autoconfig/cache'
@@ -198,6 +198,12 @@ uci commit apn-autoconfig
 
 `use_mwan3` accepts `auto`, `always`, or `never`. `auto` uses `mwan3 use` only
 when mwan3 exists and knows the configured interface.
+
+The current primary SIM is resolved on every command by matching the
+ModemManager device to `network.<interface>.device`. This is necessary because
+ModemManager assigns new numeric modem and SIM object indices after a hardware
+power cycle. A numeric `sim_index` remains supported only as a fallback for
+older configurations and unusual ModemManager setups.
 
 `try_empty` is disabled by default because an empty APN can yield a formally
 connected bearer with an IP address but no return traffic. Enable it only if
@@ -292,7 +298,8 @@ submission has been implemented and tested.
 ## Known limitations
 
 - The bundled database is deliberately tiny.
-- SIM index is currently configured explicitly (default `0`).
+- Automatic SIM resolution requires ModemManager to expose a primary SIM path;
+  a configured numeric `sim_index` is used only when resolution is impossible.
 - Only the APN is applied; APN username/password/authentication are not.
 - The connectivity test is IPv4 HTTPS through one configured net device.
 - Boot automation is opt-in; hotplug automation and a LuCI UI are not included.

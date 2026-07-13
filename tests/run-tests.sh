@@ -46,6 +46,7 @@ get:apn-autoconfig.main.autostart) printf '%s\n' "${TEST_AUTOSTART:-0}" ;;
 get:apn-autoconfig.main.boot_delay) printf '%s\n' "${TEST_BOOT_DELAY:-0}" ;;
 get:apn-autoconfig.main.boot_attempts) printf '%s\n' "${TEST_BOOT_ATTEMPTS:-3}" ;;
 get:apn-autoconfig.main.retry_seconds) printf '%s\n' "${TEST_RETRY_SECONDS:-0}" ;;
+get:network.wwan.device) printf '%s\n' '/sys/devices/mock-modem' ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 set:*)
 	case "$2" in network.wwan.apn=*) printf '%s\n' "${2#network.wwan.apn=}" >"$TEST_STATE/apn" ;; *) exit 1 ;; esac
@@ -58,6 +59,23 @@ EOF
 
 cat >"$MOCKBIN/mmcli" <<'EOF'
 #!/bin/sh
+case "${1:-}" in
+-L)
+	printf '%s\n' "    /org/freedesktop/ModemManager1/Modem/${MM_MODEM_INDEX:-7} [Quectel] RM520N-GL"
+	exit 0
+	;;
+-m)
+	printf '%s\n' \
+		"modem.generic.device : /sys/devices/mock-modem" \
+		"modem.generic.physdev : /sys/devices/mock-modem" \
+		"modem.generic.sim : /org/freedesktop/ModemManager1/SIM/${MM_SIM_INDEX:-9}"
+	exit 0
+	;;
+-i)
+	[ "${2:-}" = "${MM_SIM_INDEX:-9}" ] || exit 1
+	;;
+*) exit 1 ;;
+esac
 printf '%s\n' \
 "sim.properties.active                         : yes" \
 "sim.properties.imsi                           : ${SIM_IMSI:-262014740651867}" \
@@ -134,6 +152,7 @@ printf '%s\n' 'TEST detect is read-only and finds the specific candidate'
 before="$(cat "$STATE/apn")"
 detect_output="$(sh "$SCRIPT" detect 2>&1)"
 assert_contains "$detect_output" 'Kaufland Mobil'
+assert_contains "$detect_output" 'SIM index:       9'
 first_candidate="$(printf '%s\n' "$detect_output" | awk '/^[[:space:]]*1\./ { print; exit }')"
 assert_contains "$first_candidate" 'Kaufland Mobil'
 [ "$(printf '%s\n' "$detect_output" | grep -F -c 'internet.telekom')" -eq 1 ] || fail 'detect did not deduplicate identical APNs'

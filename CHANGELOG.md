@@ -8,6 +8,10 @@
 - Keep boot automation disabled by default until explicitly enabled in UCI.
 - Retry temporary ModemManager/SIM readiness failures without restarting any
   interface other than the configured WWAN interface.
+- Resolve the current primary SIM through the matching ModemManager device on
+  every run, because modem and SIM object indices change after a hardware reset.
+- Treat the legacy numeric `sim_index` setting as a fallback, preserving
+  configurations created by earlier package versions.
 - Add behavioral tests for disabled startup, successful retry and exhausted
   retry limits.
 

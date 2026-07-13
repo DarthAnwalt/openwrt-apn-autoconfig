@@ -7,8 +7,10 @@ PROG="apn-autoconfig"
 CONFIG="apn-autoconfig"
 
 INTERFACE="wwan"
-SIM_INDEX="0"
+SIM_INDEX_FALLBACK="0"
+SIM_INDEX=""
 DEVICE="wwan0"
+NETWORK_DEVICE=""
 DATABASE="/usr/share/apn-autoconfig/providers.tsv"
 CACHE_DIR="/etc/apn-autoconfig/cache"
 STATE_DIR="/etc/apn-autoconfig"
@@ -22,6 +24,8 @@ USE_MWAN3="auto"
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
 TMP_BASE="/tmp/apn-autoconfig.$$"
 SIM_DATA="${TMP_BASE}.sim"
+MODEM_DATA="${TMP_BASE}.modem"
+MODEM_LIST="${TMP_BASE}.modems"
 CANDIDATES="${TMP_BASE}.candidates"
 SEEN_APNS="${TMP_BASE}.seen"
 
@@ -45,7 +49,8 @@ die() {
 }
 
 cleanup_files() {
-	rm -f "$SIM_DATA" "$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS"
+	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
+		"$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS"
 	if [ "$LOCK_HELD" -eq 1 ]; then
 		rm -f "$LOCK_DIR/pid"
 		rmdir "$LOCK_DIR" 2>/dev/null || :
@@ -92,8 +97,9 @@ load_config() {
 		die "uci is required"
 	fi
 	value="$(uci -q get "${CONFIG}.main.interface")" && [ -n "$value" ] && INTERFACE="$value"
-	value="$(uci -q get "${CONFIG}.main.sim_index")" && [ -n "$value" ] && SIM_INDEX="$value"
+	value="$(uci -q get "${CONFIG}.main.sim_index")" && [ -n "$value" ] && SIM_INDEX_FALLBACK="$value"
 	value="$(uci -q get "${CONFIG}.main.device")" && [ -n "$value" ] && DEVICE="$value"
+	value="$(uci -q get "network.${INTERFACE}.device")" && [ -n "$value" ] && NETWORK_DEVICE="$value"
 	value="$(uci -q get "${CONFIG}.main.database")" && [ -n "$value" ] && DATABASE="$value"
 	value="$(uci -q get "${CONFIG}.main.cache_dir")" && [ -n "$value" ] && CACHE_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
@@ -108,7 +114,7 @@ load_config() {
 
 validate_config() {
 	case "$INTERFACE" in *[!A-Za-z0-9_]*) die "invalid interface name: $INTERFACE" ;; esac
-	case "$SIM_INDEX" in ''|*[!0-9]*) die "sim_index must be numeric" ;; esac
+	case "$SIM_INDEX_FALLBACK" in auto) : ;; ''|*[!0-9]*) die "sim_index must be auto or numeric" ;; esac
 	case "$DEVICE" in ''|*[!A-Za-z0-9_.:-]*) die "invalid device name: $DEVICE" ;; esac
 	case "$WAIT_SECONDS" in ''|*[!0-9]*) die "wait_seconds must be numeric" ;; esac
 	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
@@ -124,8 +130,9 @@ validate_config() {
 	command_exists ifdown || die "ifdown is required"
 }
 
-kv_value() {
-	keys="$1"
+kv_value_from() {
+	file="$1"
+	keys="$2"
 	awk -F ':' -v wanted="$keys" '
 		BEGIN { n=split(wanted, a, " ") }
 		{
@@ -138,10 +145,58 @@ kv_value() {
 				if ($0 != "--" && $0 != "unknown") { print $0; exit }
 			}
 		}
-	' "$SIM_DATA"
+	' "$file"
+}
+
+kv_value() {
+	kv_value_from "$SIM_DATA" "$1"
+}
+
+resolve_sim_index() {
+	: >"$MODEM_LIST"
+	mmcli -L 2>/dev/null | \
+		sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' >"$MODEM_LIST" || :
+
+	selected_sim=""
+	first_sim=""
+	modem_count=0
+	while IFS= read -r modem_index; do
+		case "$modem_index" in ''|*[!0-9]*) continue ;; esac
+		mmcli -m "$modem_index" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || continue
+		modem_count=$((modem_count + 1))
+		modem_device="$(kv_value_from "$MODEM_DATA" 'modem.generic.device')"
+		modem_physdev="$(kv_value_from "$MODEM_DATA" 'modem.generic.physdev')"
+		sim_path="$(kv_value_from "$MODEM_DATA" 'modem.generic.sim')"
+		sim_index="${sim_path##*/}"
+		case "$sim_index" in ''|*[!0-9]*) continue ;; esac
+		[ -n "$first_sim" ] || first_sim="$sim_index"
+
+		if [ -z "$NETWORK_DEVICE" ] || \
+			[ "$modem_device" = "$NETWORK_DEVICE" ] || \
+			[ "$modem_physdev" = "$NETWORK_DEVICE" ]; then
+			selected_sim="$sim_index"
+			break
+		fi
+	done <"$MODEM_LIST"
+
+	if [ -z "$selected_sim" ] && [ "$modem_count" -eq 1 ]; then
+		selected_sim="$first_sim"
+	fi
+	if [ -n "$selected_sim" ]; then
+		SIM_INDEX="$selected_sim"
+		return 0
+	fi
+
+	if [ "$SIM_INDEX_FALLBACK" != "auto" ]; then
+		SIM_INDEX="$SIM_INDEX_FALLBACK"
+		log warning "primary SIM could not be resolved; falling back to configured SIM $SIM_INDEX"
+		return 0
+	fi
+	die "cannot resolve the primary SIM for interface $INTERFACE"
 }
 
 read_sim() {
+	resolve_sim_index
 	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
 		die "cannot read SIM $SIM_INDEX with mmcli"
 	IMSI="$(kv_value 'sim.properties.imsi')"

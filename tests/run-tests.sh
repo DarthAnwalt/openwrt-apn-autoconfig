@@ -9,6 +9,7 @@ DB="$TESTROOT/providers.tsv"
 PERSIST="$TESTROOT/persist"
 CACHE="$PERSIST/cache"
 SCRIPT="$BASE/files/usr/sbin/apn-autoconfig"
+BOOT_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-boot"
 
 cleanup() {
 	rm -rf "$TESTROOT"
@@ -41,6 +42,10 @@ get:apn-autoconfig.main.wait_seconds) printf '%s\n' 2 ;;
 get:apn-autoconfig.main.try_empty) printf '%s\n' 0 ;;
 get:apn-autoconfig.main.use_mwan3) printf '%s\n' auto ;;
 get:apn-autoconfig.main.lock_dir) printf '%s\n' "$TEST_LOCK" ;;
+get:apn-autoconfig.main.autostart) printf '%s\n' "${TEST_AUTOSTART:-0}" ;;
+get:apn-autoconfig.main.boot_delay) printf '%s\n' "${TEST_BOOT_DELAY:-0}" ;;
+get:apn-autoconfig.main.boot_attempts) printf '%s\n' "${TEST_BOOT_ATTEMPTS:-3}" ;;
+get:apn-autoconfig.main.retry_seconds) printf '%s\n' "${TEST_RETRY_SECONDS:-0}" ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 set:*)
 	case "$2" in network.wwan.apn=*) printf '%s\n' "${2#network.wwan.apn=}" >"$TEST_STATE/apn" ;; *) exit 1 ;; esac
@@ -102,6 +107,17 @@ EOF
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROOT/lock" TEST_PERSIST="$PERSIST"
+
+cat >"$MOCKBIN/apn-autoconfig-command" <<'EOF'
+#!/bin/sh
+[ "${1:-}" = "reconcile" ] || exit 2
+count="$(cat "$TEST_STATE/boot-calls" 2>/dev/null || printf '0')"
+count=$((count + 1))
+printf '%s\n' "$count" >"$TEST_STATE/boot-calls"
+[ "$count" -ge "${BOOT_SUCCESS_AT:-1}" ]
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-command"
+export APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-command"
 
 fail() {
 	printf 'FAIL: %s\n' "$*" >&2
@@ -197,5 +213,30 @@ printf '%s\n' 'rollback.apn' >"$STATE/apn"
 printf '%s\n' 'TEST status reports configured APN'
 status_output="$(sh "$SCRIPT" status 2>&1)"
 assert_contains "$status_output" 'Configured APN:  rollback.apn'
+
+printf '%s\n' 'TEST boot worker is inert while autostart is disabled'
+rm -f "$STATE/boot-calls"
+TEST_AUTOSTART=0
+export TEST_AUTOSTART
+sh "$BOOT_SCRIPT" >/dev/null 2>&1
+[ ! -e "$STATE/boot-calls" ] || fail 'disabled boot worker invoked reconcile'
+
+printf '%s\n' 'TEST boot worker retries a bounded failure and then succeeds'
+TEST_AUTOSTART=1
+TEST_BOOT_ATTEMPTS=3
+BOOT_SUCCESS_AT=2
+export TEST_AUTOSTART TEST_BOOT_ATTEMPTS BOOT_SUCCESS_AT
+sh "$BOOT_SCRIPT" >/dev/null 2>&1
+[ "$(cat "$STATE/boot-calls")" -eq 2 ] || fail 'boot worker did not stop after successful retry'
+
+printf '%s\n' 'TEST boot worker fails after the configured attempt limit'
+rm -f "$STATE/boot-calls"
+TEST_BOOT_ATTEMPTS=2
+BOOT_SUCCESS_AT=99
+export TEST_BOOT_ATTEMPTS BOOT_SUCCESS_AT
+if sh "$BOOT_SCRIPT" >/dev/null 2>&1; then
+	fail 'boot worker unexpectedly succeeded after exhausted retries'
+fi
+[ "$(cat "$STATE/boot-calls")" -eq 2 ] || fail 'boot worker ignored the attempt limit'
 
 printf '%s\n' 'All tests passed.'

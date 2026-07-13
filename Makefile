@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.2.2
+PKG_VERSION:=0.3.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -39,6 +39,10 @@ define Package/apn-autoconfig/install
 	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig/providers.tsv $(1)/usr/share/apn-autoconfig/providers.tsv
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/apn-autoconfig $(1)/etc/config/apn-autoconfig
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/apn-autoconfig $(1)/etc/init.d/apn-autoconfig
+	$(INSTALL_DIR) $(1)/usr/libexec
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-boot $(1)/usr/libexec/apn-autoconfig-boot
 endef
 
 # A real removal restores the APN baseline first. A failed reset aborts
@@ -46,6 +50,10 @@ endef
 define Package/apn-autoconfig/prerm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+if [ -x /etc/init.d/apn-autoconfig ]; then
+	/etc/init.d/apn-autoconfig stop >/dev/null 2>&1 || :
+	/etc/init.d/apn-autoconfig disable >/dev/null 2>&1 || :
+fi
 if [ -x /usr/sbin/apn-autoconfig ]; then
 	/usr/sbin/apn-autoconfig reset || {
 		echo "APN reset failed; apn-autoconfig was not removed." >&2

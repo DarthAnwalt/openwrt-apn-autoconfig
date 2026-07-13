@@ -1,11 +1,12 @@
-# apn-autoconfig 0.2.2 — OpenWrt source package
+# apn-autoconfig 0.3.0 — OpenWrt source package
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
 OpenWrt. It reads SIM identity with `mmcli -i 0`, finds APN candidates in a
 local TSV database, restarts only the configured mobile interface, verifies
 real Internet access through `wwan0` with `curl`, caches the successful APN by
-ICCID, and restores the previous APN when all candidates fail. Version 0.2.2
-also includes a manual, idempotent `reconcile` command for SIM transitions.
+ICCID, and restores the previous APN when all candidates fail. It includes an
+idempotent `reconcile` command for SIM transitions and an opt-in delayed boot
+service. Automatic boot reconciliation is disabled by default.
 
 This repository is an OpenWrt source package. It builds a normal `.apk` with
 the official OpenWrt 25.12 SDK. It is still an MVP, not a finished worldwide
@@ -31,8 +32,8 @@ The implementation is MIT licensed; see `LICENSE`.
   fails, package removal is aborted and the program remains available for
   diagnosis and retry.
 - A lock prevents two simultaneous `apply` runs.
-- No automatic boot/hotplug trigger is installed in this MVP. In 0.2.2,
-  `reconcile` must be invoked manually while its behavior is validated.
+- The boot service is installed but inert while `option autostart '0'` remains
+  configured. Hotplug automation is not included.
 
 Existing client connections over the mobile link will naturally be interrupted
 while APNs are tested. Other working mwan3 uplinks should remain available.
@@ -65,15 +66,17 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.2.2-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.3.0-r1.apk
 ```
 
 The package owns:
 
 ```text
 /usr/sbin/apn-autoconfig
+/usr/libexec/apn-autoconfig-boot
 /usr/share/apn-autoconfig/providers.tsv
 /etc/config/apn-autoconfig
+/etc/init.d/apn-autoconfig
 ```
 
 The UCI file is declared as a package configuration file. Cache files are
@@ -162,6 +165,35 @@ config apn_autoconfig 'main'
         option try_empty '0'
         option use_mwan3 'auto'
         option lock_dir '/var/lock/apn-autoconfig.lock'
+        option autostart '0'
+        option boot_delay '30'
+        option boot_attempts '6'
+        option retry_seconds '15'
+```
+
+## Optional boot reconciliation
+
+The installed procd service does nothing by default. After manual
+`reconcile` testing, enable it explicitly:
+
+```sh
+uci set apn-autoconfig.main.autostart='1'
+uci commit apn-autoconfig
+/etc/init.d/apn-autoconfig enable
+/etc/init.d/apn-autoconfig restart
+```
+
+On boot it waits `boot_delay` seconds and then runs `reconcile`. Temporary
+failures are retried at most `boot_attempts` times with `retry_seconds` between
+attempts. It never loops indefinitely and does not use procd respawn.
+
+Disable it without uninstalling the package:
+
+```sh
+uci set apn-autoconfig.main.autostart='0'
+uci commit apn-autoconfig
+/etc/init.d/apn-autoconfig stop
+/etc/init.d/apn-autoconfig disable
 ```
 
 `use_mwan3` accepts `auto`, `always`, or `never`. `auto` uses `mwan3 use` only
@@ -233,8 +265,9 @@ To restore the baseline and remove the package:
 apk del apn-autoconfig
 ```
 
-The package pre-deinstall script restores the baseline first. If restoration
-fails, removal aborts. After a successful reset, package removal deletes:
+The package pre-deinstall script stops and disables the boot service, then
+restores the baseline. If restoration fails, removal aborts. After a successful
+reset, package removal deletes:
 
 ```text
 /usr/sbin/apn-autoconfig
@@ -262,7 +295,7 @@ submission has been implemented and tested.
 - SIM index is currently configured explicitly (default `0`).
 - Only the APN is applied; APN username/password/authentication are not.
 - The connectivity test is IPv4 HTTPS through one configured net device.
-- No boot/hotplug automation and no LuCI UI are included.
+- Boot automation is opt-in; hotplug automation and a LuCI UI are not included.
 - A provider missing from the TSV requires a manual APN or a larger generated
   database.
 

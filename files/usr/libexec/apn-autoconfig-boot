@@ -1,0 +1,81 @@
+#!/bin/sh
+
+PROG="apn-autoconfig-boot"
+AUTOCONFIG_BIN="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+config_value() {
+	key="$1"
+	default="$2"
+	value="$(uci -q get "apn-autoconfig.main.${key}")" || value=""
+	printf '%s\n' "${value:-$default}"
+}
+
+numeric_value() {
+	key="$1"
+	default="$2"
+	value="$(config_value "$key" "$default")"
+	case "$value" in
+		''|*[!0-9]*)
+			log err "invalid numeric option $key: $value"
+			exit 2
+			;;
+	esac
+	printf '%s\n' "$value"
+}
+
+enabled="$(config_value autostart 0)"
+case "$enabled" in
+	0)
+		log notice "automatic boot reconciliation is disabled"
+		exit 0
+		;;
+	1) : ;;
+	*)
+		log err "autostart must be 0 or 1"
+		exit 2
+		;;
+esac
+
+delay="$(numeric_value boot_delay 30)" || exit $?
+attempts="$(numeric_value boot_attempts 6)" || exit $?
+retry_seconds="$(numeric_value retry_seconds 15)" || exit $?
+[ "$attempts" -gt 0 ] || {
+	log err "boot_attempts must be greater than zero"
+	exit 2
+}
+[ -x "$AUTOCONFIG_BIN" ] || {
+	log err "helper is not executable: $AUTOCONFIG_BIN"
+	exit 2
+}
+
+log notice "waiting ${delay}s before boot reconciliation"
+[ "$delay" -eq 0 ] || sleep "$delay"
+
+attempt=1
+while [ "$attempt" -le "$attempts" ]; do
+	log notice "boot reconciliation attempt $attempt of $attempts"
+	if "$AUTOCONFIG_BIN" reconcile; then
+		log notice "boot reconciliation completed successfully"
+		exit 0
+	else
+		status=$?
+	fi
+	if [ "$attempt" -ge "$attempts" ]; then
+		log err "boot reconciliation failed after $attempts attempts"
+		exit "$status"
+	fi
+	log warning "attempt $attempt failed; retrying in ${retry_seconds}s"
+	[ "$retry_seconds" -eq 0 ] || sleep "$retry_seconds"
+	attempt=$((attempt + 1))
+done
+
+exit 1

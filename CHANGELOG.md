@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Make candidate specificity ordering portable to BusyBox `sort`.
+- Deduplicate identical APNs after sorting, preserving the most-specific provider.
+- Add regression tests for candidate order and duplicate suppression.
+
 ## 0.2.0
 
 - Converted the reversible prototype into an OpenWrt source package.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Add an opt-in procd boot service for delayed, bounded APN reconciliation.
+- Keep boot automation disabled by default until explicitly enabled in UCI.
+- Retry temporary ModemManager/SIM readiness failures without restarting any
+  interface other than the configured WWAN interface.
+- Add behavioral tests for disabled startup, successful retry and exhausted
+  retry limits.
+
 ## 0.2.2
 
 - Add a manual `reconcile` command that treats ICCID changes as authoritative,

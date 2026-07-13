@@ -2,6 +2,11 @@ name: Build OpenWrt APK
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to receive verified assets (optional)
+        required: false
+        type: string
   push:
     branches: [main]
     tags: ['v*']
@@ -32,7 +37,7 @@ jobs:
           if-no-files-found: error
 
   publish-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.release_tag != ''
     needs: test-and-build
     runs-on: ubuntu-24.04
     permissions:
@@ -46,8 +51,10 @@ jobs:
       - name: Attach APK and checksum to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
         run: |
-          gh release upload "$GITHUB_REF_NAME" \
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             release-assets/*.apk \
             release-assets/SHA256SUMS \
             --clobber

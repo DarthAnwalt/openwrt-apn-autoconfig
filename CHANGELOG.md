@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Add a manual `reconcile` command that treats ICCID changes as authoritative,
+  even when the old APN happens to provide working Internet on the new SIM.
+- Persist the last successfully reconciled ICCID/APN in `active.tsv`.
+- Avoid restarting WWAN when the same SIM, APN and verified connection are
+  already active.
+- Keep boot and hotplug automation disabled until manual reconciliation has
+  been validated on real hardware.
+
 ## 0.2.1
 
 - Make candidate specificity ordering portable to BusyBox `sort`.

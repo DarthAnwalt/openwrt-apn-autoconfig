@@ -1,10 +1,11 @@
-# apn-autoconfig 0.2.1 — OpenWrt source package
+# apn-autoconfig 0.2.2 — OpenWrt source package
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
 OpenWrt. It reads SIM identity with `mmcli -i 0`, finds APN candidates in a
 local TSV database, restarts only the configured mobile interface, verifies
 real Internet access through `wwan0` with `curl`, caches the successful APN by
-ICCID, and restores the previous APN when all candidates fail.
+ICCID, and restores the previous APN when all candidates fail. Version 0.2.2
+also includes a manual, idempotent `reconcile` command for SIM transitions.
 
 This repository is an OpenWrt source package. It builds a normal `.apk` with
 the official OpenWrt 25.12 SDK. It is still an MVP, not a finished worldwide
@@ -30,7 +31,8 @@ The implementation is MIT licensed; see `LICENSE`.
   fails, package removal is aborted and the program remains available for
   diagnosis and retry.
 - A lock prevents two simultaneous `apply` runs.
-- No automatic boot/hotplug trigger is installed in this MVP.
+- No automatic boot/hotplug trigger is installed in this MVP. In 0.2.2,
+  `reconcile` must be invoked manually while its behavior is validated.
 
 Existing client connections over the mobile link will naturally be interrupted
 while APNs are tested. Other working mwan3 uplinks should remain available.
@@ -63,7 +65,7 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.2.1-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.2.2-r1.apk
 ```
 
 The package owns:
@@ -97,6 +99,17 @@ Show the current configuration and cached result with:
 ```sh
 apn-autoconfig status
 ```
+
+Reconcile the current SIM with its cached/database APN:
+
+```sh
+apn-autoconfig reconcile
+```
+
+`reconcile` regards a changed ICCID as authoritative. It applies the APN for
+the new SIM even if the previous provider's APN happens to pass the Internet
+test. If ICCID, configured APN and the last successfully reconciled state all
+match, it verifies connectivity and exits without restarting `wwan`.
 
 Return to the APN state that existed before the first `apply`:
 
@@ -249,7 +262,7 @@ submission has been implemented and tested.
 - SIM index is currently configured explicitly (default `0`).
 - Only the APN is applied; APN username/password/authentication are not.
 - The connectivity test is IPv4 HTTPS through one configured net device.
-- No hotplug automation and no LuCI UI are included.
+- No boot/hotplug automation and no LuCI UI are included.
 - A provider missing from the TSV requires a manual APN or a larger generated
   database.
 

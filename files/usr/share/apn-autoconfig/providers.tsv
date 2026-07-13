@@ -1,0 +1,10 @@
+# apn-autoconfig demo database v1
+# TAB-separated columns:
+# mccmnc  imsi_prefix  iccid_prefix  gid1  spn_substring  provider  apn  priority
+#
+# '-' means "not constrained". Lower priority numbers are tried first after
+# the most-specific match wins. This is intentionally NOT a worldwide database.
+# Replace this file with a larger generated TSV using the same schema.
+26201	-	-	01	Kaufland Mobil	Kaufland Mobil (Telekom DE)	internet.telekom	10
+26201	-	-	-	-	Telekom Germany	internet.telekom	20
+26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10

@@ -1,4 +1,4 @@
-# apn-autoconfig 0.2.0 — OpenWrt source package
+# apn-autoconfig 0.2.1 — OpenWrt source package
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
 OpenWrt. It reads SIM identity with `mmcli -i 0`, finds APN candidates in a
@@ -63,7 +63,7 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.2.0-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.2.1-r1.apk
 ```
 
 The package owns:

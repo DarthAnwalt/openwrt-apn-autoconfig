@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.4.0
+PKG_VERSION:=0.5.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -43,6 +43,9 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/etc/init.d/apn-autoconfig $(1)/etc/init.d/apn-autoconfig
 	$(INSTALL_DIR) $(1)/usr/libexec
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-boot $(1)/usr/libexec/apn-autoconfig-boot
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-action $(1)/usr/libexec/apn-autoconfig-action
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-query $(1)/usr/libexec/apn-autoconfig-query
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-control $(1)/usr/libexec/apn-autoconfig-control
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/button
 	$(INSTALL_BIN) ./files/etc/hotplug.d/button/50-apn-autoconfig $(1)/etc/hotplug.d/button/50-apn-autoconfig
 endef
@@ -63,6 +66,11 @@ if [ -x /usr/sbin/apn-autoconfig ]; then
 		exit 1
 	}
 fi
+action_state_dir="$$(uci -q get apn-autoconfig.main.action_state_dir 2>/dev/null || printf '%s' /tmp/apn-autoconfig-action)"
+case "$${action_state_dir}" in
+	/tmp/*) rm -rf "$${action_state_dir}" "$${action_state_dir}.start-lock" ;;
+	*) echo "Runtime action state outside /tmp was not removed: $${action_state_dir}" >&2 ;;
+esac
 exit 0
 endef
 

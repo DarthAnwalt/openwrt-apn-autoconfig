@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+- Add stable JSON output for SIM/APN status and candidate detection.
+- Add a non-blocking job API for APN reconciliation and hardware modem reset.
+- Expose one unified busy state for jobs started through LuCI and operations
+  started through SSH or the physical button.
+- Reject overlapping operations and persist terminal success/failure state in
+  a volatile runtime directory.
+- Add separate read-only and mutating rpcd entry points with narrow ACLs.
+- Add the first `luci-app-apn-autoconfig` package with live status, background
+  action polling, physical-button configuration and advanced board settings.
+- Keep both virtual action buttons disabled until the core confirms completion;
+  polling errors do not incorrectly unlock the controls.
+- Extend behavioral tests with valid-JSON, concurrency, external-operation and
+  failed-job coverage.
+
 ## 0.4.0
 
 - Add a manually callable `modem-reset` command for a bounded GPIO modem power

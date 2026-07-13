@@ -1,0 +1,17 @@
+{
+	"luci-app-apn-autoconfig": {
+		"description": "Grant access to APN Auto-Config",
+		"read": {
+			"uci": [ "apn-autoconfig" ],
+			"file": {
+				"/usr/libexec/apn-autoconfig-query": [ "list", "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "apn-autoconfig" ],
+			"file": {
+				"/usr/libexec/apn-autoconfig-control": [ "list", "exec" ]
+			}
+		}
+	}
+}

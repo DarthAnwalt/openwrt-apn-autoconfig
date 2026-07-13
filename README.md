@@ -1,4 +1,4 @@
-# apn-autoconfig 0.4.0 — OpenWrt source package
+# apn-autoconfig 0.5.0 — OpenWrt source packages
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
 OpenWrt. It dynamically resolves the active ModemManager SIM, finds APN
@@ -11,9 +11,14 @@ exported GPIO and reconcile
 the APN after the modem returns. Boot and hardware-button automation are both
 disabled by default.
 
-This repository is an OpenWrt source package. It builds a normal `.apk` with
-the official OpenWrt 25.12 SDK. It is still an MVP, not a finished worldwide
-provider database and not a LuCI application.
+This repository contains two OpenWrt source packages. It builds normal `.apk`
+packages with the official OpenWrt 25.12 SDK:
+
+- `apn-autoconfig`, the POSIX-shell core;
+- `luci-app-apn-autoconfig`, the optional web interface.
+
+It is still an MVP and does not yet include a finished worldwide provider
+database.
 
 The implementation is MIT licensed; see `LICENSE`.
 
@@ -41,6 +46,12 @@ The implementation is MIT licensed; see `LICENSE`.
   remains configured.
 - A modem reset uses the same operation lock as APN changes. Repeated button
   presses cannot start overlapping resets.
+- LuCI starts long operations in the background. Both virtual action buttons
+  remain disabled while the core reports a queued, running, SSH-initiated or
+  physical-button-initiated operation.
+- A lost or invalid polling response does not falsely mark an operation as
+  finished. The buttons are re-enabled only after a successful status response
+  reports a terminal state.
 - If the reset command is interrupted while modem power is off, its exit trap
   attempts to restore the configured power-on value and bring `wwan` back up.
 
@@ -83,7 +94,8 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.4.0-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.5.0-r1.apk
+apk add --allow-untrusted ./luci-app-apn-autoconfig-0.1.0-r1.apk
 ```
 
 The package owns:
@@ -91,6 +103,9 @@ The package owns:
 ```text
 /usr/sbin/apn-autoconfig
 /usr/libexec/apn-autoconfig-boot
+/usr/libexec/apn-autoconfig-action
+/usr/libexec/apn-autoconfig-query
+/usr/libexec/apn-autoconfig-control
 /usr/share/apn-autoconfig/providers.tsv
 /etc/config/apn-autoconfig
 /etc/init.d/apn-autoconfig
@@ -99,6 +114,46 @@ The package owns:
 
 The UCI file is declared as a package configuration file. Cache files are
 created later under `/etc/apn-autoconfig/cache/`.
+
+The LuCI package adds **Network → APN Auto-Config**. It owns only its view,
+menu and ACL files and can be removed independently from the core.
+
+## LuCI actions and operation state
+
+The web interface provides two actions:
+
+- **Re-detect and verify APN** runs `reconcile`;
+- **Power-cycle modem and re-read SIM** runs `modem-reset`.
+
+Both show a confirmation first. After confirmation the HTTP request only starts
+a background job; it does not remain open for the full modem reset. The page
+polls the machine API and disables both buttons for the entire operation. The
+same busy indicator also covers a command started through SSH or the physical
+button, so entry points cannot overlap.
+
+Runtime job state is deliberately volatile and stored by default in:
+
+```text
+/tmp/apn-autoconfig-action/state.tsv
+```
+
+It records `starting`, `running`, `success` or `failed`; it contains no SIM
+secrets beyond the action name and process/timing information. The normal APN
+operation lock remains authoritative.
+
+Machine-readable commands used by LuCI are also available for diagnostics:
+
+```sh
+apn-autoconfig status-json
+apn-autoconfig detect-json
+apn-autoconfig action-start reconcile
+apn-autoconfig action-start modem-reset
+apn-autoconfig action-status
+```
+
+The LuCI ACL does not execute the general-purpose command directly. Separate
+query and control wrappers accept only the required read-only and mutating
+operations.
 
 ## First use
 
@@ -231,6 +286,7 @@ config apn_autoconfig 'main'
         option try_empty '0'
         option use_mwan3 'auto'
         option lock_dir '/var/lock/apn-autoconfig.lock'
+        option action_state_dir '/tmp/apn-autoconfig-action'
         option autostart '0'
         option boot_delay '30'
         option boot_attempts '6'
@@ -377,8 +433,9 @@ submission has been implemented and tested.
   a configured numeric `sim_index` is used only when resolution is impossible.
 - Only the APN is applied; APN username/password/authentication are not.
 - The connectivity test is IPv4 HTTPS through one configured net device.
-- Boot and hardware-button automation are independently opt-in; a LuCI UI is
-  not included.
+- Boot and hardware-button automation are independently opt-in. The first LuCI
+  UI covers live state, manual background actions and the most relevant UCI
+  settings; it does not yet manage the init-script enable/disable state.
 - The bundled GPIO defaults are specific to the tested Huasifei WH3000 Pro
   eMMC and must not be assumed correct for another board.
 - A provider missing from the TSV requires a manual APN or a larger generated

@@ -118,6 +118,9 @@ printf '%s\n' 'TEST detect is read-only and finds the specific candidate'
 before="$(cat "$STATE/apn")"
 detect_output="$(sh "$SCRIPT" detect 2>&1)"
 assert_contains "$detect_output" 'Kaufland Mobil'
+first_candidate="$(printf '%s\n' "$detect_output" | awk '/^[[:space:]]*1\./ { print; exit }')"
+assert_contains "$first_candidate" 'Kaufland Mobil'
+[ "$(printf '%s\n' "$detect_output" | grep -F -c 'internet.telekom')" -eq 1 ] || fail 'detect did not deduplicate identical APNs'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'detect changed APN'
 
 printf '%s\n' 'TEST apply stores working APN and ICCID cache'

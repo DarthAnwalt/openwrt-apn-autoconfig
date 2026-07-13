@@ -3,6 +3,8 @@
 ## 0.3.0
 
 - Add an opt-in procd boot service for delayed, bounded APN reconciliation.
+- Keep boot-worker stdout and stderr out of procd's syslog capture so messages
+  emitted through `logger` are not duplicated as `daemon.err` entries.
 - Keep boot automation disabled by default until explicitly enabled in UCI.
 - Retry temporary ModemManager/SIM readiness failures without restarting any
   interface other than the configured WWAN interface.

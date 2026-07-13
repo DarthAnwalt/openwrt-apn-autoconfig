@@ -13,6 +13,7 @@ DATABASE="/usr/share/apn-autoconfig/providers.tsv"
 CACHE_DIR="/etc/apn-autoconfig/cache"
 STATE_DIR="/etc/apn-autoconfig"
 BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
+ACTIVE_FILE="/etc/apn-autoconfig/active.tsv"
 TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
 WAIT_SECONDS="35"
 TRY_EMPTY="0"
@@ -102,6 +103,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
 	BASELINE_FILE="$STATE_DIR/baseline.tsv"
+	ACTIVE_FILE="$STATE_DIR/active.tsv"
 }
 
 validate_config() {
@@ -252,6 +254,7 @@ save_baseline() {
 reset_cmd() {
 	if [ ! -r "$BASELINE_FILE" ]; then
 		rm -rf "$CACHE_DIR"
+		rm -f "$ACTIVE_FILE"
 		log notice "no saved APN baseline; cache cleared, network unchanged"
 		return 0
 	fi
@@ -276,6 +279,7 @@ reset_cmd() {
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored APN, but interface $INTERFACE did not start"
 	rm -rf "$CACHE_DIR"
+	rm -f "$ACTIVE_FILE"
 	rm -f "$BASELINE_FILE"
 	log notice "restored original APN state; cache and baseline removed"
 }
@@ -304,6 +308,12 @@ status_cmd() {
 	printf 'Last result:     '
 	if [ -r "$CACHE_DIR/last-result" ]; then
 		cat "$CACHE_DIR/last-result"
+	else
+		printf -- '-\n'
+	fi
+	printf 'Reconciled SIM:  '
+	if [ -r "$ACTIVE_FILE" ]; then
+		awk -F '\t' 'NR == 1 && $1 == "v1" { printf "%s (%s)\n", $2, $3; found=1 } END { if (!found) print "invalid state" }' "$ACTIVE_FILE"
 	else
 		printf -- '-\n'
 	fi
@@ -414,6 +424,25 @@ write_last_result() {
 	printf '%s\n' "$*" >"$CACHE_DIR/last-result"
 }
 
+save_active_state() {
+	apn="$1"
+	mkdir -p "$STATE_DIR" || return 1
+	tmp="$STATE_DIR/.active.tmp.$$"
+	active_apn="${apn:-<empty>}"
+	printf 'v1\t%s\t%s\n' "$ICCID" "$active_apn" >"$tmp" || return 1
+	mv "$tmp" "$ACTIVE_FILE"
+}
+
+active_iccid() {
+	[ -r "$ACTIVE_FILE" ] || return 1
+	awk -F '\t' 'NR == 1 && $1 == "v1" { print $2; exit }' "$ACTIVE_FILE"
+}
+
+active_apn() {
+	[ -r "$ACTIVE_FILE" ] || return 1
+	awk -F '\t' 'NR == 1 && $1 == "v1" { print $3; exit }' "$ACTIVE_FILE"
+}
+
 apply_cmd() {
 	read_sim
 	find_candidates
@@ -446,6 +475,7 @@ apply_cmd() {
 		fi
 		if test_connectivity; then
 			save_cache "$apn" "$provider" || log warning "APN worked, but cache could not be written"
+			save_active_state "$apn" || log warning "APN worked, but reconciled SIM state could not be written"
 			write_last_result "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
 			log notice "APN '$display_apn' is working; configuration kept"
@@ -458,6 +488,34 @@ apply_cmd() {
 	die "all APN candidates failed; previous APN will be restored"
 }
 
+reconcile_cmd() {
+	read_sim
+	previous_iccid="$(active_iccid 2>/dev/null || :)"
+	previous_apn="$(active_apn 2>/dev/null || :)"
+	configured_apn="$(current_apn 2>/dev/null || :)"
+	[ "$previous_apn" = "<empty>" ] && previous_apn=""
+
+	if [ -n "$previous_iccid" ] && \
+	   [ "$previous_iccid" = "$ICCID" ] && \
+	   [ "$previous_apn" = "$configured_apn" ] && \
+	   interface_is_up && test_connectivity; then
+		log notice "SIM $ICCID is already reconciled with APN '${configured_apn:-<empty>}'; no changes"
+		return 0
+	fi
+
+	if [ -n "$previous_iccid" ] && [ "$previous_iccid" != "$ICCID" ]; then
+		log notice "SIM change detected: $previous_iccid -> $ICCID"
+	elif [ -z "$previous_iccid" ]; then
+		log notice "no reconciled SIM state found; applying APN for ICCID $ICCID"
+	elif [ "$previous_apn" != "$configured_apn" ]; then
+		log notice "configured APN differs from the reconciled APN for ICCID $ICCID"
+	else
+		log notice "reconciled WWAN connectivity is unavailable; retrying APN for ICCID $ICCID"
+	fi
+
+	apply_cmd
+}
+
 usage() {
 	cat <<EOF
 Usage: $PROG <command>
@@ -465,6 +523,7 @@ Usage: $PROG <command>
 Commands:
   detect   Read SIM identity and list matching APN candidates; no changes
   apply    Try candidates, verify Internet through $DEVICE, cache success
+  reconcile  Apply only when SIM/APN changed or verified connectivity failed
   status   Show SIM identity, configured/cached APN and last result
   reset    Restore the APN state saved before the first apply; clear cache
 EOF
@@ -476,6 +535,7 @@ main() {
 	case "${1:-}" in
 		detect) detect_cmd ;;
 		apply) apply_cmd ;;
+		reconcile) reconcile_cmd ;;
 		status) status_cmd ;;
 		reset) reset_cmd ;;
 		-h|--help|help|'') usage ;;

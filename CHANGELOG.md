@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+- Add a manually callable `modem-reset` command for a bounded GPIO modem power
+  cycle followed by dynamic SIM discovery and APN reconciliation.
+- Restore modem power and attempt to bring `wwan` back after an interrupted or
+  failed reset.
+- Install an opt-in OpenWrt button hotplug handler for `BTN_0` release events.
+- Keep button automation disabled by default until the manual hardware reset
+  has been verified on the target router.
+- Serialize hardware resets with normal APN operations to prevent overlapping
+  button actions.
+- Add `kmod-button-hotplug` as a package dependency and behavioral tests for
+  GPIO restoration, APN reconciliation, and release-only button activation.
+- Validate the full flow on a WH3000 Pro eMMC with an RM520N-GL: physical
+  `BTN_0` release, modem object re-enumeration, changed physical SIM/ICCID,
+  automatic Telekom APN selection, real connectivity, and mwan3 recovery.
+
 ## 0.3.0
 
 - Add an opt-in procd boot service for delayed, bounded APN reconciliation.

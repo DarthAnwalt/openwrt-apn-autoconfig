@@ -196,9 +196,12 @@ find_candidates() {
 			if (!wildcard(row_gid1)) score += 50
 			if (!wildcard(row_spn)) score += 40
 			if (priority !~ /^[0-9]+$/) priority=100
-			print score, priority, apn, provider
+			# Fixed-width inverse score makes the required order portable even on
+			# BusyBox sort variants that handle per-key reverse modifiers differently.
+			rank=999999-score
+			printf "%06d\t%06d\t%s\t%s\n", rank, priority, apn, provider
 		}
-	' "$DATABASE" | sort -t "$(printf '\t')" -k1,1nr -k2,2n >"$CANDIDATES"
+	' "$DATABASE" | sort | awk -F '\t' '!seen[$3]++' >"$CANDIDATES"
 }
 
 print_identity() {

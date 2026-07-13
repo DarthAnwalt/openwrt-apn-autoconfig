@@ -1,12 +1,13 @@
 # apn-autoconfig 0.4.0 — OpenWrt source package
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
-OpenWrt. It reads SIM identity with `mmcli -i 0`, finds APN candidates in a
-local TSV database, restarts only the configured mobile interface, verifies
-real Internet access through `wwan0` with `curl`, caches the successful APN by
-ICCID, and restores the previous APN when all candidates fail. It includes an
-idempotent `reconcile` command for SIM transitions and an opt-in delayed boot
-service. It can also power-cycle a modem through an exported GPIO and reconcile
+OpenWrt. It dynamically resolves the active ModemManager SIM, finds APN
+candidates in a local TSV database, restarts only the configured mobile
+interface, verifies real Internet access through `wwan0` with `curl`, caches
+the successful APN by ICCID, and restores the previous APN when all candidates
+fail. It includes an idempotent `reconcile` command for SIM transitions and an
+opt-in delayed boot service. It can also power-cycle a modem through an
+exported GPIO and reconcile
 the APN after the modem returns. Boot and hardware-button automation are both
 disabled by default.
 
@@ -58,6 +59,13 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 
 The defaults match the Huasifei WH3000 Pro + Quectel RM520N-GL setup for which
 this MVP was prepared. Edit `/etc/config/apn-autoconfig` for other names.
+
+The complete button flow was tested on that hardware with a live physical SIM
+change from SIMon mobile/Vodafone Germany to Kaufland Mobil/Telekom Germany.
+One `BTN_0` release power-cycled the modem, resolved the newly assigned
+ModemManager modem/SIM object indices, detected the changed ICCID, selected
+`internet.telekom`, restored real Internet access and returned `wwan` to the
+online state in mwan3.
 
 ## Building the APK
 

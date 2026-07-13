@@ -13,6 +13,9 @@
   button actions.
 - Add `kmod-button-hotplug` as a package dependency and behavioral tests for
   GPIO restoration, APN reconciliation, and release-only button activation.
+- Validate the full flow on a WH3000 Pro eMMC with an RM520N-GL: physical
+  `BTN_0` release, modem object re-enumeration, changed physical SIM/ICCID,
+  automatic Telekom APN selection, real connectivity, and mwan3 recovery.
 
 ## 0.3.0
 

@@ -4,6 +4,8 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
 sh -n "$ROOT/files/usr/sbin/apn-autoconfig"
+sh -n "$ROOT/files/usr/libexec/apn-autoconfig-boot"
+sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/verify.sh"

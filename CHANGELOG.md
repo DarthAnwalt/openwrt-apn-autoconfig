@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0
+
+- Add an opt-in procd boot service for delayed, bounded APN reconciliation.
+- Keep boot-worker stdout and stderr out of procd's syslog capture so messages
+  emitted through `logger` are not duplicated as `daemon.err` entries.
+- Keep boot automation disabled by default until explicitly enabled in UCI.
+- Retry temporary ModemManager/SIM readiness failures without restarting any
+  interface other than the configured WWAN interface.
+- Resolve the current primary SIM through the matching ModemManager device on
+  every run, because modem and SIM object indices change after a hardware reset.
+- Treat the legacy numeric `sim_index` setting as a fallback, preserving
+  configurations created by earlier package versions.
+- Add behavioral tests for disabled startup, successful retry and exhausted
+  retry limits.
+
 ## 0.2.2
 
 - Add a manual `reconcile` command that treats ICCID changes as authoritative,

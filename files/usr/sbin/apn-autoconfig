@@ -1,0 +1,483 @@
+#!/bin/sh
+
+# Minimal APN auto-configuration helper for OpenWrt + ModemManager.
+# POSIX shell; intended for OpenWrt 25.12 and BusyBox ash.
+
+PROG="apn-autoconfig"
+CONFIG="apn-autoconfig"
+
+INTERFACE="wwan"
+SIM_INDEX="0"
+DEVICE="wwan0"
+DATABASE="/usr/share/apn-autoconfig/providers.tsv"
+CACHE_DIR="/etc/apn-autoconfig/cache"
+STATE_DIR="/etc/apn-autoconfig"
+BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
+TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
+WAIT_SECONDS="35"
+TRY_EMPTY="0"
+USE_MWAN3="auto"
+
+LOCK_DIR="/var/lock/apn-autoconfig.lock"
+TMP_BASE="/tmp/apn-autoconfig.$$"
+SIM_DATA="${TMP_BASE}.sim"
+CANDIDATES="${TMP_BASE}.candidates"
+SEEN_APNS="${TMP_BASE}.seen"
+
+ROLLBACK_ARMED=0
+OLD_APN_SET=0
+OLD_APN=""
+LOCK_HELD=0
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+die() {
+	log err "$*"
+	exit 1
+}
+
+cleanup_files() {
+	rm -f "$SIM_DATA" "$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS"
+	if [ "$LOCK_HELD" -eq 1 ]; then
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || :
+		LOCK_HELD=0
+	fi
+}
+
+set_apn() {
+	value="$1"
+	uci set "network.${INTERFACE}.apn=$value" >/dev/null 2>&1 || return 1
+	uci commit network >/dev/null 2>&1
+}
+
+restore_old_apn() {
+	log warning "restoring previous APN for interface $INTERFACE"
+	if [ "$OLD_APN_SET" -eq 1 ]; then
+		uci set "network.${INTERFACE}.apn=$OLD_APN" >/dev/null 2>&1 || return 1
+	else
+		uci -q delete "network.${INTERFACE}.apn" >/dev/null 2>&1 || :
+	fi
+	uci commit network >/dev/null 2>&1 || return 1
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	ifup "$INTERFACE" >/dev/null 2>&1 || :
+}
+
+on_exit() {
+	status=$?
+	trap - 0 HUP INT TERM
+	if [ "$ROLLBACK_ARMED" -eq 1 ]; then
+		restore_old_apn || log err "automatic rollback failed; restore APN in LuCI"
+	fi
+	cleanup_files
+	exit "$status"
+}
+
+trap on_exit 0 HUP INT TERM
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+load_config() {
+	if ! command_exists uci; then
+		die "uci is required"
+	fi
+	value="$(uci -q get "${CONFIG}.main.interface")" && [ -n "$value" ] && INTERFACE="$value"
+	value="$(uci -q get "${CONFIG}.main.sim_index")" && [ -n "$value" ] && SIM_INDEX="$value"
+	value="$(uci -q get "${CONFIG}.main.device")" && [ -n "$value" ] && DEVICE="$value"
+	value="$(uci -q get "${CONFIG}.main.database")" && [ -n "$value" ] && DATABASE="$value"
+	value="$(uci -q get "${CONFIG}.main.cache_dir")" && [ -n "$value" ] && CACHE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.test_url")" && [ -n "$value" ] && TEST_URL="$value"
+	value="$(uci -q get "${CONFIG}.main.wait_seconds")" && [ -n "$value" ] && WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.try_empty")" && [ -n "$value" ] && TRY_EMPTY="$value"
+	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
+	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
+	BASELINE_FILE="$STATE_DIR/baseline.tsv"
+}
+
+validate_config() {
+	case "$INTERFACE" in *[!A-Za-z0-9_]*) die "invalid interface name: $INTERFACE" ;; esac
+	case "$SIM_INDEX" in ''|*[!0-9]*) die "sim_index must be numeric" ;; esac
+	case "$DEVICE" in ''|*[!A-Za-z0-9_.:-]*) die "invalid device name: $DEVICE" ;; esac
+	case "$WAIT_SECONDS" in ''|*[!0-9]*) die "wait_seconds must be numeric" ;; esac
+	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
+	case "$USE_MWAN3" in auto|always|never) : ;; *) die "use_mwan3 must be auto, always or never" ;; esac
+	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+	case "$CACHE_DIR" in /|*/../*|*/..) die "unsafe cache_dir" ;; /*) : ;; *) die "cache_dir must be absolute" ;; esac
+	case "$CACHE_DIR" in "$STATE_DIR"/?*) : ;; *) die "cache_dir must be inside state_dir" ;; esac
+	case "$LOCK_DIR" in /|*/../*|*/..) die "unsafe lock_dir" ;; /*) : ;; *) die "lock_dir must be absolute" ;; esac
+	[ -r "$DATABASE" ] || die "database not readable: $DATABASE"
+	command_exists mmcli || die "mmcli is required"
+	command_exists curl || die "curl is required"
+	command_exists ifup || die "ifup is required"
+	command_exists ifdown || die "ifdown is required"
+}
+
+kv_value() {
+	keys="$1"
+	awk -F ':' -v wanted="$keys" '
+		BEGIN { n=split(wanted, a, " ") }
+		{
+			key=$1
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			for (i=1; i<=n; i++) if (key == a[i]) {
+				$1=""
+				sub(/^:[[:space:]]*/, "", $0)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+				if ($0 != "--" && $0 != "unknown") { print $0; exit }
+			}
+		}
+	' "$SIM_DATA"
+}
+
+read_sim() {
+	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
+		die "cannot read SIM $SIM_INDEX with mmcli"
+	IMSI="$(kv_value 'sim.properties.imsi')"
+	ICCID="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
+	EID="$(kv_value 'sim.properties.eid')"
+	OPERATOR_ID="$(kv_value 'sim.properties.operator-id sim.properties.operator-code')"
+	OPERATOR_NAME="$(kv_value 'sim.properties.operator-name')"
+	GID1="$(kv_value 'sim.properties.gid1')"
+	GID2="$(kv_value 'sim.properties.gid2')"
+	[ -n "$ICCID" ] || die "SIM ICCID is unavailable"
+	case "$ICCID" in *[!0-9]*) die "unexpected ICCID format" ;; esac
+}
+
+cache_file() {
+	printf '%s/%s.tsv\n' "$CACHE_DIR" "$ICCID"
+}
+
+cached_apn() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && $1 == "v1" { print $2; exit }' "$file"
+}
+
+cached_provider() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && $1 == "v1" { print $3; exit }' "$file"
+}
+
+find_candidates() {
+	: >"$CANDIDATES"
+	awk -F '\t' \
+		-v operator_id="$OPERATOR_ID" \
+		-v imsi="$IMSI" \
+		-v iccid="$ICCID" \
+		-v gid1="$GID1" \
+		-v spn="$OPERATOR_NAME" '
+		function wildcard(v) { return v == "" || v == "-" || v == "*" }
+		function starts(value, prefix) { return substr(value, 1, length(prefix)) == prefix }
+		BEGIN { OFS="\t"; spn_l=tolower(spn); gid1_l=tolower(gid1) }
+		/^[[:space:]]*#/ || NF < 8 { next }
+		{
+			mccmnc=$1; imsi_prefix=$2; iccid_prefix=$3; row_gid1=$4
+			row_spn=$5; provider=$6; apn=$7; priority=$8
+			if (!wildcard(mccmnc) && operator_id != mccmnc) next
+			if (!wildcard(imsi_prefix) && !starts(imsi, imsi_prefix)) next
+			if (!wildcard(iccid_prefix) && !starts(iccid, iccid_prefix)) next
+			if (!wildcard(row_gid1) && tolower(row_gid1) != gid1_l) next
+			if (!wildcard(row_spn) && index(spn_l, tolower(row_spn)) == 0) next
+			score=0
+			if (!wildcard(mccmnc)) score += 100 + length(mccmnc)
+			if (!wildcard(imsi_prefix)) score += 200 + length(imsi_prefix)
+			if (!wildcard(iccid_prefix)) score += 200 + length(iccid_prefix)
+			if (!wildcard(row_gid1)) score += 50
+			if (!wildcard(row_spn)) score += 40
+			if (priority !~ /^[0-9]+$/) priority=100
+			print score, priority, apn, provider
+		}
+	' "$DATABASE" | sort -t "$(printf '\t')" -k1,1nr -k2,2n >"$CANDIDATES"
+}
+
+print_identity() {
+	printf 'SIM index:       %s\n' "$SIM_INDEX"
+	printf 'ICCID:           %s\n' "$ICCID"
+	printf 'IMSI:            %s\n' "${IMSI:--}"
+	printf 'EID:             %s\n' "${EID:--}"
+	printf 'Home operator:   %s\n' "${OPERATOR_ID:--}"
+	printf 'Provider/SPN:    %s\n' "${OPERATOR_NAME:--}"
+	printf 'GID1 / GID2:     %s / %s\n' "${GID1:--}" "${GID2:--}"
+}
+
+detect_cmd() {
+	read_sim
+	find_candidates
+	print_identity
+	cache="$(cached_apn 2>/dev/null || :)"
+	if [ -n "$cache" ]; then
+		printf 'Cached APN:      %s\n' "$cache"
+	else
+		printf 'Cached APN:      -\n'
+	fi
+	printf '\nCandidates from %s:\n' "$DATABASE"
+	if [ -s "$CANDIDATES" ]; then
+		awk -F '\t' '{ printf "  %d. %-28s %s\n", NR, $3, $4 }' "$CANDIDATES"
+	else
+		printf '  none (the bundled database is intentionally only a demo)\n'
+	fi
+}
+
+current_apn() {
+	uci -q get "network.${INTERFACE}.apn"
+}
+
+save_baseline() {
+	set_flag="$1"
+	value="$2"
+	[ -e "$BASELINE_FILE" ] && return 0
+	case "$value" in ''|*[!A-Za-z0-9._-]*) [ -z "$value" ] || die "refusing to save an unexpected APN value" ;; esac
+	mkdir -p "$STATE_DIR" || die "cannot create state directory: $STATE_DIR"
+	tmp="$STATE_DIR/.baseline.tmp.$$"
+	stored_value="${value:-<empty>}"
+	printf 'v1\t%s\t%s\t%s\n' "$INTERFACE" "$set_flag" "$stored_value" >"$tmp" || die "cannot write baseline"
+	mv "$tmp" "$BASELINE_FILE" || die "cannot install baseline"
+	log notice "saved original APN state for interface $INTERFACE"
+}
+
+reset_cmd() {
+	if [ ! -r "$BASELINE_FILE" ]; then
+		rm -rf "$CACHE_DIR"
+		log notice "no saved APN baseline; cache cleared, network unchanged"
+		return 0
+	fi
+	baseline_version="$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")"
+	baseline_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
+	baseline_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+	baseline_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+	[ "$baseline_version" = "v1" ] || die "unknown baseline format"
+	case "$baseline_interface" in ''|*[!A-Za-z0-9_]*) die "invalid interface in baseline" ;; esac
+	case "$baseline_set" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
+	[ "$baseline_apn" = "<empty>" ] && baseline_apn=""
+	case "$baseline_apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$baseline_apn" ] || die "invalid APN in baseline" ;; esac
+
+	acquire_lock
+	INTERFACE="$baseline_interface"
+	if [ "$baseline_set" -eq 1 ]; then
+		uci set "network.${INTERFACE}.apn=$baseline_apn" >/dev/null 2>&1 || die "cannot restore baseline APN"
+	else
+		uci -q delete "network.${INTERFACE}.apn" >/dev/null 2>&1 || :
+	fi
+	uci commit network >/dev/null 2>&1 || die "cannot commit restored APN"
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored APN, but interface $INTERFACE did not start"
+	rm -rf "$CACHE_DIR"
+	rm -f "$BASELINE_FILE"
+	log notice "restored original APN state; cache and baseline removed"
+}
+
+interface_is_up() {
+	if command_exists ubus; then
+		ubus call "network.interface.${INTERFACE}" status 2>/dev/null | \
+			grep -q '"up"[[:space:]]*:[[:space:]]*true'
+	else
+		return 1
+	fi
+}
+
+status_cmd() {
+	read_sim
+	print_identity
+	apn="$(current_apn 2>/dev/null || :)"
+	printf 'Configured APN:  %s\n' "${apn:-<empty>}"
+	cache="$(cached_apn 2>/dev/null || :)"
+	printf 'Cached APN:      %s\n' "${cache:--}"
+	if interface_is_up; then
+		printf 'Interface %s:   up\n' "$INTERFACE"
+	else
+		printf 'Interface %s:   down or pending\n' "$INTERFACE"
+	fi
+	printf 'Last result:     '
+	if [ -r "$CACHE_DIR/last-result" ]; then
+		cat "$CACHE_DIR/last-result"
+	else
+		printf -- '-\n'
+	fi
+}
+
+acquire_lock() {
+	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+		case "$old_pid" in
+			''|*[!0-9]*) die "lock exists without a valid PID: $LOCK_DIR" ;;
+		esac
+		if kill -0 "$old_pid" 2>/dev/null; then
+			die "another operation is already running (PID $old_pid)"
+		fi
+		log warning "removing stale lock left by PID $old_pid"
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || die "cannot remove stale lock: $LOCK_DIR"
+		mkdir "$LOCK_DIR" 2>/dev/null || die "cannot acquire lock: $LOCK_DIR"
+	fi
+	printf '%s\n' "$$" >"$LOCK_DIR/pid" || {
+		rmdir "$LOCK_DIR" 2>/dev/null || :
+		die "cannot write lock PID"
+	}
+	LOCK_HELD=1
+}
+
+add_candidate() {
+	apn="$1"
+	provider="$2"
+	case "$apn" in
+		''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 0 ;;
+	esac
+	key="${apn:-<empty>}"
+	grep -F -x -q -- "$key" "$SEEN_APNS" 2>/dev/null && return 0
+	printf '%s\n' "$key" >>"$SEEN_APNS"
+	printf '%s\t%s\n' "$key" "$provider" >>"${CANDIDATES}.apply"
+}
+
+build_apply_candidates() {
+	: >"$SEEN_APNS"
+	: >"${CANDIDATES}.apply"
+	cache="$(cached_apn 2>/dev/null || :)"
+	provider="$(cached_provider 2>/dev/null || :)"
+	if [ "$cache" = "<empty>" ]; then
+		add_candidate "" "${provider:-cache}"
+	elif [ -n "$cache" ]; then
+		add_candidate "$cache" "${provider:-cache}"
+	fi
+	while IFS="$(printf '\t')" read -r score priority apn provider; do
+		[ -n "$apn" ] && add_candidate "$apn" "$provider"
+	done <"$CANDIDATES"
+	[ "$TRY_EMPTY" = "1" ] && add_candidate "" "empty APN fallback"
+}
+
+restart_interface() {
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+wait_for_interface() {
+	remaining="$WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		interface_is_up && return 0
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 1
+}
+
+mwan3_available() {
+	command_exists mwan3 || return 1
+	case "$USE_MWAN3" in
+		never) return 1 ;;
+		always) return 0 ;;
+		auto)
+			mwan3 interfaces 2>/dev/null | grep -q "interface ${INTERFACE} is"
+			return $?
+		;;
+	esac
+}
+
+test_connectivity() {
+	if mwan3_available; then
+		mwan3 use "$INTERFACE" curl -4 --interface "$DEVICE" \
+			--connect-timeout 10 --max-time 15 -fsS -o /dev/null "$TEST_URL"
+	else
+		curl -4 --interface "$DEVICE" --connect-timeout 10 --max-time 15 \
+			-fsS -o /dev/null "$TEST_URL"
+	fi
+}
+
+save_cache() {
+	apn="$1"
+	provider="$2"
+	mkdir -p "$CACHE_DIR" || return 1
+	tmp="$CACHE_DIR/.${ICCID}.tmp.$$"
+	# Tabs/newlines are not accepted in APNs; sanitize provider for a one-line cache.
+	provider="$(printf '%s' "$provider" | tr '\t\r\n' '   ')"
+	cache_apn="${apn:-<empty>}"
+	printf 'v1\t%s\t%s\t%s\n' "$cache_apn" "$provider" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" >"$tmp" || return 1
+	mv "$tmp" "$(cache_file)"
+}
+
+write_last_result() {
+	mkdir -p "$CACHE_DIR" || return 0
+	printf '%s\n' "$*" >"$CACHE_DIR/last-result"
+}
+
+apply_cmd() {
+	read_sim
+	find_candidates
+	build_apply_candidates
+	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or set APN manually"
+	acquire_lock
+	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
+		OLD_APN_SET=1
+		OLD_APN="$(current_apn 2>/dev/null || :)"
+	fi
+	save_baseline "$OLD_APN_SET" "$OLD_APN"
+	ROLLBACK_ARMED=1
+	log notice "starting APN detection for ICCID $ICCID on $INTERFACE"
+
+	while IFS="$(printf '\t')" read -r apn provider; do
+		[ "$apn" = "<empty>" ] && apn=""
+		display_apn="${apn:-<empty>}"
+		log notice "trying APN '$display_apn' ($provider)"
+		if ! set_apn "$apn"; then
+			log err "failed to write APN '$display_apn'"
+			continue
+		fi
+		if ! restart_interface; then
+			log warning "interface $INTERFACE did not restart for APN '$display_apn'"
+			continue
+		fi
+		if ! wait_for_interface; then
+			log warning "interface $INTERFACE did not become up within ${WAIT_SECONDS}s"
+			continue
+		fi
+		if test_connectivity; then
+			save_cache "$apn" "$provider" || log warning "APN worked, but cache could not be written"
+			write_last_result "success: $display_apn ($provider)"
+			ROLLBACK_ARMED=0
+			log notice "APN '$display_apn' is working; configuration kept"
+			exit 0
+		fi
+		log warning "real Internet check failed for APN '$display_apn'"
+	done <"${CANDIDATES}.apply"
+
+	write_last_result "failed: all candidates rejected; previous APN restored"
+	die "all APN candidates failed; previous APN will be restored"
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG <command>
+
+Commands:
+  detect   Read SIM identity and list matching APN candidates; no changes
+  apply    Try candidates, verify Internet through $DEVICE, cache success
+  status   Show SIM identity, configured/cached APN and last result
+  reset    Restore the APN state saved before the first apply; clear cache
+EOF
+}
+
+main() {
+	load_config
+	validate_config
+	case "${1:-}" in
+		detect) detect_cmd ;;
+		apply) apply_cmd ;;
+		status) status_cmd ;;
+		reset) reset_cmd ;;
+		-h|--help|help|'') usage ;;
+		*) usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

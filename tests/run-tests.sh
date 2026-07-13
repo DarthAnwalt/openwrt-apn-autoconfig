@@ -10,6 +10,7 @@ PERSIST="$TESTROOT/persist"
 CACHE="$PERSIST/cache"
 SCRIPT="$BASE/files/usr/sbin/apn-autoconfig"
 BOOT_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-boot"
+BUTTON_SCRIPT="$BASE/files/etc/hotplug.d/button/50-apn-autoconfig"
 
 cleanup() {
 	rm -rf "$TESTROOT"
@@ -17,6 +18,8 @@ cleanup() {
 trap cleanup 0 HUP INT TERM
 
 mkdir -p "$MOCKBIN" "$STATE" "$CACHE" "$PERSIST"
+mkdir -p "$TESTROOT/sys/class/gpio/modem_power"
+printf '%s\n' '0' >"$TESTROOT/sys/class/gpio/modem_power/value"
 
 cat >"$DB" <<'EOF'
 # demo
@@ -46,6 +49,14 @@ get:apn-autoconfig.main.autostart) printf '%s\n' "${TEST_AUTOSTART:-0}" ;;
 get:apn-autoconfig.main.boot_delay) printf '%s\n' "${TEST_BOOT_DELAY:-0}" ;;
 get:apn-autoconfig.main.boot_attempts) printf '%s\n' "${TEST_BOOT_ATTEMPTS:-3}" ;;
 get:apn-autoconfig.main.retry_seconds) printf '%s\n' "${TEST_RETRY_SECONDS:-0}" ;;
+get:apn-autoconfig.main.button_enabled) printf '%s\n' "${TEST_BUTTON_ENABLED:-0}" ;;
+get:apn-autoconfig.main.button_name) printf '%s\n' BTN_0 ;;
+get:apn-autoconfig.main.modem_power_path) printf '%s\n' "$TEST_GPIO" ;;
+get:apn-autoconfig.main.modem_power_off_value) printf '%s\n' 1 ;;
+get:apn-autoconfig.main.modem_power_on_value) printf '%s\n' 0 ;;
+get:apn-autoconfig.main.modem_power_off_seconds) printf '%s\n' 1 ;;
+get:apn-autoconfig.main.modem_wait_seconds) printf '%s\n' 3 ;;
+get:apn-autoconfig.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:network.wwan.device) printf '%s\n' '/sys/devices/mock-modem' ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 set:*)
@@ -59,6 +70,7 @@ EOF
 
 cat >"$MOCKBIN/mmcli" <<'EOF'
 #!/bin/sh
+[ "${MMCLI_UNAVAILABLE:-0}" = "1" ] && exit 1
 case "${1:-}" in
 -L)
 	printf '%s\n' "    /org/freedesktop/ModemManager1/Modem/${MM_MODEM_INDEX:-7} [Quectel] RM520N-GL"
@@ -122,9 +134,16 @@ cat >"$MOCKBIN/logger" <<'EOF'
 exit 0
 EOF
 
+cat >"$MOCKBIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROOT/lock" TEST_PERSIST="$PERSIST"
+export TEST_GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
+export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
 
 cat >"$MOCKBIN/apn-autoconfig-command" <<'EOF'
 #!/bin/sh
@@ -257,5 +276,50 @@ if sh "$BOOT_SCRIPT" >/dev/null 2>&1; then
 	fail 'boot worker unexpectedly succeeded after exhausted retries'
 fi
 [ "$(cat "$STATE/boot-calls")" -eq 2 ] || fail 'boot worker ignored the attempt limit'
+
+printf '%s\n' 'TEST hardware modem reset restores power and reconciles APN'
+printf '%s\n' 'wrong.apn' >"$STATE/apn"
+SIM_ICCID=89490200002186275443
+CURL_SUCCESS_APN=internet.telekom
+export SIM_ICCID CURL_SUCCESS_APN
+: >"$STATE/events"
+sh "$SCRIPT" modem-reset >/dev/null 2>&1
+[ "$(cat "$TEST_GPIO")" = '0' ] || fail 'modem power was not restored after reset'
+[ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'modem reset did not reconcile APN'
+grep -F -q 'down wwan' "$STATE/events" || fail 'modem reset did not stop WWAN'
+grep -F -q 'up wwan' "$STATE/events" || fail 'modem reset did not restore WWAN'
+
+printf '%s\n' 'TEST failed modem return leaves power on and attempts WWAN recovery'
+: >"$STATE/events"
+if MMCLI_UNAVAILABLE=1 sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+	fail 'modem reset unexpectedly succeeded while ModemManager was unavailable'
+fi
+[ "$(cat "$TEST_GPIO")" = '0' ] || fail 'failed modem reset left modem power off'
+grep -F -q 'up wwan' "$STATE/events" || fail 'failed modem reset did not attempt WWAN recovery'
+
+printf '%s\n' 'TEST button ignores press and invokes modem reset only on release'
+cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/button-calls"
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-button-command"
+rm -f "$STATE/button-calls"
+TEST_BUTTON_ENABLED=0 BUTTON=BTN_0 ACTION=released \
+	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+	sh "$BUTTON_SCRIPT"
+[ ! -e "$STATE/button-calls" ] || fail 'disabled button invoked modem-reset'
+TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=pressed \
+	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+	sh "$BUTTON_SCRIPT"
+[ ! -e "$STATE/button-calls" ] || fail 'button press triggered the action before release'
+TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=released \
+	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+	sh "$BUTTON_SCRIPT"
+button_wait=10
+while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
+	/bin/sleep 1
+	button_wait=$((button_wait - 1))
+done
+grep -F -q 'modem-reset' "$STATE/button-calls" || fail 'button release did not invoke modem-reset'
 
 printf '%s\n' 'All tests passed.'

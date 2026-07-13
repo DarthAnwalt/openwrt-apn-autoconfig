@@ -1,4 +1,4 @@
-# apn-autoconfig 0.3.0 — OpenWrt source package
+# apn-autoconfig 0.4.0 — OpenWrt source package
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
 OpenWrt. It reads SIM identity with `mmcli -i 0`, finds APN candidates in a
@@ -6,7 +6,9 @@ local TSV database, restarts only the configured mobile interface, verifies
 real Internet access through `wwan0` with `curl`, caches the successful APN by
 ICCID, and restores the previous APN when all candidates fail. It includes an
 idempotent `reconcile` command for SIM transitions and an opt-in delayed boot
-service. Automatic boot reconciliation is disabled by default.
+service. It can also power-cycle a modem through an exported GPIO and reconcile
+the APN after the modem returns. Boot and hardware-button automation are both
+disabled by default.
 
 This repository is an OpenWrt source package. It builds a normal `.apk` with
 the official OpenWrt 25.12 SDK. It is still an MVP, not a finished worldwide
@@ -33,7 +35,13 @@ The implementation is MIT licensed; see `LICENSE`.
   diagnosis and retry.
 - A lock prevents two simultaneous `apply` runs.
 - The boot service is installed but inert while `option autostart '0'` remains
-  configured. Hotplug automation is not included.
+  configured.
+- The button handler is installed but inert while `option button_enabled '0'`
+  remains configured.
+- A modem reset uses the same operation lock as APN changes. Repeated button
+  presses cannot start overlapping resets.
+- If the reset command is interrupted while modem power is off, its exit trap
+  attempts to restore the configured power-on value and bring `wwan` back up.
 
 Existing client connections over the mobile link will naturally be interrupted
 while APNs are tested. Other working mwan3 uplinks should remain available.
@@ -46,6 +54,7 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 - a configured netifd ModemManager interface named `wwan`
 - its data device named `wwan0`
 - optional: `mwan3`
+- `kmod-button-hotplug` when the hardware-button integration is enabled
 
 The defaults match the Huasifei WH3000 Pro + Quectel RM520N-GL setup for which
 this MVP was prepared. Edit `/etc/config/apn-autoconfig` for other names.
@@ -66,7 +75,7 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.3.0-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.4.0-r1.apk
 ```
 
 The package owns:
@@ -77,6 +86,7 @@ The package owns:
 /usr/share/apn-autoconfig/providers.tsv
 /etc/config/apn-autoconfig
 /etc/init.d/apn-autoconfig
+/etc/hotplug.d/button/50-apn-autoconfig
 ```
 
 The UCI file is declared as a package configuration file. Cache files are
@@ -129,6 +139,54 @@ Logs use the tag `apn-autoconfig`:
 logread | grep apn-autoconfig
 ```
 
+## Hardware modem reset and button
+
+The reset command is deliberately available before the button is enabled:
+
+```sh
+apn-autoconfig modem-reset
+```
+
+For the tested Huasifei WH3000 Pro eMMC this performs the following bounded
+sequence:
+
+1. acquire the normal APN operation lock;
+2. stop only `wwan`;
+3. write `1` to `/sys/class/gpio/modem_power/value` for five seconds;
+4. restore the value to `0`;
+5. wait up to 90 seconds for ModemManager and a readable SIM;
+6. run `reconcile`, which selects and tests the APN;
+7. leave `mwan3` configuration untouched.
+
+The GPIO polarity and path are board-specific. The defaults are based only on
+the WH3000 Pro eMMC sequence verified on real hardware. Do not enable this on a
+different router before confirming its GPIO semantics.
+
+After the manual command has been tested successfully, enable the physical
+button explicitly:
+
+```sh
+uci set apn-autoconfig.main.button_enabled='1'
+uci commit apn-autoconfig
+```
+
+The handler accepts only `BUTTON=BTN_0` with `ACTION=released`. Press events
+are ignored, preventing a press/release pair from triggering two resets. The
+action runs in the background so the OpenWrt hotplug dispatcher is not blocked.
+
+Disable the button without disabling boot reconciliation:
+
+```sh
+uci set apn-autoconfig.main.button_enabled='0'
+uci commit apn-autoconfig
+```
+
+Button and reset logs can be inspected with:
+
+```sh
+logread | grep -E 'apn-autoconfig(-button)?'
+```
+
 ## What `apply` does
 
 Candidate order is:
@@ -169,6 +227,14 @@ config apn_autoconfig 'main'
         option boot_delay '30'
         option boot_attempts '6'
         option retry_seconds '15'
+        option button_enabled '0'
+        option button_name 'BTN_0'
+        option modem_power_path '/sys/class/gpio/modem_power/value'
+        option modem_power_off_value '1'
+        option modem_power_on_value '0'
+        option modem_power_off_seconds '5'
+        option modem_wait_seconds '90'
+        option modem_poll_seconds '2'
 ```
 
 ## Optional boot reconciliation
@@ -286,7 +352,8 @@ Removal deliberately deletes this package's modified UCI configuration instead
 of leaving a package-manager configuration remnant. It does not modify mwan3,
 Travelmate, firewall, DNS, WireGuard, ZeroTier or any unrelated interface.
 
-The program does not install or enable an automatic startup task.
+Package removal also removes the button handler. It does not leave a hotplug
+script or enable any APN automation outside this package.
 
 ## Attended sysupgrade
 
@@ -302,7 +369,10 @@ submission has been implemented and tested.
   a configured numeric `sim_index` is used only when resolution is impossible.
 - Only the APN is applied; APN username/password/authentication are not.
 - The connectivity test is IPv4 HTTPS through one configured net device.
-- Boot automation is opt-in; hotplug automation and a LuCI UI are not included.
+- Boot and hardware-button automation are independently opt-in; a LuCI UI is
+  not included.
+- The bundled GPIO defaults are specific to the tested Huasifei WH3000 Pro
+  eMMC and must not be assumed correct for another board.
 - A provider missing from the TSV requires a manual APN or a larger generated
   database.
 

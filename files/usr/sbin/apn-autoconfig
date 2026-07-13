@@ -20,6 +20,13 @@ TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
 WAIT_SECONDS="35"
 TRY_EMPTY="0"
 USE_MWAN3="auto"
+MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
+MODEM_POWER_OFF_VALUE="1"
+MODEM_POWER_ON_VALUE="0"
+MODEM_POWER_OFF_SECONDS="5"
+MODEM_WAIT_SECONDS="90"
+MODEM_POLL_SECONDS="2"
+SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
 TMP_BASE="/tmp/apn-autoconfig.$$"
@@ -33,6 +40,8 @@ ROLLBACK_ARMED=0
 OLD_APN_SET=0
 OLD_APN=""
 LOCK_HELD=0
+MODEM_POWER_OFF_ARMED=0
+INTERFACE_RESTORE_ARMED=0
 
 log() {
 	level="$1"
@@ -79,8 +88,16 @@ restore_old_apn() {
 on_exit() {
 	status=$?
 	trap - 0 HUP INT TERM
+	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
+		printf '%s\n' "$MODEM_POWER_ON_VALUE" >"$MODEM_POWER_PATH" 2>/dev/null || \
+			log err "failed to restore modem power after interruption"
+		MODEM_POWER_OFF_ARMED=0
+	fi
 	if [ "$ROLLBACK_ARMED" -eq 1 ]; then
 		restore_old_apn || log err "automatic rollback failed; restore APN in LuCI"
+	elif [ "$INTERFACE_RESTORE_ARMED" -eq 1 ]; then
+		ifup "$INTERFACE" >/dev/null 2>&1 || \
+			log err "failed to restart interface $INTERFACE after modem reset failure"
 	fi
 	cleanup_files
 	exit "$status"
@@ -108,6 +125,12 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.try_empty")" && [ -n "$value" ] && TRY_EMPTY="$value"
 	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_path")" && [ -n "$value" ] && MODEM_POWER_PATH="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_value")" && [ -n "$value" ] && MODEM_POWER_OFF_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
 	BASELINE_FILE="$STATE_DIR/baseline.tsv"
 	ACTIVE_FILE="$STATE_DIR/active.tsv"
 }
@@ -119,6 +142,16 @@ validate_config() {
 	case "$WAIT_SECONDS" in ''|*[!0-9]*) die "wait_seconds must be numeric" ;; esac
 	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
 	case "$USE_MWAN3" in auto|always|never) : ;; *) die "use_mwan3 must be auto, always or never" ;; esac
+	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
+	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
+	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
+	[ "$MODEM_POWER_OFF_VALUE" != "$MODEM_POWER_ON_VALUE" ] || die "modem power on/off values must differ"
+	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
+	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
+	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
+	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
+	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
 	case "$CACHE_DIR" in /|*/../*|*/..) die "unsafe cache_dir" ;; /*) : ;; *) die "cache_dir must be absolute" ;; esac
 	case "$CACHE_DIR" in "$STATE_DIR"/?*) : ;; *) die "cache_dir must be inside state_dir" ;; esac
@@ -192,11 +225,11 @@ resolve_sim_index() {
 		log warning "primary SIM could not be resolved; falling back to configured SIM $SIM_INDEX"
 		return 0
 	fi
-	die "cannot resolve the primary SIM for interface $INTERFACE"
+	return 1
 }
 
 read_sim() {
-	resolve_sim_index
+	resolve_sim_index || die "cannot resolve the primary SIM for interface $INTERFACE"
 	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
 		die "cannot read SIM $SIM_INDEX with mmcli"
 	IMSI="$(kv_value 'sim.properties.imsi')"
@@ -375,6 +408,7 @@ status_cmd() {
 }
 
 acquire_lock() {
+	[ "$LOCK_HELD" -eq 1 ] && return 0
 	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
 	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
 		old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
@@ -534,7 +568,7 @@ apply_cmd() {
 			write_last_result "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
 			log notice "APN '$display_apn' is working; configuration kept"
-			exit 0
+			return 0
 		fi
 		log warning "real Internet check failed for APN '$display_apn'"
 	done <"${CANDIDATES}.apply"
@@ -571,6 +605,53 @@ reconcile_cmd() {
 	apply_cmd
 }
 
+write_modem_power() {
+	value="$1"
+	printf '%s\n' "$value" >"$MODEM_POWER_PATH" 2>/dev/null
+}
+
+wait_for_modem() {
+	remaining="$MODEM_WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		SIM_INDEX=""
+		if resolve_sim_index && \
+		   mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+			ready_iccid="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
+			case "$ready_iccid" in
+				''|*[!0-9]*) : ;;
+				*) return 0 ;;
+			esac
+		fi
+		sleep "$MODEM_POLL_SECONDS"
+		remaining=$((remaining - MODEM_POLL_SECONDS))
+	done
+	return 1
+}
+
+modem_reset_cmd() {
+	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+	acquire_lock
+	log notice "hardware modem reset requested; stopping interface $INTERFACE"
+	INTERFACE_RESTORE_ARMED=1
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+
+	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
+	MODEM_POWER_OFF_ARMED=1
+	write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
+	sleep "$MODEM_POWER_OFF_SECONDS"
+	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
+	MODEM_POWER_OFF_ARMED=0
+
+	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for ModemManager and SIM"
+	if ! wait_for_modem; then
+		die "modem or SIM did not return within ${MODEM_WAIT_SECONDS}s"
+	fi
+	log notice "modem and SIM are available again; reconciling APN"
+	reconcile_cmd
+	INTERFACE_RESTORE_ARMED=0
+	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
 usage() {
 	cat <<EOF
 Usage: $PROG <command>
@@ -579,6 +660,7 @@ Commands:
   detect   Read SIM identity and list matching APN candidates; no changes
   apply    Try candidates, verify Internet through $DEVICE, cache success
   reconcile  Apply only when SIM/APN changed or verified connectivity failed
+  modem-reset  Power-cycle the modem GPIO, wait for SIM, then reconcile APN
   status   Show SIM identity, configured/cached APN and last result
   reset    Restore the APN state saved before the first apply; clear cache
 EOF
@@ -591,6 +673,7 @@ main() {
 		detect) detect_cmd ;;
 		apply) apply_cmd ;;
 		reconcile) reconcile_cmd ;;
+		modem-reset) modem_reset_cmd ;;
 		status) status_cmd ;;
 		reset) reset_cmd ;;
 		-h|--help|help|'') usage ;;

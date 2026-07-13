@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.3.0
-PKG_RELEASE:=2
+PKG_VERSION:=0.4.0
+PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=DarthAnwalt
@@ -16,7 +16,7 @@ define Package/apn-autoconfig
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Automatic APN selection for ModemManager
-  DEPENDS:=+ca-bundle +curl +modemmanager +netifd +ubus +uci
+  DEPENDS:=+ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
 endef
 
 define Package/apn-autoconfig/description
@@ -43,6 +43,8 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/etc/init.d/apn-autoconfig $(1)/etc/init.d/apn-autoconfig
 	$(INSTALL_DIR) $(1)/usr/libexec
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-boot $(1)/usr/libexec/apn-autoconfig-boot
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/button
+	$(INSTALL_BIN) ./files/etc/hotplug.d/button/50-apn-autoconfig $(1)/etc/hotplug.d/button/50-apn-autoconfig
 endef
 
 # A real removal restores the APN baseline first. A failed reset aborts

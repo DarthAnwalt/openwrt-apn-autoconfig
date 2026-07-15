@@ -346,6 +346,12 @@ cached_provider() {
 	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $3; exit }' "$file"
 }
 
+cached_version() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $1; exit }' "$file"
+}
+
 cached_profile_field() {
 	column="$1"
 	file="$(cache_file)"
@@ -845,10 +851,25 @@ build_apply_candidates() {
 	: >"${CANDIDATES}.apply"
 	cache="$(cached_apn 2>/dev/null || :)"
 	provider="$(cached_provider 2>/dev/null || :)"
-	username="$(cached_profile_field 5 2>/dev/null || printf '%s' -)"
-	password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
-	auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
-	ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
+	if [ "$(cached_version 2>/dev/null || :)" = "v1" ]; then
+		# v0.5 cached only the APN. Preserve the optional values that belong to
+		# that known-working configuration instead of deleting them on upgrade.
+		username="$(uci -q get "network.${INTERFACE}.username" 2>/dev/null || printf '%s' -)"
+		password="$(uci -q get "network.${INTERFACE}.password" 2>/dev/null || printf '%s' -)"
+		allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
+		case "$allowedauth" in
+			'pap chap'|'chap pap') auth="pap-or-chap" ;;
+			none|pap|chap) auth="$allowedauth" ;;
+			*) auth="-" ;;
+		esac
+		ip_type="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+		case "$ip_type" in ipv4|ipv6|ipv4v6) : ;; *) ip_type="-" ;; esac
+	else
+		username="$(cached_profile_field 5 2>/dev/null || printf '%s' -)"
+		password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
+		auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
+		ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
+	fi
 	if [ "$cache" = "<empty>" ]; then
 		add_candidate "" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
 	elif [ -n "$cache" ]; then

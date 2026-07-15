@@ -276,6 +276,19 @@ sh "$SCRIPT" reset >/dev/null 2>&1
 [ ! -e "$PERSIST/active.tsv" ] || fail 'reset left reconciled SIM state behind'
 [ ! -e "$CACHE" ] || fail 'reset left cache behind'
 
+printf '%s\n' 'TEST a v0.5 cache preserves the optional values of its working profile'
+mkdir -p "$CACHE"
+printf 'v1\tinternet.telekom\tlegacy cache\t2026-01-01T00:00:00Z\n' >"$CACHE/89490200002186275443.tsv"
+CURL_SUCCESS_APN=internet.telekom
+export CURL_SUCCESS_APN
+sh "$SCRIPT" apply >/dev/null 2>&1
+[ "$(cat "$STATE/username")" = 'old-user' ] || fail 'v1 cache migration removed username'
+[ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'v1 cache migration removed password'
+[ "$(cat "$STATE/allowedauth")" = 'chap' ] || fail 'v1 cache migration changed authentication'
+[ "$(cat "$STATE/iptype")" = 'ipv4' ] || fail 'v1 cache migration changed IP type'
+grep -F -q 'v2' "$CACHE/89490200002186275443.tsv" || fail 'v1 cache was not upgraded'
+sh "$SCRIPT" reset >/dev/null 2>&1
+
 printf '%s\n' 'TEST a v0.5 APN baseline is migrated without losing optional profile values'
 printf 'v1\twwan\t1\tlegacy.apn\n' >"$PERSIST/baseline.tsv"
 CURL_SUCCESS_APN=internet.telekom

@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install build prerequisites
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: POSIX shell tests
@@ -28,7 +28,7 @@ jobs:
       - name: Build with official OpenWrt 25.12.5 SDK
         run: sh scripts/build-with-sdk.sh
       - name: Upload APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: apn-autoconfig-openwrt-25.12.5
           path: |
@@ -44,7 +44,7 @@ jobs:
       contents: write
     steps:
       - name: Download verified build artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: apn-autoconfig-openwrt-25.12.5
           path: release-assets

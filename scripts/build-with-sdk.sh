@@ -43,6 +43,8 @@ SDK_DIR="$(find "$EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 rm -rf "$SDK_DIR/package/apn-autoconfig"
 mkdir -p "$SDK_DIR/package/apn-autoconfig"
 cp -R "$ROOT/Makefile" "$ROOT/LICENSE" "$ROOT/files" "$SDK_DIR/package/apn-autoconfig/"
+mkdir -p "$SDK_DIR/package/apn-autoconfig/data"
+cp -R "$ROOT/data/licenses" "$SDK_DIR/package/apn-autoconfig/data/"
 rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
 cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 

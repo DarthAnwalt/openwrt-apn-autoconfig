@@ -24,12 +24,17 @@ printf '%s\n' '0' >"$TESTROOT/sys/class/gpio/modem_power/value"
 
 cat >"$DB" <<'EOF'
 # demo
-26201	-	-	01	Kaufland Mobil	Kaufland Mobil	internet.telekom	10
+26201	-	-	01	Kaufland Mobil	Kaufland Mobil	internet.telekom	10	fixture-user	fixture-pass	pap-or-chap	ipv4v6
 26201	-	-	-	-	Telekom Germany	internet.telekom	20
 26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10
+21403	2140352xxxxxxxx	-	-	-	Pattern MVNO	pattern.example	10
 EOF
 
 printf '%s\n' 'old.apn' >"$STATE/apn"
+printf '%s\n' 'old-user' >"$STATE/username"
+printf '%s\n' 'old-pass' >"$STATE/password"
+printf '%s\n' 'chap' >"$STATE/allowedauth"
+printf '%s\n' 'ipv4' >"$STATE/iptype"
 
 cat >"$MOCKBIN/uci" <<'EOF'
 #!/bin/sh
@@ -61,10 +66,26 @@ get:apn-autoconfig.main.modem_wait_seconds) printf '%s\n' 3 ;;
 get:apn-autoconfig.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:network.wwan.device) printf '%s\n' '/sys/devices/mock-modem' ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
+get:network.wwan.username) cat "$TEST_STATE/username" ;;
+get:network.wwan.password) cat "$TEST_STATE/password" ;;
+get:network.wwan.allowedauth) cat "$TEST_STATE/allowedauth" ;;
+get:network.wwan.iptype) cat "$TEST_STATE/iptype" ;;
 set:*)
-	case "$2" in network.wwan.apn=*) printf '%s\n' "${2#network.wwan.apn=}" >"$TEST_STATE/apn" ;; *) exit 1 ;; esac
+	case "$2" in
+		network.wwan.*=*)
+			option="${2#network.wwan.}"
+			value="${option#*=}"
+			option="${option%%=*}"
+			case "$option" in apn|username|password|allowedauth|iptype) printf '%s\n' "$value" >"$TEST_STATE/$option" ;; *) exit 1 ;; esac
+		;;
+		*) exit 1 ;;
+	esac
 ;;
 delete:network.wwan.apn) rm -f "$TEST_STATE/apn" ;;
+delete:network.wwan.username) rm -f "$TEST_STATE/username" ;;
+delete:network.wwan.password) rm -f "$TEST_STATE/password" ;;
+delete:network.wwan.allowedauth) rm -f "$TEST_STATE/allowedauth" ;;
+delete:network.wwan.iptype) rm -f "$TEST_STATE/iptype" ;;
 commit:network) : ;;
 *) exit 1 ;;
 esac
@@ -183,16 +204,33 @@ assert_contains "$detect_output" 'Kaufland Mobil'
 assert_contains "$detect_output" 'SIM index:       9'
 first_candidate="$(printf '%s\n' "$detect_output" | awk '/^[[:space:]]*1\./ { print; exit }')"
 assert_contains "$first_candidate" 'Kaufland Mobil'
-[ "$(printf '%s\n' "$detect_output" | grep -F -c 'internet.telekom')" -eq 1 ] || fail 'detect did not deduplicate identical APNs'
+[ "$(printf '%s\n' "$detect_output" | grep -F -c 'internet.telekom')" -eq 2 ] || \
+	fail 'detect collapsed distinct authentication profiles or emitted an unexpected duplicate'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'detect changed APN'
+
+printf '%s\n' 'TEST detect supports AOSP-style IMSI digit masks'
+SIM_IMSI=214035212345678
+SIM_ICCID=8952000000000000000
+SIM_OPERATOR_ID=21403
+SIM_OPERATOR_NAME='Pattern MVNO'
+SIM_GID1=FF
+export SIM_IMSI SIM_ICCID SIM_OPERATOR_ID SIM_OPERATOR_NAME SIM_GID1
+pattern_output="$(sh "$SCRIPT" detect 2>&1)"
+assert_contains "$pattern_output" 'pattern.example'
+unset SIM_IMSI SIM_ICCID SIM_OPERATOR_ID SIM_OPERATOR_NAME SIM_GID1
 
 printf '%s\n' 'TEST apply stores working APN and ICCID cache'
 CURL_SUCCESS_APN=internet.telekom
 export CURL_SUCCESS_APN
 sh "$SCRIPT" apply
 [ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'working APN not kept'
+[ "$(cat "$STATE/username")" = 'fixture-user' ] || fail 'working username not kept'
+[ "$(cat "$STATE/password")" = 'fixture-pass' ] || fail 'working password not kept'
+[ "$(cat "$STATE/allowedauth")" = 'pap chap' ] || fail 'working authentication not kept'
+[ "$(cat "$STATE/iptype")" = 'ipv4v6' ] || fail 'working IP type not kept'
 [ -s "$CACHE/89490200002186275443.tsv" ] || fail 'ICCID cache missing'
 grep -F -q 'internet.telekom' "$CACHE/89490200002186275443.tsv" || fail 'cache APN missing'
+grep -F -q 'fixture-user' "$CACHE/89490200002186275443.tsv" || fail 'cache profile missing'
 [ -s "$PERSIST/baseline.tsv" ] || fail 'pre-apply APN baseline missing'
 [ -s "$PERSIST/active.tsv" ] || fail 'reconciled SIM state missing'
 
@@ -230,9 +268,26 @@ export CURL_SUCCESS_APN
 printf '%s\n' 'TEST reset restores pre-apply APN and removes generated state'
 sh "$SCRIPT" reset >/dev/null 2>&1
 [ "$(cat "$STATE/apn")" = 'old.apn' ] || fail 'reset did not restore original APN'
+[ "$(cat "$STATE/username")" = 'old-user' ] || fail 'reset did not restore original username'
+[ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'reset did not restore original password'
+[ "$(cat "$STATE/allowedauth")" = 'chap' ] || fail 'reset did not restore original authentication'
+[ "$(cat "$STATE/iptype")" = 'ipv4' ] || fail 'reset did not restore original IP type'
 [ ! -e "$PERSIST/baseline.tsv" ] || fail 'reset left baseline behind'
 [ ! -e "$PERSIST/active.tsv" ] || fail 'reset left reconciled SIM state behind'
 [ ! -e "$CACHE" ] || fail 'reset left cache behind'
+
+printf '%s\n' 'TEST a v0.5 APN baseline is migrated without losing optional profile values'
+printf 'v1\twwan\t1\tlegacy.apn\n' >"$PERSIST/baseline.tsv"
+CURL_SUCCESS_APN=internet.telekom
+export CURL_SUCCESS_APN
+sh "$SCRIPT" apply >/dev/null 2>&1
+grep -F -q 'v2' "$PERSIST/baseline.tsv" || fail 'legacy baseline was not migrated'
+sh "$SCRIPT" reset >/dev/null 2>&1
+[ "$(cat "$STATE/apn")" = 'legacy.apn' ] || fail 'migrated baseline lost its original APN'
+[ "$(cat "$STATE/username")" = 'old-user' ] || fail 'migrated baseline lost its username'
+[ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'migrated baseline lost its password'
+[ "$(cat "$STATE/allowedauth")" = 'chap' ] || fail 'migrated baseline lost authentication'
+[ "$(cat "$STATE/iptype")" = 'ipv4' ] || fail 'migrated baseline lost IP type'
 
 printf '%s\n' 'TEST failed apply rolls back the previous APN'
 rm -f "$CACHE/89490200002186275443.tsv"
@@ -243,6 +298,8 @@ if sh "$SCRIPT" apply >/dev/null 2>&1; then
 	fail 'failed candidate unexpectedly succeeded'
 fi
 [ "$(cat "$STATE/apn")" = 'rollback.apn' ] || fail 'previous APN was not restored'
+[ "$(cat "$STATE/username")" = 'old-user' ] || fail 'previous username was not restored'
+[ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'previous password was not restored'
 
 printf '%s\n' 'TEST reset after failed apply is idempotent for network state'
 sh "$SCRIPT" reset >/dev/null 2>&1
@@ -265,7 +322,7 @@ printf '%s\n' 'TEST machine-readable status and detect output are valid JSON'
 status_json="$(sh "$SCRIPT" status-json)"
 detect_json="$(sh "$SCRIPT" detect-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True' "$status_json" || fail 'invalid status JSON'
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["iccid"] == "89490200002186275443"; assert len(d["candidates"]) == 1; assert d["candidates"][0]["apn"] == "internet.telekom"' "$detect_json" || fail 'invalid detect JSON'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["iccid"] == "89490200002186275443"; assert len(d["candidates"]) == 2; assert all(x["apn"] == "internet.telekom" for x in d["candidates"]); assert d["candidates"][0]["provider"] == "Kaufland Mobil"; assert d["candidates"][0]["username_required"] is True; assert d["candidates"][0]["authentication"] == "pap-or-chap"; assert d["candidates"][0]["ip_type"] == "ipv4v6"' "$detect_json" || fail 'invalid detect JSON'
 
 printf '%s\n' 'TEST background action reports busy and rejects an overlapping start'
 rm -rf "$TEST_ACTION_STATE" "$TEST_ACTION_STATE.start-lock"

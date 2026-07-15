@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<apns version="8">
+  <apn carrier="Fixture MVNO" mcc="999" mnc="01" apn="mvno.net"
+       type="default,ia" mvno_type="imsi" mvno_match_data="99901x2"
+       protocol="IPV4V6" authtype="3"/>
+  <apn carrier="Fixture IMS" mcc="999" mnc="01" apn="ims"
+       type="ims,ia"/>
+</apns>

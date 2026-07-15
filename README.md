@@ -1,10 +1,10 @@
-# apn-autoconfig 0.5.0 — OpenWrt source packages
+# apn-autoconfig — OpenWrt source packages
 
 `apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
-OpenWrt. It dynamically resolves the active ModemManager SIM, finds APN
-candidates in a local TSV database, restarts only the configured mobile
+OpenWrt. It dynamically resolves the active ModemManager SIM, finds mobile
+profile candidates in a worldwide local TSV database, restarts only the configured mobile
 interface, verifies real Internet access through `wwan0` with `curl`, caches
-the successful APN by ICCID, and restores the previous APN when all candidates
+the successful profile by ICCID, and restores the previous profile when all candidates
 fail. It includes an idempotent `reconcile` command for SIM transitions and an
 opt-in delayed boot service. It can also power-cycle a modem through an
 exported GPIO and reconcile
@@ -17,25 +17,30 @@ packages with the official OpenWrt 25.12 SDK:
 - `apn-autoconfig`, the POSIX-shell core;
 - `luci-app-apn-autoconfig`, the optional web interface.
 
-It is still an MVP and does not yet include a finished worldwide provider
-database.
+The generated provider database combines GNOME mobile-broadband-provider-info,
+the AOSP sample APN database and locally verified overrides. Large upstream XML
+files are converted at development time into a compact TSV installed on the
+router.
 
-The implementation is MIT licensed; see `LICENSE`.
+The implementation is MIT licensed. Imported AOSP data is Apache-2.0 and the
+GNOME provider database is dedicated to the public domain; see `LICENSE` and
+`data/licenses/`.
 
 ## Safety model
 
 - `detect` and `status` are read-only.
-- `apply` edits only `network.<interface>.apn` (default: `network.wwan.apn`).
+- `apply` edits only the ModemManager profile options `apn`, `username`,
+  `password`, `allowedauth` and `iptype` under `network.<interface>`.
 - It calls only `ifdown wwan` / `ifup wwan`; it does not reload or restart the
   whole network.
 - It does not edit mwan3 interfaces, members, policies, rules, or metrics.
 - If mwan3 is available, the connectivity test is run using
   `mwan3 use wwan curl ...` so the test follows the selected WAN routing table.
-- An interrupted or failed `apply` restores the prior APN and restarts only
+- An interrupted or failed `apply` restores the prior mobile profile and restarts only
   `wwan`.
-- Before the first `apply`, the original APN state is stored persistently in
+- Before the first `apply`, the original profile state is stored persistently in
   `/etc/apn-autoconfig/baseline.tsv`.
-- `reset` restores that pre-test APN state and removes generated cache.
+- `reset` restores that pre-test profile state and removes generated cache.
 - `apk del apn-autoconfig` runs `reset` before deleting any files. If reset
   fails, package removal is aborted and the program remains available for
   diagnosis and retry.
@@ -94,7 +99,7 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.5.0-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.6.0-r1.apk
 apk add --allow-untrusted ./luci-app-apn-autoconfig-0.1.0-r1.apk
 ```
 
@@ -184,12 +189,12 @@ Reconcile the current SIM with its cached/database APN:
 apn-autoconfig reconcile
 ```
 
-`reconcile` regards a changed ICCID as authoritative. It applies the APN for
+`reconcile` regards a changed ICCID as authoritative. It applies the mobile profile for
 the new SIM even if the previous provider's APN happens to pass the Internet
-test. If ICCID, configured APN and the last successfully reconciled state all
+test. If ICCID, configured profile and the last successfully reconciled state all
 match, it verifies connectivity and exits without restarting `wwan`.
 
-Return to the APN state that existed before the first `apply`:
+Return to the mobile profile that existed before the first `apply`:
 
 ```sh
 apn-autoconfig reset
@@ -341,25 +346,28 @@ older configurations and unusual ModemManager setups.
 connected bearer with an IP address but no return traffic. Enable it only if
 you deliberately want it as the final fallback.
 
-## Demo TSV database
+## Generated worldwide provider database
 
-The bundled database contains only the two configurations verified while
-building this MVP:
+The bundled database contains Internet-capable profiles generated from two
+upstream projects plus manually verified overrides. MMS-only, IMS, FOTA, XCAP,
+CBS, emergency, WAP-only, disabled and test-network profiles are excluded.
 
-- Telekom Germany / Kaufland Mobil: `internet.telekom`
-- Vodafone Germany: `web.vodafone.de`
-
-It is explicitly **not** a worldwide APN database.
+Exact upstream revisions are pinned so normal OpenWrt package builds never
+depend on the network. A scheduled workflow checks upstream weekly, retains
+removed profiles as low-priority fallbacks, rejects suspicious changes and
+commits only a fully verified generated update. See `docs/provider-database.md`
+for source, filtering, licensing and regeneration details.
 
 The schema is tab-separated:
 
 ```text
-mccmnc  imsi_prefix  iccid_prefix  gid1  spn_substring  provider  apn  priority
+mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 ```
 
-Use `-` for an unconstrained matching field. More specific rows win; `priority`
-orders equally specific candidates. A generated worldwide database can replace
-`/usr/share/apn-autoconfig/providers.tsv` without changing the program.
+Use `-` for an unconstrained or unavailable field. `x` in an IMSI or ICCID
+pattern matches one decimal digit. Plain shorter patterns match the beginning
+of the SIM identifier. More specific rows win; `priority` orders equally
+specific candidates.
 
 Example:
 
@@ -369,9 +377,9 @@ Example:
 
 The file must contain literal TAB characters, not spaces.
 
-The MVP applies the APN field only. Username, password, authentication type,
-MVNO-specific rules beyond the listed matching fields, and automatic conversion
-from `mobile-broadband-provider-info` are future work.
+The ModemManager backend applies APN, username, password, authentication and
+IP-family as one profile. Passwords are used internally and are never included
+in the read-only JSON candidate API.
 
 ## Cache
 
@@ -386,10 +394,10 @@ detection for that SIM.
 
 ## Exact rollback and package removal
 
-The first `apply` creates a persistent baseline recording both the original APN
-value and whether the UCI APN option originally existed at all. Consequently,
-an originally absent option is removed again rather than restored as an empty
-option.
+The first `apply` creates a persistent baseline recording the original values
+and presence of all five managed UCI options. Consequently, an originally
+absent option is removed again rather than restored as an empty option. A
+baseline created by v0.5 is migrated on first use.
 
 To undo testing but keep the package installed:
 
@@ -430,18 +438,19 @@ submission has been implemented and tested.
 
 ## Known limitations
 
-- The bundled database is deliberately tiny.
+- Worldwide coverage is broad but cannot be mathematically complete: carrier
+  settings change and some MVNOs do not expose a usable SIM discriminator.
 - Automatic SIM resolution requires ModemManager to expose a primary SIM path;
   a configured numeric `sim_index` is used only when resolution is impossible.
-- Only the APN is applied; APN username/password/authentication are not.
-- The connectivity test is IPv4 HTTPS through one configured net device.
+- The connectivity test uses HTTPS through one configured net device. It uses
+  the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
 - Boot and hardware-button automation are independently opt-in. The first LuCI
   UI covers live state, manual background actions and the most relevant UCI
   settings; it does not yet manage the init-script enable/disable state.
 - The bundled GPIO defaults are specific to the tested Huasifei WH3000 Pro
   eMMC and must not be assumed correct for another board.
-- A provider missing from the TSV requires a manual APN or a larger generated
-  database.
+- A missing or stale provider profile requires a manually verified override
+  and regeneration of the database.
 
-These limits are intentional for a first version whose failure mode is safe and
-understandable.
+The database is designed to improve continuously without making router package
+builds or runtime behavior depend on upstream availability.

@@ -1,0 +1,19 @@
+{
+  "format": 1,
+  "sources": {
+    "mbpi": {
+      "name": "GNOME mobile-broadband-provider-info",
+      "repository": "https://gitlab.gnome.org/GNOME/mobile-broadband-provider-info.git",
+      "revision": "052f1e6999f205ba88cc3557627f260b9ae0840e",
+      "path": "serviceproviders.xml",
+      "license": "CC-PD"
+    },
+    "aosp": {
+      "name": "Android Open Source Project sample APN database",
+      "repository": "https://android.googlesource.com/device/sample",
+      "revision": "73f904fbeb872f5675cb5f18cd9dfb15856425a6",
+      "path": "etc/apns-full-conf.xml",
+      "license": "Apache-2.0"
+    }
+  }
+}

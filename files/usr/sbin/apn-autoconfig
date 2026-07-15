@@ -3,6 +3,8 @@
 # Minimal APN auto-configuration helper for OpenWrt + ModemManager.
 # POSIX shell; intended for OpenWrt 25.12 and BusyBox ash.
 
+umask 077
+
 PROG="apn-autoconfig"
 CONFIG="apn-autoconfig"
 
@@ -41,6 +43,14 @@ SEEN_APNS="${TMP_BASE}.seen"
 ROLLBACK_ARMED=0
 OLD_APN_SET=0
 OLD_APN=""
+OLD_USERNAME_SET=0
+OLD_USERNAME=""
+OLD_PASSWORD_SET=0
+OLD_PASSWORD=""
+OLD_ALLOWEDAUTH_SET=0
+OLD_ALLOWEDAUTH=""
+OLD_IPTYPE_SET=0
+OLD_IPTYPE=""
 LOCK_HELD=0
 MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
@@ -69,22 +79,94 @@ cleanup_files() {
 	fi
 }
 
-set_apn() {
+state_value_is_safe() {
 	value="$1"
-	uci set "network.${INTERFACE}.apn=$value" >/dev/null 2>&1 || return 1
-	uci commit network >/dev/null 2>&1
+	tab="$(printf '\t')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
 }
 
-restore_old_apn() {
-	log warning "restoring previous APN for interface $INTERFACE"
-	if [ "$OLD_APN_SET" -eq 1 ]; then
-		uci set "network.${INTERFACE}.apn=$OLD_APN" >/dev/null 2>&1 || return 1
+set_or_delete_option() {
+	option="$1"
+	set_flag="$2"
+	value="$3"
+	if [ "$set_flag" -eq 1 ]; then
+		uci set "network.${INTERFACE}.${option}=$value" >/dev/null 2>&1
 	else
-		uci -q delete "network.${INTERFACE}.apn" >/dev/null 2>&1 || :
+		uci -q delete "network.${INTERFACE}.${option}" >/dev/null 2>&1 || :
 	fi
+}
+
+capture_old_profile() {
+	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
+		OLD_APN_SET=1
+		OLD_APN="$(uci -q get "network.${INTERFACE}.apn")"
+	fi
+	if uci -q get "network.${INTERFACE}.username" >/dev/null 2>&1; then
+		OLD_USERNAME_SET=1
+		OLD_USERNAME="$(uci -q get "network.${INTERFACE}.username")"
+	fi
+	if uci -q get "network.${INTERFACE}.password" >/dev/null 2>&1; then
+		OLD_PASSWORD_SET=1
+		OLD_PASSWORD="$(uci -q get "network.${INTERFACE}.password")"
+	fi
+	if uci -q get "network.${INTERFACE}.allowedauth" >/dev/null 2>&1; then
+		OLD_ALLOWEDAUTH_SET=1
+		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.allowedauth")"
+	fi
+	if uci -q get "network.${INTERFACE}.iptype" >/dev/null 2>&1; then
+		OLD_IPTYPE_SET=1
+		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.iptype")"
+	fi
+}
+
+restore_old_profile() {
+	log warning "restoring previous mobile profile for interface $INTERFACE"
+	set_or_delete_option apn "$OLD_APN_SET" "$OLD_APN" || return 1
+	set_or_delete_option username "$OLD_USERNAME_SET" "$OLD_USERNAME" || return 1
+	set_or_delete_option password "$OLD_PASSWORD_SET" "$OLD_PASSWORD" || return 1
+	set_or_delete_option allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
+	set_or_delete_option iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
 	uci commit network >/dev/null 2>&1 || return 1
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	ifup "$INTERFACE" >/dev/null 2>&1 || :
+}
+
+set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+
+	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
+	if [ "$username" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$password" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
+	fi
+	case "$auth" in
+		-) uci -q delete "network.${INTERFACE}.allowedauth" >/dev/null 2>&1 || : ;;
+		pap-or-chap) uci set "network.${INTERFACE}.allowedauth=pap chap" >/dev/null 2>&1 || return 1 ;;
+		*) uci set "network.${INTERFACE}.allowedauth=$auth" >/dev/null 2>&1 || return 1 ;;
+	esac
+	if [ "$ip_type" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.iptype" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.iptype=$ip_type" >/dev/null 2>&1 || return 1
+	fi
+	uci commit network >/dev/null 2>&1
 }
 
 on_exit() {
@@ -96,7 +178,7 @@ on_exit() {
 		MODEM_POWER_OFF_ARMED=0
 	fi
 	if [ "$ROLLBACK_ARMED" -eq 1 ]; then
-		restore_old_apn || log err "automatic rollback failed; restore APN in LuCI"
+		restore_old_profile || log err "automatic rollback failed; restore the mobile profile in LuCI"
 	elif [ "$INTERFACE_RESTORE_ARMED" -eq 1 ]; then
 		ifup "$INTERFACE" >/dev/null 2>&1 || \
 			log err "failed to restart interface $INTERFACE after modem reset failure"
@@ -255,13 +337,23 @@ cache_file() {
 cached_apn() {
 	file="$(cache_file)"
 	[ -r "$file" ] || return 1
-	awk -F '\t' 'NR == 1 && $1 == "v1" { print $2; exit }' "$file"
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $2; exit }' "$file"
 }
 
 cached_provider() {
 	file="$(cache_file)"
 	[ -r "$file" ] || return 1
-	awk -F '\t' 'NR == 1 && $1 == "v1" { print $3; exit }' "$file"
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $3; exit }' "$file"
+}
+
+cached_profile_field() {
+	column="$1"
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' -v column="$column" '
+		NR == 1 && $1 == "v2" { value=$column; print value == "" ? "-" : value; exit }
+		NR == 1 && $1 == "v1" { print "-"; exit }
+	' "$file"
 }
 
 find_candidates() {
@@ -274,29 +366,45 @@ find_candidates() {
 		-v spn="$OPERATOR_NAME" '
 		function wildcard(v) { return v == "" || v == "-" || v == "*" }
 		function starts(value, prefix) { return substr(value, 1, length(prefix)) == prefix }
+		function digit_pattern(value, pattern, i, expected, actual) {
+			if (length(value) < length(pattern)) return 0
+			pattern=tolower(pattern)
+			for (i=1; i<=length(pattern); i++) {
+				expected=substr(pattern, i, 1)
+				actual=substr(value, i, 1)
+				if (expected != "x" && expected != actual) return 0
+			}
+			return 1
+		}
 		BEGIN { OFS="\t"; spn_l=tolower(spn); gid1_l=tolower(gid1) }
 		/^[[:space:]]*#/ || NF < 8 { next }
 		{
-			mccmnc=$1; imsi_prefix=$2; iccid_prefix=$3; row_gid1=$4
+			mccmnc=$1; imsi_pattern=$2; iccid_pattern=$3; row_gid1=$4
 			row_spn=$5; provider=$6; apn=$7; priority=$8
-			if (!wildcard(mccmnc) && operator_id != mccmnc) next
-			if (!wildcard(imsi_prefix) && !starts(imsi, imsi_prefix)) next
-			if (!wildcard(iccid_prefix) && !starts(iccid, iccid_prefix)) next
+			username=NF >= 9 && $9 != "" ? $9 : "-"
+			password=NF >= 10 && $10 != "" ? $10 : "-"
+			auth=NF >= 11 && $11 != "" ? $11 : "-"
+			ip_type=NF >= 12 && $12 != "" ? $12 : "-"
+			if (!wildcard(mccmnc) && operator_id != mccmnc &&
+			    !(operator_id == "" && starts(imsi, mccmnc))) next
+			if (!wildcard(imsi_pattern) && !digit_pattern(imsi, imsi_pattern)) next
+			if (!wildcard(iccid_pattern) && !digit_pattern(iccid, iccid_pattern)) next
 			if (!wildcard(row_gid1) && tolower(row_gid1) != gid1_l) next
-			if (!wildcard(row_spn) && index(spn_l, tolower(row_spn)) == 0) next
+			if (!wildcard(row_spn) && spn_l != tolower(row_spn)) next
 			score=0
 			if (!wildcard(mccmnc)) score += 100 + length(mccmnc)
-			if (!wildcard(imsi_prefix)) score += 200 + length(imsi_prefix)
-			if (!wildcard(iccid_prefix)) score += 200 + length(iccid_prefix)
+			if (!wildcard(imsi_pattern)) score += 200 + length(imsi_pattern)
+			if (!wildcard(iccid_pattern)) score += 200 + length(iccid_pattern)
 			if (!wildcard(row_gid1)) score += 50
 			if (!wildcard(row_spn)) score += 40
 			if (priority !~ /^[0-9]+$/) priority=100
 			# Fixed-width inverse score makes the required order portable even on
 			# BusyBox sort variants that handle per-key reverse modifiers differently.
 			rank=999999-score
-			printf "%06d\t%06d\t%s\t%s\n", rank, priority, apn, provider
+			printf "%06d\t%06d\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+				rank, priority, apn, provider, username, password, auth, ip_type
 		}
-	' "$DATABASE" | sort | awk -F '\t' '!seen[$3]++' >"$CANDIDATES"
+	' "$DATABASE" | sort | awk -F '\t' '!seen[$3 SUBSEP $5 SUBSEP $6 SUBSEP $7 SUBSEP $8]++' >"$CANDIDATES"
 }
 
 print_identity() {
@@ -323,7 +431,7 @@ detect_cmd() {
 	if [ -s "$CANDIDATES" ]; then
 		awk -F '\t' '{ printf "  %d. %-28s %s\n", NR, $3, $4 }' "$CANDIDATES"
 	else
-		printf '  none (the bundled database is intentionally only a demo)\n'
+		printf '  none (no matching profile is present in the provider database)\n'
 	fi
 }
 
@@ -331,17 +439,53 @@ current_apn() {
 	uci -q get "network.${INTERFACE}.apn"
 }
 
+write_baseline_option() {
+	file="$1"
+	option="$2"
+	set_flag="$3"
+	value="$4"
+	state_value_is_safe "$value" || die "refusing to save an unsafe $option value"
+	printf 'option\t%s\t%s\t%s\n' "$option" "$set_flag" "$value" >>"$file" || \
+		die "cannot write baseline option $option"
+}
+
+migrate_legacy_baseline() {
+	[ -r "$BASELINE_FILE" ] || return 0
+	[ "$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")" = "v1" ] || return 0
+	legacy_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
+	legacy_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+	legacy_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+	[ "$legacy_interface" = "$INTERFACE" ] || \
+		die "legacy baseline belongs to interface $legacy_interface; run reset before changing interfaces"
+	case "$legacy_set" in 0|1) : ;; *) die "invalid legacy baseline set flag" ;; esac
+	[ "$legacy_apn" = "<empty>" ] && legacy_apn=""
+	state_value_is_safe "$legacy_apn" || die "unsafe APN in legacy baseline"
+
+	tmp="$STATE_DIR/.baseline.migrate.$$"
+	printf 'v2\t%s\n' "$legacy_interface" >"$tmp" || die "cannot migrate legacy baseline"
+	write_baseline_option "$tmp" apn "$legacy_set" "$legacy_apn"
+	# v0.5 changed only APN, so the current optional values are still the
+	# original values and can safely complete the old baseline.
+	write_baseline_option "$tmp" username "$OLD_USERNAME_SET" "$OLD_USERNAME"
+	write_baseline_option "$tmp" password "$OLD_PASSWORD_SET" "$OLD_PASSWORD"
+	write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+	write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+	mv "$tmp" "$BASELINE_FILE" || die "cannot install migrated baseline"
+	log notice "migrated v1 APN baseline to a complete v2 mobile profile baseline"
+}
+
 save_baseline() {
-	set_flag="$1"
-	value="$2"
 	[ -e "$BASELINE_FILE" ] && return 0
-	case "$value" in ''|*[!A-Za-z0-9._-]*) [ -z "$value" ] || die "refusing to save an unexpected APN value" ;; esac
 	mkdir -p "$STATE_DIR" || die "cannot create state directory: $STATE_DIR"
 	tmp="$STATE_DIR/.baseline.tmp.$$"
-	stored_value="${value:-<empty>}"
-	printf 'v1\t%s\t%s\t%s\n' "$INTERFACE" "$set_flag" "$stored_value" >"$tmp" || die "cannot write baseline"
+	printf 'v2\t%s\n' "$INTERFACE" >"$tmp" || die "cannot write baseline"
+	write_baseline_option "$tmp" apn "$OLD_APN_SET" "$OLD_APN"
+	write_baseline_option "$tmp" username "$OLD_USERNAME_SET" "$OLD_USERNAME"
+	write_baseline_option "$tmp" password "$OLD_PASSWORD_SET" "$OLD_PASSWORD"
+	write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+	write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
 	mv "$tmp" "$BASELINE_FILE" || die "cannot install baseline"
-	log notice "saved original APN state for interface $INTERFACE"
+	log notice "saved original mobile profile for interface $INTERFACE"
 }
 
 reset_cmd() {
@@ -354,27 +498,36 @@ reset_cmd() {
 	fi
 	baseline_version="$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")"
 	baseline_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
-	baseline_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
-	baseline_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
-	[ "$baseline_version" = "v1" ] || die "unknown baseline format"
 	case "$baseline_interface" in ''|*[!A-Za-z0-9_]*) die "invalid interface in baseline" ;; esac
-	case "$baseline_set" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
-	[ "$baseline_apn" = "<empty>" ] && baseline_apn=""
-	case "$baseline_apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$baseline_apn" ] || die "invalid APN in baseline" ;; esac
 
 	INTERFACE="$baseline_interface"
-	if [ "$baseline_set" -eq 1 ]; then
-		uci set "network.${INTERFACE}.apn=$baseline_apn" >/dev/null 2>&1 || die "cannot restore baseline APN"
-	else
-		uci -q delete "network.${INTERFACE}.apn" >/dev/null 2>&1 || :
-	fi
-	uci commit network >/dev/null 2>&1 || die "cannot commit restored APN"
+	case "$baseline_version" in
+		v1)
+			baseline_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+			baseline_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+			case "$baseline_set" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
+			[ "$baseline_apn" = "<empty>" ] && baseline_apn=""
+			case "$baseline_apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$baseline_apn" ] || die "invalid APN in baseline" ;; esac
+			set_or_delete_option apn "$baseline_set" "$baseline_apn" || die "cannot restore baseline APN"
+		;;
+		v2)
+			while IFS="$(printf '\t')" read -r kind option set_flag value; do
+				[ "$kind" = "option" ] || continue
+				case "$option" in apn|username|password|allowedauth|iptype) : ;; *) die "invalid option in baseline" ;; esac
+				case "$set_flag" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
+				state_value_is_safe "$value" || die "unsafe value in baseline"
+				set_or_delete_option "$option" "$set_flag" "$value" || die "cannot restore baseline $option"
+			done <"$BASELINE_FILE"
+		;;
+		*) die "unknown baseline format" ;;
+	esac
+	uci commit network >/dev/null 2>&1 || die "cannot commit restored mobile profile"
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
-	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored APN, but interface $INTERFACE did not start"
+	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
 	rm -rf "$CACHE_DIR"
 	rm -f "$ACTIVE_FILE"
 	rm -f "$BASELINE_FILE"
-	log notice "restored original APN state; cache and baseline removed"
+	log notice "restored original mobile profile; cache and baseline removed"
 }
 
 interface_is_up() {
@@ -406,7 +559,7 @@ status_cmd() {
 	fi
 	printf 'Reconciled SIM:  '
 	if [ -r "$ACTIVE_FILE" ]; then
-		awk -F '\t' 'NR == 1 && $1 == "v1" { printf "%s (%s)\n", $2, $3; found=1 } END { if (!found) print "invalid state" }' "$ACTIVE_FILE"
+		awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { printf "%s (%s)\n", $2, $3; found=1 } END { if (!found) print "invalid state" }' "$ACTIVE_FILE"
 	else
 		printf -- '-\n'
 	fi
@@ -492,12 +645,15 @@ detect_json_cmd() {
 	json_key_string gid2 "$GID2"; printf ','
 	json_key_string cached_apn "$cache"; printf ',"candidates":['
 	separator=""
-	while IFS="$(printf '\t')" read -r score priority apn provider; do
+	while IFS="$(printf '\t')" read -r score priority apn provider username password auth ip_type; do
 		[ -n "$apn" ] || continue
 		priority="$(printf '%s\n' "$priority" | awk '{ print $1 + 0 }')"
 		printf '%s{' "$separator"
 		json_key_string apn "$apn"; printf ','
 		json_key_string provider "$provider"; printf ','
+		printf '"username_required":%s,' "$([ "$username" != - ] && printf true || printf false)"
+		json_key_string authentication "$([ "$auth" = - ] && printf '' || printf '%s' "$auth")"; printf ','
+		json_key_string ip_type "$([ "$ip_type" = - ] && printf '' || printf '%s' "$ip_type")"; printf ','
 		printf '"priority":%s' "$priority"
 		printf '}'
 		separator=','
@@ -666,13 +822,22 @@ acquire_lock() {
 add_candidate() {
 	apn="$1"
 	provider="$2"
+	username="${3:--}"
+	password="${4:--}"
+	auth="${5:--}"
+	ip_type="${6:--}"
 	case "$apn" in
 		''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 0 ;;
 	esac
-	key="${apn:-<empty>}"
+	state_value_is_safe "$username" || return 0
+	state_value_is_safe "$password" || return 0
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 0 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 0 ;; esac
+	key="${apn:-<empty>}$(printf '\t')${username}$(printf '\t')${password}$(printf '\t')${auth}$(printf '\t')${ip_type}"
 	grep -F -x -q -- "$key" "$SEEN_APNS" 2>/dev/null && return 0
 	printf '%s\n' "$key" >>"$SEEN_APNS"
-	printf '%s\t%s\n' "$key" "$provider" >>"${CANDIDATES}.apply"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${apn:-<empty>}" "$provider" \
+		"$username" "$password" "$auth" "$ip_type" >>"${CANDIDATES}.apply"
 }
 
 build_apply_candidates() {
@@ -680,15 +845,19 @@ build_apply_candidates() {
 	: >"${CANDIDATES}.apply"
 	cache="$(cached_apn 2>/dev/null || :)"
 	provider="$(cached_provider 2>/dev/null || :)"
+	username="$(cached_profile_field 5 2>/dev/null || printf '%s' -)"
+	password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
+	auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
+	ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
 	if [ "$cache" = "<empty>" ]; then
-		add_candidate "" "${provider:-cache}"
+		add_candidate "" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
 	elif [ -n "$cache" ]; then
-		add_candidate "$cache" "${provider:-cache}"
+		add_candidate "$cache" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
 	fi
-	while IFS="$(printf '\t')" read -r score priority apn provider; do
-		[ -n "$apn" ] && add_candidate "$apn" "$provider"
+	while IFS="$(printf '\t')" read -r score priority apn provider username password auth ip_type; do
+		[ -n "$apn" ] && add_candidate "$apn" "$provider" "$username" "$password" "$auth" "$ip_type"
 	done <"$CANDIDATES"
-	[ "$TRY_EMPTY" = "1" ] && add_candidate "" "empty APN fallback"
+	[ "$TRY_EMPTY" = "1" ] && add_candidate "" "empty APN fallback" - - - -
 }
 
 restart_interface() {
@@ -719,25 +888,42 @@ mwan3_available() {
 	esac
 }
 
-test_connectivity() {
+test_connectivity_family() {
+	family="$1"
 	if mwan3_available; then
-		mwan3 use "$INTERFACE" curl -4 --interface "$DEVICE" \
+		mwan3 use "$INTERFACE" curl "$family" --interface "$DEVICE" \
 			--connect-timeout 10 --max-time 15 -fsS -o /dev/null "$TEST_URL"
 	else
-		curl -4 --interface "$DEVICE" --connect-timeout 10 --max-time 15 \
+		curl "$family" --interface "$DEVICE" --connect-timeout 10 --max-time 15 \
 			-fsS -o /dev/null "$TEST_URL"
 	fi
+}
+
+test_connectivity() {
+	case "${1:--}" in
+		ipv4) test_connectivity_family -4 ;;
+		ipv6) test_connectivity_family -6 ;;
+		*) test_connectivity_family -4 || test_connectivity_family -6 ;;
+	esac
 }
 
 save_cache() {
 	apn="$1"
 	provider="$2"
+	username="$3"
+	password="$4"
+	auth="$5"
+	ip_type="$6"
 	mkdir -p "$CACHE_DIR" || return 1
 	tmp="$CACHE_DIR/.${ICCID}.tmp.$$"
-	# Tabs/newlines are not accepted in APNs; sanitize provider for a one-line cache.
+	# Provider labels are informational; profile values must remain exact.
 	provider="$(printf '%s' "$provider" | tr '\t\r\n' '   ')"
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
 	cache_apn="${apn:-<empty>}"
-	printf 'v1\t%s\t%s\t%s\n' "$cache_apn" "$provider" "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" >"$tmp" || return 1
+	printf 'v2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$cache_apn" "$provider" \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" \
+		"$username" "$password" "$auth" "$ip_type" >"$tmp" || return 1
 	mv "$tmp" "$(cache_file)"
 }
 
@@ -748,21 +934,54 @@ write_last_result() {
 
 save_active_state() {
 	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
 	mkdir -p "$STATE_DIR" || return 1
 	tmp="$STATE_DIR/.active.tmp.$$"
 	active_apn="${apn:-<empty>}"
-	printf 'v1\t%s\t%s\n' "$ICCID" "$active_apn" >"$tmp" || return 1
+	case "$auth" in
+		-) allowedauth="-" ;;
+		pap-or-chap) allowedauth="pap chap" ;;
+		*) allowedauth="$auth" ;;
+	esac
+	printf 'v2\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ICCID" "$active_apn" \
+		"$username" "$password" "$allowedauth" "$ip_type" >"$tmp" || return 1
 	mv "$tmp" "$ACTIVE_FILE"
 }
 
 active_iccid() {
 	[ -r "$ACTIVE_FILE" ] || return 1
-	awk -F '\t' 'NR == 1 && $1 == "v1" { print $2; exit }' "$ACTIVE_FILE"
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $2; exit }' "$ACTIVE_FILE"
 }
 
 active_apn() {
 	[ -r "$ACTIVE_FILE" ] || return 1
-	awk -F '\t' 'NR == 1 && $1 == "v1" { print $3; exit }' "$ACTIVE_FILE"
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $3; exit }' "$ACTIVE_FILE"
+}
+
+configured_profile_matches_active() {
+	[ -r "$ACTIVE_FILE" ] || return 1
+	version="$(awk -F '\t' 'NR == 1 { print $1 }' "$ACTIVE_FILE")"
+	active_value="$(active_apn 2>/dev/null || :)"
+	[ "$active_value" = "<empty>" ] && active_value=""
+	[ "$(current_apn 2>/dev/null || :)" = "$active_value" ] || return 1
+	[ "$version" = "v1" ] && return 0
+	[ "$version" = "v2" ] || return 1
+
+	active_username="$(awk -F '\t' 'NR == 1 { print $4 }' "$ACTIVE_FILE")"
+	active_password="$(awk -F '\t' 'NR == 1 { print $5 }' "$ACTIVE_FILE")"
+	active_allowedauth="$(awk -F '\t' 'NR == 1 { print $6 }' "$ACTIVE_FILE")"
+	active_iptype="$(awk -F '\t' 'NR == 1 { print $7 }' "$ACTIVE_FILE")"
+	configured_username="$(uci -q get "network.${INTERFACE}.username" 2>/dev/null || printf '%s' -)"
+	configured_password="$(uci -q get "network.${INTERFACE}.password" 2>/dev/null || printf '%s' -)"
+	configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
+	configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+	[ "$configured_username" = "$active_username" ] && \
+		[ "$configured_password" = "$active_password" ] && \
+		[ "$configured_allowedauth" = "$active_allowedauth" ] && \
+		[ "$configured_iptype" = "$active_iptype" ]
 }
 
 apply_cmd() {
@@ -771,20 +990,18 @@ apply_cmd() {
 	build_apply_candidates
 	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or set APN manually"
 	acquire_lock
-	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
-		OLD_APN_SET=1
-		OLD_APN="$(current_apn 2>/dev/null || :)"
-	fi
-	save_baseline "$OLD_APN_SET" "$OLD_APN"
+	capture_old_profile
+	migrate_legacy_baseline
+	save_baseline
 	ROLLBACK_ARMED=1
 	log notice "starting APN detection for ICCID $ICCID on $INTERFACE"
 
-	while IFS="$(printf '\t')" read -r apn provider; do
+	while IFS="$(printf '\t')" read -r apn provider username password auth ip_type; do
 		[ "$apn" = "<empty>" ] && apn=""
 		display_apn="${apn:-<empty>}"
 		log notice "trying APN '$display_apn' ($provider)"
-		if ! set_apn "$apn"; then
-			log err "failed to write APN '$display_apn'"
+		if ! set_profile "$apn" "$username" "$password" "$auth" "$ip_type"; then
+			log err "failed to write mobile profile for APN '$display_apn'"
 			continue
 		fi
 		if ! restart_interface; then
@@ -795,9 +1012,11 @@ apply_cmd() {
 			log warning "interface $INTERFACE did not become up within ${WAIT_SECONDS}s"
 			continue
 		fi
-		if test_connectivity; then
-			save_cache "$apn" "$provider" || log warning "APN worked, but cache could not be written"
-			save_active_state "$apn" || log warning "APN worked, but reconciled SIM state could not be written"
+		if test_connectivity "$ip_type"; then
+			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$ip_type" || \
+				log warning "APN worked, but cache could not be written"
+			save_active_state "$apn" "$username" "$password" "$auth" "$ip_type" || \
+				log warning "APN worked, but reconciled SIM state could not be written"
 			write_last_result "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
 			log notice "APN '$display_apn' is working; configuration kept"
@@ -806,8 +1025,8 @@ apply_cmd() {
 		log warning "real Internet check failed for APN '$display_apn'"
 	done <"${CANDIDATES}.apply"
 
-	write_last_result "failed: all candidates rejected; previous APN restored"
-	die "all APN candidates failed; previous APN will be restored"
+	write_last_result "failed: all candidates rejected; previous mobile profile restored"
+	die "all APN candidates failed; previous mobile profile will be restored"
 }
 
 reconcile_cmd() {
@@ -819,8 +1038,9 @@ reconcile_cmd() {
 
 	if [ -n "$previous_iccid" ] && \
 	   [ "$previous_iccid" = "$ICCID" ] && \
-	   [ "$previous_apn" = "$configured_apn" ] && \
-	   interface_is_up && test_connectivity; then
+	   configured_profile_matches_active && \
+	   interface_is_up && \
+	   test_connectivity "$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"; then
 		log notice "SIM $ICCID is already reconciled with APN '${configured_apn:-<empty>}'; no changes"
 		return 0
 	fi
@@ -829,8 +1049,8 @@ reconcile_cmd() {
 		log notice "SIM change detected: $previous_iccid -> $ICCID"
 	elif [ -z "$previous_iccid" ]; then
 		log notice "no reconciled SIM state found; applying APN for ICCID $ICCID"
-	elif [ "$previous_apn" != "$configured_apn" ]; then
-		log notice "configured APN differs from the reconciled APN for ICCID $ICCID"
+	elif ! configured_profile_matches_active; then
+		log notice "configured mobile profile differs from the reconciled profile for ICCID $ICCID"
 	else
 		log notice "reconciled WWAN connectivity is unavailable; retrying APN for ICCID $ICCID"
 	fi

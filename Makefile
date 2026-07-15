@@ -1,10 +1,10 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.5.0
-PKG_RELEASE:=2
-PKG_LICENSE:=MIT
-PKG_LICENSE_FILES:=LICENSE
+PKG_VERSION:=0.6.0
+PKG_RELEASE:=1
+PKG_LICENSE:=MIT AND Apache-2.0
+PKG_LICENSE_FILES:=LICENSE data/licenses/Apache-2.0.txt data/licenses/MBPI-CC-PD.txt
 PKG_MAINTAINER:=DarthAnwalt
 PKG_URL:=https://github.com/DarthAnwalt/openwrt-apn-autoconfig
 PKGARCH:=all
@@ -20,9 +20,10 @@ define Package/apn-autoconfig
 endef
 
 define Package/apn-autoconfig/description
- POSIX-shell APN detection and testing helper for OpenWrt ModemManager.
- It matches SIM identity against a local TSV database, verifies real Internet
- access, caches successful APNs per ICCID and safely rolls back failures.
+ POSIX-shell mobile profile detection and testing helper for OpenWrt
+ ModemManager. It matches SIM identity against a worldwide local TSV database,
+ verifies real Internet access, caches successful profiles per ICCID and safely
+ rolls back failures.
 endef
 
 define Package/apn-autoconfig/conffiles
@@ -50,7 +51,7 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/etc/hotplug.d/button/50-apn-autoconfig $(1)/etc/hotplug.d/button/50-apn-autoconfig
 endef
 
-# A real removal restores the APN baseline first. A failed reset aborts
+# A real removal restores the mobile profile baseline first. A failed reset aborts
 # deinstallation, leaving the package available for diagnosis and retry.
 define Package/apn-autoconfig/prerm
 #!/bin/sh

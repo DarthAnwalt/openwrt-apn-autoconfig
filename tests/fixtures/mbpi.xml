@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<serviceproviders format="2.0">
+  <country code="zz">
+    <provider primary="true">
+      <name>Fixture Mobile</name>
+      <gsm>
+        <network-id mcc="999" mnc="01"/>
+        <apn value="fixture.net">
+          <usage type="internet"/>
+          <username>fixture</username>
+          <password>secret</password>
+          <authentication method="pap"/>
+        </apn>
+        <apn value="fixture.mms"><usage type="mms"/></apn>
+      </gsm>
+    </provider>
+  </country>
+</serviceproviders>

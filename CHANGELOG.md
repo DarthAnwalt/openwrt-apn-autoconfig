@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.0
+
+- Replace the three-row demonstration database with a deterministic worldwide
+  database generated from GNOME mobile-broadband-provider-info, AOSP and local
+  verified overrides.
+- Add a versioned 12-column runtime schema and apply APN, username, password,
+  authentication and IP-family as one ModemManager profile.
+- Support AOSP-style IMSI and ICCID digit masks and exact SPN matching.
+- Pin upstream source revisions and include their public-domain and Apache-2.0
+  licensing information.
+- Add generator fixtures, deterministic-output tests and production database
+  validation.
+- Cache and reconcile complete profiles, migrate v0.5 baselines, and restore
+  every managed UCI option exactly after failure, reset or package removal.
+- Select IPv4 or IPv6 connectivity checks from the candidate profile and try
+  both families for dual-stack or unspecified profiles.
+- Add a weekly unattended source refresh with anomaly gates, complete runtime
+  verification and automatic commits for accepted database updates.
+- Retain profiles removed by upstream sources as progressively demoted fallback
+  candidates instead of deleting known working settings immediately.
+
 ## 0.5.0
 
 - Add stable JSON output for SIM/APN status and candidate detection.

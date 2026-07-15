@@ -1,0 +1,37 @@
+name: Update provider database
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: provider-database-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refresh trusted provider sources
+        run: sh scripts/refresh-providers.sh
+      - name: Verify generated database and package behavior
+        run: sh scripts/verify.sh
+      - name: Commit safe update
+        run: |
+          if git diff --quiet -- data/provider-sources.json data/providers-report.json files/usr/share/apn-autoconfig/providers.tsv; then
+            echo "Provider database is already current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/provider-sources.json data/providers-report.json files/usr/share/apn-autoconfig/providers.tsv
+          git commit -m "Update provider database"
+          git push

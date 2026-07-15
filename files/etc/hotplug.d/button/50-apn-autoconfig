@@ -18,8 +18,10 @@ autoconfig_bin="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 	exit 1
 }
 
-(
-	"$autoconfig_bin" modem-reset </dev/null >/dev/null 2>&1
-) &
+if ! "$autoconfig_bin" action-start modem-reset </dev/null >/dev/null 2>&1; then
+	logger -t apn-autoconfig-button -p user.err -- \
+		"failed to enqueue modem reset and APN reconciliation" 2>/dev/null || :
+	exit 1
+fi
 
 exit 0

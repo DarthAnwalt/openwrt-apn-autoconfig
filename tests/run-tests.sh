@@ -3,6 +3,7 @@ set -eu
 
 BASE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 TESTROOT="${TMPDIR:-/tmp}/apn-autoconfig-test.$$"
+TEST_ACTION_STATE="/tmp/apn-autoconfig-action-test.$$"
 MOCKBIN="$TESTROOT/bin"
 STATE="$TESTROOT/state"
 DB="$TESTROOT/providers.tsv"
@@ -13,7 +14,7 @@ BOOT_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-boot"
 BUTTON_SCRIPT="$BASE/files/etc/hotplug.d/button/50-apn-autoconfig"
 
 cleanup() {
-	rm -rf "$TESTROOT"
+	rm -rf "$TESTROOT" "$TEST_ACTION_STATE" "$TEST_ACTION_STATE.start-lock"
 }
 trap cleanup 0 HUP INT TERM
 
@@ -45,6 +46,7 @@ get:apn-autoconfig.main.wait_seconds) printf '%s\n' 2 ;;
 get:apn-autoconfig.main.try_empty) printf '%s\n' 0 ;;
 get:apn-autoconfig.main.use_mwan3) printf '%s\n' auto ;;
 get:apn-autoconfig.main.lock_dir) printf '%s\n' "$TEST_LOCK" ;;
+get:apn-autoconfig.main.action_state_dir) printf '%s\n' "$TEST_ACTION_STATE" ;;
 get:apn-autoconfig.main.autostart) printf '%s\n' "${TEST_AUTOSTART:-0}" ;;
 get:apn-autoconfig.main.boot_delay) printf '%s\n' "${TEST_BOOT_DELAY:-0}" ;;
 get:apn-autoconfig.main.boot_attempts) printf '%s\n' "${TEST_BOOT_ATTEMPTS:-3}" ;;
@@ -148,6 +150,12 @@ export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
 cat >"$MOCKBIN/apn-autoconfig-command" <<'EOF'
 #!/bin/sh
 [ "${1:-}" = "reconcile" ] || exit 2
+if [ "${BLOCK_ACTION:-0}" = "1" ]; then
+	while [ ! -e "$TEST_STATE/action-release" ]; do
+		/bin/sleep 1
+	done
+fi
+[ "${ACTION_EXIT:-0}" -eq 0 ] || exit "$ACTION_EXIT"
 count="$(cat "$TEST_STATE/boot-calls" 2>/dev/null || printf '0')"
 count=$((count + 1))
 printf '%s\n' "$count" >"$TEST_STATE/boot-calls"
@@ -155,6 +163,7 @@ printf '%s\n' "$count" >"$TEST_STATE/boot-calls"
 EOF
 chmod 0755 "$MOCKBIN/apn-autoconfig-command"
 export APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-command"
+export TEST_ACTION_STATE
 
 fail() {
 	printf 'FAIL: %s\n' "$*" >&2
@@ -252,6 +261,52 @@ printf '%s\n' 'TEST status reports configured APN'
 status_output="$(sh "$SCRIPT" status 2>&1)"
 assert_contains "$status_output" 'Configured APN:  rollback.apn'
 
+printf '%s\n' 'TEST machine-readable status and detect output are valid JSON'
+status_json="$(sh "$SCRIPT" status-json)"
+detect_json="$(sh "$SCRIPT" detect-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True' "$status_json" || fail 'invalid status JSON'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["iccid"] == "89490200002186275443"; assert len(d["candidates"]) == 1; assert d["candidates"][0]["apn"] == "internet.telekom"' "$detect_json" || fail 'invalid detect JSON'
+
+printf '%s\n' 'TEST background action reports busy and rejects an overlapping start'
+rm -rf "$TEST_ACTION_STATE" "$TEST_ACTION_STATE.start-lock"
+rm -f "$STATE/action-release"
+BLOCK_ACTION=1 APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" \
+	APN_AUTOCONFIG_ACTION_COMMAND="$MOCKBIN/apn-autoconfig-command" \
+	sh "$SCRIPT" action-start reconcile >"$STATE/action-start.json"
+/bin/sleep 1
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["accepted"] is True' "$STATE/action-start.json" || fail 'first background action was not accepted'
+busy_json="$(APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" sh "$SCRIPT" action-status)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["busy"] is True and d["action"] == "reconcile"' "$busy_json" || fail 'running action not reported busy'
+second_json="$(APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" sh "$SCRIPT" action-start modem-reset)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is False and d["busy"] is True' "$second_json" || fail 'overlapping background action was not rejected'
+touch "$STATE/action-release"
+action_wait=10
+while [ "$action_wait" -gt 0 ]; do
+	action_json="$(sh "$SCRIPT" action-status)"
+	action_busy="$(python3 -c 'import json,sys; print(str(json.loads(sys.argv[1])["busy"]).lower())' "$action_json")"
+	[ "$action_busy" = false ] && break
+	/bin/sleep 1
+	action_wait=$((action_wait - 1))
+done
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "success" and d["busy"] is False' "$action_json" || fail 'background action did not reach success'
+
+printf '%s\n' 'TEST failed background action reaches a terminal state and releases GUI controls'
+rm -rf "$TEST_ACTION_STATE"
+ACTION_EXIT=7 APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" \
+	APN_AUTOCONFIG_ACTION_COMMAND="$MOCKBIN/apn-autoconfig-command" \
+	sh "$SCRIPT" action-start reconcile >"$STATE/action-failed-start.json"
+/bin/sleep 1
+failed_json="$(sh "$SCRIPT" action-status)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "failed" and d["busy"] is False and d["exit_code"] == "7"' "$failed_json" || fail 'failed action left GUI controls busy'
+
+printf '%s\n' 'TEST an operation started outside the job API disables GUI actions'
+rm -rf "$TEST_ACTION_STATE"
+mkdir -p "$TEST_LOCK"
+printf '%s\n' "$$" >"$TEST_LOCK/pid"
+external_json="$(sh "$SCRIPT" action-status)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["busy"] is True and d["state"] == "external"' "$external_json" || fail 'external operation lock was not exposed'
+rm -rf "$TEST_LOCK"
+
 printf '%s\n' 'TEST boot worker is inert while autostart is disabled'
 rm -f "$STATE/boot-calls"
 TEST_AUTOSTART=0
@@ -297,7 +352,7 @@ fi
 [ "$(cat "$TEST_GPIO")" = '0' ] || fail 'failed modem reset left modem power off'
 grep -F -q 'up wwan' "$STATE/events" || fail 'failed modem reset did not attempt WWAN recovery'
 
-printf '%s\n' 'TEST button ignores press and invokes modem reset only on release'
+printf '%s\n' 'TEST button ignores press and queues modem reset only on release'
 cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_STATE/button-calls"
@@ -307,7 +362,7 @@ rm -f "$STATE/button-calls"
 TEST_BUTTON_ENABLED=0 BUTTON=BTN_0 ACTION=released \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
-[ ! -e "$STATE/button-calls" ] || fail 'disabled button invoked modem-reset'
+[ ! -e "$STATE/button-calls" ] || fail 'disabled button queued modem-reset'
 TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=pressed \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
@@ -320,6 +375,7 @@ while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
 	/bin/sleep 1
 	button_wait=$((button_wait - 1))
 done
-grep -F -q 'modem-reset' "$STATE/button-calls" || fail 'button release did not invoke modem-reset'
+grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
+	fail 'button release did not queue modem-reset through the job API'
 
 printf '%s\n' 'All tests passed.'

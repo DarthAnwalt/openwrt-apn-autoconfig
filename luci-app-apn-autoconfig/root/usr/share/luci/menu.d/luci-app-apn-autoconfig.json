@@ -1,0 +1,13 @@
+{
+	"admin/network/apn-autoconfig": {
+		"title": "APN Auto-Config",
+		"order": 65,
+		"action": {
+			"type": "view",
+			"path": "network/apn-autoconfig"
+		},
+		"depends": {
+			"acl": [ "luci-app-apn-autoconfig" ]
+		}
+	}
+}

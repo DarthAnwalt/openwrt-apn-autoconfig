@@ -29,6 +29,8 @@ MODEM_POLL_SECONDS="2"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
+ACTION_STATE_DIR="/tmp/apn-autoconfig-action"
+ACTION_WORKER="${APN_AUTOCONFIG_ACTION_WORKER:-/usr/libexec/apn-autoconfig-action}"
 TMP_BASE="/tmp/apn-autoconfig.$$"
 SIM_DATA="${TMP_BASE}.sim"
 MODEM_DATA="${TMP_BASE}.modem"
@@ -125,6 +127,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.try_empty")" && [ -n "$value" ] && TRY_EMPTY="$value"
 	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_power_path")" && [ -n "$value" ] && MODEM_POWER_PATH="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_power_off_value")" && [ -n "$value" ] && MODEM_POWER_OFF_VALUE="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
@@ -156,6 +159,8 @@ validate_config() {
 	case "$CACHE_DIR" in /|*/../*|*/..) die "unsafe cache_dir" ;; /*) : ;; *) die "cache_dir must be absolute" ;; esac
 	case "$CACHE_DIR" in "$STATE_DIR"/?*) : ;; *) die "cache_dir must be inside state_dir" ;; esac
 	case "$LOCK_DIR" in /|*/../*|*/..) die "unsafe lock_dir" ;; /*) : ;; *) die "lock_dir must be absolute" ;; esac
+	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
+	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
 	[ -r "$DATABASE" ] || die "database not readable: $DATABASE"
 	command_exists mmcli || die "mmcli is required"
 	command_exists curl || die "curl is required"
@@ -340,6 +345,7 @@ save_baseline() {
 }
 
 reset_cmd() {
+	acquire_lock
 	if [ ! -r "$BASELINE_FILE" ]; then
 		rm -rf "$CACHE_DIR"
 		rm -f "$ACTIVE_FILE"
@@ -356,7 +362,6 @@ reset_cmd() {
 	[ "$baseline_apn" = "<empty>" ] && baseline_apn=""
 	case "$baseline_apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$baseline_apn" ] || die "invalid APN in baseline" ;; esac
 
-	acquire_lock
 	INTERFACE="$baseline_interface"
 	if [ "$baseline_set" -eq 1 ]; then
 		uci set "network.${INTERFACE}.apn=$baseline_apn" >/dev/null 2>&1 || die "cannot restore baseline APN"
@@ -405,6 +410,234 @@ status_cmd() {
 	else
 		printf -- '-\n'
 	fi
+}
+
+json_escape() {
+	awk 'BEGIN { ORS="" }
+	{
+		if (NR > 1) printf "\\n"
+		gsub(/\\/, "\\\\")
+		gsub(/\"/, "\\\"")
+		gsub(/\t/, "\\t")
+		gsub(/\r/, "\\r")
+		printf "%s", $0
+	}'
+}
+
+json_string() {
+	printf '"'
+	printf '%s' "$1" | json_escape
+	printf '"'
+}
+
+json_key_string() {
+	printf '"%s":' "$1"
+	json_string "$2"
+}
+
+read_last_result() {
+	if [ -r "$CACHE_DIR/last-result" ]; then
+		sed -n '1p' "$CACHE_DIR/last-result"
+	fi
+}
+
+status_json_cmd() {
+	read_sim
+	apn="$(current_apn 2>/dev/null || :)"
+	cache="$(cached_apn 2>/dev/null || :)"
+	last_result="$(read_last_result)"
+	reconciled_iccid="$(active_iccid 2>/dev/null || :)"
+	reconciled_apn="$(active_apn 2>/dev/null || :)"
+	interface_up=false
+	interface_is_up && interface_up=true
+	autostart="$(uci -q get "${CONFIG}.main.autostart" 2>/dev/null || printf '0')"
+	button_enabled="$(uci -q get "${CONFIG}.main.button_enabled" 2>/dev/null || printf '0')"
+
+	printf '{'
+	json_key_string version "v1"; printf ','
+	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string iccid "$ICCID"; printf ','
+	json_key_string imsi "$IMSI"; printf ','
+	json_key_string eid "$EID"; printf ','
+	json_key_string operator_id "$OPERATOR_ID"; printf ','
+	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string gid1 "$GID1"; printf ','
+	json_key_string gid2 "$GID2"; printf ','
+	json_key_string interface "$INTERFACE"; printf ','
+	json_key_string device "$DEVICE"; printf ','
+	json_key_string configured_apn "$apn"; printf ','
+	json_key_string cached_apn "$cache"; printf ','
+	printf '"interface_up":%s,' "$interface_up"
+	json_key_string last_result "$last_result"; printf ','
+	json_key_string reconciled_iccid "$reconciled_iccid"; printf ','
+	json_key_string reconciled_apn "$reconciled_apn"; printf ','
+	printf '"autostart":%s,' "$([ "$autostart" = 1 ] && printf true || printf false)"
+	printf '"button_enabled":%s' "$([ "$button_enabled" = 1 ] && printf true || printf false)"
+	printf '}\n'
+}
+
+detect_json_cmd() {
+	read_sim
+	find_candidates
+	cache="$(cached_apn 2>/dev/null || :)"
+	printf '{'
+	json_key_string version "v1"; printf ','
+	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string iccid "$ICCID"; printf ','
+	json_key_string imsi "$IMSI"; printf ','
+	json_key_string eid "$EID"; printf ','
+	json_key_string operator_id "$OPERATOR_ID"; printf ','
+	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string gid1 "$GID1"; printf ','
+	json_key_string gid2 "$GID2"; printf ','
+	json_key_string cached_apn "$cache"; printf ',"candidates":['
+	separator=""
+	while IFS="$(printf '\t')" read -r score priority apn provider; do
+		[ -n "$apn" ] || continue
+		priority="$(printf '%s\n' "$priority" | awk '{ print $1 + 0 }')"
+		printf '%s{' "$separator"
+		json_key_string apn "$apn"; printf ','
+		json_key_string provider "$provider"; printf ','
+		printf '"priority":%s' "$priority"
+		printf '}'
+		separator=','
+	done <"$CANDIDATES"
+	printf ']}\n'
+}
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+operation_lock_pid() {
+	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+	process_is_alive "$pid" || return 1
+	printf '%s\n' "$pid"
+}
+
+action_state_field() {
+	field="$1"
+	[ -r "$ACTION_STATE_DIR/state.tsv" ] || return 1
+	awk -F '\t' -v field="$field" 'NR == 1 && $1 == "v1" { print $field; exit }' \
+		"$ACTION_STATE_DIR/state.tsv"
+}
+
+action_status_values() {
+	ACTION_STATUS="idle"
+	ACTION_NAME=""
+	ACTION_PID=""
+	ACTION_STARTED=""
+	ACTION_FINISHED=""
+	ACTION_EXIT_CODE=""
+	ACTION_MESSAGE=""
+	ACTION_BUSY=false
+
+	if [ -r "$ACTION_STATE_DIR/state.tsv" ]; then
+		ACTION_STATUS="$(action_state_field 2)"
+		ACTION_NAME="$(action_state_field 3)"
+		ACTION_PID="$(action_state_field 4)"
+		ACTION_STARTED="$(action_state_field 5)"
+		ACTION_FINISHED="$(action_state_field 6)"
+		ACTION_EXIT_CODE="$(action_state_field 7)"
+		ACTION_MESSAGE="$(action_state_field 8)"
+		case "$ACTION_STATUS" in
+			starting|queued|running)
+				if process_is_alive "$ACTION_PID"; then
+					ACTION_BUSY=true
+				else
+					ACTION_STATUS="failed"
+					ACTION_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+					ACTION_EXIT_CODE="1"
+					ACTION_MESSAGE="background worker stopped unexpectedly"
+				fi
+			;;
+		esac
+	fi
+
+	lock_pid="$(operation_lock_pid 2>/dev/null || :)"
+	if [ -n "$lock_pid" ] && [ "$ACTION_BUSY" != true ]; then
+		ACTION_STATUS="external"
+		ACTION_NAME="operation"
+		ACTION_PID="$lock_pid"
+		ACTION_STARTED=""
+		ACTION_FINISHED=""
+		ACTION_EXIT_CODE=""
+		ACTION_MESSAGE="operation started outside the job API"
+		ACTION_BUSY=true
+	fi
+}
+
+print_action_json() {
+	accepted="$1"
+	action_status_values
+	printf '{'
+	json_key_string version "v1"; printf ','
+	printf '"accepted":%s,' "$accepted"
+	printf '"busy":%s,' "$ACTION_BUSY"
+	json_key_string state "$ACTION_STATUS"; printf ','
+	json_key_string action "$ACTION_NAME"; printf ','
+	json_key_string pid "$ACTION_PID"; printf ','
+	json_key_string started_at "$ACTION_STARTED"; printf ','
+	json_key_string finished_at "$ACTION_FINISHED"; printf ','
+	json_key_string exit_code "$ACTION_EXIT_CODE"; printf ','
+	json_key_string message "$ACTION_MESSAGE"
+	printf '}\n'
+}
+
+action_status_cmd() {
+	print_action_json false
+}
+
+action_start_cmd() {
+	action="${1:-}"
+	case "$action" in reconcile|modem-reset) : ;; *) die "action must be reconcile or modem-reset" ;; esac
+	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
+
+	start_lock="${ACTION_STATE_DIR}.start-lock"
+	mkdir -p "$(dirname "$ACTION_STATE_DIR")" || die "cannot create action state parent"
+	if ! mkdir "$start_lock" 2>/dev/null; then
+		start_pid="$(cat "$start_lock/pid" 2>/dev/null || :)"
+		if process_is_alive "$start_pid"; then
+			print_action_json false
+			return 0
+		fi
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || {
+			print_action_json false
+			return 0
+		}
+		mkdir "$start_lock" 2>/dev/null || {
+			print_action_json false
+			return 0
+		}
+	fi
+	printf '%s\n' "$$" >"$start_lock/pid" || {
+		rmdir "$start_lock" 2>/dev/null || :
+		die "cannot record action launch lock"
+	}
+
+	action_status_values
+	if [ "$ACTION_BUSY" = true ]; then
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || :
+		print_action_json false
+		return 0
+	fi
+
+	mkdir -p "$ACTION_STATE_DIR" || {
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || :
+		die "cannot create action state directory"
+	}
+	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	printf 'v1\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\n' \
+		"$action" "$$" "$started" >"$ACTION_STATE_DIR/state.tsv"
+	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" \
+		</dev/null >/dev/null 2>&1 &
+	rm -f "$start_lock/pid"
+	rmdir "$start_lock" 2>/dev/null || :
+	print_action_json true
 }
 
 acquire_lock() {
@@ -658,10 +891,14 @@ Usage: $PROG <command>
 
 Commands:
   detect   Read SIM identity and list matching APN candidates; no changes
+  detect-json  Machine-readable detect output for LuCI and integrations
   apply    Try candidates, verify Internet through $DEVICE, cache success
   reconcile  Apply only when SIM/APN changed or verified connectivity failed
   modem-reset  Power-cycle the modem GPIO, wait for SIM, then reconcile APN
   status   Show SIM identity, configured/cached APN and last result
+  status-json  Machine-readable status output for LuCI and integrations
+  action-start <reconcile|modem-reset>  Start one operation in background
+  action-status  Show background/external operation state as JSON
   reset    Restore the APN state saved before the first apply; clear cache
 EOF
 }
@@ -671,10 +908,14 @@ main() {
 	validate_config
 	case "${1:-}" in
 		detect) detect_cmd ;;
+		detect-json) detect_json_cmd ;;
 		apply) apply_cmd ;;
 		reconcile) reconcile_cmd ;;
 		modem-reset) modem_reset_cmd ;;
 		status) status_cmd ;;
+		status-json) status_json_cmd ;;
+		action-start) action_start_cmd "${2:-}" ;;
+		action-status) action_status_cmd ;;
 		reset) reset_cmd ;;
 		-h|--help|help|'') usage ;;
 		*) usage >&2; exit 2 ;;

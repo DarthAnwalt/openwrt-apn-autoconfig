@@ -43,19 +43,25 @@ SDK_DIR="$(find "$EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 rm -rf "$SDK_DIR/package/apn-autoconfig"
 mkdir -p "$SDK_DIR/package/apn-autoconfig"
 cp -R "$ROOT/Makefile" "$ROOT/LICENSE" "$ROOT/files" "$SDK_DIR/package/apn-autoconfig/"
+rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
+cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 
 (
 	cd "$SDK_DIR"
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig=m' >>.config
+	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
 	make defconfig
 	make package/apn-autoconfig/clean
 	make package/apn-autoconfig/compile V=s
+	make package/luci-app-apn-autoconfig/clean
+	make package/luci-app-apn-autoconfig/compile V=s
 )
 
-rm -f "$OUTPUT"/apn-autoconfig-*.apk
+rm -f "$OUTPUT"/apn-autoconfig-*.apk "$OUTPUT"/luci-app-apn-autoconfig-*.apk
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
-set -- "$OUTPUT"/apn-autoconfig-*.apk
-[ -f "$1" ] || { printf '%s\n' 'No APK was produced' >&2; exit 1; }
-(cd "$OUTPUT" && sha256sum apn-autoconfig-*.apk >SHA256SUMS)
+find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
+set -- "$OUTPUT"/apn-autoconfig-*.apk "$OUTPUT"/luci-app-apn-autoconfig-*.apk
+[ -f "$1" ] && [ -f "$2" ] || { printf '%s\n' 'One or more APKs were not produced' >&2; exit 1; }
+(cd "$OUTPUT" && sha256sum apn-autoconfig-*.apk luci-app-apn-autoconfig-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print

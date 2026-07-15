@@ -13,6 +13,9 @@
   action polling, physical-button configuration and advanced board settings.
 - Keep both virtual action buttons disabled until the core confirms completion;
   polling errors do not incorrectly unlock the controls.
+- Route physical-button resets through the same background job API so LuCI
+  records their exact action and terminal result instead of reverting to stale
+  history after an external operation finishes.
 - Extend behavioral tests with valid-JSON, concurrency, external-operation and
   failed-job coverage.
 

@@ -129,7 +129,9 @@ Both show a confirmation first. After confirmation the HTTP request only starts
 a background job; it does not remain open for the full modem reset. The page
 polls the machine API and disables both buttons for the entire operation. The
 same busy indicator also covers a command started through SSH or the physical
-button, so entry points cannot overlap.
+button, so entry points cannot overlap. The packaged button handler submits its
+reset through the same background job API, allowing LuCI to show the exact
+action and its final success or failure.
 
 Runtime job state is deliberately volatile and stored by default in:
 

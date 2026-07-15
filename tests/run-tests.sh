@@ -352,7 +352,7 @@ fi
 [ "$(cat "$TEST_GPIO")" = '0' ] || fail 'failed modem reset left modem power off'
 grep -F -q 'up wwan' "$STATE/events" || fail 'failed modem reset did not attempt WWAN recovery'
 
-printf '%s\n' 'TEST button ignores press and invokes modem reset only on release'
+printf '%s\n' 'TEST button ignores press and queues modem reset only on release'
 cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_STATE/button-calls"
@@ -362,7 +362,7 @@ rm -f "$STATE/button-calls"
 TEST_BUTTON_ENABLED=0 BUTTON=BTN_0 ACTION=released \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
-[ ! -e "$STATE/button-calls" ] || fail 'disabled button invoked modem-reset'
+[ ! -e "$STATE/button-calls" ] || fail 'disabled button queued modem-reset'
 TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=pressed \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
@@ -375,6 +375,7 @@ while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
 	/bin/sleep 1
 	button_wait=$((button_wait - 1))
 done
-grep -F -q 'modem-reset' "$STATE/button-calls" || fail 'button release did not invoke modem-reset'
+grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
+	fail 'button release did not queue modem-reset through the job API'
 
 printf '%s\n' 'All tests passed.'

@@ -99,8 +99,8 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.6.0-r1.apk
-apk add --allow-untrusted ./luci-app-apn-autoconfig-0.1.0-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.6.1-r1.apk
+apk add --allow-untrusted ./luci-app-apn-autoconfig-0.1.1-r1.apk
 ```
 
 The package owns:
@@ -267,7 +267,8 @@ Candidate order is:
 
 For each candidate the helper:
 
-1. writes the APN through UCI and commits `network`;
+1. writes the APN, optional credentials, authentication and IP type through
+   UCI and commits `network`;
 2. runs `ifdown wwan`, then `ifup wwan`;
 3. waits until netifd reports the interface as up;
 4. runs an HTTPS request through `wwan0` with `curl`;
@@ -310,27 +311,26 @@ config apn_autoconfig 'main'
 
 ## Optional boot reconciliation
 
-The installed procd service does nothing by default. After manual
-`reconcile` testing, enable it explicitly:
+The installed procd service does nothing by default. After manual `reconcile`
+testing, enable **Automatic reconciliation at boot** in LuCI and save the
+configuration. The equivalent command is:
 
 ```sh
 uci set apn-autoconfig.main.autostart='1'
 uci commit apn-autoconfig
-/etc/init.d/apn-autoconfig enable
-/etc/init.d/apn-autoconfig restart
 ```
 
 On boot it waits `boot_delay` seconds and then runs `reconcile`. Temporary
 failures are retried at most `boot_attempts` times with `retry_seconds` between
-attempts. It never loops indefinitely and does not use procd respawn.
+attempts. It never loops indefinitely and does not use procd respawn. Keep the
+init script enabled; the `autostart` option is the authoritative behavior
+switch and the boot worker exits without touching the network when it is off.
 
-Disable it without uninstalling the package:
+Disable it in LuCI by clearing the same checkbox, or use:
 
 ```sh
 uci set apn-autoconfig.main.autostart='0'
 uci commit apn-autoconfig
-/etc/init.d/apn-autoconfig stop
-/etc/init.d/apn-autoconfig disable
 ```
 
 `use_mwan3` accepts `auto`, `always`, or `never`. `auto` uses `mwan3 use` only
@@ -444,9 +444,8 @@ submission has been implemented and tested.
   a configured numeric `sim_index` is used only when resolution is impossible.
 - The connectivity test uses HTTPS through one configured net device. It uses
   the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
-- Boot and hardware-button automation are independently opt-in. The first LuCI
-  UI covers live state, manual background actions and the most relevant UCI
-  settings; it does not yet manage the init-script enable/disable state.
+- Boot and hardware-button automation are independently opt-in and exposed as
+  separate LuCI checkboxes.
 - The bundled GPIO defaults are specific to the tested Huasifei WH3000 Pro
   eMMC and must not be assumed correct for another board.
 - A missing or stale provider profile requires a manually verified override

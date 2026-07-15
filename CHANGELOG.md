@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1
+
+- Add a LuCI checkbox for enabling or disabling automatic reconciliation at
+  boot through the existing safe `autostart` option.
+- Update checkout and artifact GitHub Actions to their Node.js 24 releases.
+- Correct the README description of complete mobile profile application and
+  simplify the documented boot-reconciliation toggle.
+
 ## 0.6.0
 
 - Replace the three-row demonstration database with a deterministic worldwide

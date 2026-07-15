@@ -168,6 +168,11 @@ return view.extend({
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
 
+		o = s.taboption('general', form.Flag, 'autostart', _('Automatic reconciliation at boot'));
+		o.default = o.disabled;
+		o.rmempty = false;
+		o.description = _('After boot, wait for the configured delay and reconcile the current SIM and mobile profile. The service remains inert when this option is disabled.');
+
 		o = s.taboption('general', form.Flag, 'button_enabled', _('Enable physical modem-reset button'));
 		o.default = o.disabled;
 		o.rmempty = false;

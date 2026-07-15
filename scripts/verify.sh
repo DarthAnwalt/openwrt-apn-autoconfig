@@ -31,6 +31,16 @@ python3 -m json.tool "$ROOT/data/providers-report.json" >/dev/null
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 fi
+grep -F -q "form.Flag, 'autostart'" \
+	"$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
+grep -F -q 'actions/checkout@v7' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/upload-artifact@v7' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/download-artifact@v8' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/checkout@v7' "$ROOT/.github/workflows/update-provider-database.yml"
+if grep -R -E 'actions/(checkout|upload-artifact|download-artifact)@v4' "$ROOT/.github/workflows"; then
+	printf '%s\n' 'Legacy Node.js 20 GitHub Action remains configured.' >&2
+	exit 1
+fi
 
 awk -F '\t' '
 	/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }

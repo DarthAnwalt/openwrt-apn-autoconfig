@@ -20,6 +20,9 @@
   blocked data roaming.
 - Add a live-verified lifecell Ukraine `internet` override while retaining the
   alternate legacy `speed` profile as a lower-priority fallback.
+- Refresh informational provider labels for matching cached profiles and wait
+  for netifd readiness after re-enabling roaming before retrying an unchanged
+  APN.
 - Add behavioral coverage for home/roaming identity, explicit policy blocks,
   denied and pending registration, policy editing, blocked actions and bounded
   boot retry semantics.

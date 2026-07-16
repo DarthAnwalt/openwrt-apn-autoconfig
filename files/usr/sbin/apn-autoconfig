@@ -989,6 +989,29 @@ add_candidate() {
 		"$username" "$password" "$auth" "$ip_type" >>"${CANDIDATES}.apply"
 }
 
+matching_database_provider() {
+	wanted_apn="$1"
+	wanted_username="$2"
+	wanted_password="$3"
+	wanted_auth="$4"
+	wanted_ip_type="$5"
+	awk -F '\t' \
+		-v wanted_apn="$wanted_apn" \
+		-v wanted_username="$wanted_username" \
+		-v wanted_password="$wanted_password" \
+		-v wanted_auth="$wanted_auth" \
+		-v wanted_ip_type="$wanted_ip_type" '
+		$3 == wanted_apn &&
+		$5 == wanted_username &&
+		$6 == wanted_password &&
+		$7 == wanted_auth &&
+		$8 == wanted_ip_type {
+			print $4
+			exit
+		}
+	' "$CANDIDATES"
+}
+
 build_apply_candidates() {
 	: >"$SEEN_APNS"
 	: >"${CANDIDATES}.apply"
@@ -1012,6 +1035,11 @@ build_apply_candidates() {
 		password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
 		auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
 		ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
+	fi
+	if [ -n "$cache" ] && [ "$cache" != "<empty>" ]; then
+		current_provider="$(matching_database_provider "$cache" "$username" \
+			"$password" "$auth" "$ip_type" 2>/dev/null || :)"
+		[ -n "$current_provider" ] && provider="$current_provider"
 	fi
 	if [ "$cache" = "<empty>" ]; then
 		add_candidate "" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
@@ -1378,6 +1406,7 @@ roaming_policy_set_cmd() {
 
 	if [ "$requested" != block ] && [ "$was_up" -eq 0 ] && [ "$sim_available" -eq 1 ]; then
 		ifup "$INTERFACE" >/dev/null 2>&1 || die "roaming policy was saved, but interface $INTERFACE did not start"
+		wait_for_interface || :
 		reconcile_cmd
 		return $?
 	fi

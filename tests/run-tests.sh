@@ -140,7 +140,9 @@ EOF
 
 cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
-if [ "${UBUS_UP:-1}" = 1 ]; then
+if [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
+	printf '%s\n' '{ "up": true }'
+elif [ "${UBUS_UP:-1}" = 1 ]; then
 	printf '%s\n' '{ "up": true }'
 else
 	printf '%s\n' '{ "up": false }'
@@ -255,6 +257,13 @@ grep -F -q 'fixture-user' "$CACHE/89490200002186275443.tsv" || fail 'cache profi
 [ -s "$PERSIST/baseline.tsv" ] || fail 'pre-apply APN baseline missing'
 [ -s "$PERSIST/active.tsv" ] || fail 'reconciled SIM state missing'
 
+printf '%s\n' 'TEST a matching cached profile refreshes its provider label from the database'
+printf 'v2\tinternet.telekom\tLegacy provider label\t2026-01-01T00:00:00Z\t-\t-\t-\t-\n' \
+	>"$CACHE/89490200002186275443.tsv"
+cache_refresh_output="$(sh "$SCRIPT" apply 2>&1)"
+grep -F -q 'Telekom Germany' "$CACHE/89490200002186275443.tsv" || \
+	fail "matching cached profile kept a stale provider label: $cache_refresh_output; $(cat "$CACHE/89490200002186275443.tsv")"
+
 printf '%s\n' 'TEST reconcile is idempotent for an already verified SIM and APN'
 : >"$STATE/events"
 sh "$SCRIPT" reconcile
@@ -265,6 +274,10 @@ printf '%s\n' 'wrong.apn' >"$STATE/apn"
 : >"$STATE/events"
 sh "$SCRIPT" reconcile
 [ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'reconcile did not restore cached APN'
+[ ! -e "$STATE/username" ] || fail 'credential-free cached profile left a stale username'
+[ ! -e "$STATE/password" ] || fail 'credential-free cached profile left a stale password'
+[ ! -e "$STATE/allowedauth" ] || fail 'credential-free cached profile left stale authentication'
+[ ! -e "$STATE/iptype" ] || fail 'credential-free cached profile left a stale IP type'
 [ -s "$STATE/events" ] || fail 'reconcile did not restart the interface after APN change'
 
 printf '%s\n' 'TEST changed ICCID is reconciled even when the old APN could still work'
@@ -407,9 +420,22 @@ sh "$SCRIPT" roaming-policy-set default >/dev/null 2>&1
 sh "$SCRIPT" roaming-policy-set block >/dev/null 2>&1
 [ "$(cat "$STATE/allow_roaming")" = 0 ] || fail 'block policy did not write network.wwan.allow_roaming=0'
 grep -F -q 'down wwan' "$STATE/events" || fail 'blocking data while roaming did not stop the interface'
+printf 'v2\t89380062300756308069\tinternet.telekom\tfixture-user\tfixture-pass\tpap chap\tipv4v6\n' \
+	>"$PERSIST/active.tsv"
+printf '%s\n' internet.telekom >"$STATE/apn"
+printf '%s\n' fixture-user >"$STATE/username"
+printf '%s\n' fixture-pass >"$STATE/password"
+printf '%s\n' 'pap chap' >"$STATE/allowedauth"
+printf '%s\n' ipv4v6 >"$STATE/iptype"
+rm -f "$STATE/ifup-seen"
+: >"$STATE/events"
+UBUS_UP=0 UBUS_UP_AFTER_IFUP=1 sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1
+[ "$(cat "$STATE/events")" = 'up wwan' ] || \
+	fail 'allowing roaming reapplied an already reconciled profile instead of waiting for netifd'
+printf '%s\n' 0 >"$STATE/allow_roaming"
 MMCLI_UNAVAILABLE=1 sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1
 [ "$(cat "$STATE/allow_roaming")" = 1 ] || fail 'policy could not be saved while no SIM was readable'
-rm -f "$STATE/allow_roaming"
+rm -f "$STATE/allow_roaming" "$STATE/ifup-seen" "$PERSIST/active.tsv"
 
 printf '%s\n' 'TEST registration denial and registration timeout do not test APNs'
 rm -f "$STATE/allow_roaming"

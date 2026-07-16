@@ -89,7 +89,7 @@ inspect_package() {
 		cat "$metadata" >&2
 		exit 1
 	}
-	grep -E -q '"arch"[[:space:]]*:[[:space:]]*"all"' "$metadata" || {
+	grep -E -q '"arch"[[:space:]]*:[[:space:]]*"noarch"' "$metadata" || {
 		printf 'Package is not architecture-independent: %s\n' "$package" >&2
 		cat "$metadata" >&2
 		exit 1

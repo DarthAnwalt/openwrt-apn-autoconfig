@@ -78,17 +78,25 @@ do
 		fail "packages.adb does not contain $package_name"
 done
 
-# Verify both the signed index and a package payload using only the public key.
+# Verify the signed index and fetch a package payload using only the public key.
+# Fetch deliberately avoids resolving dependencies from the official OpenWrt
+# feeds, which are already present on a real router.
 VERIFY_ROOT="$WORK_DIR/verify-root"
-mkdir -p "$VERIFY_ROOT"
+FETCH_DIR="$WORK_DIR/fetched"
+mkdir -p "$VERIFY_ROOT" "$FETCH_DIR"
 "$APK_TOOL" \
 	--root "$VERIFY_ROOT" \
 	--usermode \
 	--keys-dir "$KEYS_DIR" \
 	--repositories-file /dev/null \
 	--repository "file://$FEED_DIR/packages.adb" \
-	add --initdb --no-cache --no-scripts --arch noarch \
-	apn-autoconfig-providers >/dev/null
+	--arch noarch \
+	fetch --output "$FETCH_DIR" apn-autoconfig-providers >/dev/null
+set -- "$FETCH_DIR"/apn-autoconfig-providers-*.apk
+[ "$#" -eq 1 ] && [ -f "$1" ] ||
+	fail 'APK fetch did not produce exactly one provider package'
+cmp -s "$PROVIDER_PACKAGE" "$1" ||
+	fail 'the package fetched through packages.adb differs from the built APK'
 
 touch "$SITE_DIR/.nojekyll"
 (

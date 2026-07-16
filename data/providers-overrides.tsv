@@ -1,6 +1,7 @@
 # apn-autoconfig manually verified provider overrides v2
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
+25506	-	-	-	-	lifecell (Ukraine)	internet	10	-	-	-	-
 26201	-	-	01	Kaufland Mobil	Kaufland Mobil (Telekom DE)	internet.telekom	10	-	-	-	-
 26201	-	-	-	-	Telekom Germany	internet.telekom	20	-	-	-	-
 26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10	-	-	-	-

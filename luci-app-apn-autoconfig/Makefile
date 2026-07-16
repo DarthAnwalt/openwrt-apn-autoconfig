@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-apn-autoconfig
-PKG_VERSION:=0.1.1
+PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=DarthAnwalt

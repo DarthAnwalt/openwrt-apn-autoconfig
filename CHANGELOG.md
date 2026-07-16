@@ -1,5 +1,29 @@
 # Changelog
 
+## apn-autoconfig 0.7.0 / luci-app-apn-autoconfig 0.2.0
+
+- Resolve and report the matching ModemManager modem alongside the active SIM,
+  including home and serving operators, registration and roaming state,
+  access technologies, signal quality and manual PLMN selection.
+- Add a registration preflight which prevents APN changes when roaming data is
+  explicitly blocked, registration is denied, only emergency or messaging
+  service is available, or registration is still pending.
+- Classify operation results and make only registration-pending failures
+  retryable at boot; expose intentional roaming-policy blocks as a distinct
+  terminal background state.
+- Upgrade status and detect JSON to v2 with stable roaming and result fields.
+- Keep `network.<interface>.allow_roaming` as the sole source of policy. Normal
+  APN operations only read it; explicit policy actions safely edit that exact
+  option under the existing operation lock.
+- Extend LuCI with roaming banners, serving-network diagnostics and a
+  three-state policy control for default, explicitly allowed and explicitly
+  blocked data roaming.
+- Add a live-verified lifecell Ukraine `internet` override while retaining the
+  alternate legacy `speed` profile as a lower-priority fallback.
+- Add behavioral coverage for home/roaming identity, explicit policy blocks,
+  denied and pending registration, policy editing, blocked actions and bounded
+  boot retry semantics.
+
 ## 0.6.1
 
 - Add a LuCI checkbox for enabling or disabling automatic reconciliation at

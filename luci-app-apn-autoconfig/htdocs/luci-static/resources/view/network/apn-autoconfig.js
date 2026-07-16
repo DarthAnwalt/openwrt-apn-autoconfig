@@ -35,6 +35,24 @@ function row(label, value) {
 	]);
 }
 
+function roamingPolicyLabel(status) {
+	switch (status && status.roaming_policy) {
+	case 'explicit-allow': return _('Explicitly allowed');
+	case 'explicit-block': return _('Explicitly blocked');
+	case 'default-allow': return _('Allowed by the OpenWrt default');
+	case 'invalid': return _('Invalid configuration');
+	default: return _('Unknown');
+	}
+}
+
+function policyValue(status) {
+	switch (status && status.roaming_policy) {
+	case 'explicit-allow': return 'allow';
+	case 'explicit-block': return 'block';
+	default: return 'default';
+	}
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -50,20 +68,42 @@ return view.extend({
 				_('Status is temporarily unavailable: %s').format(status && status.error || _('unknown error'))
 			]) ];
 
-		return [ E('table', { 'class': 'table' }, [
+		var nodes = [];
+		if (status.roaming === true)
+			nodes.push(E('div', { 'class': status.roaming_allowed ? 'alert-message notice' : 'alert-message warning' }, [
+				status.roaming_allowed
+					? _('Roaming via %s (%s). Mobile data is %s.').format(
+						text(status.serving_operator_name), text(status.serving_operator_id), roamingPolicyLabel(status).toLowerCase())
+					: _('Roaming via %s (%s), but mobile data roaming is explicitly blocked. APN profiles will not be tested.').format(
+						text(status.serving_operator_name), text(status.serving_operator_id))
+			]));
+		else if (status.registration_state === 'denied' || status.registration_state === 'emergency-only')
+			nodes.push(E('div', { 'class': 'alert-message warning' }, [
+				_('Mobile registration is %s. This happens before APN testing.').format(status.registration_state)
+			]));
+
+		nodes.push(E('table', { 'class': 'table' }, [
 			row(_('SIM / eSIM provider'), status.operator_name),
-			row(_('Home operator'), status.operator_id),
+			row(_('Home network'), '%s (%s)'.format(text(status.home_operator_name), text(status.home_operator_id))),
 			row(_('ICCID'), status.iccid),
 			row(_('IMSI'), status.imsi),
 			row(_('EID'), status.eid),
 			row(_('ModemManager SIM index'), status.sim_index),
+			row(_('ModemManager modem index'), status.modem_index),
+			row(_('Registration'), status.registration_state),
+			row(_('Serving network'), '%s (%s)'.format(text(status.serving_operator_name), text(status.serving_operator_id))),
+			row(_('Roaming data policy'), roamingPolicyLabel(status)),
+			row(_('Manual operator lock (PLMN)'), status.configured_plmn),
+			row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
+			row(_('Signal quality'), status.signal_quality ? '%s%%'.format(status.signal_quality) : ''),
 			row(_('Configured APN'), status.configured_apn || _('<empty>')),
 			row(_('Cached APN for this SIM'), status.cached_apn),
 			row(_('Mobile interface'), '%s: %s'.format(status.interface, status.interface_up ? _('up') : _('down or pending'))),
 			row(_('Last result'), status.last_result),
 			row(_('Reconciled SIM'), status.reconciled_iccid),
 			row(_('Reconciled APN'), status.reconciled_apn)
-		]) ];
+		]));
+		return nodes;
 	},
 
 	actionDescription: function(action) {
@@ -82,6 +122,10 @@ return view.extend({
 			return _('The last %s operation completed successfully.').format(action.action);
 		case 'failed':
 			return _('The last %s operation failed: %s').format(action.action, action.message || _('see system log'));
+		case 'blocked':
+			return _('The %s operation was intentionally blocked by the roaming policy.').format(action.action);
+		case 'retryable':
+			return _('The %s operation could not run because mobile registration or SIM state is temporarily unavailable. It is safe to retry.').format(action.action);
 		default:
 			return _('No operation is running.');
 		}
@@ -93,6 +137,10 @@ return view.extend({
 			this.reconcileButton.disabled = this.busy;
 		if (this.resetButton)
 			this.resetButton.disabled = this.busy;
+		if (this.policyButton)
+			this.policyButton.disabled = this.busy || !this.policySupported;
+		if (this.policySelect)
+			this.policySelect.disabled = this.busy || !this.policySupported;
 		if (this.actionStatus)
 			dom.content(this.actionStatus, [ this.actionDescription(action) ]);
 	},
@@ -106,12 +154,41 @@ return view.extend({
 			if (wasBusy && !action.busy)
 				return call(queryCommand, [ 'status' ]).then(function(status) {
 					dom.content(self.statusBox, self.statusNodes(status));
+					self.policySupported = status.version === 'v2';
+					if (self.policySelect)
+						self.policySelect.value = policyValue(status);
+					self.setBusy(action.busy, action);
 				});
 		}).catch(function(error) {
 			/* A transient polling failure is not evidence that a long-running
 			 * operation ended. Keep controls disabled until the core says so. */
 			self.setBusy(self.busy, { error: error.message });
 		});
+	},
+
+	confirmRoamingPolicy: function() {
+		var self = this;
+		var value = self.policySelect.value;
+		var labels = {
+			'default': _('Use the OpenWrt default (allowed)'),
+			'allow': _('Explicitly allow roaming data'),
+			'block': _('Explicitly block roaming data')
+		};
+		ui.showModal(_('Change roaming data policy'), [
+			E('p', {}, [ _('Apply “%s” to the mobile interface? If needed, the mobile connection will be stopped or re-established.').format(labels[value]) ]),
+			E('p', {}, [ _('Allowing roaming data does not mean that roaming is included in your tariff or free of charge.') ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-action important',
+					'click': function() {
+						ui.hideModal();
+						self.startAction('roaming-' + value);
+					}
+				}, [ _('Apply policy') ])
+			])
+		]);
 	},
 
 	startAction: function(action) {
@@ -164,6 +241,7 @@ return view.extend({
 			_('Automatic APN selection for a ModemManager mobile interface. Long operations run in the background and cannot overlap.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Settings'));
 		var o;
+		self.policySupported = status && status.version === 'v2';
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -218,6 +296,12 @@ return view.extend({
 		o.datatype = 'uinteger';
 		o.rmempty = false;
 
+		o = s.taboption('advanced', form.Value, 'registration_wait_seconds', _('Maximum registration wait'));
+		o.default = '30';
+		o.datatype = 'uinteger';
+		o.rmempty = false;
+		o.description = _('Wait for home or roaming registration before changing any APN profile.');
+
 		o = s.taboption('advanced', form.Value, 'test_url', _('Connectivity test URL'));
 		o.default = 'https://connectivitycheck.gstatic.com/generate_204';
 		o.rmempty = false;
@@ -234,6 +318,16 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
 		}, [ _('Power-cycle modem and re-read SIM') ]);
+		self.policySelect = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { 'value': 'default', 'selected': policyValue(status) === 'default' }, [ _('OpenWrt default (allowed)') ]),
+			E('option', { 'value': 'allow', 'selected': policyValue(status) === 'allow' }, [ _('Explicitly allow') ]),
+			E('option', { 'value': 'block', 'selected': policyValue(status) === 'block' }, [ _('Explicitly block') ])
+		]);
+		self.policyButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmRoamingPolicy(); }
+		}, [ _('Apply roaming policy') ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
 		poll.add(function() { return self.refreshStatus(); }, 2);
@@ -244,6 +338,13 @@ return view.extend({
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, [ _('Current SIM and APN') ]),
 					self.statusBox
+				]),
+				E('div', { 'class': 'cbi-section' }, [
+					E('h3', {}, [ _('Roaming data policy') ]),
+					E('p', {}, [ _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(status.interface || 'wwan') ]),
+					self.policySelect,
+					' ',
+					self.policyButton
 				]),
 				E('div', { 'class': 'cbi-section' }, [
 					E('h3', {}, [ _('Actions') ]),

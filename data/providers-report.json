@@ -26,7 +26,7 @@
     "mbpi_duplicates": 80,
     "mbpi_non_internet": 350,
     "mbpi_skipped": 17,
-    "overrides_accepted": 3
+    "overrides_accepted": 4
   },
   "unique_apns": 1040,
   "warnings": [

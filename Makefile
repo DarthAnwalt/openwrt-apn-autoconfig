@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.6.1
+PKG_VERSION:=0.7.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT AND Apache-2.0
 PKG_LICENSE_FILES:=LICENSE data/licenses/Apache-2.0.txt data/licenses/MBPI-CC-PD.txt

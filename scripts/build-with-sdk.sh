@@ -64,6 +64,92 @@ find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" 
 find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
 set -- "$OUTPUT"/apn-autoconfig-*.apk "$OUTPUT"/luci-app-apn-autoconfig-*.apk
 [ -f "$1" ] && [ -f "$2" ] || { printf '%s\n' 'One or more APKs were not produced' >&2; exit 1; }
+
+APK_TOOL="$SDK_DIR/staging_dir/host/bin/apk"
+[ -x "$APK_TOOL" ] || { printf '%s\n' 'SDK apk v3 inspection tool was not found' >&2; exit 1; }
+
+inspect_package() {
+	package="$1"
+	name="$2"
+	expected_count="$3"
+	shift 3
+	inspect_root="$BUILD_ROOT/inspect-$name"
+	metadata="$BUILD_ROOT/$name-adbdump.json"
+
+	rm -rf "$inspect_root"
+	mkdir -p "$inspect_root"
+	"$APK_TOOL" adbdump --format json "$package" >"$metadata"
+	(
+		cd "$inspect_root"
+		"$APK_TOOL" extract --allow-untrusted "$package" >/dev/null
+	)
+
+	grep -E -q '"name"[[:space:]]*:[[:space:]]*"'"$name"'"' "$metadata" || {
+		printf 'Unexpected package name metadata in %s\n' "$package" >&2
+		cat "$metadata" >&2
+		exit 1
+	}
+	grep -E -q '"arch"[[:space:]]*:[[:space:]]*"noarch"' "$metadata" || {
+		printf 'Package is not architecture-independent: %s\n' "$package" >&2
+		cat "$metadata" >&2
+		exit 1
+	}
+
+	actual_count="$(find "$inspect_root" -type f | wc -l | tr -d ' ')"
+	[ "$actual_count" = "$expected_count" ] || {
+		printf 'Unexpected file count in %s: expected %s, found %s\n' \
+			"$package" "$expected_count" "$actual_count" >&2
+		find "$inspect_root" -type f -print >&2
+		exit 1
+	}
+	for path do
+		[ -f "$inspect_root/$path" ] || {
+			printf 'Required package file is missing from %s: /%s\n' "$package" "$path" >&2
+			exit 1
+		}
+	done
+}
+
+inspect_package "$1" apn-autoconfig 12 \
+	usr/sbin/apn-autoconfig \
+	usr/libexec/apn-autoconfig-boot \
+	usr/libexec/apn-autoconfig-action \
+	usr/libexec/apn-autoconfig-query \
+	usr/libexec/apn-autoconfig-control \
+	usr/share/apn-autoconfig/providers.tsv \
+	etc/config/apn-autoconfig \
+	etc/init.d/apn-autoconfig \
+	etc/hotplug.d/button/50-apn-autoconfig \
+	lib/apk/packages/apn-autoconfig.list \
+	lib/apk/packages/apn-autoconfig.conffiles \
+	lib/apk/packages/apn-autoconfig.conffiles_static
+
+grep -F -q '/etc/config/apn-autoconfig' \
+	"$BUILD_ROOT/inspect-apn-autoconfig/lib/apk/packages/apn-autoconfig.conffiles"
+grep -F -q '/etc/config/apn-autoconfig ' \
+	"$BUILD_ROOT/inspect-apn-autoconfig/lib/apk/packages/apn-autoconfig.conffiles_static"
+
+for executable in \
+	usr/sbin/apn-autoconfig \
+	usr/libexec/apn-autoconfig-boot \
+	usr/libexec/apn-autoconfig-action \
+	usr/libexec/apn-autoconfig-query \
+	usr/libexec/apn-autoconfig-control \
+	etc/init.d/apn-autoconfig \
+	etc/hotplug.d/button/50-apn-autoconfig
+do
+	[ -x "$BUILD_ROOT/inspect-apn-autoconfig/$executable" ] || {
+		printf 'Package file is not executable: /%s\n' "$executable" >&2
+		exit 1
+	}
+done
+
+inspect_package "$2" luci-app-apn-autoconfig 4 \
+	www/luci-static/resources/view/network/apn-autoconfig.js \
+	usr/share/luci/menu.d/luci-app-apn-autoconfig.json \
+	usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json \
+	lib/apk/packages/luci-app-apn-autoconfig.list
+
 (cd "$OUTPUT" && sha256sum apn-autoconfig-*.apk luci-app-apn-autoconfig-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print

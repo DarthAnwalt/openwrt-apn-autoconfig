@@ -11,6 +11,7 @@ CONFIG="apn-autoconfig"
 INTERFACE="wwan"
 SIM_INDEX_FALLBACK="0"
 SIM_INDEX=""
+MODEM_INDEX=""
 DEVICE="wwan0"
 NETWORK_DEVICE=""
 DATABASE="/usr/share/apn-autoconfig/providers.tsv"
@@ -20,6 +21,7 @@ BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
 ACTIVE_FILE="/etc/apn-autoconfig/active.tsv"
 TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
 WAIT_SECONDS="35"
+REGISTRATION_WAIT_SECONDS="30"
 TRY_EMPTY="0"
 USE_MWAN3="auto"
 MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
@@ -54,6 +56,18 @@ OLD_IPTYPE=""
 LOCK_HELD=0
 MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
+LEAVE_INTERFACE_DOWN=0
+
+MODEM_STATE="unknown"
+REGISTRATION_STATE="unknown"
+ROAMING_STATUS="unknown"
+SERVING_OPERATOR_ID=""
+SERVING_OPERATOR_NAME=""
+ACCESS_TECHNOLOGIES=""
+SIGNAL_QUALITY=""
+ROAMING_POLICY="default-allow"
+ROAMING_ALLOWED=true
+CONFIGURED_PLMN=""
 
 log() {
 	level="$1"
@@ -67,6 +81,13 @@ log() {
 die() {
 	log err "$*"
 	exit 1
+}
+
+die_code() {
+	code="$1"
+	shift
+	log err "$*"
+	exit "$code"
 }
 
 cleanup_files() {
@@ -129,6 +150,7 @@ restore_old_profile() {
 	set_or_delete_option iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
 	uci commit network >/dev/null 2>&1 || return 1
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
 	ifup "$INTERFACE" >/dev/null 2>&1 || :
 }
 
@@ -206,6 +228,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.test_url")" && [ -n "$value" ] && TEST_URL="$value"
 	value="$(uci -q get "${CONFIG}.main.wait_seconds")" && [ -n "$value" ] && WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.registration_wait_seconds")" && [ -n "$value" ] && REGISTRATION_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.try_empty")" && [ -n "$value" ] && TRY_EMPTY="$value"
 	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
@@ -225,6 +248,7 @@ validate_config() {
 	case "$SIM_INDEX_FALLBACK" in auto) : ;; ''|*[!0-9]*) die "sim_index must be auto or numeric" ;; esac
 	case "$DEVICE" in ''|*[!A-Za-z0-9_.:-]*) die "invalid device name: $DEVICE" ;; esac
 	case "$WAIT_SECONDS" in ''|*[!0-9]*) die "wait_seconds must be numeric" ;; esac
+	case "$REGISTRATION_WAIT_SECONDS" in ''|*[!0-9]*) die "registration_wait_seconds must be numeric" ;; esac
 	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
 	case "$USE_MWAN3" in auto|always|never) : ;; *) die "use_mwan3 must be auto, always or never" ;; esac
 	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
@@ -278,7 +302,9 @@ resolve_sim_index() {
 		sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' >"$MODEM_LIST" || :
 
 	selected_sim=""
+	selected_modem=""
 	first_sim=""
+	first_modem=""
 	modem_count=0
 	while IFS= read -r modem_index; do
 		case "$modem_index" in ''|*[!0-9]*) continue ;; esac
@@ -290,35 +316,106 @@ resolve_sim_index() {
 		sim_index="${sim_path##*/}"
 		case "$sim_index" in ''|*[!0-9]*) continue ;; esac
 		[ -n "$first_sim" ] || first_sim="$sim_index"
+		[ -n "$first_modem" ] || first_modem="$modem_index"
 
 		if [ -z "$NETWORK_DEVICE" ] || \
 			[ "$modem_device" = "$NETWORK_DEVICE" ] || \
 			[ "$modem_physdev" = "$NETWORK_DEVICE" ]; then
 			selected_sim="$sim_index"
+			selected_modem="$modem_index"
 			break
 		fi
 	done <"$MODEM_LIST"
 
 	if [ -z "$selected_sim" ] && [ "$modem_count" -eq 1 ]; then
 		selected_sim="$first_sim"
+		selected_modem="$first_modem"
 	fi
 	if [ -n "$selected_sim" ]; then
 		SIM_INDEX="$selected_sim"
+		MODEM_INDEX="$selected_modem"
 		return 0
 	fi
 
 	if [ "$SIM_INDEX_FALLBACK" != "auto" ]; then
 		SIM_INDEX="$SIM_INDEX_FALLBACK"
+		[ "$modem_count" -eq 1 ] && MODEM_INDEX="$first_modem"
 		log warning "primary SIM could not be resolved; falling back to configured SIM $SIM_INDEX"
 		return 0
 	fi
 	return 1
 }
 
+read_roaming_policy() {
+	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	if value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null)"; then
+		case "$value" in
+			0)
+				ROAMING_POLICY="explicit-block"
+				ROAMING_ALLOWED=false
+			;;
+			1)
+				ROAMING_POLICY="explicit-allow"
+				ROAMING_ALLOWED=true
+			;;
+			*)
+				ROAMING_POLICY="invalid"
+				ROAMING_ALLOWED=false
+			;;
+		esac
+	else
+		# OpenWrt's ModemManager protocol handler explicitly defaults to yes.
+		ROAMING_POLICY="default-allow"
+		ROAMING_ALLOWED=true
+	fi
+}
+
+read_access_technologies() {
+	awk -F ':' '
+		/^modem\.generic\.access-technologies\.value\[[0-9]+\]/ {
+			value=$2
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			if (value != "" && value != "--" && value != "unknown") {
+				if (out != "") out=out ","
+				out=out value
+			}
+		}
+		END { print out }
+	' "$MODEM_DATA"
+}
+
+refresh_modem_status() {
+	MODEM_STATE="unknown"
+	REGISTRATION_STATE="unknown"
+	ROAMING_STATUS="unknown"
+	SERVING_OPERATOR_ID=""
+	SERVING_OPERATOR_NAME=""
+	ACCESS_TECHNOLOGIES=""
+	SIGNAL_QUALITY=""
+	read_roaming_policy
+
+	[ -n "$MODEM_INDEX" ] || return 1
+	mmcli -m "$MODEM_INDEX" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || return 1
+	MODEM_STATE="$(kv_value_from "$MODEM_DATA" 'modem.generic.state')"
+	REGISTRATION_STATE="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.registration-state')"
+	SERVING_OPERATOR_ID="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.operator-code')"
+	SERVING_OPERATOR_NAME="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.operator-name')"
+	SIGNAL_QUALITY="$(kv_value_from "$MODEM_DATA" 'modem.generic.signal-quality.value')"
+	ACCESS_TECHNOLOGIES="$(read_access_technologies)"
+	[ -n "$MODEM_STATE" ] || MODEM_STATE="unknown"
+	[ -n "$REGISTRATION_STATE" ] || REGISTRATION_STATE="unknown"
+	case "$REGISTRATION_STATE" in
+		roaming|roaming-sms-only) ROAMING_STATUS=true ;;
+		home|home-sms-only) ROAMING_STATUS=false ;;
+		*) ROAMING_STATUS=unknown ;;
+	esac
+	return 0
+}
+
 read_sim() {
-	resolve_sim_index || die "cannot resolve the primary SIM for interface $INTERFACE"
+	resolve_sim_index || die_code 3 "cannot yet resolve the primary SIM for interface $INTERFACE"
 	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
-		die "cannot read SIM $SIM_INDEX with mmcli"
+		die_code 3 "cannot yet read SIM $SIM_INDEX with mmcli"
 	IMSI="$(kv_value 'sim.properties.imsi')"
 	ICCID="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
 	EID="$(kv_value 'sim.properties.eid')"
@@ -326,8 +423,9 @@ read_sim() {
 	OPERATOR_NAME="$(kv_value 'sim.properties.operator-name')"
 	GID1="$(kv_value 'sim.properties.gid1')"
 	GID2="$(kv_value 'sim.properties.gid2')"
-	[ -n "$ICCID" ] || die "SIM ICCID is unavailable"
+	[ -n "$ICCID" ] || die_code 3 "SIM ICCID is not available yet"
 	case "$ICCID" in *[!0-9]*) die "unexpected ICCID format" ;; esac
+	refresh_modem_status || :
 }
 
 cache_file() {
@@ -415,12 +513,18 @@ find_candidates() {
 
 print_identity() {
 	printf 'SIM index:       %s\n' "$SIM_INDEX"
+	printf 'Modem index:     %s\n' "${MODEM_INDEX:--}"
 	printf 'ICCID:           %s\n' "$ICCID"
 	printf 'IMSI:            %s\n' "${IMSI:--}"
 	printf 'EID:             %s\n' "${EID:--}"
 	printf 'Home operator:   %s\n' "${OPERATOR_ID:--}"
 	printf 'Provider/SPN:    %s\n' "${OPERATOR_NAME:--}"
 	printf 'GID1 / GID2:     %s / %s\n' "${GID1:--}" "${GID2:--}"
+	printf 'Registration:    %s\n' "$REGISTRATION_STATE"
+	printf 'Serving network: %s (%s)\n' "${SERVING_OPERATOR_NAME:--}" "${SERVING_OPERATOR_ID:--}"
+	printf 'Roaming policy:  %s\n' "$ROAMING_POLICY"
+	printf 'Access / signal: %s / %s%%\n' "${ACCESS_TECHNOLOGIES:--}" "${SIGNAL_QUALITY:--}"
+	[ -n "$CONFIGURED_PLMN" ] && printf 'Manual PLMN:     %s\n' "$CONFIGURED_PLMN"
 }
 
 detect_cmd() {
@@ -594,9 +698,20 @@ json_key_string() {
 	json_string "$2"
 }
 
+json_key_boolean_or_null() {
+	printf '"%s":' "$1"
+	case "$2" in true|false) printf '%s' "$2" ;; *) printf 'null' ;; esac
+}
+
 read_last_result() {
 	if [ -r "$CACHE_DIR/last-result" ]; then
 		sed -n '1p' "$CACHE_DIR/last-result"
+	fi
+}
+
+read_last_result_code() {
+	if [ -r "$CACHE_DIR/last-result-code" ]; then
+		sed -n '1p' "$CACHE_DIR/last-result-code"
 	fi
 }
 
@@ -605,6 +720,7 @@ status_json_cmd() {
 	apn="$(current_apn 2>/dev/null || :)"
 	cache="$(cached_apn 2>/dev/null || :)"
 	last_result="$(read_last_result)"
+	result_code="$(read_last_result_code)"
 	reconciled_iccid="$(active_iccid 2>/dev/null || :)"
 	reconciled_apn="$(active_apn 2>/dev/null || :)"
 	interface_up=false
@@ -613,13 +729,26 @@ status_json_cmd() {
 	button_enabled="$(uci -q get "${CONFIG}.main.button_enabled" 2>/dev/null || printf '0')"
 
 	printf '{'
-	json_key_string version "v1"; printf ','
+	json_key_string version "v2"; printf ','
 	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string modem_index "$MODEM_INDEX"; printf ','
 	json_key_string iccid "$ICCID"; printf ','
 	json_key_string imsi "$IMSI"; printf ','
 	json_key_string eid "$EID"; printf ','
 	json_key_string operator_id "$OPERATOR_ID"; printf ','
 	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string home_operator_id "$OPERATOR_ID"; printf ','
+	json_key_string home_operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string modem_state "$MODEM_STATE"; printf ','
+	json_key_string registration_state "$REGISTRATION_STATE"; printf ','
+	json_key_boolean_or_null roaming "$ROAMING_STATUS"; printf ','
+	json_key_string roaming_policy "$ROAMING_POLICY"; printf ','
+	printf '"roaming_allowed":%s,' "$ROAMING_ALLOWED"
+	json_key_string serving_operator_id "$SERVING_OPERATOR_ID"; printf ','
+	json_key_string serving_operator_name "$SERVING_OPERATOR_NAME"; printf ','
+	json_key_string access_technologies "$ACCESS_TECHNOLOGIES"; printf ','
+	json_key_string signal_quality "$SIGNAL_QUALITY"; printf ','
+	json_key_string configured_plmn "$CONFIGURED_PLMN"; printf ','
 	json_key_string gid1 "$GID1"; printf ','
 	json_key_string gid2 "$GID2"; printf ','
 	json_key_string interface "$INTERFACE"; printf ','
@@ -628,6 +757,7 @@ status_json_cmd() {
 	json_key_string cached_apn "$cache"; printf ','
 	printf '"interface_up":%s,' "$interface_up"
 	json_key_string last_result "$last_result"; printf ','
+	json_key_string result_code "$result_code"; printf ','
 	json_key_string reconciled_iccid "$reconciled_iccid"; printf ','
 	json_key_string reconciled_apn "$reconciled_apn"; printf ','
 	printf '"autostart":%s,' "$([ "$autostart" = 1 ] && printf true || printf false)"
@@ -640,13 +770,23 @@ detect_json_cmd() {
 	find_candidates
 	cache="$(cached_apn 2>/dev/null || :)"
 	printf '{'
-	json_key_string version "v1"; printf ','
+	json_key_string version "v2"; printf ','
 	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string modem_index "$MODEM_INDEX"; printf ','
 	json_key_string iccid "$ICCID"; printf ','
 	json_key_string imsi "$IMSI"; printf ','
 	json_key_string eid "$EID"; printf ','
 	json_key_string operator_id "$OPERATOR_ID"; printf ','
 	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string home_operator_id "$OPERATOR_ID"; printf ','
+	json_key_string home_operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string registration_state "$REGISTRATION_STATE"; printf ','
+	json_key_boolean_or_null roaming "$ROAMING_STATUS"; printf ','
+	json_key_string roaming_policy "$ROAMING_POLICY"; printf ','
+	printf '"roaming_allowed":%s,' "$ROAMING_ALLOWED"
+	json_key_string serving_operator_id "$SERVING_OPERATOR_ID"; printf ','
+	json_key_string serving_operator_name "$SERVING_OPERATOR_NAME"; printf ','
+	json_key_string configured_plmn "$CONFIGURED_PLMN"; printf ','
 	json_key_string gid1 "$GID1"; printf ','
 	json_key_string gid2 "$GID2"; printf ','
 	json_key_string cached_apn "$cache"; printf ',"candidates":['
@@ -681,7 +821,7 @@ operation_lock_pid() {
 action_state_field() {
 	field="$1"
 	[ -r "$ACTION_STATE_DIR/state.tsv" ] || return 1
-	awk -F '\t' -v field="$field" 'NR == 1 && $1 == "v1" { print $field; exit }' \
+	awk -F '\t' -v field="$field" 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $field; exit }' \
 		"$ACTION_STATE_DIR/state.tsv"
 }
 
@@ -734,7 +874,7 @@ print_action_json() {
 	accepted="$1"
 	action_status_values
 	printf '{'
-	json_key_string version "v1"; printf ','
+	json_key_string version "v2"; printf ','
 	printf '"accepted":%s,' "$accepted"
 	printf '"busy":%s,' "$ACTION_BUSY"
 	json_key_string state "$ACTION_STATUS"; printf ','
@@ -753,7 +893,10 @@ action_status_cmd() {
 
 action_start_cmd() {
 	action="${1:-}"
-	case "$action" in reconcile|modem-reset) : ;; *) die "action must be reconcile or modem-reset" ;; esac
+	case "$action" in
+		reconcile|modem-reset|roaming-default|roaming-allow|roaming-block) : ;;
+		*) die "unsupported background action: $action" ;;
+	esac
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
 
 	start_lock="${ACTION_STATE_DIR}.start-lock"
@@ -793,7 +936,7 @@ action_start_cmd() {
 		die "cannot create action state directory"
 	}
 	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
-	printf 'v1\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\n' \
+	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\n' \
 		"$action" "$$" "$started" >"$ACTION_STATE_DIR/state.tsv"
 	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" \
 		</dev/null >/dev/null 2>&1 &
@@ -811,7 +954,7 @@ acquire_lock() {
 			''|*[!0-9]*) die "lock exists without a valid PID: $LOCK_DIR" ;;
 		esac
 		if kill -0 "$old_pid" 2>/dev/null; then
-			die "another operation is already running (PID $old_pid)"
+			die_code 3 "another operation is already running (PID $old_pid); retry later"
 		fi
 		log warning "removing stale lock left by PID $old_pid"
 		rm -f "$LOCK_DIR/pid"
@@ -846,6 +989,29 @@ add_candidate() {
 		"$username" "$password" "$auth" "$ip_type" >>"${CANDIDATES}.apply"
 }
 
+matching_database_provider() {
+	wanted_apn="$1"
+	wanted_username="$2"
+	wanted_password="$3"
+	wanted_auth="$4"
+	wanted_ip_type="$5"
+	awk -F '\t' \
+		-v wanted_apn="$wanted_apn" \
+		-v wanted_username="$wanted_username" \
+		-v wanted_password="$wanted_password" \
+		-v wanted_auth="$wanted_auth" \
+		-v wanted_ip_type="$wanted_ip_type" '
+		$3 == wanted_apn &&
+		$5 == wanted_username &&
+		$6 == wanted_password &&
+		$7 == wanted_auth &&
+		$8 == wanted_ip_type {
+			print $4
+			exit
+		}
+	' "$CANDIDATES"
+}
+
 build_apply_candidates() {
 	: >"$SEEN_APNS"
 	: >"${CANDIDATES}.apply"
@@ -869,6 +1035,11 @@ build_apply_candidates() {
 		password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
 		auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
 		ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
+	fi
+	if [ -n "$cache" ] && [ "$cache" != "<empty>" ]; then
+		current_provider="$(matching_database_provider "$cache" "$username" \
+			"$password" "$auth" "$ip_type" 2>/dev/null || :)"
+		[ -n "$current_provider" ] && provider="$current_provider"
 	fi
 	if [ "$cache" = "<empty>" ]; then
 		add_candidate "" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
@@ -949,8 +1120,92 @@ save_cache() {
 }
 
 write_last_result() {
+	result_code="$1"
+	shift
 	mkdir -p "$CACHE_DIR" || return 0
 	printf '%s\n' "$*" >"$CACHE_DIR/last-result"
+	printf '%s\n' "$result_code" >"$CACHE_DIR/last-result-code"
+}
+
+registration_is_pending() {
+	case "$REGISTRATION_STATE" in
+		unknown|idle|searching|registering|'') return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+registration_preflight() {
+	read_roaming_policy
+	[ "$ROAMING_POLICY" != "invalid" ] || {
+		write_last_result invalid-roaming-policy \
+			"failed: network.${INTERFACE}.allow_roaming must be 0, 1 or absent"
+		log err "network.${INTERFACE}.allow_roaming must be 0, 1 or absent"
+		return 1
+	}
+
+	remaining="$REGISTRATION_WAIT_SECONDS"
+	registration_start_attempted=0
+	while :; do
+		refresh_modem_status || :
+		registration_is_pending || break
+		if [ "$registration_start_attempted" -eq 0 ] && ! interface_is_up; then
+			ifup "$INTERFACE" >/dev/null 2>&1 || :
+			registration_start_attempted=1
+			log notice "started interface $INTERFACE once to obtain mobile registration state"
+		fi
+		[ "$remaining" -gt 0 ] || {
+			write_last_result registration-pending \
+				"pending: modem registration state is ${REGISTRATION_STATE:-unknown}"
+			log warning "mobile registration is still ${REGISTRATION_STATE:-unknown}; APN profiles were not changed"
+			return 3
+		}
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+
+	case "$REGISTRATION_STATE" in
+		roaming)
+			if [ "$ROAMING_ALLOWED" != true ]; then
+				if interface_is_up; then
+					ifdown "$INTERFACE" >/dev/null 2>&1 || :
+					log notice "stopped interface $INTERFACE to enforce the roaming-data block"
+				fi
+				write_last_result blocked-roaming-policy \
+					"blocked: registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network}, but mobile data roaming is disabled"
+				log notice "registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network} (${SERVING_OPERATOR_ID:--}); data roaming is explicitly blocked; APN profiles were not changed"
+				return 2
+			fi
+			log notice "registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network} (${SERVING_OPERATOR_ID:--}); policy is $ROAMING_POLICY"
+		;;
+		home)
+			log notice "registered on the home network ${SERVING_OPERATOR_NAME:-unknown} (${SERVING_OPERATOR_ID:--})"
+		;;
+		denied)
+			write_last_result registration-denied \
+				"failed: mobile network registration was denied before APN testing"
+			log err "mobile network registration was denied; APN profiles were not changed"
+			return 1
+		;;
+		emergency-only)
+			write_last_result emergency-only \
+				"failed: only emergency service is available; APN profiles were not changed"
+			log err "only emergency service is available; APN profiles were not changed"
+			return 1
+		;;
+		home-sms-only|roaming-sms-only)
+			write_last_result data-service-unavailable \
+				"failed: registered for messaging only; packet data is unavailable"
+			log err "registration state is $REGISTRATION_STATE; packet data is unavailable"
+			return 1
+		;;
+		*)
+			write_last_result registration-unusable \
+				"failed: registration state '$REGISTRATION_STATE' does not allow APN testing"
+			log err "registration state '$REGISTRATION_STATE' does not allow APN testing"
+			return 1
+		;;
+	esac
+	return 0
 }
 
 save_active_state() {
@@ -1007,15 +1262,17 @@ configured_profile_matches_active() {
 
 apply_cmd() {
 	read_sim
+	acquire_lock
+	registration_preflight || return $?
 	find_candidates
 	build_apply_candidates
 	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or set APN manually"
-	acquire_lock
 	capture_old_profile
 	migrate_legacy_baseline
 	save_baseline
 	ROLLBACK_ARMED=1
 	log notice "starting APN detection for ICCID $ICCID on $INTERFACE"
+	saw_bearer_up=0
 
 	while IFS="$(printf '\t')" read -r apn provider username password auth ip_type; do
 		[ "$apn" = "<empty>" ] && apn=""
@@ -1030,15 +1287,39 @@ apply_cmd() {
 			continue
 		fi
 		if ! wait_for_interface; then
-			log warning "interface $INTERFACE did not become up within ${WAIT_SECONDS}s"
+			refresh_modem_status || :
+			case "$REGISTRATION_STATE" in
+				roaming)
+					if [ "$ROAMING_ALLOWED" != true ]; then
+						LEAVE_INTERFACE_DOWN=1
+						write_last_result blocked-roaming-policy \
+							"blocked: registration changed to roaming while data roaming is disabled"
+						die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
+					fi
+				;;
+				denied|emergency-only|home-sms-only|roaming-sms-only)
+					write_last_result data-service-unavailable \
+						"failed: registration state became $REGISTRATION_STATE during profile testing"
+					die "registration state became $REGISTRATION_STATE; stopping profile testing"
+				;;
+			esac
+			log warning "mobile data session did not become ready within ${WAIT_SECONDS}s for profile '$display_apn'"
 			continue
+		fi
+		saw_bearer_up=1
+		refresh_modem_status || :
+		if [ "$REGISTRATION_STATE" = roaming ] && [ "$ROAMING_ALLOWED" != true ]; then
+			LEAVE_INTERFACE_DOWN=1
+			write_last_result blocked-roaming-policy \
+				"blocked: registration changed to roaming while data roaming is disabled"
+			die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
 		fi
 		if test_connectivity "$ip_type"; then
 			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$ip_type" || \
 				log warning "APN worked, but cache could not be written"
 			save_active_state "$apn" "$username" "$password" "$auth" "$ip_type" || \
 				log warning "APN worked, but reconciled SIM state could not be written"
-			write_last_result "success: $display_apn ($provider)"
+			write_last_result success "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
 			log notice "APN '$display_apn' is working; configuration kept"
 			return 0
@@ -1046,12 +1327,20 @@ apply_cmd() {
 		log warning "real Internet check failed for APN '$display_apn'"
 	done <"${CANDIDATES}.apply"
 
-	write_last_result "failed: all candidates rejected; previous mobile profile restored"
-	die "all APN candidates failed; previous mobile profile will be restored"
+	if [ "$saw_bearer_up" -eq 1 ]; then
+		write_last_result connectivity-failed \
+			"failed: a mobile session came up, but real Internet checks failed for every profile"
+	else
+		write_last_result bearer-rejected \
+			"failed: no tested mobile profile produced a usable data session"
+	fi
+	die "all mobile profiles failed; previous profile will be restored"
 }
 
 reconcile_cmd() {
 	read_sim
+	acquire_lock
+	registration_preflight || return $?
 	previous_iccid="$(active_iccid 2>/dev/null || :)"
 	previous_apn="$(active_apn 2>/dev/null || :)"
 	configured_apn="$(current_apn 2>/dev/null || :)"
@@ -1077,6 +1366,51 @@ reconcile_cmd() {
 	fi
 
 	apply_cmd
+}
+
+roaming_policy_set_cmd() {
+	requested="${1:-}"
+	case "$requested" in default|allow|block) : ;; *) die "roaming policy must be default, allow or block" ;; esac
+	acquire_lock
+	was_up=0
+	interface_is_up && was_up=1
+	was_roaming=unknown
+	sim_available=0
+	SIM_INDEX=""
+	MODEM_INDEX=""
+	if resolve_sim_index && mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+		sim_available=1
+		refresh_modem_status || :
+		was_roaming="$ROAMING_STATUS"
+	fi
+
+	case "$requested" in
+		default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
+		allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
+		block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
+	esac
+	uci commit network >/dev/null 2>&1 || die "cannot commit roaming policy"
+	read_roaming_policy
+	log notice "roaming policy for $INTERFACE changed to $ROAMING_POLICY"
+
+	if [ "$requested" = block ] && [ "$was_roaming" = true ]; then
+		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		log notice "mobile interface $INTERFACE stopped because the modem is registered in roaming"
+		return 0
+	fi
+	if [ "$requested" = block ] && [ "$was_roaming" = unknown ] && [ "$was_up" -eq 1 ]; then
+		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		log warning "mobile interface $INTERFACE stopped because roaming state could not be verified while applying the block"
+		return 0
+	fi
+
+	if [ "$requested" != block ] && [ "$was_up" -eq 0 ] && [ "$sim_available" -eq 1 ]; then
+		ifup "$INTERFACE" >/dev/null 2>&1 || die "roaming policy was saved, but interface $INTERFACE did not start"
+		wait_for_interface || :
+		reconcile_cmd
+		return $?
+	fi
+	return 0
 }
 
 write_modem_power() {
@@ -1122,6 +1456,11 @@ modem_reset_cmd() {
 	fi
 	log notice "modem and SIM are available again; reconciling APN"
 	reconcile_cmd
+	status=$?
+	if [ "$status" -ne 0 ]; then
+		[ "$status" -eq 2 ] && INTERFACE_RESTORE_ARMED=0
+		return "$status"
+	fi
 	INTERFACE_RESTORE_ARMED=0
 	log notice "hardware modem reset and APN reconciliation completed successfully"
 }
@@ -1138,8 +1477,10 @@ Commands:
   modem-reset  Power-cycle the modem GPIO, wait for SIM, then reconcile APN
   status   Show SIM identity, configured/cached APN and last result
   status-json  Machine-readable status output for LuCI and integrations
-  action-start <reconcile|modem-reset>  Start one operation in background
+  action-start <reconcile|modem-reset|roaming-default|roaming-allow|roaming-block>
+           Start one operation in background
   action-status  Show background/external operation state as JSON
+  roaming-policy-set <default|allow|block>  Change OpenWrt's canonical policy
   reset    Restore the APN state saved before the first apply; clear cache
 EOF
 }
@@ -1157,6 +1498,7 @@ main() {
 		status-json) status_json_cmd ;;
 		action-start) action_start_cmd "${2:-}" ;;
 		action-status) action_status_cmd ;;
+		roaming-policy-set) roaming_policy_set_cmd "${2:-}" ;;
 		reset) reset_cmd ;;
 		-h|--help|help|'') usage ;;
 		*) usage >&2; exit 2 ;;

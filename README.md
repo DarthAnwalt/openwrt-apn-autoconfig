@@ -5,7 +5,9 @@ OpenWrt. It dynamically resolves the active ModemManager SIM, finds mobile
 profile candidates in a worldwide local TSV database, restarts only the configured mobile
 interface, verifies real Internet access through `wwan0` with `curl`, caches
 the successful profile by ICCID, and restores the previous profile when all candidates
-fail. It includes an idempotent `reconcile` command for SIM transitions and an
+fail. It distinguishes the SIM's home operator from the serving network,
+honors OpenWrt's canonical data-roaming policy before changing any APN, and
+reports registration failures separately from profile failures. It includes an idempotent `reconcile` command for SIM transitions and an
 opt-in delayed boot service. It can also power-cycle a modem through an
 exported GPIO and reconcile
 the APN after the modem returns. Boot and hardware-button automation are both
@@ -29,6 +31,8 @@ GNOME provider database is dedicated to the public domain; see `LICENSE` and
 ## Safety model
 
 - `detect` and `status` are read-only.
+- Normal APN operations never write `network.<interface>.allow_roaming`; the
+  existing OpenWrt network option remains the sole source of roaming policy.
 - `apply` edits only the ModemManager profile options `apn`, `username`,
   `password`, `allowedauth` and `iptype` under `network.<interface>`.
 - It calls only `ifdown wwan` / `ifup wwan`; it does not reload or restart the
@@ -83,6 +87,14 @@ ModemManager modem/SIM object indices, detected the changed ICCID, selected
 `internet.telekom`, restored real Internet access and returned `wwan` to the
 online state in mwan3.
 
+The 0.7.0 roaming flow was validated on the same router with a lifecell Ukraine
+SIM in Germany. The modem registered in roaming on Telekom Germany, selected
+the live-verified `internet` APN and restored Internet access. Explicitly
+blocking roaming stopped only `wwan`, returned the dedicated blocked result
+without cycling APNs, and remained effective across a reboot without boot
+retries. Returning the policy to its OpenWrt default restored the existing
+profile without reapplying it.
+
 ## Building the APK
 
 The package is built with the official OpenWrt 25.12.5 mediatek/filogic SDK.
@@ -99,8 +111,8 @@ toolchain.
 Install a locally built package on OpenWrt 25.12 with:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.6.1-r1.apk
-apk add --allow-untrusted ./luci-app-apn-autoconfig-0.1.1-r1.apk
+apk add --allow-untrusted ./apn-autoconfig-0.7.0-r1.apk
+apk add --allow-untrusted ./luci-app-apn-autoconfig-0.2.0-r1.apk
 ```
 
 The package owns:
@@ -125,10 +137,14 @@ menu and ACL files and can be removed independently from the core.
 
 ## LuCI actions and operation state
 
-The web interface provides two actions:
+The web interface provides two APN/modem actions:
 
 - **Re-detect and verify APN** runs `reconcile`;
 - **Power-cycle modem and re-read SIM** runs `modem-reset`.
+
+It also shows home and serving networks, registration and roaming state, and a
+three-state control for OpenWrt's existing roaming policy: default, explicitly
+allow, or explicitly block.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
 a background job; it does not remain open for the full modem reset. The page
@@ -144,7 +160,7 @@ Runtime job state is deliberately volatile and stored by default in:
 /tmp/apn-autoconfig-action/state.tsv
 ```
 
-It records `starting`, `running`, `success` or `failed`; it contains no SIM
+It records `starting`, `running`, `success`, `blocked`, `retryable` or `failed`; it contains no SIM
 secrets beyond the action name and process/timing information. The normal APN
 operation lock remains authoritative.
 
@@ -157,6 +173,10 @@ apn-autoconfig action-start reconcile
 apn-autoconfig action-start modem-reset
 apn-autoconfig action-status
 ```
+
+The v2 status schema adds modem and registration states, separate home and
+serving operators, roaming state and effective policy, manual PLMN lock,
+access technologies, signal quality and a stable result code.
 
 The LuCI ACL does not execute the general-purpose command directly. Separate
 query and control wrappers accept only the required read-only and mutating
@@ -193,6 +213,40 @@ apn-autoconfig reconcile
 the new SIM even if the previous provider's APN happens to pass the Internet
 test. If ICCID, configured profile and the last successfully reconciled state all
 match, it verifies connectivity and exits without restarting `wwan`.
+
+Before APN changes, `apply` and `reconcile` wait for usable home or roaming
+registration. Explicitly blocked roaming, denied registration, emergency-only
+service and messaging-only registration stop without cycling APN profiles. A
+registration that remains pending is reported as retryable to the bounded boot
+worker.
+
+## Data roaming policy
+
+OpenWrt's ModemManager protocol uses `network.<interface>.allow_roaming` as
+the canonical persistent policy:
+
+- option absent: allowed by the OpenWrt default;
+- `option allow_roaming '1'`: explicitly allowed;
+- `option allow_roaming '0'`: explicitly blocked.
+
+Normal APN detection, reconciliation, reset and package removal only read this
+option. The LuCI page exposes an explicit travel-router control which edits
+only that same canonical network option under the normal operation lock.
+Blocking data while already roaming stops the mobile interface. Allowing data
+when the interface is down starts and reconciles it. Technical permission does
+not imply that roaming is included in the tariff or free of charge.
+
+Equivalent explicit CLI operations are:
+
+```sh
+apn-autoconfig roaming-policy-set default
+apn-autoconfig roaming-policy-set allow
+apn-autoconfig roaming-policy-set block
+```
+
+`default` removes the explicit option and returns to OpenWrt's current default
+of allowing roaming. Direct `mmcli --simple-connect` policy changes are avoided
+because netifd owns bearer creation and would replace them on reconnect.
 
 Return to the mobile profile that existed before the first `apply`:
 
@@ -267,12 +321,13 @@ Candidate order is:
 
 For each candidate the helper:
 
-1. writes the APN, optional credentials, authentication and IP type through
+1. confirms that registration and roaming policy permit packet data;
+2. writes the APN, optional credentials, authentication and IP type through
    UCI and commits `network`;
-2. runs `ifdown wwan`, then `ifup wwan`;
-3. waits until netifd reports the interface as up;
-4. runs an HTTPS request through `wwan0` with `curl`;
-5. caches a successful result by ICCID.
+3. runs `ifdown wwan`, then `ifup wwan`;
+4. waits until netifd reports the interface as up;
+5. runs an HTTPS request through `wwan0` with `curl`;
+6. caches a successful result by ICCID.
 
 If every candidate fails, the original APN (including an originally absent or
 empty setting) is restored and `wwan` alone is restarted.
@@ -291,6 +346,7 @@ config apn_autoconfig 'main'
         option state_dir '/etc/apn-autoconfig'
         option test_url 'https://connectivitycheck.gstatic.com/generate_204'
         option wait_seconds '35'
+        option registration_wait_seconds '30'
         option try_empty '0'
         option use_mwan3 'auto'
         option lock_dir '/var/lock/apn-autoconfig.lock'
@@ -450,6 +506,11 @@ submission has been implemented and tested.
   eMMC and must not be assumed correct for another board.
 - A missing or stale provider profile requires a manually verified override
   and regeneration of the database.
+- ModemManager cannot report tariff cost, roaming quotas or whether roaming is
+  free. The policy controls technical permission only.
+- A generic bearer rejection cannot always distinguish a wrong APN from a
+  subscription or roaming-agreement restriction; messages avoid claiming an
+  APN-specific cause without evidence.
 
 The database is designed to improve continuously without making router package
 builds or runtime behavior depend on upstream availability.

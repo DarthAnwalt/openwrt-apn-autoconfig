@@ -69,6 +69,14 @@ while [ "$attempt" -le "$attempts" ]; do
 	else
 		status=$?
 	fi
+	if [ "$status" -eq 2 ]; then
+		log notice "boot reconciliation stopped because mobile data roaming is blocked by policy"
+		exit 0
+	fi
+	if [ "$status" -ne 3 ]; then
+		log err "boot reconciliation failed with a non-retryable error (exit $status)"
+		exit "$status"
+	fi
 	if [ "$attempt" -ge "$attempts" ]; then
 		log err "boot reconciliation failed after $attempts attempts"
 		exit "$status"

@@ -954,7 +954,7 @@ acquire_lock() {
 			''|*[!0-9]*) die "lock exists without a valid PID: $LOCK_DIR" ;;
 		esac
 		if kill -0 "$old_pid" 2>/dev/null; then
-			die "another operation is already running (PID $old_pid)"
+			die_code 3 "another operation is already running (PID $old_pid); retry later"
 		fi
 		log warning "removing stale lock left by PID $old_pid"
 		rm -f "$LOCK_DIR/pid"

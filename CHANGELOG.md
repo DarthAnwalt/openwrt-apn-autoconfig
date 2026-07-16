@@ -8,9 +8,9 @@
 - Add a registration preflight which prevents APN changes when roaming data is
   explicitly blocked, registration is denied, only emergency or messaging
   service is available, or registration is still pending.
-- Classify operation results and make only registration-pending failures
-  retryable at boot; expose intentional roaming-policy blocks as a distinct
-  terminal background state.
+- Classify operation results, retry temporary readiness and operation-lock
+  contention at boot, and expose intentional roaming-policy blocks as a
+  distinct terminal background state.
 - Upgrade status and detect JSON to v2 with stable roaming and result fields.
 - Keep `network.<interface>.allow_roaming` as the sole source of policy. Normal
   APN operations only read it; explicit policy actions safely edit that exact

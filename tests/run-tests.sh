@@ -552,6 +552,12 @@ mkdir -p "$TEST_LOCK"
 printf '%s\n' "$$" >"$TEST_LOCK/pid"
 external_json="$(sh "$SCRIPT" action-status)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["busy"] is True and d["state"] == "external"' "$external_json" || fail 'external operation lock was not exposed'
+if sh "$SCRIPT" reconcile >/dev/null 2>&1; then
+	fail 'reconcile unexpectedly started while another operation held the lock'
+else
+	lock_status=$?
+fi
+[ "$lock_status" -eq 3 ] || fail 'live operation lock contention was not classified as retryable'
 rm -rf "$TEST_LOCK"
 
 printf '%s\n' 'TEST boot worker is inert while autostart is disabled'

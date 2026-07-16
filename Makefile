@@ -7,7 +7,6 @@ PKG_LICENSE:=MIT AND Apache-2.0
 PKG_LICENSE_FILES:=LICENSE data/licenses/Apache-2.0.txt data/licenses/MBPI-CC-PD.txt
 PKG_MAINTAINER:=DarthAnwalt
 PKG_URL:=https://github.com/DarthAnwalt/openwrt-apn-autoconfig
-PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -17,6 +16,7 @@ define Package/apn-autoconfig
   SUBMENU:=WWAN
   TITLE:=Automatic APN selection for ModemManager
   DEPENDS:=+ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
+  PKGARCH:=all
 endef
 
 define Package/apn-autoconfig/description

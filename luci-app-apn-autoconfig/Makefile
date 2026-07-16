@@ -5,7 +5,6 @@ PKG_VERSION:=0.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_MAINTAINER:=DarthAnwalt
-PKGARCH:=all
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -15,6 +14,7 @@ define Package/luci-app-apn-autoconfig
   SUBMENU:=3. Applications
   TITLE:=LuCI support for APN Auto-Config
   DEPENDS:=+luci-base +apn-autoconfig
+  PKGARCH:=all
 endef
 
 define Package/luci-app-apn-autoconfig/description

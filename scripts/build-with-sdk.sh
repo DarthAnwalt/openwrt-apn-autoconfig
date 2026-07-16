@@ -84,6 +84,17 @@ inspect_package() {
 		"$APK_TOOL" extract --allow-untrusted "$package" >/dev/null
 	)
 
+	grep -E -q '"name"[[:space:]]*:[[:space:]]*"'"$name"'"' "$metadata" || {
+		printf 'Unexpected package name metadata in %s\n' "$package" >&2
+		cat "$metadata" >&2
+		exit 1
+	}
+	grep -E -q '"arch"[[:space:]]*:[[:space:]]*"all"' "$metadata" || {
+		printf 'Package is not architecture-independent: %s\n' "$package" >&2
+		cat "$metadata" >&2
+		exit 1
+	}
+
 	actual_count="$(find "$inspect_root" -type f | wc -l | tr -d ' ')"
 	[ "$actual_count" = "$expected_count" ] || {
 		printf 'Unexpected file count in %s: expected %s, found %s\n' \

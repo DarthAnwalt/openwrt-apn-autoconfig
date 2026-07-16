@@ -87,6 +87,14 @@ ModemManager modem/SIM object indices, detected the changed ICCID, selected
 `internet.telekom`, restored real Internet access and returned `wwan` to the
 online state in mwan3.
 
+The 0.7.0 roaming flow was validated on the same router with a lifecell Ukraine
+SIM in Germany. The modem registered in roaming on Telekom Germany, selected
+the live-verified `internet` APN and restored Internet access. Explicitly
+blocking roaming stopped only `wwan`, returned the dedicated blocked result
+without cycling APNs, and remained effective across a reboot without boot
+retries. Returning the policy to its OpenWrt default restored the existing
+profile without reapplying it.
+
 ## Building the APK
 
 The package is built with the official OpenWrt 25.12.5 mediatek/filogic SDK.

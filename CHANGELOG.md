@@ -23,6 +23,9 @@
 - Refresh informational provider labels for matching cached profiles and wait
   for netifd readiness after re-enabling roaming before retrying an unchanged
   APN.
+- Validate the complete roaming flow on live hardware with a lifecell Ukraine
+  SIM registered through Telekom Germany, including policy blocking,
+  reboot behavior and recovery without redundant APN cycling.
 - Add behavioral coverage for home/roaming identity, explicit policy blocks,
   denied and pending registration, policy editing, blocked actions and bounded
   boot retry semantics.

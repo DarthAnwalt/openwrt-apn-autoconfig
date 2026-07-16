@@ -268,10 +268,41 @@ validate_config() {
 	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
 	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
 	[ -r "$DATABASE" ] || die "database not readable: $DATABASE"
+	database_format="$(database_declared_format)"
+	case "$database_format" in
+		''|2) : ;;
+		*) die "unsupported provider database format: $database_format" ;;
+	esac
 	command_exists mmcli || die "mmcli is required"
 	command_exists curl || die "curl is required"
 	command_exists ifup || die "ifup is required"
 	command_exists ifdown || die "ifdown is required"
+}
+
+database_metadata_value() {
+	key="$1"
+	awk -v prefix="# ${key}: " '
+		index($0, prefix) == 1 {
+			print substr($0, length(prefix) + 1)
+			exit
+		}
+	' "$DATABASE"
+}
+
+database_declared_format() {
+	declared_format="$(database_metadata_value database-format)"
+	if [ -z "$declared_format" ]; then
+		declared_format="$(sed -n 's/^# apn-autoconfig generated provider database v\([0-9][0-9]*\)$/\1/p' \
+			"$DATABASE" | sed -n '1p')"
+	fi
+	printf '%s\n' "$declared_format"
+}
+
+read_database_metadata() {
+	DATABASE_VERSION="$(database_metadata_value database-version)"
+	DATABASE_FORMAT="$(database_declared_format)"
+	DATABASE_SOURCES="$(database_metadata_value sources)"
+	DATABASE_REVISIONS="$(database_metadata_value revisions)"
 }
 
 kv_value_from() {
@@ -651,7 +682,10 @@ interface_is_up() {
 
 status_cmd() {
 	read_sim
+	read_database_metadata
 	print_identity
+	printf 'APN database:    %s (format v%s)\n' "${DATABASE_VERSION:--}" "${DATABASE_FORMAT:--}"
+	printf 'Database path:   %s\n' "$DATABASE"
 	apn="$(current_apn 2>/dev/null || :)"
 	printf 'Configured APN:  %s\n' "${apn:-<empty>}"
 	cache="$(cached_apn 2>/dev/null || :)"
@@ -717,6 +751,7 @@ read_last_result_code() {
 
 status_json_cmd() {
 	read_sim
+	read_database_metadata
 	apn="$(current_apn 2>/dev/null || :)"
 	cache="$(cached_apn 2>/dev/null || :)"
 	last_result="$(read_last_result)"
@@ -753,6 +788,11 @@ status_json_cmd() {
 	json_key_string gid2 "$GID2"; printf ','
 	json_key_string interface "$INTERFACE"; printf ','
 	json_key_string device "$DEVICE"; printf ','
+	json_key_string database_path "$DATABASE"; printf ','
+	json_key_string database_version "$DATABASE_VERSION"; printf ','
+	json_key_string database_format "$DATABASE_FORMAT"; printf ','
+	json_key_string database_sources "$DATABASE_SOURCES"; printf ','
+	json_key_string database_revisions "$DATABASE_REVISIONS"; printf ','
 	json_key_string configured_apn "$apn"; printf ','
 	json_key_string cached_apn "$cache"; printf ','
 	printf '"interface_up":%s,' "$interface_up"
@@ -767,6 +807,7 @@ status_json_cmd() {
 
 detect_json_cmd() {
 	read_sim
+	read_database_metadata
 	find_candidates
 	cache="$(cached_apn 2>/dev/null || :)"
 	printf '{'
@@ -789,6 +830,11 @@ detect_json_cmd() {
 	json_key_string configured_plmn "$CONFIGURED_PLMN"; printf ','
 	json_key_string gid1 "$GID1"; printf ','
 	json_key_string gid2 "$GID2"; printf ','
+	json_key_string database_path "$DATABASE"; printf ','
+	json_key_string database_version "$DATABASE_VERSION"; printf ','
+	json_key_string database_format "$DATABASE_FORMAT"; printf ','
+	json_key_string database_sources "$DATABASE_SOURCES"; printf ','
+	json_key_string database_revisions "$DATABASE_REVISIONS"; printf ','
 	json_key_string cached_apn "$cache"; printf ',"candidates":['
 	separator=""
 	while IFS="$(printf '\t')" read -r score priority apn provider username password auth ip_type; do

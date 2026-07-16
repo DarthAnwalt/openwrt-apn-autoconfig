@@ -3,9 +3,10 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 MANIFEST="${APN_PROVIDER_MANIFEST:-$ROOT/data/provider-sources.json}"
-OUTPUT="${APN_PROVIDER_OUTPUT:-$ROOT/files/usr/share/apn-autoconfig/providers.tsv}"
+OUTPUT="${APN_PROVIDER_OUTPUT:-$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv}"
 REPORT="${APN_PROVIDER_REPORT:-$ROOT/data/providers-report.json}"
-PREVIOUS="${APN_PROVIDER_PREVIOUS:-$ROOT/files/usr/share/apn-autoconfig/providers.tsv}"
+PREVIOUS="${APN_PROVIDER_PREVIOUS:-$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv}"
+VERSION_FILE="${APN_PROVIDER_VERSION_FILE:-$ROOT/apn-autoconfig-providers/VERSION}"
 TMP="${TMPDIR:-/tmp}/apn-provider-update.$$"
 trap 'rm -rf "$TMP"' 0 HUP INT TERM
 mkdir -p "$TMP"
@@ -33,6 +34,7 @@ set -- python3 "$ROOT/scripts/generate-providers.py" \
 	--mbpi "$TMP/mbpi/$(manifest_value mbpi path)" \
 	--aosp "$TMP/aosp/$(manifest_value aosp path)" \
 	--manifest "$MANIFEST" \
+	--database-version-file "$VERSION_FILE" \
 	--output "$OUTPUT" \
 	--report "$REPORT"
 [ ! -r "$PREVIOUS" ] || set -- "$@" --previous "$PREVIOUS"

@@ -1,10 +1,10 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.7.0
+PKG_VERSION:=0.8.0
 PKG_RELEASE:=1
-PKG_LICENSE:=MIT AND Apache-2.0
-PKG_LICENSE_FILES:=LICENSE data/licenses/Apache-2.0.txt data/licenses/MBPI-CC-PD.txt
+PKG_LICENSE:=MIT
+PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=DarthAnwalt
 PKG_URL:=https://github.com/DarthAnwalt/openwrt-apn-autoconfig
 
@@ -15,7 +15,7 @@ define Package/apn-autoconfig
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Automatic APN selection for ModemManager
-  DEPENDS:=+ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
+  DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
   PKGARCH:=all
 endef
 
@@ -36,8 +36,6 @@ endef
 define Package/apn-autoconfig/install
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/apn-autoconfig $(1)/usr/sbin/apn-autoconfig
-	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig
-	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig/providers.tsv $(1)/usr/share/apn-autoconfig/providers.tsv
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/apn-autoconfig $(1)/etc/config/apn-autoconfig
 	$(INSTALL_DIR) $(1)/etc/init.d

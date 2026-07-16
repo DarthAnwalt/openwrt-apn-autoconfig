@@ -17,6 +17,10 @@ generate() {
 generate "$TMP/one.tsv"
 generate "$TMP/two.tsv"
 cmp "$TMP/one.tsv" "$TMP/two.tsv"
+grep -F -q '# database-version: 2026.07.16' "$TMP/one.tsv"
+grep -F -q '# database-format: 2' "$TMP/one.tsv"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["database_version"] == "2026.07.16"; assert d["database_format"] == 2' \
+	"$TMP/one.tsv.json"
 
 python3 "$ROOT/scripts/generate-providers.py" \
 	--mbpi "$ROOT/tests/fixtures/mbpi.xml" \

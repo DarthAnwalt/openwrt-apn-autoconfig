@@ -1,4 +1,6 @@
 # apn-autoconfig generated provider database v2
+# database-version: 2026.07.16
+# database-format: 2
 # sources: mbpi, aosp, local overrides
 # revisions: mbpi@052f1e6999f205ba88cc3557627f260b9ae0840e, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6
 # TAB-separated columns:

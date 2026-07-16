@@ -15,9 +15,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST = ROOT / "data/provider-sources.json"
 DEFAULT_OVERRIDES = ROOT / "data/providers-overrides.tsv"
-DEFAULT_OUTPUT = ROOT / "files/usr/share/apn-autoconfig/providers.tsv"
+DEFAULT_VERSION_FILE = ROOT / "apn-autoconfig-providers/VERSION"
+DEFAULT_OUTPUT = ROOT / "apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
 APN_RE = re.compile(r"[A-Za-z0-9._-]+")
 DIGIT_PATTERN_RE = re.compile(r"[0-9xX]+")
+DATABASE_VERSION_RE = re.compile(r"[0-9]{4}\.[0-9]{2}\.[0-9]{2}")
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 SERVICE_ONLY_APNS = {"ims", "vzwims"}
 
@@ -312,7 +314,12 @@ def load_manifest(path: Path) -> dict:
 
 
 def write_database(
-    path: Path, generator: Generator, manifest: dict, include_aosp: bool, include_previous: bool
+    path: Path,
+    generator: Generator,
+    manifest: dict,
+    database_version: str,
+    include_aosp: bool,
+    include_previous: bool,
 ) -> None:
     source_names = ["mbpi"] + (["aosp"] if include_aosp else [])
     if include_previous:
@@ -339,6 +346,8 @@ def write_database(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as output:
         output.write("# apn-autoconfig generated provider database v2\n")
+        output.write(f"# database-version: {database_version}\n")
+        output.write("# database-format: 2\n")
         output.write(f"# sources: {', '.join(source_names)}\n")
         output.write(f"# revisions: {', '.join(source_revisions)}\n")
         output.write("# TAB-separated columns:\n")
@@ -350,11 +359,14 @@ def write_database(
             output.write(row.as_tsv() + "\n")
 
 
-def write_report(path: Path, generator: Generator, manifest: dict, include_aosp: bool) -> None:
+def write_report(
+    path: Path, generator: Generator, manifest: dict, database_version: str, include_aosp: bool
+) -> None:
     rows = list(generator.rows.values())
     report = {
         "format": 1,
         "database_format": 2,
+        "database_version": database_version,
         "sources": {
             key: {
                 "revision": manifest["sources"][key]["revision"],
@@ -387,6 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--aosp", type=Path, help="path to AOSP apns-full-conf.xml")
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--overrides", type=Path, default=DEFAULT_OVERRIDES)
+    parser.add_argument("--database-version-file", type=Path, default=DEFAULT_VERSION_FILE)
     parser.add_argument("--previous", type=Path, help="previous v2 database whose removed profiles become fallbacks")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--report", type=Path, help="optional deterministic JSON quality report")
@@ -396,6 +409,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     manifest = load_manifest(args.manifest)
+    database_version = args.database_version_file.read_text(encoding="utf-8").strip()
+    if not DATABASE_VERSION_RE.fullmatch(database_version):
+        raise ValueError(f"invalid database version: {database_version!r}")
     generator = Generator()
     import_mbpi(args.mbpi, generator)
     if args.aosp:
@@ -404,9 +420,16 @@ def main() -> int:
     if args.previous:
         import_previous(args.previous, generator)
     retained_previous = generator.stats.get("previous_retained", 0) > 0
-    write_database(args.output, generator, manifest, args.aosp is not None, retained_previous)
+    write_database(
+        args.output,
+        generator,
+        manifest,
+        database_version,
+        args.aosp is not None,
+        retained_previous,
+    )
     if args.report:
-        write_report(args.report, generator, manifest, args.aosp is not None)
+        write_report(args.report, generator, manifest, database_version, args.aosp is not None)
 
     print(f"generated {len(generator.rows)} provider profiles", file=sys.stderr)
     for key in sorted(generator.stats):

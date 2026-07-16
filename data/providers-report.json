@@ -1,6 +1,7 @@
 {
   "credential_profiles": 883,
   "database_format": 2,
+  "database_version": "2026.07.16",
   "format": 1,
   "mccmnc": 1459,
   "mvno_specific_profiles": 429,

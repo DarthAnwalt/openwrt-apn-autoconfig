@@ -28,6 +28,18 @@ python3 -m json.tool "$ROOT/data/provider-sources.json" >/dev/null
 python3 -m json.tool "$ROOT/data/providers-report.json" >/dev/null
 [ -f "$ROOT/data/licenses/Apache-2.0.txt" ]
 [ -f "$ROOT/data/licenses/MBPI-CC-PD.txt" ]
+[ -f "$ROOT/apn-autoconfig-providers/Makefile" ]
+[ -f "$ROOT/apn-autoconfig-providers/VERSION" ]
+database_version="$(sed -n '1p' "$ROOT/apn-autoconfig-providers/VERSION")"
+grep -F -q "# database-version: $database_version" \
+	"$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["database_version"] == sys.argv[2]' \
+	"$ROOT/data/providers-report.json" "$database_version"
+grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
+if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
+	printf '%s\n' 'The core package still owns the provider database.' >&2
+	exit 1
+fi
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 fi
@@ -49,7 +61,7 @@ awk -F '\t' '
 	$7 !~ /^[A-Za-z0-9._-]+$/ { print "invalid APN at line " NR > "/dev/stderr"; bad=1 }
 	$8 !~ /^[0-9]+$/ { print "invalid priority at line " NR > "/dev/stderr"; bad=1 }
 	END { exit bad }
-' "$ROOT/files/usr/share/apn-autoconfig/providers.tsv"
+' "$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
 
 sh "$ROOT/tests/test-provider-generator.sh"
 sh "$ROOT/tests/run-tests.sh"

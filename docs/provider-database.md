@@ -1,7 +1,8 @@
 # Provider database v2
 
-The packaged provider database is a generated, compact runtime artifact. The
-large upstream XML files are deliberately not installed on the router.
+The provider database is a generated, compact runtime artifact installed by the
+independently versioned `apn-autoconfig-providers` package. The large upstream
+XML files are deliberately not installed on the router.
 
 ## Sources
 
@@ -36,6 +37,20 @@ Only profiles usable for ordinary Internet access are imported. MMS-only,
 IMS, FOTA, XCAP, CBS, emergency and WAP-only profiles are excluded. Disabled
 AOSP entries and test-network MCC 001 are excluded as well.
 
+The comment header contains machine-readable metadata:
+
+```text
+# database-version: 2026.07.16
+# database-format: 2
+# sources: mbpi, aosp, local overrides
+# revisions: mbpi@..., aosp@...
+```
+
+The database uses a date-based `YYYY.MM.DD-rN` package version independent from
+the core. Updates that keep format v2 do not require a new core or LuCI package.
+An explicitly declared unsupported format is rejected before any modem or
+network operation.
+
 ## Regeneration
 
 Check out the two pinned upstream revisions and run:
@@ -49,18 +64,22 @@ python3 scripts/generate-providers.py \
 
 Alternatively, `sh scripts/update-providers.sh` fetches exactly the revisions
 from the manifest, regenerates the runtime database and writes the deterministic
-quality report. It is never run during package builds.
+quality report. It is never run during package builds. Before committing a
+manual database-content change, set `apn-autoconfig-providers/VERSION` to the
+new `YYYY.MM.DD` version; the verification suite requires the package, TSV
+header and quality report to agree.
 
 The `Update provider database` GitHub Actions workflow runs every Monday. It
 resolves the latest commits of both trusted sources, generates temporary
 artifacts, rejects reductions in coverage or anomalous growth, runs all static
-and behavioral tests, and commits only the manifest, report and runtime TSV.
+and behavioral tests, and commits only the manifest, report, database version
+and runtime TSV.
 If any source, validation or test step fails, the repository is unchanged and
 the workflow is visibly failed.
 
 The generator validates MCC/MNC values, APNs, selectors, field delimiters,
-authentication modes and IP-family values. Output contains no timestamps and
-is reproducible for identical inputs.
+authentication modes and IP-family values. Output contains no generation
+timestamp and is reproducible for identical inputs and database version.
 
 During an update, profiles that disappeared upstream are retained with a lower
 priority. A router therefore tries new data first but can still recover through

@@ -1,5 +1,20 @@
 # Changelog
 
+## apn-autoconfig 0.8.0 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.0
+
+- Split the generated provider database into the independently versioned
+  `apn-autoconfig-providers` package.
+- Make the core depend on the provider package while keeping the runtime
+  database path and UCI configuration compatible with 0.7.0.
+- Add deterministic database version and format metadata alongside the pinned
+  upstream source revisions.
+- Expose the database path, version, format, sources and revisions through the
+  read-only machine API and show them in LuCI.
+- Reject an explicitly declared unsupported database format before any modem or
+  network operation.
+- Build, inspect and publish three independent APK artifacts with one checksum
+  manifest.
+
 ## apn-autoconfig 0.7.0 / luci-app-apn-autoconfig 0.2.0
 
 - Resolve and report the matching ModemManager modem alongside the active SIM,

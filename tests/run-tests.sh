@@ -23,7 +23,11 @@ mkdir -p "$TESTROOT/sys/class/gpio/modem_power"
 printf '%s\n' '0' >"$TESTROOT/sys/class/gpio/modem_power/value"
 
 cat >"$DB" <<'EOF'
-# demo
+# apn-autoconfig generated provider database v2
+# database-version: 2026.07.16
+# database-format: 2
+# sources: fixture
+# revisions: fixture@1234567
 26201	-	-	01	Kaufland Mobil	Kaufland Mobil	internet.telekom	10	fixture-user	fixture-pass	pap-or-chap	ipv4v6
 26201	-	-	-	-	Telekom Germany	internet.telekom	20
 26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10
@@ -375,12 +379,23 @@ printf '%s\n' 'rollback.apn' >"$STATE/apn"
 printf '%s\n' 'TEST status reports configured APN'
 status_output="$(sh "$SCRIPT" status 2>&1)"
 assert_contains "$status_output" 'Configured APN:  rollback.apn'
+assert_contains "$status_output" 'APN database:    2026.07.16 (format v2)'
 
 printf '%s\n' 'TEST machine-readable status and detect output are valid JSON'
 status_json="$(sh "$SCRIPT" status-json)"
 detect_json="$(sh "$SCRIPT" detect-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["roaming_policy"] == "default-allow"; assert d["serving_operator_id"] == "26201"' "$status_json" || fail 'invalid status JSON'
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["iccid"] == "89490200002186275443"; assert len(d["candidates"]) == 2; assert all(x["apn"] == "internet.telekom" for x in d["candidates"]); assert d["candidates"][0]["provider"] == "Kaufland Mobil"; assert d["candidates"][0]["username_required"] is True; assert d["candidates"][0]["authentication"] == "pap-or-chap"; assert d["candidates"][0]["ip_type"] == "ipv4v6"' "$detect_json" || fail 'invalid detect JSON'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["roaming_policy"] == "default-allow"; assert d["serving_operator_id"] == "26201"; assert d["database_version"] == "2026.07.16"; assert d["database_format"] == "2"; assert d["database_sources"] == "fixture"; assert d["database_revisions"] == "fixture@1234567"; assert d["database_path"] == sys.argv[2]' "$status_json" "$DB" || fail 'invalid status JSON'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["iccid"] == "89490200002186275443"; assert d["database_version"] == "2026.07.16"; assert len(d["candidates"]) == 2; assert all(x["apn"] == "internet.telekom" for x in d["candidates"]); assert d["candidates"][0]["provider"] == "Kaufland Mobil"; assert d["candidates"][0]["username_required"] is True; assert d["candidates"][0]["authentication"] == "pap-or-chap"; assert d["candidates"][0]["ip_type"] == "ipv4v6"' "$detect_json" || fail 'invalid detect JSON'
+
+printf '%s\n' 'TEST an explicitly unsupported provider database format is rejected'
+awk '{ if ($0 == "# database-format: 2") print "# database-format: 3"; else print }' "$DB" >"$DB.new"
+mv "$DB.new" "$DB"
+if unsupported_output="$(sh "$SCRIPT" status-json 2>&1)"; then
+	fail 'unsupported provider database format was accepted'
+fi
+assert_contains "$unsupported_output" 'unsupported provider database format: 3'
+awk '{ if ($0 == "# database-format: 3") print "# database-format: 2"; else print }' "$DB" >"$DB.new"
+mv "$DB.new" "$DB"
 
 printf '%s\n' 'TEST roaming status separates the home SIM from the serving network'
 MM_REGISTRATION_STATE=roaming

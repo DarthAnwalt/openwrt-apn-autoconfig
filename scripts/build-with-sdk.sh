@@ -43,27 +43,41 @@ SDK_DIR="$(find "$EXTRACT" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 rm -rf "$SDK_DIR/package/apn-autoconfig"
 mkdir -p "$SDK_DIR/package/apn-autoconfig"
 cp -R "$ROOT/Makefile" "$ROOT/LICENSE" "$ROOT/files" "$SDK_DIR/package/apn-autoconfig/"
-mkdir -p "$SDK_DIR/package/apn-autoconfig/data"
-cp -R "$ROOT/data/licenses" "$SDK_DIR/package/apn-autoconfig/data/"
+rm -rf "$SDK_DIR/package/apn-autoconfig-providers"
+cp -R "$ROOT/apn-autoconfig-providers" "$SDK_DIR/package/apn-autoconfig-providers"
+mkdir -p "$SDK_DIR/package/apn-autoconfig-providers/licenses"
+cp "$ROOT/data/licenses/Apache-2.0.txt" "$ROOT/data/licenses/MBPI-CC-PD.txt" \
+	"$SDK_DIR/package/apn-autoconfig-providers/licenses/"
 rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
 cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 
 (
 	cd "$SDK_DIR"
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig=m' >>.config
+	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-providers=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
 	make defconfig
+	make package/apn-autoconfig-providers/clean
+	make package/apn-autoconfig-providers/compile V=s
 	make package/apn-autoconfig/clean
 	make package/apn-autoconfig/compile V=s
 	make package/luci-app-apn-autoconfig/clean
 	make package/luci-app-apn-autoconfig/compile V=s
 )
 
-rm -f "$OUTPUT"/apn-autoconfig-*.apk "$OUTPUT"/luci-app-apn-autoconfig-*.apk
-find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
+rm -f "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
+	"$OUTPUT"/apn-autoconfig-providers-*.apk \
+	"$OUTPUT"/luci-app-apn-autoconfig-*.apk
+find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-[0-9]*.apk' -exec cp {} "$OUTPUT/" \;
+find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-providers-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
-set -- "$OUTPUT"/apn-autoconfig-*.apk "$OUTPUT"/luci-app-apn-autoconfig-*.apk
-[ -f "$1" ] && [ -f "$2" ] || { printf '%s\n' 'One or more APKs were not produced' >&2; exit 1; }
+set -- "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
+	"$OUTPUT"/apn-autoconfig-providers-*.apk \
+	"$OUTPUT"/luci-app-apn-autoconfig-*.apk
+[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] || {
+	printf '%s\n' 'One or more APKs were not produced' >&2
+	exit 1
+}
 
 APK_TOOL="$SDK_DIR/staging_dir/host/bin/apk"
 [ -x "$APK_TOOL" ] || { printf '%s\n' 'SDK apk v3 inspection tool was not found' >&2; exit 1; }
@@ -110,19 +124,22 @@ inspect_package() {
 	done
 }
 
-inspect_package "$1" apn-autoconfig 12 \
+inspect_package "$1" apn-autoconfig 11 \
 	usr/sbin/apn-autoconfig \
 	usr/libexec/apn-autoconfig-boot \
 	usr/libexec/apn-autoconfig-action \
 	usr/libexec/apn-autoconfig-query \
 	usr/libexec/apn-autoconfig-control \
-	usr/share/apn-autoconfig/providers.tsv \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
 	etc/hotplug.d/button/50-apn-autoconfig \
 	lib/apk/packages/apn-autoconfig.list \
 	lib/apk/packages/apn-autoconfig.conffiles \
 	lib/apk/packages/apn-autoconfig.conffiles_static
+
+inspect_package "$2" apn-autoconfig-providers 2 \
+	usr/share/apn-autoconfig/providers.tsv \
+	lib/apk/packages/apn-autoconfig-providers.list
 
 grep -F -q '/etc/config/apn-autoconfig' \
 	"$BUILD_ROOT/inspect-apn-autoconfig/lib/apk/packages/apn-autoconfig.conffiles"
@@ -144,12 +161,15 @@ do
 	}
 done
 
-inspect_package "$2" luci-app-apn-autoconfig 4 \
+inspect_package "$3" luci-app-apn-autoconfig 4 \
 	www/luci-static/resources/view/network/apn-autoconfig.js \
 	usr/share/luci/menu.d/luci-app-apn-autoconfig.json \
 	usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json \
 	lib/apk/packages/luci-app-apn-autoconfig.list
 
-(cd "$OUTPUT" && sha256sum apn-autoconfig-*.apk luci-app-apn-autoconfig-*.apk >SHA256SUMS)
+(cd "$OUTPUT" && sha256sum \
+	apn-autoconfig-[0-9]*.apk \
+	apn-autoconfig-providers-*.apk \
+	luci-app-apn-autoconfig-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print

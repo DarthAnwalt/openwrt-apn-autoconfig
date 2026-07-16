@@ -13,10 +13,11 @@ exported GPIO and reconcile
 the APN after the modem returns. Boot and hardware-button automation are both
 disabled by default.
 
-This repository contains two OpenWrt source packages. It builds normal `.apk`
+This repository contains three OpenWrt source packages. It builds normal `.apk`
 packages with the official OpenWrt 25.12 SDK:
 
 - `apn-autoconfig`, the POSIX-shell core;
+- `apn-autoconfig-providers`, the independently versioned provider database;
 - `luci-app-apn-autoconfig`, the optional web interface.
 
 The generated provider database combines GNOME mobile-broadband-provider-info,
@@ -104,18 +105,26 @@ On Linux x86_64:
 sh scripts/build-with-sdk.sh
 ```
 
-The resulting package and checksum are written to `dist/`. On macOS, use the
+The resulting packages and checksums are written to `dist/`. On macOS, use the
 included GitHub Actions workflow because the official SDK is a Linux x86_64
 toolchain.
 
-Install a locally built package on OpenWrt 25.12 with:
+Install locally built packages on OpenWrt 25.12 in one transaction:
 
 ```sh
-apk add --allow-untrusted ./apn-autoconfig-0.7.0-r1.apk
-apk add --allow-untrusted ./luci-app-apn-autoconfig-0.2.0-r1.apk
+apk add --allow-untrusted \
+  ./apn-autoconfig-providers-2026.07.16-r1.apk \
+  ./apn-autoconfig-0.8.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.3.0-r1.apk
 ```
 
-The package owns:
+Use the same single transaction when upgrading from 0.7.0. It transfers
+`/usr/share/apn-autoconfig/providers.tsv` from the old core package to the new
+provider package while preserving the UCI configuration, baseline and ICCID
+cache. Do not uninstall 0.7.0 first, because a real core removal intentionally
+runs `reset`.
+
+The core package owns:
 
 ```text
 /usr/sbin/apn-autoconfig
@@ -123,10 +132,15 @@ The package owns:
 /usr/libexec/apn-autoconfig-action
 /usr/libexec/apn-autoconfig-query
 /usr/libexec/apn-autoconfig-control
-/usr/share/apn-autoconfig/providers.tsv
 /etc/config/apn-autoconfig
 /etc/init.d/apn-autoconfig
 /etc/hotplug.d/button/50-apn-autoconfig
+```
+
+The provider package owns:
+
+```text
+/usr/share/apn-autoconfig/providers.tsv
 ```
 
 The UCI file is declared as a package configuration file. Cache files are
@@ -144,7 +158,9 @@ The web interface provides two APN/modem actions:
 
 It also shows home and serving networks, registration and roaming state, and a
 three-state control for OpenWrt's existing roaming policy: default, explicitly
-allow, or explicitly block.
+allow, or explicitly block. Version 0.3.0 also shows the active provider
+database version, format, source revisions and path. It does not perform
+network update checks; signed feed support is planned separately.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
 a background job; it does not remain open for the full modem reset. The page
@@ -174,9 +190,10 @@ apn-autoconfig action-start modem-reset
 apn-autoconfig action-status
 ```
 
-The v2 status schema adds modem and registration states, separate home and
+The v2 status schema includes modem and registration states, separate home and
 serving operators, roaming state and effective policy, manual PLMN lock,
-access technologies, signal quality and a stable result code.
+access technologies, signal quality, a stable result code and active provider
+database metadata.
 
 The LuCI ACL does not execute the general-purpose command directly. Separate
 query and control wrappers accept only the required read-only and mutating
@@ -404,7 +421,7 @@ you deliberately want it as the final fallback.
 
 ## Generated worldwide provider database
 
-The bundled database contains Internet-capable profiles generated from two
+The separately packaged database contains Internet-capable profiles generated from two
 upstream projects plus manually verified overrides. MMS-only, IMS, FOTA, XCAP,
 CBS, emergency, WAP-only, disabled and test-network profiles are excluded.
 
@@ -432,6 +449,10 @@ Example:
 ```
 
 The file must contain literal TAB characters, not spaces.
+
+The comment header records a date-based database version, the schema format and
+the exact upstream source revisions. Database package versions use
+`YYYY.MM.DD-rN` and are independent from the core version.
 
 The ModemManager backend applies APN, username, password, authentication and
 IP-family as one profile. Passwords are used internally and are never included
@@ -473,10 +494,14 @@ reset, package removal deletes:
 
 ```text
 /usr/sbin/apn-autoconfig
-/usr/share/apn-autoconfig/providers.tsv
 /etc/config/apn-autoconfig
 /etc/apn-autoconfig/             (baseline and cache)
 ```
+
+The core removal scripts do not own or delete the provider database. APK
+manages it as the separate `apn-autoconfig-providers` package. To explicitly
+remove both packages, list both in the same `apk del` transaction after the
+core profile reset succeeds.
 
 Removal deliberately deletes this package's modified UCI configuration instead
 of leaving a package-manager configuration remnant. It does not modify mwan3,

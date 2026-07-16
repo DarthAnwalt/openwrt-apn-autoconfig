@@ -96,6 +96,54 @@ without cycling APNs, and remained effective across a reboot without boot
 retries. Returning the policy to its OpenWrt default restored the existing
 profile without reapplying it.
 
+## Signed package repository
+
+OpenWrt 25.12 routers can install and upgrade all three packages from the
+project's signed APK repository. Trust its public key once, add the feed and
+install the LuCI package; APK resolves the core and provider-database
+dependencies automatically:
+
+```sh
+wget -O /tmp/apn-autoconfig.pem \
+  https://darthanwalt.github.io/openwrt-apn-autoconfig/public-key.pem
+echo '0d4d6d383c84205c8fa16fafdf341ff80de24c63574a1d7d938cfb532fa458d3  /tmp/apn-autoconfig.pem' \
+  | sha256sum -c -
+cp /tmp/apn-autoconfig.pem /etc/apk/keys/apn-autoconfig.pem
+chmod 0644 /etc/apk/keys/apn-autoconfig.pem
+
+feed='https://darthanwalt.github.io/openwrt-apn-autoconfig/25.12/noarch/packages.adb'
+grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null ||
+  echo "$feed" >>/etc/apk/repositories.d/customfeeds.list
+
+apk update
+apk add luci-app-apn-autoconfig
+```
+
+The public-key SHA-256 fingerprint is:
+
+```text
+0d4d6d383c84205c8fa16fafdf341ff80de24c63574a1d7d938cfb532fa458d3
+```
+
+Normal package upgrades no longer require `--allow-untrusted`:
+
+```sh
+apk update
+apk upgrade apn-autoconfig apn-autoconfig-providers luci-app-apn-autoconfig
+```
+
+To upgrade only the independently versioned provider database:
+
+```sh
+apk update
+apk upgrade apn-autoconfig-providers
+```
+
+The feed is generated with the official OpenWrt 25.12 SDK APK v3 tool. Its
+signed `packages.adb`, package payloads, JSON inspection output, checksums and
+public key are published by the release workflow through GitHub Pages. The
+private signing key is never stored in the repository or build artifacts.
+
 ## Building the APK
 
 The package is built with the official OpenWrt 25.12.5 mediatek/filogic SDK.

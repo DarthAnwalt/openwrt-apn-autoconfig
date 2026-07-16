@@ -6,6 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
@@ -25,9 +26,11 @@ jobs:
       - name: Verify generated database and package behavior
         run: sh scripts/verify.sh
       - name: Commit safe update
+        id: commit
         run: |
           if git diff --quiet -- data/provider-sources.json data/providers-report.json apn-autoconfig-providers/VERSION apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv; then
             echo "Provider database is already current."
+            echo "changed=false" >>"$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "github-actions[bot]"
@@ -35,3 +38,9 @@ jobs:
           git add data/provider-sources.json data/providers-report.json apn-autoconfig-providers/VERSION apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv
           git commit -m "Update provider database"
           git push
+          echo "changed=true" >>"$GITHUB_OUTPUT"
+      - name: Publish signed provider package update
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run build.yml --ref main -f publish_repository=true

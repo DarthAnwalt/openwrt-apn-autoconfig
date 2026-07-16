@@ -3,3 +3,8 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# APK repository signing material. Only repository/public-key.pem is public.
+private-key.pem
+*.private.pem
+*.encrypted.pem

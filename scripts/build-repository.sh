@@ -109,6 +109,7 @@ touch "$SITE_DIR/.nojekyll"
 )
 
 rm -rf "$OUTPUT_DIR"
+mkdir -p "$(dirname "$OUTPUT_DIR")"
 mv "$SITE_DIR" "$OUTPUT_DIR"
 trap - EXIT HUP INT TERM
 rm -rf "$WORK_DIR"

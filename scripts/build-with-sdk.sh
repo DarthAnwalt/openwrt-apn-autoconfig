@@ -99,7 +99,7 @@ inspect_package() {
 	done
 }
 
-inspect_package "$1" apn-autoconfig 9 \
+inspect_package "$1" apn-autoconfig 12 \
 	usr/sbin/apn-autoconfig \
 	usr/libexec/apn-autoconfig-boot \
 	usr/libexec/apn-autoconfig-action \
@@ -108,7 +108,15 @@ inspect_package "$1" apn-autoconfig 9 \
 	usr/share/apn-autoconfig/providers.tsv \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
-	etc/hotplug.d/button/50-apn-autoconfig
+	etc/hotplug.d/button/50-apn-autoconfig \
+	lib/apk/packages/apn-autoconfig.list \
+	lib/apk/packages/apn-autoconfig.conffiles \
+	lib/apk/packages/apn-autoconfig.conffiles_static
+
+grep -F -q '/etc/config/apn-autoconfig' \
+	"$BUILD_ROOT/inspect-apn-autoconfig/lib/apk/packages/apn-autoconfig.conffiles"
+grep -F -q '/etc/config/apn-autoconfig ' \
+	"$BUILD_ROOT/inspect-apn-autoconfig/lib/apk/packages/apn-autoconfig.conffiles_static"
 
 for executable in \
 	usr/sbin/apn-autoconfig \
@@ -125,10 +133,11 @@ do
 	}
 done
 
-inspect_package "$2" luci-app-apn-autoconfig 3 \
+inspect_package "$2" luci-app-apn-autoconfig 4 \
 	www/luci-static/resources/view/network/apn-autoconfig.js \
 	usr/share/luci/menu.d/luci-app-apn-autoconfig.json \
-	usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json
+	usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json \
+	lib/apk/packages/luci-app-apn-autoconfig.list
 
 (cd "$OUTPUT" && sha256sum apn-autoconfig-*.apk luci-app-apn-autoconfig-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'

@@ -86,7 +86,6 @@ FETCH_DIR="$WORK_DIR/fetched"
 mkdir -p "$VERIFY_ROOT" "$FETCH_DIR"
 "$APK_TOOL" \
 	--root "$VERIFY_ROOT" \
-	--usermode \
 	--keys-dir "$KEYS_DIR" \
 	--repositories-file /dev/null \
 	--repository "file://$FEED_DIR/packages.adb" \

@@ -83,6 +83,7 @@ VERIFY_ROOT="$WORK_DIR/verify-root"
 mkdir -p "$VERIFY_ROOT"
 "$APK_TOOL" \
 	--root "$VERIFY_ROOT" \
+	--usermode \
 	--keys-dir "$KEYS_DIR" \
 	--repositories-file /dev/null \
 	--repository "file://$FEED_DIR/packages.adb" \

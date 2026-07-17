@@ -62,16 +62,16 @@ if command -v node >/dev/null 2>&1; then
 fi
 grep -F -q "form.Flag, 'autostart'" \
 	"$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
-grep -F -q 'actions/checkout@v7' "$ROOT/.github/workflows/build.yml"
-grep -F -q 'actions/upload-artifact@v7' "$ROOT/.github/workflows/build.yml"
-grep -F -q 'actions/download-artifact@v8' "$ROOT/.github/workflows/build.yml"
-grep -F -q 'actions/upload-pages-artifact@v5' "$ROOT/.github/workflows/build.yml"
-grep -F -q 'actions/deploy-pages@v5' "$ROOT/.github/workflows/build.yml"
-grep -F -q 'actions/checkout@v7' "$ROOT/.github/workflows/update-provider-database.yml"
+grep -F -q 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5' "$ROOT/.github/workflows/build.yml"
+grep -F -q 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7' "$ROOT/.github/workflows/update-provider-database.yml"
 grep -F -q 'actions: write' "$ROOT/.github/workflows/update-provider-database.yml"
 grep -F -q 'publish_repository=true' "$ROOT/.github/workflows/update-provider-database.yml"
-if grep -R -E 'actions/(checkout|upload-artifact|download-artifact)@v4' "$ROOT/.github/workflows"; then
-	printf '%s\n' 'Legacy Node.js 20 GitHub Action remains configured.' >&2
+if grep -R -E 'uses:[[:space:]]+actions/[^@]+@v[0-9]+' "$ROOT/.github/workflows"; then
+	printf '%s\n' 'A GitHub-maintained Action is not pinned to an immutable commit.' >&2
 	exit 1
 fi
 

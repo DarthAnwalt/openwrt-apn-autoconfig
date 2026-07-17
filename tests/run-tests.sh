@@ -50,7 +50,7 @@ get:apn-autoconfig.main.device) printf '%s\n' wwan0 ;;
 get:apn-autoconfig.main.database) printf '%s\n' "$TEST_DB" ;;
 get:apn-autoconfig.main.cache_dir) printf '%s\n' "$TEST_CACHE" ;;
 get:apn-autoconfig.main.state_dir) printf '%s\n' "$TEST_PERSIST" ;;
-get:apn-autoconfig.main.test_url) printf '%s\n' https://example.invalid/check ;;
+get:apn-autoconfig.main.test_url) printf '%s\n' "${TEST_CONFIG_URL:-https://example.invalid/check}" ;;
 get:apn-autoconfig.main.wait_seconds) printf '%s\n' 2 ;;
 get:apn-autoconfig.main.registration_wait_seconds) printf '%s\n' "${TEST_REGISTRATION_WAIT_SECONDS:-2}" ;;
 get:apn-autoconfig.main.try_empty) printf '%s\n' 0 ;;
@@ -223,6 +223,12 @@ assert_contains() {
 	needle="$2"
 	printf '%s\n' "$haystack" | grep -F -q "$needle" || fail "missing: $needle"
 }
+
+printf '%s\n' 'TEST connectivity URL rejects non-HTTP schemes'
+if invalid_url_output="$(TEST_CONFIG_URL=file:///etc/passwd sh "$SCRIPT" status 2>&1)"; then
+	fail 'file URL was accepted as a connectivity test endpoint'
+fi
+assert_contains "$invalid_url_output" 'test_url must be an http(s) URL'
 
 printf '%s\n' 'TEST detect is read-only and finds the specific candidate'
 before="$(cat "$STATE/apn")"

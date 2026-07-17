@@ -251,6 +251,7 @@ validate_config() {
 	case "$REGISTRATION_WAIT_SECONDS" in ''|*[!0-9]*) die "registration_wait_seconds must be numeric" ;; esac
 	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
 	case "$USE_MWAN3" in auto|always|never) : ;; *) die "use_mwan3 must be auto, always or never" ;; esac
+	case "$TEST_URL" in http://*|https://*) : ;; *) die "test_url must be an http(s) URL" ;; esac
 	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
 	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
 	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
@@ -1092,7 +1093,7 @@ build_apply_candidates() {
 	elif [ -n "$cache" ]; then
 		add_candidate "$cache" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
 	fi
-	while IFS="$(printf '\t')" read -r score priority apn provider username password auth ip_type; do
+	while IFS="$(printf '\t')" read -r _ priority apn provider username password auth ip_type; do
 		[ -n "$apn" ] && add_candidate "$apn" "$provider" "$username" "$password" "$auth" "$ip_type"
 	done <"$CANDIDATES"
 	[ "$TRY_EMPTY" = "1" ] && add_candidate "" "empty APN fallback" - - - -

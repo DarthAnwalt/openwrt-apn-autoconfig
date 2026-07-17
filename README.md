@@ -179,8 +179,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.16-r1.apk \
-  ./apn-autoconfig-0.8.1-r1.apk \
-  ./luci-app-apn-autoconfig-0.3.0-r1.apk
+  ./apn-autoconfig-0.8.2-r1.apk \
+  ./luci-app-apn-autoconfig-0.3.1-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -226,6 +226,9 @@ three-state control for OpenWrt's existing roaming policy: default, explicitly
 allow, or explicitly block. Version 0.3.0 also shows the active provider
 database version, format, source revisions and path. It does not perform
 network update checks; signed feed support is planned separately.
+
+Version 0.3.1 corrects the initial policy selection and keeps its Apply button
+disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
 a background job; it does not remain open for the full modem reset. The page

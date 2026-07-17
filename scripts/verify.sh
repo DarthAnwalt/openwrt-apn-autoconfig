@@ -48,6 +48,19 @@ if find "$ROOT" -path "$ROOT/.git" -prune -o -type f \
 	exit 1
 fi
 database_version="$(sed -n '1p' "$ROOT/apn-autoconfig-providers/VERSION")"
+core_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile")"
+luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
+[ -n "$core_version" ]
+[ -n "$luci_version" ]
+grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
+	"$ROOT/CHANGELOG.md"
+grep -F -q "./apn-autoconfig-$core_version-r1.apk" "$ROOT/README.md"
+grep -F -q "./luci-app-apn-autoconfig-$luci_version-r1.apk" "$ROOT/README.md"
+if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
+	printf 'Release tag %s does not match core package version %s.\n' \
+		"$EXPECTED_RELEASE_TAG" "$core_version" >&2
+	exit 1
+fi
 grep -F -q "# database-version: $database_version" \
 	"$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["database_version"] == sys.argv[2]' \
@@ -59,6 +72,10 @@ if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
 fi
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
+	node "$ROOT/tests/test-luci-roaming-policy.js"
+elif [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
+	printf '%s\n' 'Node.js is required for LuCI verification in CI and release builds.' >&2
+	exit 1
 fi
 grep -F -q "form.Flag, 'autostart'" \
 	"$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"

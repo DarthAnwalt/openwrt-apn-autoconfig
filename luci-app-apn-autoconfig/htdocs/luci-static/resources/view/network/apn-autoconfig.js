@@ -142,12 +142,16 @@ return view.extend({
 			this.reconcileButton.disabled = this.busy;
 		if (this.resetButton)
 			this.resetButton.disabled = this.busy;
-		if (this.policyButton)
-			this.policyButton.disabled = this.busy || !this.policySupported;
-		if (this.policySelect)
-			this.policySelect.disabled = this.busy || !this.policySupported;
+		this.updatePolicyControls();
 		if (this.actionStatus)
 			dom.content(this.actionStatus, [ this.actionDescription(action) ]);
+	},
+
+	updatePolicyControls: function() {
+		if (this.policyButton)
+			this.policyButton.disabled = this.busy || !this.policySupported || !this.policyDirty;
+		if (this.policySelect)
+			this.policySelect.disabled = this.busy || !this.policySupported;
 	},
 
 	refreshStatus: function() {
@@ -160,8 +164,10 @@ return view.extend({
 				return call(queryCommand, [ 'status' ]).then(function(status) {
 					dom.content(self.statusBox, self.statusNodes(status));
 					self.policySupported = status.version === 'v2';
-					if (self.policySelect)
+					if (self.policySelect) {
 						self.policySelect.value = policyValue(status);
+						self.policyDirty = false;
+					}
 					self.setBusy(action.busy, action);
 				});
 		}).catch(function(error) {
@@ -173,6 +179,9 @@ return view.extend({
 
 	confirmRoamingPolicy: function() {
 		var self = this;
+		if (self.busy || !self.policySupported || !self.policyDirty)
+			return;
+
 		var value = self.policySelect.value;
 		var labels = {
 			'default': _('Use the OpenWrt default (allowed)'),
@@ -207,6 +216,12 @@ return view.extend({
 			if (result.accepted && !result.busy)
 				return call(queryCommand, [ 'status' ]).then(function(status) {
 					dom.content(self.statusBox, self.statusNodes(status));
+					self.policySupported = status.version === 'v2';
+					if (self.policySelect) {
+						self.policySelect.value = policyValue(status);
+						self.policyDirty = false;
+					}
+					self.setBusy(false, result);
 				});
 		}).catch(function(error) {
 			/* The launch response may have been lost after the job was accepted.
@@ -247,6 +262,7 @@ return view.extend({
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Settings'));
 		var o;
 		self.policySupported = status && status.version === 'v2';
+		self.policyDirty = false;
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -323,11 +339,21 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
 		}, [ _('Power-cycle modem and re-read SIM') ]);
-		self.policySelect = E('select', { 'class': 'cbi-input-select' }, [
-			E('option', { 'value': 'default', 'selected': policyValue(status) === 'default' }, [ _('OpenWrt default (allowed)') ]),
-			E('option', { 'value': 'allow', 'selected': policyValue(status) === 'allow' }, [ _('Explicitly allow') ]),
-			E('option', { 'value': 'block', 'selected': policyValue(status) === 'block' }, [ _('Explicitly block') ])
+		self.policySelect = E('select', {
+			'class': 'cbi-input-select',
+			'change': function() {
+				self.policyDirty = true;
+				self.updatePolicyControls();
+			}
+		}, [
+			E('option', { 'value': 'default' }, [ _('OpenWrt default (allowed)') ]),
+			E('option', { 'value': 'allow' }, [ _('Explicitly allow') ]),
+			E('option', { 'value': 'block' }, [ _('Explicitly block') ])
 		]);
+		/* LuCI's E()/dom.attr() serializes false as selected="false". HTML
+		 * boolean attributes are true whenever present, so assigning the value
+		 * after construction is required to avoid selecting the last option. */
+		self.policySelect.value = policyValue(status);
 		self.policyButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',

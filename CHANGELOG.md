@@ -1,5 +1,16 @@
 # Changelog
 
+## apn-autoconfig 0.8.2 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.1
+
+- Correct the initial LuCI roaming-policy selection so the browser cannot
+  display `Explicitly block` while OpenWrt is using its default allowed policy.
+- Keep the policy Apply button disabled until the user deliberately changes
+  the selection, preventing a misleading initial value from being committed.
+- Add a browser-semantics regression test for all three roaming-policy states
+  before LuCI's first background status refresh.
+- Reject release tags that do not match the core package version, and verify
+  current package versions against the changelog and installation example.
+
 ## apn-autoconfig 0.8.1 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.0
 
 - Restrict the configured connectivity-test endpoint to HTTP or HTTPS URLs.

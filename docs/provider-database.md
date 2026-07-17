@@ -77,6 +77,17 @@ and runtime TSV.
 If any source, validation or test step fails, the repository is unchanged and
 the workflow is visibly failed.
 
+## Supply-chain trust
+
+MBPI and AOSP are trusted data sources within the automated validation limits.
+The anomaly checks detect malformed input, reduced coverage and unusually large
+growth, but cannot prove that every syntactically valid APN profile is correct.
+A subtle upstream change that remains within those limits can therefore be
+included in an automatically generated and signed provider package. The pinned
+source revisions committed in `data/provider-sources.json` are the audit trail
+for each update. Package signatures authenticate what this project published;
+they do not independently attest to the correctness of every upstream row.
+
 The generator validates MCC/MNC values, APNs, selectors, field delimiters,
 authentication modes and IP-family values. Output contains no generation
 timestamp and is reproducible for identical inputs and database version.

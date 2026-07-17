@@ -45,6 +45,9 @@ GNOME provider database is dedicated to the public domain; see `LICENSE` and
   `wwan`.
 - Before the first `apply`, the original profile state is stored persistently in
   `/etc/apn-autoconfig/baseline.tsv`.
+- Baseline, active-profile and ICCID-cache files may contain APN usernames and
+  passwords in cleartext. This is intentional, matches OpenWrt's `network` UCI
+  storage, and is restricted to root by the process-wide `umask 077`.
 - `reset` restores that pre-test profile state and removes generated cache.
 - `apk del apn-autoconfig` runs `reset` before deleting any files. If reset
   fails, package removal is aborted and the program remains available for
@@ -162,7 +165,7 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.16-r1.apk \
-  ./apn-autoconfig-0.8.0-r1.apk \
+  ./apn-autoconfig-0.8.1-r1.apk \
   ./luci-app-apn-autoconfig-0.3.0-r1.apk
 ```
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## apn-autoconfig 0.8.1 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.0
+
+- Restrict the configured connectivity-test endpoint to HTTP or HTTPS URLs.
+- Document the automated provider-update trust boundary and intentional
+  root-only cleartext storage of APN profile credentials.
+- Pin every GitHub-maintained workflow action to an immutable commit while
+  retaining the corresponding release line in comments.
+- Remove an unused candidate-score read variable.
+
 ## apn-autoconfig 0.8.0 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.0
 
 - Split the generated provider database into the independently versioned

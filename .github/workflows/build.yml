@@ -26,6 +26,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Install build prerequisites
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: POSIX shell tests
@@ -53,6 +55,24 @@ jobs:
         with:
           name: apn-autoconfig-openwrt-25.12.5
           path: release-assets
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_tag }}
+        run: |
+          case "$RELEASE_TAG" in
+            v[0-9]*) ;;
+            *) echo "Release tag must start with v followed by a digit." >&2; exit 1 ;;
+          esac
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "GitHub Release $RELEASE_TAG already exists."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --generate-notes
+          fi
       - name: Attach APK and checksum to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -78,6 +98,8 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
       - name: Install repository prerequisites
         run: sudo apt-get update && sudo apt-get install -y zstd
       - name: Download verified packages

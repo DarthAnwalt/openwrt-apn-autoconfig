@@ -142,6 +142,20 @@ apk update
 apk upgrade apn-autoconfig-providers
 ```
 
+Packages originally installed from local `.apk` files may have checksum-bound
+entries in `/etc/apk/world`. In that one-time migration case, `apk` can list a
+newer signed-feed package as upgradable while a normal `apk upgrade` makes no
+change. After adding the signed repository and running `apk update`, replace
+those local-file constraints with normal package names, then upgrade:
+
+```sh
+apk add apn-autoconfig apn-autoconfig-providers luci-app-apn-autoconfig
+apk upgrade apn-autoconfig apn-autoconfig-providers luci-app-apn-autoconfig
+```
+
+The first command only normalizes the world constraints when the same versions
+are already installed. Subsequent upgrades use the normal `apk upgrade` command.
+
 The feed is generated with the official OpenWrt 25.12 SDK APK v3 tool. Its
 signed `packages.adb`, package payloads, JSON inspection output, checksums and
 public key are published by the release workflow through GitHub Pages. The

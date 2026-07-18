@@ -16,14 +16,15 @@ KEYS_DIR="${APN_DATABASE_KEYS_DIR:-/etc/apk/keys}"
 FEED_URL="${APN_DATABASE_FEED_URL:-https://darthanwalt.github.io/openwrt-apn-autoconfig/25.12/noarch/packages.adb}"
 KEY_SHA256="${APN_DATABASE_KEY_SHA256:-0d4d6d383c84205c8fa16fafdf341ff80de24c63574a1d7d938cfb532fa458d3}"
 APK="${APN_DATABASE_APK:-apk}"
-TMP_BASE="${APN_DATABASE_TMP_BASE:-/tmp/apn-autoconfig-database.$$}"
-REPO_FILE="$TMP_BASE/repositories"
-CACHE_DIR="$TMP_BASE/cache"
-DOWNLOAD_DIR="$TMP_BASE/download"
-EXTRACT_DIR="$TMP_BASE/extract"
-APK_STDOUT="$TMP_BASE/apk.stdout"
-APK_STDERR="$TMP_BASE/apk.stderr"
+TMP_BASE="${APN_DATABASE_TMP_BASE:-}"
+REPO_FILE=""
+CACHE_DIR=""
+DOWNLOAD_DIR=""
+EXTRACT_DIR=""
+APK_STDOUT=""
+APK_STDERR=""
 LOCK_HELD=0
+WORKSPACE_CREATED=0
 
 STATE="never"
 CHECKED_AT=""
@@ -48,12 +49,31 @@ log() {
 }
 
 cleanup() {
-	rm -rf "$TMP_BASE"
+	[ "$WORKSPACE_CREATED" -eq 0 ] || rm -rf "$TMP_BASE"
 	if [ "$LOCK_HELD" -eq 1 ]; then
 		rm -f "$LOCK_DIR/pid"
 		rmdir "$LOCK_DIR" 2>/dev/null || :
 		LOCK_HELD=0
 	fi
+}
+
+prepare_workspace() {
+	if [ -n "$TMP_BASE" ]; then
+		# An explicit path is used by the isolated test suite. Refuse to reuse
+		# anything already present so a symlink or stale directory cannot be
+		# followed by this root process.
+		[ ! -e "$TMP_BASE" ] && [ ! -L "$TMP_BASE" ] || return 1
+		mkdir -m 0700 "$TMP_BASE" || return 1
+	else
+		TMP_BASE="$(mktemp -d /tmp/apn-autoconfig-database.XXXXXX)" || return 1
+	fi
+	WORKSPACE_CREATED=1
+	REPO_FILE="$TMP_BASE/repositories"
+	CACHE_DIR="$TMP_BASE/cache"
+	DOWNLOAD_DIR="$TMP_BASE/download"
+	EXTRACT_DIR="$TMP_BASE/extract"
+	APK_STDOUT="$TMP_BASE/apk.stdout"
+	APK_STDERR="$TMP_BASE/apk.stderr"
 }
 
 trap cleanup 0 HUP INT TERM
@@ -272,6 +292,7 @@ prepare_repository() {
 	feed_is_configured || return 4
 	key_is_trusted || return 5
 	command -v "$APK" >/dev/null 2>&1 || return 127
+	prepare_workspace || return 1
 	mkdir -p "$CACHE_DIR" "$DOWNLOAD_DIR" "$EXTRACT_DIR" || return 1
 	printf '%s\n' "$FEED_URL" >"$REPO_FILE" || return 1
 	"$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \

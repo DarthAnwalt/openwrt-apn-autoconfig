@@ -195,4 +195,16 @@ if sh "$SCRIPT" check >/dev/null 2>&1; then fail 'check ran without the trusted 
 key_json="$(sh "$SCRIPT" status-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "check-failed"; assert d["key_trusted"] is False; assert "key" in d["message"].lower()' "$key_json" || fail 'missing key was not explained'
 
+printf '%s\n' 'TEST pre-existing temporary workspace is rejected'
+mv "$KEYS/apn-autoconfig.pem.disabled" "$KEYS/apn-autoconfig.pem"
+APN_DATABASE_KEY_SHA256="$KEY_SHA256"
+export APN_DATABASE_KEY_SHA256
+mkdir -p "$TMP/work"
+printf '%s\n' sentinel >"$TMP/work/sentinel"
+if sh "$SCRIPT" check >/dev/null 2>&1; then
+	fail 'pre-existing temporary workspace was reused'
+fi
+[ ! -e "$TMP/work/cache" ] || fail 'files were created inside the pre-existing workspace'
+[ "$(cat "$TMP/work/sentinel")" = sentinel ] || fail 'pre-existing workspace was modified or removed'
+
 printf '%s\n' 'Database updater tests passed.'

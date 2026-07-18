@@ -11,10 +11,14 @@ XML files are deliberately not installed on the router.
 - AOSP `device/sample/etc/apns-full-conf.xml` supplements MBPI with additional
   MCC/MNC coverage and MVNO selectors. It is licensed under Apache-2.0.
 - `data/providers-overrides.tsv` contains manually verified corrections and
-  receives the highest priority.
+  receives the highest priority. Its evidence log is
+  `docs/provider-overrides.md`.
 
 Exact upstream revisions are pinned in `data/provider-sources.json`. Normal
 OpenWrt package builds and router runtime therefore never fetch network data.
+The generator records the transformation notice and AOSP copyright in the TSV;
+the provider APK includes the complete Apache-2.0 and CC-PDDC texts and a
+third-party NOTICE.
 
 ## Runtime format
 
@@ -40,7 +44,7 @@ AOSP entries and test-network MCC 001 are excluded as well.
 The comment header contains machine-readable metadata:
 
 ```text
-# database-version: 2026.07.16
+# database-version: 2026.07.18
 # database-format: 2
 # sources: mbpi, aosp, local overrides
 # revisions: mbpi@..., aosp@...
@@ -53,7 +57,7 @@ network operation.
 
 ## Manual update through LuCI
 
-LuCI 0.4.0 can check and install this package independently from the core. The
+LuCI 0.4.1 can check and install this package independently from the core. The
 updater requires the project feed to be present in APK's repository
 configuration and the pinned project public key to exist in APK's trusted key
 directory. It never downloads a raw TSV, and the actual APK transaction never
@@ -122,3 +126,7 @@ During an update, profiles that disappeared upstream are retained with a lower
 priority. A router therefore tries new data first but can still recover through
 the last known profile. Repeatedly absent profiles are progressively demoted
 and capped at priority 900000 instead of being silently deleted.
+Whenever at least one such fallback remains, the generator carries forward the
+previous database's revision list into the new TSV header. The installed file
+therefore retains an audit trail for historical source revisions still capable
+of contributing rows, rather than reporting only the newest upstream commits.

@@ -305,6 +305,17 @@ def import_previous(path: Path, generator: Generator) -> None:
             generator.count("previous_retained")
 
 
+def previous_source_revisions(path: Path) -> list[str]:
+    with path.open(encoding="utf-8") as source:
+        for raw_line in source:
+            if raw_line.startswith("# revisions:"):
+                value = raw_line.split(":", 1)[1].strip()
+                return [item.strip() for item in value.split(",") if item.strip()]
+            if not raw_line.startswith("#"):
+                break
+    return []
+
+
 def load_manifest(path: Path) -> dict:
     with path.open(encoding="utf-8") as source:
         manifest = json.load(source)
@@ -320,6 +331,7 @@ def write_database(
     database_version: str,
     include_aosp: bool,
     include_previous: bool,
+    previous_revisions: list[str],
 ) -> None:
     source_names = ["mbpi"] + (["aosp"] if include_aosp else [])
     if include_previous:
@@ -330,6 +342,9 @@ def write_database(
     ]
     if include_aosp:
         source_revisions.append(f"aosp@{manifest['sources']['aosp']['revision']}")
+    if include_previous:
+        source_revisions.extend(previous_revisions)
+    source_revisions = list(dict.fromkeys(source_revisions))
     rows = sorted(
         generator.rows.values(),
         key=lambda row: (
@@ -346,6 +361,11 @@ def write_database(
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="\n") as output:
         output.write("# apn-autoconfig generated provider database v2\n")
+        output.write("# Contains modified data derived from AOSP and GNOME MBPI.\n")
+        output.write("# AOSP portion: Copyright 2006, The Android Open Source Project; Apache-2.0.\n")
+        output.write("# MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).\n")
+        output.write("# Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.\n")
+        output.write("# License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/\n")
         output.write(f"# database-version: {database_version}\n")
         output.write("# database-format: 2\n")
         output.write(f"# sources: {', '.join(source_names)}\n")
@@ -417,7 +437,9 @@ def main() -> int:
     if args.aosp:
         import_aosp(args.aosp, generator)
     import_overrides(args.overrides, generator)
+    previous_revisions: list[str] = []
     if args.previous:
+        previous_revisions = previous_source_revisions(args.previous)
         import_previous(args.previous, generator)
     retained_previous = generator.stats.get("previous_retained", 0) > 0
     write_database(
@@ -427,6 +449,7 @@ def main() -> int:
         database_version,
         args.aosp is not None,
         retained_previous,
+        previous_revisions,
     )
     if args.report:
         write_report(args.report, generator, manifest, database_version, args.aosp is not None)

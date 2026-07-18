@@ -1,0 +1,27 @@
+apn-autoconfig provider database — third-party notices
+
+This product contains filtered, normalized, deduplicated and reformatted data
+derived from device/sample/etc/apns-full-conf.xml from the Android Open Source
+Project.
+
+Copyright 2006, The Android Open Source Project
+
+The AOSP-derived portion is licensed under the Apache License, Version 2.0.
+The complete license is distributed as Apache-2.0.txt next to this NOTICE.
+The exact source revision is recorded in the header of providers.tsv.
+
+This product also contains transformed data derived from GNOME
+mobile-broadband-provider-info/serviceproviders.xml. That source identifies
+Antti Kaijanmaki, Dan Williams and other contributors and carries the Creative
+Commons Public Domain Dedication and Certification (CC-PDDC). The complete
+dedication is distributed as MBPI-CC-PDDC.txt next to this NOTICE. The exact
+source revision is recorded in the header of providers.tsv.
+
+The resulting database was changed by apn-autoconfig contributors: source
+records were selected, filtered, normalized, deduplicated, merged with local
+overrides, assigned priorities and converted from XML to TSV.
+
+Android is a trademark of Google LLC. GNOME is a registered trademark of the
+GNOME Foundation. All mobile operator names and marks belong to their
+respective owners. Their use identifies data sources or network providers and
+does not imply affiliation, sponsorship or endorsement.

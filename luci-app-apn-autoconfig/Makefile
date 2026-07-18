@@ -1,9 +1,10 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-apn-autoconfig
-PKG_VERSION:=0.4.0
+PKG_VERSION:=0.4.1
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
+PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=DarthAnwalt
 
 include $(INCLUDE_DIR)/package.mk
@@ -25,6 +26,9 @@ define Build/Compile
 endef
 
 define Package/luci-app-apn-autoconfig/install
+	$(INSTALL_DIR) $(1)/usr/share/licenses/luci-app-apn-autoconfig
+	$(INSTALL_DATA) ./LICENSE \
+		$(1)/usr/share/licenses/luci-app-apn-autoconfig/LICENSE
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view/network
 	$(INSTALL_DATA) ./htdocs/luci-static/resources/view/network/apn-autoconfig.js \
 		$(1)/www/luci-static/resources/view/network/apn-autoconfig.js

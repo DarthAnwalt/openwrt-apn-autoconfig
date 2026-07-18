@@ -1,5 +1,11 @@
 # Changelog
 
+## apn-autoconfig 0.8.6 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.4.1
+
+- Licensing-only release: include the required MIT, Apache-2.0 and CC-PDDC
+  notices in APKs and clarify third-party attribution and provenance.
+- No runtime functional changes or bug fixes.
+
 ## apn-autoconfig 0.8.5 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.4.0
 
 - Add manual provider-database update checks and installations through LuCI,

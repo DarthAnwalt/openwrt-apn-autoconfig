@@ -27,13 +27,22 @@ python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __
 	"$ROOT/scripts/refresh-provider-sources.py"
 python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
 	"$ROOT/scripts/check-provider-update.py"
+python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
+	"$ROOT/scripts/verify-provider-source-licenses.py"
 
 python3 -m json.tool "$ROOT/luci-app-apn-autoconfig/root/usr/share/luci/menu.d/luci-app-apn-autoconfig.json" >/dev/null
 python3 -m json.tool "$ROOT/luci-app-apn-autoconfig/root/usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json" >/dev/null
 python3 -m json.tool "$ROOT/data/provider-sources.json" >/dev/null
 python3 -m json.tool "$ROOT/data/providers-report.json" >/dev/null
 [ -f "$ROOT/data/licenses/Apache-2.0.txt" ]
-[ -f "$ROOT/data/licenses/MBPI-CC-PD.txt" ]
+[ -f "$ROOT/data/licenses/MBPI-CC-PDDC.txt" ]
+[ -f "$ROOT/apn-autoconfig-providers/NOTICE" ]
+[ -f "$ROOT/luci-app-apn-autoconfig/LICENSE" ]
+cmp "$ROOT/LICENSE" "$ROOT/luci-app-apn-autoconfig/LICENSE"
+grep -F -q 'PKG_LICENSE:=Apache-2.0 AND CC-PDDC' "$ROOT/apn-autoconfig-providers/Makefile"
+grep -F -q 'Copyright 2006, The Android Open Source Project' "$ROOT/apn-autoconfig-providers/NOTICE"
+grep -F -q 'Copyright 2006, The Android Open Source Project' \
+	"$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
 [ -f "$ROOT/apn-autoconfig-providers/Makefile" ]
 [ -f "$ROOT/apn-autoconfig-providers/VERSION" ]
 [ -f "$ROOT/repository/public-key.pem" ]

@@ -198,6 +198,9 @@ async function verifyLayout() {
 	assert.ok(nodes.some(function(node) {
 		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('cbi-progressbar') !== -1;
 	}), 'signal quality must use the native LuCI progress bar');
+	assert.ok(!nodes.some(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-signal-value') !== -1;
+	}), 'signal percentage must not be duplicated beside LuCI\'s native progress label');
 	assert.ok(nodes.some(function(node) {
 		return node.tag === 'strong' && node.children.join('') === 'Signal quality';
 	}), 'status row labels must be bold');

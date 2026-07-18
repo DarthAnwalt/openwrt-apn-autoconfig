@@ -67,11 +67,8 @@ function signalQuality(value) {
 	if (isNaN(percent))
 		return text(value);
 	percent = Math.max(0, Math.min(100, percent));
-	return E('div', { 'class': 'apn-signal' }, [
-		E('div', { 'class': 'cbi-progressbar', 'title': '%s%%'.format(percent) }, [
-			E('div', { 'style': 'width:%s%%'.format(percent) })
-		]),
-		E('span', { 'class': 'apn-signal-value' }, [ '%s%%'.format(percent) ])
+	return E('div', { 'class': 'cbi-progressbar', 'title': '%s%%'.format(percent) }, [
+		E('div', { 'style': 'width:%s%%'.format(percent) })
 	]);
 }
 
@@ -553,8 +550,6 @@ return view.extend({
 					'.apn-autoconfig-page .apn-label strong{font-weight:600}' +
 					'.apn-autoconfig-page .apn-details{margin-top:.75rem}' +
 					'.apn-autoconfig-page .apn-details summary{cursor:pointer;font-weight:600;padding:.35rem 0}' +
-					'.apn-autoconfig-page .apn-signal{display:grid;grid-template-columns:minmax(8rem,1fr) auto;align-items:center;gap:.65rem}' +
-					'.apn-autoconfig-page .apn-signal-value{font-weight:600;min-width:3.2em;text-align:right}' +
 					'.apn-autoconfig-page .apn-button-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-policy-controls{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-state-good{color:#2d8a43;font-weight:600}' +

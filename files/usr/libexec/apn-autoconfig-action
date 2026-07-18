@@ -7,9 +7,10 @@ ACTION="${1:-}"
 STATE_DIR="${2:-}"
 STARTED="${3:-}"
 COMMAND="${APN_AUTOCONFIG_ACTION_COMMAND:-/usr/sbin/apn-autoconfig}"
+DATABASE_COMMAND="${APN_AUTOCONFIG_DATABASE_COMMAND:-/usr/libexec/apn-autoconfig-database}"
 STATE_FILE="$STATE_DIR/state.tsv"
 
-case "$ACTION" in reconcile|modem-reset|roaming-default|roaming-allow|roaming-block) : ;; *) exit 2 ;; esac
+case "$ACTION" in reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;; *) exit 2 ;; esac
 case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
 timestamp() {
 	date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
@@ -39,7 +40,11 @@ on_signal() {
 
 trap on_signal HUP INT TERM
 
-[ -x "$COMMAND" ] || {
+case "$ACTION" in
+	database-*) executable="$DATABASE_COMMAND" ;;
+	*) executable="$COMMAND" ;;
+esac
+[ -x "$executable" ] || {
 	write_state failed 127 "action command is not executable"
 	exit 127
 }
@@ -50,6 +55,8 @@ case "$ACTION" in
 	roaming-default) "$COMMAND" roaming-policy-set default ;;
 	roaming-allow) "$COMMAND" roaming-policy-set allow ;;
 	roaming-block) "$COMMAND" roaming-policy-set block ;;
+	database-check) "$DATABASE_COMMAND" check ;;
+	database-install) "$DATABASE_COMMAND" install ;;
 	*) "$COMMAND" "$ACTION" ;;
 esac
 status=$?
@@ -60,7 +67,11 @@ elif [ "$status" -eq 2 ]; then
 	write_state blocked 2 "operation was intentionally blocked by the roaming policy"
 	logger -t "$PROG" -p user.notice -- "background operation blocked by policy: $ACTION" 2>/dev/null || :
 elif [ "$status" -eq 3 ]; then
-	write_state retryable 3 "mobile registration or SIM state is temporarily unavailable"
+	case "$ACTION" in
+		database-*) message="another APN or database operation is running" ;;
+		*) message="mobile registration or SIM state is temporarily unavailable" ;;
+	esac
+	write_state retryable 3 "$message"
 	logger -t "$PROG" -p user.warning -- "background operation may be retried: $ACTION" 2>/dev/null || :
 else
 	write_state failed "$status" "operation failed; inspect apn-autoconfig logs"

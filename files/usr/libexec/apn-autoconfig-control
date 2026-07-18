@@ -5,7 +5,7 @@
 COMMAND="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 
 case "${1:-}" in
-	reconcile|modem-reset|roaming-default|roaming-allow|roaming-block)
+	reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install)
 		exec "$COMMAND" action-start "$1"
 	;;
 	*) exit 2 ;;

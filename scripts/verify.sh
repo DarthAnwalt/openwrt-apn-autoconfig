@@ -8,9 +8,11 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-boot"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-action"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-query"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-control"
+sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
 sh -n "$ROOT/tests/run-tests.sh"
+sh -n "$ROOT/tests/test-database-update.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/build-repository.sh"
 sh -n "$ROOT/scripts/openwrt-sdk-config.sh"
@@ -105,5 +107,6 @@ awk -F '\t' '
 ' "$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
 
 sh "$ROOT/tests/test-provider-generator.sh"
+sh "$ROOT/tests/test-database-update.sh"
 sh "$ROOT/tests/run-tests.sh"
 printf '%s\n' 'Static and behavioral verification passed.'

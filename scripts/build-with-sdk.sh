@@ -119,12 +119,13 @@ inspect_package() {
 	done
 }
 
-inspect_package "$1" apn-autoconfig 11 \
+inspect_package "$1" apn-autoconfig 12 \
 	usr/sbin/apn-autoconfig \
 	usr/libexec/apn-autoconfig-boot \
 	usr/libexec/apn-autoconfig-action \
 	usr/libexec/apn-autoconfig-query \
 	usr/libexec/apn-autoconfig-control \
+	usr/libexec/apn-autoconfig-database \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
 	etc/hotplug.d/button/50-apn-autoconfig \
@@ -147,6 +148,7 @@ for executable in \
 	usr/libexec/apn-autoconfig-action \
 	usr/libexec/apn-autoconfig-query \
 	usr/libexec/apn-autoconfig-control \
+	usr/libexec/apn-autoconfig-database \
 	etc/init.d/apn-autoconfig \
 	etc/hotplug.d/button/50-apn-autoconfig
 do

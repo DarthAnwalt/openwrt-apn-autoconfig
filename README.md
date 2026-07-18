@@ -179,8 +179,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.16-r1.apk \
-  ./apn-autoconfig-0.8.2-r1.apk \
-  ./luci-app-apn-autoconfig-0.3.1-r1.apk
+  ./apn-autoconfig-0.8.5-r1.apk \
+  ./luci-app-apn-autoconfig-0.4.0-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -197,6 +197,7 @@ The core package owns:
 /usr/libexec/apn-autoconfig-action
 /usr/libexec/apn-autoconfig-query
 /usr/libexec/apn-autoconfig-control
+/usr/libexec/apn-autoconfig-database
 /etc/config/apn-autoconfig
 /etc/init.d/apn-autoconfig
 /etc/hotplug.d/button/50-apn-autoconfig
@@ -221,13 +222,22 @@ The web interface provides two APN/modem actions:
 - **Re-detect and verify APN** runs `reconcile`;
 - **Power-cycle modem and re-read SIM** runs `modem-reset`.
 
-It also shows home and serving networks, registration and roaming state, and a
-three-state control for OpenWrt's existing roaming policy: default, explicitly
-allow, or explicitly block. Version 0.3.0 also shows the active provider
-database version, format, source revisions and path. It does not perform
-network update checks; signed feed support is planned separately.
+It groups mobile registration and signal, the current APN, provider-database
+state, roaming policy and actions into separate responsive sections. Technical
+SIM identifiers and database source revisions remain available in collapsible
+details. Signal quality uses LuCI's native progress visualization and keeps the
+numeric percentage visible.
 
-Version 0.3.1 corrects the initial policy selection and keeps its Apply button
+The provider-database section shows the installed package and data versions,
+data release date, last check, available version, configured feed and trusted
+key. **Check for updates** refreshes only the configured project repository.
+When a newer database exists, **Install update** confirms and upgrades only
+`apn-autoconfig-providers`; it does not upgrade the core or LuCI, change the
+active APN, or restart the mobile interface. The candidate package is fetched
+through APK's signed index and its TSV metadata and rows are validated before
+installation.
+
+Version 0.4.0 retains the 0.3.1 policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
@@ -236,7 +246,9 @@ polls the machine API and disables both buttons for the entire operation. The
 same busy indicator also covers a command started through SSH or the physical
 button, so entry points cannot overlap. The packaged button handler submits its
 reset through the same background job API, allowing LuCI to show the exact
-action and its final success or failure.
+action and its final success or failure. Database checks and installations use
+the same dispatcher and lock, so the provider file cannot be replaced while an
+APN operation is reading it.
 
 Runtime job state is deliberately volatile and stored by default in:
 
@@ -248,6 +260,15 @@ It records `starting`, `running`, `success`, `blocked`, `retryable` or `failed`;
 secrets beyond the action name and process/timing information. The normal APN
 operation lock remains authoritative.
 
+The most recent database check and installation result survives reboot in:
+
+```text
+/etc/apn-autoconfig/database-update.tsv
+```
+
+It contains package versions, timestamps and a sanitized result message, but no
+SIM identifiers, APNs or credentials.
+
 Machine-readable commands used by LuCI are also available for diagnostics:
 
 ```sh
@@ -255,6 +276,8 @@ apn-autoconfig status-json
 apn-autoconfig detect-json
 apn-autoconfig action-start reconcile
 apn-autoconfig action-start modem-reset
+apn-autoconfig action-start database-check
+apn-autoconfig action-start database-install
 apn-autoconfig action-status
 ```
 
@@ -427,6 +450,7 @@ config apn_autoconfig 'main'
         option sim_index 'auto'
         option device 'wwan0'
         option database '/usr/share/apn-autoconfig/providers.tsv'
+        option database_feed 'https://darthanwalt.github.io/openwrt-apn-autoconfig/25.12/noarch/packages.adb'
         option cache_dir '/etc/apn-autoconfig/cache'
         option state_dir '/etc/apn-autoconfig'
         option test_url 'https://connectivitycheck.gstatic.com/generate_204'

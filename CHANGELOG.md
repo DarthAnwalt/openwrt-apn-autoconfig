@@ -14,6 +14,8 @@
   so future adapters do not need to alter the APN matcher.
 - Replaced the fixed connectivity device assumption with netifd's current
   `l3_device`, retaining `option device` only as a validated fallback.
+- Successful idempotent reconciliation now replaces a stale failure result
+  after real connectivity has been re-verified.
 - Namespaced rollback and active-profile state per target, migrated 0.8.x
   state under the operation lock and added `reset-all` for safe package removal
   after more than one target has been used.

@@ -367,6 +367,7 @@ printf '%s\n' 'TEST reconcile is idempotent for an already verified SIM and APN'
 : >"$STATE/events"
 sh "$SCRIPT" reconcile
 [ ! -s "$STATE/events" ] || fail 'idempotent reconcile restarted the interface'
+[ "$(cat "$CACHE/last-result-code")" = success ] || fail 'idempotent connectivity verification left a stale failure result'
 
 printf '%s\n' 'TEST reconcile restores the cached APN when configuration differs'
 printf '%s\n' 'wrong.apn' >"$STATE/apn"

@@ -1694,6 +1694,7 @@ reconcile_cmd() {
 	   configured_profile_matches_active && \
 	   interface_is_up && \
 	   test_connectivity "$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"; then
+		write_last_result success "success: ${configured_apn:-<empty>} (reconciled connectivity verified)"
 		log notice "SIM $ICCID is already reconciled with APN '${configured_apn:-<empty>}'; no changes"
 		return 0
 	fi

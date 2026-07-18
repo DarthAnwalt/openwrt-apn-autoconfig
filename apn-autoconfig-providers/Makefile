@@ -5,7 +5,7 @@ PKG_NAME:=apn-autoconfig-providers
 PKG_VERSION:=$(strip $(shell cat '$(APN_PROVIDER_PACKAGE_DIR)VERSION'))
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 AND CC-PDDC
-PKG_LICENSE_FILES:=licenses/Apache-2.0.txt licenses/MBPI-CC-PD.txt
+PKG_LICENSE_FILES:=licenses/Apache-2.0.txt licenses/MBPI-CC-PDDC.txt
 PKG_MAINTAINER:=DarthAnwalt
 PKG_URL:=https://github.com/DarthAnwalt/openwrt-apn-autoconfig
 
@@ -31,6 +31,13 @@ define Package/apn-autoconfig-providers/install
 	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig
 	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig/providers.tsv \
 		$(1)/usr/share/apn-autoconfig/providers.tsv
+	$(INSTALL_DIR) $(1)/usr/share/licenses/apn-autoconfig-providers
+	$(INSTALL_DATA) ./licenses/Apache-2.0.txt \
+		$(1)/usr/share/licenses/apn-autoconfig-providers/Apache-2.0.txt
+	$(INSTALL_DATA) ./licenses/MBPI-CC-PDDC.txt \
+		$(1)/usr/share/licenses/apn-autoconfig-providers/MBPI-CC-PDDC.txt
+	$(INSTALL_DATA) ./NOTICE \
+		$(1)/usr/share/licenses/apn-autoconfig-providers/NOTICE
 endef
 
 $(eval $(call BuildPackage,apn-autoconfig-providers))

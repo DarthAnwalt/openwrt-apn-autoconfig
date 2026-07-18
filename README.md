@@ -26,8 +26,11 @@ files are converted at development time into a compact TSV installed on the
 router.
 
 The implementation is MIT licensed. Imported AOSP data is Apache-2.0 and the
-GNOME provider database is dedicated to the public domain; see `LICENSE` and
-`data/licenses/`.
+GNOME provider database carries the Creative Commons Public Domain Dedication
+and Certification (CC-PDDC). This is a multi-license repository: see `LICENSE`,
+`LICENSING.md`, `THIRD_PARTY_NOTICES.md` and `data/licenses/` for the exact
+scope, attribution and terms. References to upstream projects and mobile
+operators are factual and do not imply affiliation, sponsorship or endorsement.
 
 ## Safety model
 
@@ -247,9 +250,9 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 
 ```sh
 apk add --allow-untrusted \
-  ./apn-autoconfig-providers-2026.07.16-r1.apk \
-  ./apn-autoconfig-0.8.5-r1.apk \
-  ./luci-app-apn-autoconfig-0.4.0-r1.apk
+  ./apn-autoconfig-providers-2026.07.18-r1.apk \
+  ./apn-autoconfig-0.8.6-r1.apk \
+  ./luci-app-apn-autoconfig-0.4.1-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -306,7 +309,7 @@ active APN, or restart the mobile interface. The candidate package is fetched
 through APK's signed index and its TSV metadata and rows are validated before
 installation.
 
-Version 0.4.0 retains the 0.3.1 policy-selection fix: the Apply button remains
+Version 0.4.1 retains the 0.3.1 policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts

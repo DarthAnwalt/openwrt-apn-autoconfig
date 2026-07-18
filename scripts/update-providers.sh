@@ -30,6 +30,11 @@ fetch_source() {
 fetch_source mbpi
 fetch_source aosp
 
+python3 "$ROOT/scripts/verify-provider-source-licenses.py" \
+	--manifest "$MANIFEST" \
+	--mbpi "$TMP/mbpi/$(manifest_value mbpi path)" \
+	--aosp "$TMP/aosp/$(manifest_value aosp path)"
+
 set -- python3 "$ROOT/scripts/generate-providers.py" \
 	--mbpi "$TMP/mbpi/$(manifest_value mbpi path)" \
 	--aosp "$TMP/aosp/$(manifest_value aosp path)" \

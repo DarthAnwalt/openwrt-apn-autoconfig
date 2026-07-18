@@ -8,3 +8,6 @@ __pycache__/
 private-key.pem
 *.private.pem
 *.encrypted.pem
+
+# Device backups can contain unique identifiers, credentials or private state.
+router-backups/

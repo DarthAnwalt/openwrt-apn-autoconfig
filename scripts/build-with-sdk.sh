@@ -41,7 +41,7 @@ cp -R "$ROOT/Makefile" "$ROOT/LICENSE" "$ROOT/files" "$SDK_DIR/package/apn-autoc
 rm -rf "$SDK_DIR/package/apn-autoconfig-providers"
 cp -R "$ROOT/apn-autoconfig-providers" "$SDK_DIR/package/apn-autoconfig-providers"
 mkdir -p "$SDK_DIR/package/apn-autoconfig-providers/licenses"
-cp "$ROOT/data/licenses/Apache-2.0.txt" "$ROOT/data/licenses/MBPI-CC-PD.txt" \
+cp "$ROOT/data/licenses/Apache-2.0.txt" "$ROOT/data/licenses/MBPI-CC-PDDC.txt" \
 	"$SDK_DIR/package/apn-autoconfig-providers/licenses/"
 rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
 cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
@@ -119,7 +119,7 @@ inspect_package() {
 	done
 }
 
-inspect_package "$1" apn-autoconfig 12 \
+inspect_package "$1" apn-autoconfig 13 \
 	usr/sbin/apn-autoconfig \
 	usr/libexec/apn-autoconfig-boot \
 	usr/libexec/apn-autoconfig-action \
@@ -129,12 +129,16 @@ inspect_package "$1" apn-autoconfig 12 \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
 	etc/hotplug.d/button/50-apn-autoconfig \
+	usr/share/licenses/apn-autoconfig/LICENSE \
 	lib/apk/packages/apn-autoconfig.list \
 	lib/apk/packages/apn-autoconfig.conffiles \
 	lib/apk/packages/apn-autoconfig.conffiles_static
 
-inspect_package "$2" apn-autoconfig-providers 2 \
+inspect_package "$2" apn-autoconfig-providers 5 \
 	usr/share/apn-autoconfig/providers.tsv \
+	usr/share/licenses/apn-autoconfig-providers/Apache-2.0.txt \
+	usr/share/licenses/apn-autoconfig-providers/MBPI-CC-PDDC.txt \
+	usr/share/licenses/apn-autoconfig-providers/NOTICE \
 	lib/apk/packages/apn-autoconfig-providers.list
 
 grep -F -q '/etc/config/apn-autoconfig' \
@@ -158,10 +162,11 @@ do
 	}
 done
 
-inspect_package "$3" luci-app-apn-autoconfig 4 \
+inspect_package "$3" luci-app-apn-autoconfig 5 \
 	www/luci-static/resources/view/network/apn-autoconfig.js \
 	usr/share/luci/menu.d/luci-app-apn-autoconfig.json \
 	usr/share/rpcd/acl.d/luci-app-apn-autoconfig.json \
+	usr/share/licenses/luci-app-apn-autoconfig/LICENSE \
 	lib/apk/packages/luci-app-apn-autoconfig.list
 
 (cd "$OUTPUT" && sha256sum \

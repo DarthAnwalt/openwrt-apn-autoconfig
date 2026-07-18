@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.8.5
+PKG_VERSION:=0.8.6
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -34,6 +34,8 @@ define Build/Compile
 endef
 
 define Package/apn-autoconfig/install
+	$(INSTALL_DIR) $(1)/usr/share/licenses/apn-autoconfig
+	$(INSTALL_DATA) ./LICENSE $(1)/usr/share/licenses/apn-autoconfig/LICENSE
 	$(INSTALL_DIR) $(1)/usr/sbin
 	$(INSTALL_BIN) ./files/usr/sbin/apn-autoconfig $(1)/usr/sbin/apn-autoconfig
 	$(INSTALL_DIR) $(1)/etc/config

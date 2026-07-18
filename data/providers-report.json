@@ -1,7 +1,7 @@
 {
   "credential_profiles": 883,
   "database_format": 2,
-  "database_version": "2026.07.16",
+  "database_version": "2026.07.18",
   "format": 1,
   "mccmnc": 1459,
   "mvno_specific_profiles": 429,
@@ -12,7 +12,7 @@
       "revision": "73f904fbeb872f5675cb5f18cd9dfb15856425a6"
     },
     "mbpi": {
-      "license": "CC-PD",
+      "license": "CC-PDDC",
       "revision": "052f1e6999f205ba88cc3557627f260b9ae0840e"
     }
   },

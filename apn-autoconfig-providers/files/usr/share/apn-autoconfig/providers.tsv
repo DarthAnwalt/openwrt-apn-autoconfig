@@ -1,5 +1,10 @@
 # apn-autoconfig generated provider database v2
-# database-version: 2026.07.16
+# Contains modified data derived from AOSP and GNOME MBPI.
+# AOSP portion: Copyright 2006, The Android Open Source Project; Apache-2.0.
+# MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
+# Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
+# License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
+# database-version: 2026.07.18
 # database-format: 2
 # sources: mbpi, aosp, local overrides
 # revisions: mbpi@052f1e6999f205ba88cc3557627f260b9ae0840e, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6

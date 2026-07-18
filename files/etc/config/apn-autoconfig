@@ -1,5 +1,5 @@
 config apn_autoconfig 'main'
-	option interface 'wwan'
+	option interface 'auto'
 	option sim_index 'auto'
 	option device 'wwan0'
 	option database '/usr/share/apn-autoconfig/providers.tsv'

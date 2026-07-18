@@ -3,9 +3,17 @@
 # Narrow mutating entry point for rpcd/LuCI ACLs.
 
 COMMAND="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
+TARGET="${2:-}"
+[ "$#" -le 2 ] || exit 2
 
 case "${1:-}" in
 	reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install)
+		case "$1:$TARGET" in database-*:?*) exit 2 ;; esac
+		if [ -n "$TARGET" ]; then
+			case "$TARGET" in network:*) target_interface="${TARGET#network:}" ;; *) exit 2 ;; esac
+			case "$target_interface" in ''|*[!A-Za-z0-9_]*) exit 2 ;; esac
+			exec "$COMMAND" action-start "$1" --target "$TARGET"
+		fi
 		exec "$COMMAND" action-start "$1"
 	;;
 	*) exit 2 ;;

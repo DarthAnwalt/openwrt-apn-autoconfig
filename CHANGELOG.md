@@ -1,5 +1,34 @@
 # Changelog
 
+## apn-autoconfig 0.9.0 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.5.0
+
+- Added a versioned `targets-json` inventory with stable `network:<section>`
+  IDs, normalized backend names and explicit identity/profile capabilities.
+- Added automatic selection when exactly one writable cellular target exists;
+  ambiguous and unsupported targets fail with exit code 4 before UCI, network
+  or persistent-state mutation.
+- Kept ModemManager as the sole functional APN backend in 0.9.0 and exposed
+  QMI, MBIM, Fibocom and selected AT-managed protocols as inventory-only
+  targets without claiming incomplete support.
+- Routed SIM/status and profile operations through a backend dispatch boundary
+  so future adapters do not need to alter the APN matcher.
+- Replaced the fixed connectivity device assumption with netifd's current
+  `l3_device`, retaining `option device` only as a validated fallback.
+- Successful idempotent reconciliation now replaces a stale failure result
+  after real connectivity has been re-verified.
+- Namespaced rollback and active-profile state per target, migrated 0.8.x
+  state under the operation lock and added `reset-all` for safe package removal
+  after more than one target has been used.
+- Propagated the selected target through synchronous CLI calls, narrow
+  query/control wrappers and background workers; action status now reports the
+  target ID.
+- Updated LuCI to list discovered targets and their real write capability and
+  to display the selected protocol, backend and effective data device.
+- Added contract, ambiguity, path/input validation, unsupported-backend
+  isolation, dynamic-device, migration and multi-target removal tests.
+- Added `docs/roadmap.md` describing the tentative QMI, MBIM, AT and 1.0/FM350
+  sequence. Those later adapters are explicitly outside the 0.9.0 scope.
+
 ## apn-autoconfig 0.8.6 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.4.1
 
 - Licensing-only release: include the required MIT, Apache-2.0 and CC-PDDC

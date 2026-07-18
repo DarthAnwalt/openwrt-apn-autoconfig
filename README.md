@@ -102,9 +102,72 @@ profile without reapplying it.
 ## Signed package repository
 
 OpenWrt 25.12 routers can install and upgrade all three packages from the
-project's signed APK repository. Trust its public key once, add the feed and
-install the LuCI package; APK resolves the core and provider-database
-dependencies automatically:
+project's signed APK repository.
+
+### Quick installer
+
+The convenience installer checks the OpenWrt release, verifies the pinned
+repository key and signed APK indexes, simulates the selected installation and
+then configures the feed. It asks whether to install the LuCI web interface:
+
+```sh
+wget -qO- https://darthanwalt.github.io/openwrt-apn-autoconfig/install.sh | sh
+```
+
+The default answer installs LuCI together with the core and provider database.
+Answer `n` for a command-line-only installation. For non-interactive use, make
+the choice explicit:
+
+```sh
+# Core, provider database and LuCI
+wget -qO- https://darthanwalt.github.io/openwrt-apn-autoconfig/install.sh | sh -s -- --gui
+
+# Core and provider database only
+wget -qO- https://darthanwalt.github.io/openwrt-apn-autoconfig/install.sh | sh -s -- --nogui
+```
+
+To verify compatibility and preview APK's transaction without changing
+persistent files, add `--dry-run`:
+
+```sh
+wget -qO- https://darthanwalt.github.io/openwrt-apn-autoconfig/install.sh | sh -s -- --dry-run
+```
+
+> [!WARNING]
+> Piping a remote script directly into a root shell is convenient, but it means
+> trusting the HTTPS endpoint and executing the received contents without
+> reviewing them first. `--dry-run` prevents persistent installer changes; it
+> does not make an unreviewed remote script intrinsically trustworthy. Use the
+> download-and-review procedure below or the manual commands if this trust
+> model is not acceptable.
+
+A more cautious installation downloads the script first, verifies its
+published checksum, allows it to be reviewed, and only then runs it:
+
+```sh
+wget -O /tmp/install.sh \
+  https://darthanwalt.github.io/openwrt-apn-autoconfig/install.sh
+wget -O /tmp/apn-autoconfig-SHA256SUMS \
+  https://darthanwalt.github.io/openwrt-apn-autoconfig/SHA256SUMS
+(cd /tmp && grep '  install.sh$' apn-autoconfig-SHA256SUMS >install.sha256)
+test -s /tmp/install.sha256
+(cd /tmp && sha256sum -c install.sha256)
+sed -n '1,260p' /tmp/install.sh
+sh /tmp/install.sh --dry-run
+sh /tmp/install.sh
+rm -f /tmp/install.sh /tmp/install.sha256 /tmp/apn-autoconfig-SHA256SUMS
+```
+
+Both modes leave automatic APN reconciliation and the physical modem-reset
+button disabled. After installation, enable and operate them deliberately from
+LuCI or UCI. Package upgrades should use LuCI or `apk`; there is no advantage
+to downloading and rerunning the bootstrap installer.
+
+### Manual repository setup
+
+To avoid running an installer, trust the public key once, add the feed and
+install either the LuCI package or the command-line core. APK resolves the
+provider-database dependency automatically:
 
 ```sh
 wget -O /tmp/apn-autoconfig.pem \
@@ -120,6 +183,12 @@ grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null ||
 
 apk update
 apk add luci-app-apn-autoconfig
+```
+
+For a command-line-only installation, use this final command instead:
+
+```sh
+apk add apn-autoconfig
 ```
 
 The public-key SHA-256 fingerprint is:

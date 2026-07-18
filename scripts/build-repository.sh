@@ -5,6 +5,7 @@ ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 PACKAGE_DIR="${PACKAGE_DIR:-$ROOT/dist}"
 OUTPUT_DIR="$ROOT/dist/repository"
 PUBLIC_KEY="${PUBLIC_KEY:-$ROOT/repository/public-key.pem}"
+INSTALLER="$ROOT/scripts/install.sh"
 SIGNING_KEY="${APK_SIGNING_KEY_FILE:-}"
 OPENWRT_SERIES="${OPENWRT_SERIES:-25.12}"
 
@@ -16,6 +17,7 @@ fail() {
 [ -n "$SIGNING_KEY" ] || fail 'APK_SIGNING_KEY_FILE is not set'
 [ -f "$SIGNING_KEY" ] || fail "signing key not found: $SIGNING_KEY"
 [ -f "$PUBLIC_KEY" ] || fail "public key not found: $PUBLIC_KEY"
+[ -f "$INSTALLER" ] || fail "installer not found: $INSTALLER"
 command -v openssl >/dev/null 2>&1 || fail 'openssl is required'
 command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum is required'
 
@@ -53,6 +55,8 @@ FEED_DIR="$SITE_DIR/$OPENWRT_SERIES/noarch"
 KEYS_DIR="$WORK_DIR/keys"
 mkdir -p "$FEED_DIR" "$KEYS_DIR"
 cp "$PUBLIC_KEY" "$SITE_DIR/public-key.pem"
+cp "$INSTALLER" "$SITE_DIR/install.sh"
+chmod 0755 "$SITE_DIR/install.sh"
 cp "$PUBLIC_KEY" "$KEYS_DIR/apn-autoconfig.pem"
 cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$FEED_DIR/"
 
@@ -101,6 +105,7 @@ touch "$SITE_DIR/.nojekyll"
 (
 	cd "$SITE_DIR"
 	sha256sum \
+		install.sh \
 		public-key.pem \
 		"$OPENWRT_SERIES"/noarch/*.apk \
 		"$OPENWRT_SERIES"/noarch/packages.adb \

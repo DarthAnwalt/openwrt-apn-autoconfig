@@ -15,6 +15,7 @@ sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/build-repository.sh"
+sh -n "$ROOT/scripts/install.sh"
 sh -n "$ROOT/scripts/openwrt-sdk-config.sh"
 sh -n "$ROOT/scripts/prepare-apk-tool.sh"
 sh -n "$ROOT/scripts/refresh-providers.sh"
@@ -43,6 +44,14 @@ actual_public_key_sha256="$(sha256sum "$ROOT/repository/public-key.pem" | awk '{
 	printf '%s\n' 'Unexpected APK repository public key fingerprint.' >&2
 	exit 1
 }
+grep -q "KEY_SHA256=\"$expected_public_key_sha256\"" "$ROOT/scripts/install.sh" || {
+	printf '%s\n' 'Installer does not pin the expected repository key fingerprint.' >&2
+	exit 1
+}
+if grep -q -- '--allow-untrusted' "$ROOT/scripts/install.sh"; then
+	printf '%s\n' 'Installer must never bypass APK repository trust.' >&2
+	exit 1
+fi
 if find "$ROOT" -path "$ROOT/.git" -prune -o -type f \
 	\( -name 'private-key.pem' -o -name '*.private.pem' -o -name '*.encrypted.pem' \) \
 	-print | grep -q .; then
@@ -108,5 +117,6 @@ awk -F '\t' '
 
 sh "$ROOT/tests/test-provider-generator.sh"
 sh "$ROOT/tests/test-database-update.sh"
+sh "$ROOT/tests/test-installer.sh"
 sh "$ROOT/tests/run-tests.sh"
 printf '%s\n' 'Static and behavioral verification passed.'

@@ -1,9 +1,13 @@
 # apn-autoconfig — OpenWrt source packages
 
-`apn-autoconfig` is a small POSIX-shell helper for a ModemManager interface on
-OpenWrt. It dynamically resolves the active ModemManager SIM, finds mobile
-profile candidates in a worldwide local TSV database, restarts only the configured mobile
-interface, verifies real Internet access through `wwan0` with `curl`, caches
+`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. Version
+0.9.0 discovers configured cellular netifd interfaces and publishes their exact
+capabilities through a GUI-independent API. Its complete operational backend is
+ModemManager; QMI, MBIM, Fibocom and selected AT-managed protocols are visible
+in inventory but deliberately cannot mutate profiles until later adapters are
+implemented. The engine resolves the active SIM, finds mobile profile
+candidates in a worldwide local TSV database, restarts only the selected mobile
+interface, verifies real Internet access through netifd's current layer-3 device, caches
 the successful profile by ICCID, and restores the previous profile when all candidates
 fail. It distinguishes the SIM's home operator from the serving network,
 honors OpenWrt's canonical data-roaming policy before changing any APN, and
@@ -37,9 +41,9 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 - `detect` and `status` are read-only.
 - Normal APN operations never write `network.<interface>.allow_roaming`; the
   existing OpenWrt network option remains the sole source of roaming policy.
-- `apply` edits only the ModemManager profile options `apn`, `username`,
+- On 0.9.0, `apply` edits only the ModemManager profile options `apn`, `username`,
   `password`, `allowedauth` and `iptype` under `network.<interface>`.
-- It calls only `ifdown wwan` / `ifup wwan`; it does not reload or restart the
+- It calls only `ifdown <selected-target>` / `ifup <selected-target>`; it does not reload or restart the
   whole network.
 - It does not edit mwan3 interfaces, members, policies, rules, or metrics.
 - If mwan3 is available, the connectivity test is run using
@@ -47,7 +51,7 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 - An interrupted or failed `apply` restores the prior mobile profile and restarts only
   `wwan`.
 - Before the first `apply`, the original profile state is stored persistently in
-  `/etc/apn-autoconfig/baseline.tsv`.
+  `/etc/apn-autoconfig/targets/network_<interface>/baseline.tsv`.
 - Baseline, active-profile and ICCID-cache files may contain APN usernames and
   passwords in cleartext. This is intentional, matches OpenWrt's `network` UCI
   storage, and is restricted to root by the process-wide `umask 077`.
@@ -77,15 +81,16 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 ## Requirements
 
 - vanilla OpenWrt 25.12
-- `modemmanager` / `mmcli`
+- `modemmanager` / `mmcli` for the functional 0.9.0 APN backend
 - `curl`
-- a configured netifd ModemManager interface named `wwan`
-- its data device named `wwan0`
+- at least one configured netifd ModemManager interface; its name is discovered
+  automatically when it is the only writable cellular target
 - optional: `mwan3`
 - `kmod-button-hotplug` when the hardware-button integration is enabled
 
-The defaults match the Huasifei WH3000 Pro + Quectel RM520N-GL setup for which
-this MVP was prepared. Edit `/etc/config/apn-autoconfig` for other names.
+`option device 'wwan0'` is only a fallback for systems whose netifd status does
+not expose `l3_device`. The hardware-reset GPIO defaults still match only the
+Huasifei WH3000 Pro + Quectel RM520N-GL setup for which the MVP was prepared.
 
 The complete button flow was tested on that hardware with a live physical SIM
 change from SIMon mobile/Vodafone Germany to Kaufland Mobil/Telekom Germany.
@@ -251,8 +256,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.8.6-r1.apk \
-  ./luci-app-apn-autoconfig-0.4.1-r1.apk
+  ./apn-autoconfig-0.9.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.5.0-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -309,7 +314,7 @@ active APN, or restart the mobile interface. The candidate package is fetched
 through APK's signed index and its TSV metadata and rows are validated before
 installation.
 
-Version 0.4.1 retains the 0.3.1 policy-selection fix: the Apply button remains
+Version 0.5.0 retains the policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
@@ -328,8 +333,9 @@ Runtime job state is deliberately volatile and stored by default in:
 /tmp/apn-autoconfig-action/state.tsv
 ```
 
-It records `starting`, `running`, `success`, `blocked`, `retryable` or `failed`; it contains no SIM
-secrets beyond the action name and process/timing information. The normal APN
+It records `starting`, `running`, `success`, `blocked`, `retryable` or `failed`
+and the stable target ID; it contains no SIM secrets beyond the action name and
+process/timing information. The normal APN
 operation lock remains authoritative.
 
 The most recent database check and installation result survives reboot in:
@@ -346,6 +352,7 @@ Machine-readable commands used by LuCI are also available for diagnostics:
 ```sh
 apn-autoconfig status-json
 apn-autoconfig detect-json
+apn-autoconfig targets-json
 apn-autoconfig action-start reconcile
 apn-autoconfig action-start modem-reset
 apn-autoconfig action-start database-check
@@ -353,22 +360,33 @@ apn-autoconfig action-start database-install
 apn-autoconfig action-status
 ```
 
-The v2 status schema includes modem and registration states, separate home and
+The v1 target schema reports each stable target ID, protocol, normalized
+backend and exact read/write/apply capabilities. The v2 status schema remains
+backward compatible and adds `engine_api: v1`, target/backend fields and the
+effective layer-3 device. It includes modem and registration states, separate home and
 serving operators, roaming state and effective policy, manual PLMN lock,
 access technologies, signal quality, a stable result code and active provider
 database metadata.
 
 The LuCI ACL does not execute the general-purpose command directly. Separate
 query and control wrappers accept only the required read-only and mutating
-operations.
+operations. Both wrappers accept an optional validated `network:<section>`
+target; the background worker preserves it for the complete operation.
 
 ## First use
 
 Start with the read-only command:
 
 ```sh
+apn-autoconfig targets-json
 apn-autoconfig detect
 ```
+
+`targets-json` is the authoritative way to distinguish discovery from actual
+support. In 0.9.0 only targets with backend `modemmanager` report
+`profile_apply: true`; QMI, MBIM, Fibocom and AT entries are inventory-only.
+Use `--target network:<section>` with status, detect or mutating commands when
+more than one writable target is configured.
 
 It prints SIM identifiers and matching APN candidates. Review them before
 running:
@@ -434,7 +452,7 @@ Return to the mobile profile that existed before the first `apply`:
 apn-autoconfig reset
 ```
 
-`reset` restarts only `wwan`. It does not change mwan3, Travelmate, firewall,
+`reset` restarts only its selected target. It does not change mwan3, Travelmate, firewall,
 DNS, WireGuard, ZeroTier, or any other network interface.
 
 Logs use the tag `apn-autoconfig`:
@@ -504,13 +522,14 @@ For each candidate the helper:
 1. confirms that registration and roaming policy permit packet data;
 2. writes the APN, optional credentials, authentication and IP type through
    UCI and commits `network`;
-3. runs `ifdown wwan`, then `ifup wwan`;
+3. runs `ifdown` and `ifup` only for the selected target;
 4. waits until netifd reports the interface as up;
-5. runs an HTTPS request through `wwan0` with `curl`;
+5. asks netifd for the current `l3_device` and runs an HTTPS request through it
+   with `curl` (falling back to configured `option device` only when absent);
 6. caches a successful result by ICCID.
 
 If every candidate fails, the original APN (including an originally absent or
-empty setting) is restored and `wwan` alone is restarted.
+empty setting) is restored and only the selected target is restarted.
 
 ## Configuration
 
@@ -518,7 +537,7 @@ Default `/etc/config/apn-autoconfig`:
 
 ```text
 config apn_autoconfig 'main'
-        option interface 'wwan'
+        option interface 'auto'
         option sim_index 'auto'
         option device 'wwan0'
         option database '/usr/share/apn-autoconfig/providers.tsv'
@@ -572,6 +591,11 @@ uci commit apn-autoconfig
 
 `use_mwan3` accepts `auto`, `always`, or `never`. `auto` uses `mwan3 use` only
 when mwan3 exists and knows the configured interface.
+
+`interface` accepts `auto` or a UCI network section name. Automatic mode selects
+only when exactly one discovered target has a complete write/apply backend. It
+does not guess between two eligible modems. Existing upgrades retain their
+explicit conffile value (for example `wwan`).
 
 The current primary SIM is resolved on every command by matching the
 ModemManager device to `network.<interface>.device`. This is necessary because
@@ -635,10 +659,13 @@ detection for that SIM.
 
 ## Exact rollback and package removal
 
-The first `apply` creates a persistent baseline recording the original values
+The first `apply` for each target creates a persistent baseline recording the original values
 and presence of all five managed UCI options. Consequently, an originally
 absent option is removed again rather than restored as an empty option. A
-baseline created by v0.5 is migrated on first use.
+baseline created by v0.5–0.8 is migrated under the operation lock on first use.
+Target baselines and active state live below
+`/etc/apn-autoconfig/targets/network_<interface>/`; the per-ICCID profile cache
+remains shared because it belongs to the SIM rather than an interface.
 
 To undo testing but keep the package installed:
 
@@ -687,7 +714,10 @@ submission has been implemented and tested.
   settings change and some MVNOs do not expose a usable SIM discriminator.
 - Automatic SIM resolution requires ModemManager to expose a primary SIM path;
   a configured numeric `sim_index` is used only when resolution is impossible.
-- The connectivity test uses HTTPS through one configured net device. It uses
+- QMI, MBIM, Fibocom and AT-managed targets are inventory-only in 0.9.0. Their
+  identity and profile capabilities are false, and mutating commands exit 4
+  before changing UCI, state or network interfaces.
+- The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses
   the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
 - Boot and hardware-button automation are independently opt-in and exposed as
   separate LuCI checkboxes.

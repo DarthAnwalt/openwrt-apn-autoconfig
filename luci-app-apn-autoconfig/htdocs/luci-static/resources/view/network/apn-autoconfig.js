@@ -100,7 +100,8 @@ return view.extend({
 			uci.load('apn-autoconfig'),
 			call(queryCommand, [ 'status' ]).catch(function(error) { return { error: error.message }; }),
 			call(queryCommand, [ 'action-status' ]).catch(function(error) { return { error: error.message }; }),
-			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
+			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; }),
+			call(queryCommand, [ 'targets' ]).catch(function(error) { return { error: error.message }; })
 		]);
 	},
 
@@ -147,6 +148,9 @@ return view.extend({
 					row(_('EID'), status.eid),
 					row(_('ModemManager SIM index'), status.sim_index),
 					row(_('ModemManager modem index'), status.modem_index),
+					row(_('Engine target'), status.target_id),
+					row(_('Protocol / backend'), '%s / %s'.format(status.target_protocol, status.target_backend)),
+					row(_('Effective data device'), status.l3_device || status.device),
 					row(_('Manual operator lock (PLMN)'), status.configured_plmn)
 				])
 			])
@@ -419,8 +423,9 @@ return view.extend({
 		var status = data[1];
 		var action = data[2];
 		var database = data[3];
+		var targets = data[4];
 		var m = new form.Map('apn-autoconfig', _('Settings'),
-			_('Automatic APN selection for a ModemManager mobile interface.'));
+			_('Automatic APN selection through the target-aware cellular engine.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
 		self.policySupported = status && status.version === 'v2';
@@ -441,15 +446,29 @@ return view.extend({
 		o.rmempty = false;
 		o.description = _('On the tested WH3000 Pro, releasing BTN_0 power-cycles the modem and then reconciles the APN. Keep disabled on unverified hardware.');
 
-		o = s.taboption('general', form.Value, 'interface', _('Mobile interface'));
-		o.default = 'wwan';
+		o = s.taboption('general', form.ListValue, 'interface', _('Mobile target'));
+		o.value('auto', _('Automatic (only one writable target)'));
+		var configuredTarget = typeof uci.get === 'function'
+			? uci.get('apn-autoconfig', 'main', 'interface') : 'auto';
+		var configuredTargetListed = configuredTarget === 'auto';
+		if (targets && Array.isArray(targets.targets))
+			targets.targets.forEach(function(target) {
+				o.value(target.interface, '%s — %s (%s)'.format(target.interface, target.protocol,
+					target.capabilities.profile_apply ? _('APN supported') : _('inventory only')));
+				if (target.interface === configuredTarget)
+					configuredTargetListed = true;
+			});
+		if (configuredTarget && !configuredTargetListed)
+			o.value(configuredTarget, _('%s — currently configured, not discovered').format(configuredTarget));
+		o.default = 'auto';
 		o.rmempty = false;
-		o.datatype = 'uciname';
+		o.description = _('Automatic mode refuses to choose when more than one writable cellular target exists.');
 
 		o = s.taboption('general', form.Value, 'device', _('Mobile data device'));
 		o.default = 'wwan0';
 		o.rmempty = false;
 		o.datatype = 'uciname';
+		o.description = _('Fallback used only when netifd does not report an effective layer-3 device.');
 
 		o = s.taboption('general', form.ListValue, 'use_mwan3', _('mwan3-aware connectivity test'));
 		o.value('auto', _('Automatic'));

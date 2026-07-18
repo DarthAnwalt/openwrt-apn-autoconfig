@@ -8,10 +8,13 @@ MOCKBIN="$TESTROOT/bin"
 STATE="$TESTROOT/state"
 DB="$TESTROOT/providers.tsv"
 PERSIST="$TESTROOT/persist"
+TARGET_PERSIST="$PERSIST/targets/network_wwan"
 CACHE="$PERSIST/cache"
 SCRIPT="$BASE/files/usr/sbin/apn-autoconfig"
 BOOT_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-boot"
 BUTTON_SCRIPT="$BASE/files/etc/hotplug.d/button/50-apn-autoconfig"
+QUERY_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-query"
+CONTROL_SCRIPT="$BASE/files/usr/libexec/apn-autoconfig-control"
 
 cleanup() {
 	rm -rf "$TESTROOT" "$TEST_ACTION_STATE" "$TEST_ACTION_STATE.start-lock"
@@ -44,7 +47,20 @@ cat >"$MOCKBIN/uci" <<'EOF'
 #!/bin/sh
 [ "${1:-}" = "-q" ] && shift
 case "$1:$2" in
-get:apn-autoconfig.main.interface) printf '%s\n' wwan ;;
+show:network)
+	printf '%s\n' \
+		"network.wwan=interface" \
+		"network.wwan.proto='modemmanager'" \
+		"network.wwan.device='/sys/devices/mock-modem'" \
+		"network.cellqmi=interface" \
+		"network.cellqmi.proto='qmi'" \
+		"network.cellmbim=interface" \
+		"network.cellmbim.proto='mbim'"
+	if [ "${TEST_SECOND_MM:-0}" = 1 ]; then
+		printf '%s\n' "network.wwan2=interface" "network.wwan2.proto='modemmanager'"
+	fi
+;;
+get:apn-autoconfig.main.interface) printf '%s\n' "${TEST_INTERFACE:-wwan}" ;;
 get:apn-autoconfig.main.sim_index) printf '%s\n' 0 ;;
 get:apn-autoconfig.main.device) printf '%s\n' wwan0 ;;
 get:apn-autoconfig.main.database) printf '%s\n' "$TEST_DB" ;;
@@ -70,7 +86,12 @@ get:apn-autoconfig.main.modem_power_off_seconds) printf '%s\n' 1 ;;
 get:apn-autoconfig.main.modem_wait_seconds) printf '%s\n' 3 ;;
 get:apn-autoconfig.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:network.wwan.device) printf '%s\n' '/sys/devices/mock-modem' ;;
+get:network.wwan.proto) printf '%s\n' modemmanager ;;
+get:network.wwan2.proto) printf '%s\n' modemmanager ;;
+get:network.cellqmi.proto) printf '%s\n' qmi ;;
+get:network.cellmbim.proto) printf '%s\n' mbim ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
+get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
 get:network.wwan.username) cat "$TEST_STATE/username" ;;
 get:network.wwan.password) cat "$TEST_STATE/password" ;;
 get:network.wwan.allowedauth) cat "$TEST_STATE/allowedauth" ;;
@@ -85,6 +106,7 @@ set:*)
 			option="${option%%=*}"
 			case "$option" in apn|username|password|allowedauth|iptype|allow_roaming) printf '%s\n' "$value" >"$TEST_STATE/$option" ;; *) exit 1 ;; esac
 		;;
+		network.wwan2.apn=*) printf '%s\n' "${2#network.wwan2.apn=}" >"$TEST_STATE/apn-wwan2" ;;
 		*) exit 1 ;;
 	esac
 ;;
@@ -94,6 +116,7 @@ delete:network.wwan.password) rm -f "$TEST_STATE/password" ;;
 delete:network.wwan.allowedauth) rm -f "$TEST_STATE/allowedauth" ;;
 delete:network.wwan.iptype) rm -f "$TEST_STATE/iptype" ;;
 delete:network.wwan.allow_roaming) rm -f "$TEST_STATE/allow_roaming" ;;
+delete:network.wwan2.apn) rm -f "$TEST_STATE/apn-wwan2" ;;
 commit:network) : ;;
 *) exit 1 ;;
 esac
@@ -144,12 +167,14 @@ EOF
 
 cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
+suffix=""
+[ -z "${UBUS_L3_DEVICE:-}" ] || suffix=", \"l3_device\": \"$UBUS_L3_DEVICE\""
 if [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
-	printf '%s\n' '{ "up": true }'
+	printf '{ "up": true%s }\n' "$suffix"
 elif [ "${UBUS_UP:-1}" = 1 ]; then
-	printf '%s\n' '{ "up": true }'
+	printf '{ "up": true%s }\n' "$suffix"
 else
-	printf '%s\n' '{ "up": false }'
+	printf '{ "up": false%s }\n' "$suffix"
 fi
 EOF
 
@@ -175,6 +200,11 @@ EOF
 
 cat >"$MOCKBIN/curl" <<'EOF'
 #!/bin/sh
+previous=""
+for argument in "$@"; do
+	[ "$previous" = --interface ] && printf '%s\n' "$argument" >"$TEST_STATE/curl-device"
+	previous="$argument"
+done
 current="$(cat "$TEST_STATE/apn" 2>/dev/null || :)"
 [ "$current" = "${CURL_SUCCESS_APN:-internet.telekom}" ]
 EOF
@@ -224,6 +254,62 @@ assert_contains() {
 	printf '%s\n' "$haystack" | grep -F -q "$needle" || fail "missing: $needle"
 }
 
+printf '%s\n' 'TEST target inventory reports exact backend capabilities'
+targets_json="$(sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v1"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and t["network:cellqmi"]["capabilities"]["profile_apply"] is False; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
+
+printf '%s\n' 'TEST narrow integration wrappers preserve and validate target IDs'
+cat >"$MOCKBIN/apn-autoconfig-wrapper-command" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$TEST_STATE/wrapper-args"
+printf '{}\n'
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-wrapper-command"
+APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-wrapper-command" \
+	sh "$QUERY_SCRIPT" status network:wwan >/dev/null
+[ "$(cat "$STATE/wrapper-args")" = 'status-json --target network:wwan' ] || fail 'query wrapper lost its target'
+APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-wrapper-command" \
+	sh "$CONTROL_SCRIPT" reconcile network:wwan >/dev/null
+[ "$(cat "$STATE/wrapper-args")" = 'action-start reconcile --target network:wwan' ] || fail 'control wrapper lost its target'
+if APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-wrapper-command" \
+	sh "$CONTROL_SCRIPT" reconcile 'network:../../tmp/x' >/dev/null 2>&1; then
+	fail 'control wrapper accepted an unsafe target'
+fi
+if APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-wrapper-command" \
+	sh "$QUERY_SCRIPT" targets network:wwan >/dev/null 2>&1; then
+	fail 'target inventory wrapper accepted a meaningless target argument'
+fi
+
+printf '%s\n' 'TEST unsupported backends fail before any profile or network mutation'
+: >"$STATE/events"
+before="$(cat "$STATE/apn")"
+if unsupported_target_output="$(sh "$SCRIPT" apply --target network:cellqmi 2>&1)"; then
+	fail 'QMI target was allowed to apply a profile'
+else
+	unsupported_target_status=$?
+fi
+[ "$unsupported_target_status" -eq 4 ] || fail "unsupported target returned $unsupported_target_status instead of 4"
+assert_contains "$unsupported_target_output" 'does not implement profile-apply'
+[ "$(cat "$STATE/apn")" = "$before" ] || fail 'unsupported target changed APN'
+[ ! -s "$STATE/events" ] || fail 'unsupported target cycled a network interface'
+[ ! -e "$PERSIST/targets/network_cellqmi" ] || fail 'unsupported target created persistent state'
+
+printf '%s\n' 'TEST unsafe and ambiguous target selection fails closed'
+if sh "$SCRIPT" status-json --target 'network:../../tmp/x' >/dev/null 2>&1; then
+	fail 'unsafe target ID was accepted'
+else
+	[ "$?" -eq 4 ] || fail 'unsafe target ID did not use the target-contract exit code'
+fi
+auto_json="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_id"] == "network:wwan" and d["target_backend"] == "modemmanager"' "$auto_json" || fail 'single writable target was not selected automatically'
+: >"$STATE/events"
+if TEST_INTERFACE=auto TEST_SECOND_MM=1 sh "$SCRIPT" apply >/dev/null 2>&1; then
+	fail 'ambiguous automatic target selection was accepted'
+else
+	[ "$?" -eq 4 ] || fail 'ambiguous target did not use the target-contract exit code'
+fi
+[ ! -s "$STATE/events" ] || fail 'ambiguous selection changed network state'
+
 printf '%s\n' 'TEST connectivity URL rejects non-HTTP schemes'
 if invalid_url_output="$(TEST_CONFIG_URL=file:///etc/passwd sh "$SCRIPT" status 2>&1)"; then
 	fail 'file URL was accepted as a connectivity test endpoint'
@@ -254,8 +340,11 @@ unset SIM_IMSI SIM_ICCID SIM_OPERATOR_ID SIM_OPERATOR_NAME SIM_GID1
 
 printf '%s\n' 'TEST apply stores working APN and ICCID cache'
 CURL_SUCCESS_APN=internet.telekom
-export CURL_SUCCESS_APN
+UBUS_L3_DEVICE=wwan_runtime
+export CURL_SUCCESS_APN UBUS_L3_DEVICE
 sh "$SCRIPT" apply
+[ "$(cat "$STATE/curl-device")" = wwan_runtime ] || fail 'connectivity test ignored netifd l3_device'
+unset UBUS_L3_DEVICE
 [ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'working APN not kept'
 [ "$(cat "$STATE/username")" = 'fixture-user' ] || fail 'working username not kept'
 [ "$(cat "$STATE/password")" = 'fixture-pass' ] || fail 'working password not kept'
@@ -264,8 +353,8 @@ sh "$SCRIPT" apply
 [ -s "$CACHE/89490200002186275443.tsv" ] || fail 'ICCID cache missing'
 grep -F -q 'internet.telekom' "$CACHE/89490200002186275443.tsv" || fail 'cache APN missing'
 grep -F -q 'fixture-user' "$CACHE/89490200002186275443.tsv" || fail 'cache profile missing'
-[ -s "$PERSIST/baseline.tsv" ] || fail 'pre-apply APN baseline missing'
-[ -s "$PERSIST/active.tsv" ] || fail 'reconciled SIM state missing'
+[ -s "$TARGET_PERSIST/baseline.tsv" ] || fail 'target-scoped pre-apply APN baseline missing'
+[ -s "$TARGET_PERSIST/active.tsv" ] || fail 'target-scoped reconciled SIM state missing'
 
 printf '%s\n' 'TEST a matching cached profile refreshes its provider label from the database'
 printf 'v2\tinternet.telekom\tLegacy provider label\t2026-01-01T00:00:00Z\t-\t-\t-\t-\n' \
@@ -303,7 +392,7 @@ export SIM_IMSI SIM_ICCID SIM_EID SIM_OPERATOR_ID SIM_OPERATOR_NAME SIM_GID1 SIM
 : >"$STATE/events"
 sh "$SCRIPT" reconcile
 [ "$(cat "$STATE/apn")" = 'web.vodafone.de' ] || fail 'changed ICCID kept the previous provider APN'
-grep -F -q '89492031246010483050' "$PERSIST/active.tsv" || fail 'changed ICCID was not recorded as reconciled'
+grep -F -q '89492031246010483050' "$TARGET_PERSIST/active.tsv" || fail 'changed ICCID was not recorded as reconciled'
 [ -s "$STATE/events" ] || fail 'changed ICCID did not restart the interface'
 unset SIM_IMSI SIM_ICCID SIM_EID SIM_OPERATOR_ID SIM_OPERATOR_NAME SIM_GID1 SIM_GID2
 CURL_SUCCESS_APN=internet.telekom
@@ -316,8 +405,8 @@ sh "$SCRIPT" reset >/dev/null 2>&1
 [ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'reset did not restore original password'
 [ "$(cat "$STATE/allowedauth")" = 'chap' ] || fail 'reset did not restore original authentication'
 [ "$(cat "$STATE/iptype")" = 'ipv4' ] || fail 'reset did not restore original IP type'
-[ ! -e "$PERSIST/baseline.tsv" ] || fail 'reset left baseline behind'
-[ ! -e "$PERSIST/active.tsv" ] || fail 'reset left reconciled SIM state behind'
+[ ! -e "$TARGET_PERSIST/baseline.tsv" ] || fail 'reset left baseline behind'
+[ ! -e "$TARGET_PERSIST/active.tsv" ] || fail 'reset left reconciled SIM state behind'
 [ ! -e "$CACHE" ] || fail 'reset left cache behind'
 
 printf '%s\n' 'TEST a v0.5 cache preserves the optional values of its working profile'
@@ -338,7 +427,7 @@ printf 'v1\twwan\t1\tlegacy.apn\n' >"$PERSIST/baseline.tsv"
 CURL_SUCCESS_APN=internet.telekom
 export CURL_SUCCESS_APN
 sh "$SCRIPT" apply >/dev/null 2>&1
-grep -F -q 'v2' "$PERSIST/baseline.tsv" || fail 'legacy baseline was not migrated'
+grep -F -q 'v3' "$TARGET_PERSIST/baseline.tsv" || fail 'legacy baseline was not migrated into v3 target state'
 sh "$SCRIPT" reset >/dev/null 2>&1
 [ "$(cat "$STATE/apn")" = 'legacy.apn' ] || fail 'migrated baseline lost its original APN'
 [ "$(cat "$STATE/username")" = 'old-user' ] || fail 'migrated baseline lost its username'
@@ -441,8 +530,9 @@ sh "$SCRIPT" roaming-policy-set default >/dev/null 2>&1
 sh "$SCRIPT" roaming-policy-set block >/dev/null 2>&1
 [ "$(cat "$STATE/allow_roaming")" = 0 ] || fail 'block policy did not write network.wwan.allow_roaming=0'
 grep -F -q 'down wwan' "$STATE/events" || fail 'blocking data while roaming did not stop the interface'
+mkdir -p "$TARGET_PERSIST"
 printf 'v2\t89380062300756308069\tinternet.telekom\tfixture-user\tfixture-pass\tpap chap\tipv4v6\n' \
-	>"$PERSIST/active.tsv"
+	>"$TARGET_PERSIST/active.tsv"
 printf '%s\n' internet.telekom >"$STATE/apn"
 printf '%s\n' fixture-user >"$STATE/username"
 printf '%s\n' fixture-pass >"$STATE/password"
@@ -456,7 +546,7 @@ UBUS_UP=0 UBUS_UP_AFTER_IFUP=1 sh "$SCRIPT" roaming-policy-set allow >/dev/null 
 printf '%s\n' 0 >"$STATE/allow_roaming"
 MMCLI_UNAVAILABLE=1 sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1
 [ "$(cat "$STATE/allow_roaming")" = 1 ] || fail 'policy could not be saved while no SIM was readable'
-rm -f "$STATE/allow_roaming" "$STATE/ifup-seen" "$PERSIST/active.tsv"
+rm -f "$STATE/allow_roaming" "$STATE/ifup-seen" "$TARGET_PERSIST/active.tsv"
 
 printf '%s\n' 'TEST registration denial and registration timeout do not test APNs'
 rm -f "$STATE/allow_roaming"
@@ -510,7 +600,7 @@ BLOCK_ACTION=1 APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autocon
 /bin/sleep 1
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["accepted"] is True' "$STATE/action-start.json" || fail 'first background action was not accepted'
 busy_json="$(APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" sh "$SCRIPT" action-status)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["busy"] is True and d["action"] == "reconcile"' "$busy_json" || fail 'running action not reported busy'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["busy"] is True and d["action"] == "reconcile" and d["target_id"] == "network:wwan"' "$busy_json" || fail 'running action or its target not reported'
 second_json="$(APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" sh "$SCRIPT" action-start modem-reset)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is False and d["busy"] is True' "$second_json" || fail 'overlapping background action was not rejected'
 touch "$STATE/action-release"
@@ -554,7 +644,7 @@ APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" \
 	APN_AUTOCONFIG_ACTION_COMMAND="$MOCKBIN/apn-autoconfig-policy-command" \
 	sh "$SCRIPT" action-start roaming-allow >"$STATE/action-policy-start.json"
 /bin/sleep 1
-grep -F -x -q 'roaming-policy-set allow' "$STATE/policy-action-args" || fail 'roaming-allow action used the wrong command'
+grep -F -x -q 'roaming-policy-set allow --target network:wwan' "$STATE/policy-action-args" || fail 'roaming-allow action lost its target or used the wrong command'
 policy_action_json="$(sh "$SCRIPT" action-status)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "success" and d["busy"] is False' "$policy_action_json" || fail 'roaming policy action did not complete'
 
@@ -675,5 +765,29 @@ while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
 done
 grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
 	fail 'button release did not queue modem-reset through the job API'
+
+printf '%s\n' 'TEST reset-all restores every target baseline before package removal'
+rm -rf "$PERSIST/targets"
+mkdir -p "$PERSIST/targets/network_wwan"
+printf '%s\n' must-not-change >"$STATE/apn"
+printf 'v3\twwan\tnetwork:wwan2\tmodemmanager\tmodemmanager\noption\tapn\t1\twrong-target\n' \
+	>"$PERSIST/targets/network_wwan/baseline.tsv"
+if sh "$SCRIPT" reset --target network:wwan >/dev/null 2>&1; then
+	fail 'reset accepted a baseline belonging to another target'
+fi
+[ "$(cat "$STATE/apn")" = must-not-change ] || fail 'mismatched baseline changed the profile'
+rm -rf "$PERSIST/targets"
+mkdir -p "$PERSIST/targets/network_wwan" "$PERSIST/targets/network_wwan2"
+printf '%s\n' changed-one >"$STATE/apn"
+printf '%s\n' changed-two >"$STATE/apn-wwan2"
+printf 'v3\twwan\tnetwork:wwan\tmodemmanager\tmodemmanager\noption\tapn\t1\trestored-one\n' \
+	>"$PERSIST/targets/network_wwan/baseline.tsv"
+printf 'v3\twwan2\tnetwork:wwan2\tmodemmanager\tmodemmanager\noption\tapn\t1\trestored-two\n' \
+	>"$PERSIST/targets/network_wwan2/baseline.tsv"
+TEST_SECOND_MM=1 sh "$SCRIPT" reset-all >/dev/null 2>&1
+[ "$(cat "$STATE/apn")" = restored-one ] || fail 'reset-all did not restore the first target'
+[ "$(cat "$STATE/apn-wwan2")" = restored-two ] || fail 'reset-all did not restore the second target'
+[ ! -e "$PERSIST/targets/network_wwan/baseline.tsv" ] || fail 'reset-all left the first baseline'
+[ ! -e "$PERSIST/targets/network_wwan2/baseline.tsv" ] || fail 'reset-all left the second baseline'
 
 printf '%s\n' 'All tests passed.'

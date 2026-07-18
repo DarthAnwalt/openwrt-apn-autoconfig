@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.8.6
+PKG_VERSION:=0.9.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -14,14 +14,15 @@ define Package/apn-autoconfig
   SECTION:=net
   CATEGORY:=Network
   SUBMENU:=WWAN
-  TITLE:=Automatic APN selection for ModemManager
+  TITLE:=Target-aware automatic APN selection
   DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
   PKGARCH:=all
 endef
 
 define Package/apn-autoconfig/description
- POSIX-shell mobile profile detection and testing helper for OpenWrt
- ModemManager. It matches SIM identity against a worldwide local TSV database,
+ POSIX-shell cellular profile detection and testing engine for OpenWrt.
+ Its complete 0.9 backend uses ModemManager, while other cellular protocols
+ are exposed through a capability-aware inventory. It matches SIM identity against a worldwide local TSV database,
  verifies real Internet access, caches successful profiles per ICCID and safely
  rolls back failures.
 endef
@@ -62,7 +63,7 @@ if [ -x /etc/init.d/apn-autoconfig ]; then
 	/etc/init.d/apn-autoconfig disable >/dev/null 2>&1 || :
 fi
 if [ -x /usr/sbin/apn-autoconfig ]; then
-	/usr/sbin/apn-autoconfig reset || {
+	/usr/sbin/apn-autoconfig reset-all || {
 		echo "APN reset failed; apn-autoconfig was not removed." >&2
 		echo "Restore the APN manually or fix the interface, then retry apk del." >&2
 		exit 1

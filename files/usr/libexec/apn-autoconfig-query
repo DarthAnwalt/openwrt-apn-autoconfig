@@ -4,11 +4,19 @@
 
 COMMAND="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 DATABASE_COMMAND="${APN_AUTOCONFIG_DATABASE_COMMAND:-/usr/libexec/apn-autoconfig-database}"
+TARGET="${2:-}"
+[ "$#" -le 2 ] || exit 2
+
+if [ -n "$TARGET" ]; then
+	case "$TARGET" in network:*) target_interface="${TARGET#network:}" ;; *) exit 2 ;; esac
+	case "$target_interface" in ''|*[!A-Za-z0-9_]*) exit 2 ;; esac
+fi
 
 case "${1:-}" in
-	status) exec "$COMMAND" status-json ;;
-	detect) exec "$COMMAND" detect-json ;;
-	action-status) exec "$COMMAND" action-status ;;
-	database-status) exec "$DATABASE_COMMAND" status-json ;;
+	targets) [ -z "$TARGET" ] || exit 2; exec "$COMMAND" targets-json ;;
+	status) [ -n "$TARGET" ] && exec "$COMMAND" status-json --target "$TARGET"; exec "$COMMAND" status-json ;;
+	detect) [ -n "$TARGET" ] && exec "$COMMAND" detect-json --target "$TARGET"; exec "$COMMAND" detect-json ;;
+	action-status) [ -z "$TARGET" ] || exit 2; exec "$COMMAND" action-status ;;
+	database-status) [ -z "$TARGET" ] || exit 2; exec "$DATABASE_COMMAND" status-json ;;
 	*) exit 2 ;;
 esac

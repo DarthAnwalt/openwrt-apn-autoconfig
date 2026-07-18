@@ -51,6 +51,32 @@ the core. Updates that keep format v2 do not require a new core or LuCI package.
 An explicitly declared unsupported format is rejected before any modem or
 network operation.
 
+## Manual update through LuCI
+
+LuCI 0.4.0 can check and install this package independently from the core. The
+updater requires the project feed to be present in APK's repository
+configuration and the pinned project public key to exist in APK's trusted key
+directory. It never downloads a raw TSV, and the actual APK transaction never
+uses `--allow-untrusted`.
+
+Each check builds a temporary repository configuration containing only the
+already configured project feed. If an update exists, installation refreshes
+that repository again, fetches the candidate package through its signed index,
+extracts it into `/tmp`, and verifies the declared v2 format, matching
+date-based package version and all runtime row fields before asking APK to
+upgrade only `apn-autoconfig-providers`. APK remains responsible for the final
+transaction. No mobile profile or interface is changed by a database update.
+
+The repository index authenticates the checksum of the fetched package.
+OpenWrt package payloads in this feed are not individually signed, so the
+standalone pre-install extraction uses `apk --allow-untrusted extract` only
+after the package has been fetched through that trusted index. Neither fetch
+nor installation permits an untrusted repository or package.
+
+The updater uses the same operation lock as APN reconciliation and modem
+control. Its persistent state records only versions, timestamps and a sanitized
+result message in `/etc/apn-autoconfig/database-update.tsv`.
+
 ## Regeneration
 
 Check out the two pinned upstream revisions and run:

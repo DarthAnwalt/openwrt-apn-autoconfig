@@ -28,10 +28,50 @@ function text(value) {
 	return value == null || value === '' ? '—' : String(value);
 }
 
+function valueNode(value) {
+	return value != null && typeof value === 'object' ? value : text(value);
+}
+
 function row(label, value) {
-	return E('tr', {}, [
-		E('td', { 'class': 'td left', 'style': 'width:35%' }, [ label ]),
-		E('td', { 'class': 'td left' }, [ text(value) ])
+	return E('tr', { 'class': 'tr' }, [
+		E('td', { 'class': 'td left apn-label', 'style': 'width:40%' }, [ E('strong', {}, [ label ]) ]),
+		E('td', { 'class': 'td left apn-value' }, [ valueNode(value) ])
+	]);
+}
+
+function table(rows) {
+	return E('table', { 'class': 'table apn-table' }, rows);
+}
+
+function networkLabel(name, id) {
+	if (name && id)
+		return '%s (%s)'.format(name, id);
+	return name || id || '';
+}
+
+function formatTimestamp(value) {
+	if (!value)
+		return '';
+	var date = new Date(value);
+	return isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function databaseReleaseDate(version) {
+	return /^\d{4}\.\d{2}\.\d{2}$/.test(version || '') ? version.replace(/\./g, '-') : '';
+}
+
+function signalQuality(value) {
+	if (value == null || value === '')
+		return '—';
+	var percent = parseInt(value, 10);
+	if (isNaN(percent))
+		return text(value);
+	percent = Math.max(0, Math.min(100, percent));
+	return E('div', { 'class': 'apn-signal' }, [
+		E('div', { 'class': 'cbi-progressbar', 'title': '%s%%'.format(percent) }, [
+			E('div', { 'style': 'width:%s%%'.format(percent) })
+		]),
+		E('span', { 'class': 'apn-signal-value' }, [ '%s%%'.format(percent) ])
 	]);
 }
 
@@ -53,86 +93,154 @@ function policyValue(status) {
 	}
 }
 
+function trustLabel(value, positive, negative) {
+	return E('span', { 'class': value ? 'apn-state-good' : 'apn-state-bad' }, [ value ? positive : negative ]);
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
 			uci.load('apn-autoconfig'),
 			call(queryCommand, [ 'status' ]).catch(function(error) { return { error: error.message }; }),
-			call(queryCommand, [ 'action-status' ]).catch(function(error) { return { error: error.message }; })
+			call(queryCommand, [ 'action-status' ]).catch(function(error) { return { error: error.message }; }),
+			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
 		]);
 	},
 
-	statusNodes: function(status) {
+	statusWarnings: function(status) {
+		var nodes = [];
 		if (!status || status.error)
 			return [ E('div', { 'class': 'alert-message warning' }, [
 				_('Status is temporarily unavailable: %s').format(status && status.error || _('unknown error'))
 			]) ];
 
-		var nodes = [];
 		if (status.roaming === true)
 			nodes.push(E('div', { 'class': status.roaming_allowed ? 'alert-message notice' : 'alert-message warning' }, [
 				status.roaming_allowed
-					? _('Roaming via %s (%s). Mobile data is %s.').format(
-						text(status.serving_operator_name), text(status.serving_operator_id), roamingPolicyLabel(status).toLowerCase())
-					: _('Roaming via %s (%s), but mobile data roaming is explicitly blocked. APN profiles will not be tested.').format(
-						text(status.serving_operator_name), text(status.serving_operator_id))
+					? _('Roaming via %s. Mobile data is %s.').format(
+						networkLabel(status.serving_operator_name, status.serving_operator_id), roamingPolicyLabel(status).toLowerCase())
+					: _('Roaming via %s, but mobile data roaming is explicitly blocked. APN profiles will not be tested.').format(
+						networkLabel(status.serving_operator_name, status.serving_operator_id))
 			]));
 		else if (status.registration_state === 'denied' || status.registration_state === 'emergency-only')
 			nodes.push(E('div', { 'class': 'alert-message warning' }, [
 				_('Mobile registration is %s. This happens before APN testing.').format(status.registration_state)
 			]));
+		return nodes;
+	},
 
-		nodes.push(E('table', { 'class': 'table' }, [
-			row(_('SIM / eSIM provider'), status.operator_name),
-			row(_('Home network'), '%s (%s)'.format(text(status.home_operator_name), text(status.home_operator_id))),
-			row(_('ICCID'), status.iccid),
-			row(_('IMSI'), status.imsi),
-			row(_('EID'), status.eid),
-			row(_('ModemManager SIM index'), status.sim_index),
-			row(_('ModemManager modem index'), status.modem_index),
-			row(_('Registration'), status.registration_state),
-			row(_('Serving network'), '%s (%s)'.format(text(status.serving_operator_name), text(status.serving_operator_id))),
-			row(_('Roaming data policy'), roamingPolicyLabel(status)),
-			row(_('Manual operator lock (PLMN)'), status.configured_plmn),
-			row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
-			row(_('Signal quality'), status.signal_quality ? '%s%%'.format(status.signal_quality) : ''),
+	connectionNodes: function(status) {
+		if (!status || status.error)
+			return this.statusWarnings(status);
+		return this.statusWarnings(status).concat([
+			table([
+				row(_('SIM / eSIM provider'), status.operator_name),
+				row(_('Home network'), networkLabel(status.home_operator_name, status.home_operator_id)),
+				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id)),
+				row(_('Registration'), status.registration_state),
+				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
+				row(_('Signal quality'), signalQuality(status.signal_quality)),
+				row(_('Mobile interface'), '%s: %s'.format(status.interface, status.interface_up ? _('up') : _('down or pending')))
+			]),
+			E('details', { 'class': 'apn-details' }, [
+				E('summary', {}, [ _('SIM and modem details') ]),
+				table([
+					row(_('ICCID'), status.iccid),
+					row(_('IMSI'), status.imsi),
+					row(_('EID'), status.eid),
+					row(_('ModemManager SIM index'), status.sim_index),
+					row(_('ModemManager modem index'), status.modem_index),
+					row(_('Manual operator lock (PLMN)'), status.configured_plmn)
+				])
+			])
+		]);
+	},
+
+	apnNodes: function(status) {
+		if (!status || status.error)
+			return [ E('p', { 'class': 'alert-message warning' }, [ _('APN status is unavailable.') ]) ];
+		return [ table([
 			row(_('Configured APN'), status.configured_apn || _('<empty>')),
 			row(_('Cached APN for this SIM'), status.cached_apn),
-			row(_('Provider database version'), status.database_version),
-			row(_('Provider database format'), status.database_format ? 'v%s'.format(status.database_format) : ''),
-			row(_('Provider database sources'), status.database_sources),
-			row(_('Provider source revisions'), status.database_revisions),
-			row(_('Provider database path'), status.database_path),
-			row(_('Mobile interface'), '%s: %s'.format(status.interface, status.interface_up ? _('up') : _('down or pending'))),
 			row(_('Last result'), status.last_result),
-			row(_('Reconciled SIM'), status.reconciled_iccid),
-			row(_('Reconciled APN'), status.reconciled_apn)
+			row(_('Reconciled APN'), status.reconciled_apn),
+			row(_('Reconciled SIM'), status.reconciled_iccid)
+		]) ];
+	},
+
+	databaseAlert: function(database) {
+		if (!database || database.error)
+			return E('div', { 'class': 'alert-message warning' }, [
+				_('Database update status is unavailable: %s').format(database && database.error || _('unknown error'))
+			]);
+		var warning = database.state === 'check-failed' || database.state === 'install-failed' ||
+			!database.feed_configured || !database.key_trusted;
+		return E('div', { 'class': warning ? 'alert-message warning' : 'alert-message notice' }, [
+			text(database.message)
+		]);
+	},
+
+	databaseNodes: function(database, status) {
+		if (!database || database.error)
+			return [ this.databaseAlert(database) ];
+		var rows = [
+			row(_('Installed package version'), database.installed_package_version),
+			row(_('Database version'), database.database_version),
+			row(_('Data release date'), databaseReleaseDate(database.database_version)),
+			row(_('Last update check'), formatTimestamp(database.checked_at) || _('Not checked yet')),
+			row(_('Last installation through this page'), formatTimestamp(database.installed_at) || _('Not recorded')),
+			row(_('Signed package feed'), trustLabel(database.feed_configured, _('Configured'), _('Not configured'))),
+			row(_('Repository signing key'), trustLabel(database.key_trusted, _('Trusted'), _('Not installed')))
+		];
+		if (database.update_available)
+			rows.splice(3, 0, row(_('Available package version'), database.available_package_version));
+
+		var nodes = [ this.databaseAlert(database), table(rows) ];
+		if (status && !status.error)
+			nodes.push(E('details', { 'class': 'apn-details' }, [
+				E('summary', {}, [ _('Database technical details') ]),
+				table([
+					row(_('Database format'), status.database_format ? 'v%s'.format(status.database_format) : ''),
+					row(_('Sources'), status.database_sources),
+					row(_('Source revisions'), status.database_revisions),
+					row(_('Database path'), status.database_path),
+					row(_('Feed URL'), database.feed_url)
+				])
+			]));
+		nodes.push(E('div', { 'class': 'apn-button-row' }, [
+			this.databaseCheckButton,
+			this.databaseInstallButton
 		]));
 		return nodes;
+	},
+
+	actionLabel: function(action) {
+		switch (action) {
+		case 'reconcile': return _('APN re-detection');
+		case 'modem-reset': return _('modem power-cycle');
+		case 'roaming-default':
+		case 'roaming-allow':
+		case 'roaming-block': return _('roaming policy change');
+		case 'database-check': return _('database update check');
+		case 'database-install': return _('database installation');
+		default: return action || _('operation');
+		}
 	},
 
 	actionDescription: function(action) {
 		if (!action || action.error)
 			return action && action.error || _('Operation status is unavailable');
-
+		var label = this.actionLabel(action.action);
 		switch (action.state) {
 		case 'starting':
-		case 'queued':
-			return _('The %s operation is queued.').format(action.action);
-		case 'running':
-			return _('The %s operation is running. Please wait; this may take over a minute.').format(action.action);
-		case 'external':
-			return _('An APN or modem operation started from SSH or the physical button is running.');
-		case 'success':
-			return _('The last %s operation completed successfully.').format(action.action);
-		case 'failed':
-			return _('The last %s operation failed: %s').format(action.action, action.message || _('see system log'));
-		case 'blocked':
-			return _('The %s operation was intentionally blocked by the roaming policy.').format(action.action);
-		case 'retryable':
-			return _('The %s operation could not run because mobile registration or SIM state is temporarily unavailable. It is safe to retry.').format(action.action);
-		default:
-			return _('No operation is running.');
+		case 'queued': return _('The %s is queued.').format(label);
+		case 'running': return _('The %s is running. Please wait; this may take over a minute.').format(label);
+		case 'external': return _('An APN, modem or database operation started outside LuCI is running.');
+		case 'success': return _('The last %s completed successfully.').format(label);
+		case 'failed': return _('The last %s failed: %s').format(label, action.message || _('see system log'));
+		case 'blocked': return _('The %s was intentionally blocked by the roaming policy.').format(label);
+		case 'retryable': return _('The %s could not run because another operation or a temporary mobile state prevents it. It is safe to retry.').format(label);
+		default: return _('No operation is running.');
 		}
 	},
 
@@ -143,6 +251,7 @@ return view.extend({
 		if (this.resetButton)
 			this.resetButton.disabled = this.busy;
 		this.updatePolicyControls();
+		this.updateDatabaseControls();
 		if (this.actionStatus)
 			dom.content(this.actionStatus, [ this.actionDescription(action) ]);
 	},
@@ -154,22 +263,64 @@ return view.extend({
 			this.policySelect.disabled = this.busy || !this.policySupported;
 	},
 
+	updateDatabaseControls: function() {
+		var available = !!(this.databaseStatus && this.databaseStatus.update_available);
+		if (this.databaseCheckButton)
+			this.databaseCheckButton.disabled = this.busy;
+		if (this.databaseInstallButton) {
+			this.databaseInstallButton.disabled = this.busy || !available;
+			this.databaseInstallButton.style.display = available ? '' : 'none';
+		}
+	},
+
+	setDatabaseStatus: function(database, status) {
+		this.databaseStatus = database;
+		if (status)
+			this.currentStatus = status;
+		if (this.databaseBox)
+			dom.content(this.databaseBox, this.databaseNodes(database, this.currentStatus));
+		this.updateDatabaseControls();
+	},
+
+	refreshDatabase: function() {
+		var self = this;
+		return call(queryCommand, [ 'database-status' ]).catch(function(error) {
+			return { error: error.message };
+		}).then(function(database) {
+			self.setDatabaseStatus(database, null);
+		});
+	},
+
+	refreshPanels: function() {
+		var self = this;
+		return Promise.all([
+			call(queryCommand, [ 'status' ]).catch(function(error) { return { error: error.message }; }),
+			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
+		]).then(function(values) {
+			var status = values[0];
+			dom.content(self.connectionBox, self.connectionNodes(status));
+			dom.content(self.apnBox, self.apnNodes(status));
+			self.policySupported = status && !status.error && status.version === 'v2';
+			if (self.policySelect && self.policySupported) {
+				self.policySelect.value = policyValue(status);
+				self.policyDirty = false;
+			}
+			self.setDatabaseStatus(values[1], status);
+			self.updatePolicyControls();
+		});
+	},
+
 	refreshStatus: function() {
 		var self = this;
 		return call(queryCommand, [ 'action-status' ]).then(function(action) {
 			var wasBusy = self.busy;
+			var databaseAction = action.action === 'database-check' || action.action === 'database-install';
 			self.setBusy(action.busy, action);
 
 			if (wasBusy && !action.busy)
-				return call(queryCommand, [ 'status' ]).then(function(status) {
-					dom.content(self.statusBox, self.statusNodes(status));
-					self.policySupported = status.version === 'v2';
-					if (self.policySelect) {
-						self.policySelect.value = policyValue(status);
-						self.policyDirty = false;
-					}
-					self.setBusy(action.busy, action);
-				});
+				return self.refreshPanels().then(function() { self.setBusy(false, action); });
+			if (action.busy && databaseAction)
+				return self.refreshDatabase().then(function() { self.setBusy(true, action); });
 		}).catch(function(error) {
 			/* A transient polling failure is not evidence that a long-running
 			 * operation ended. Keep controls disabled until the core says so. */
@@ -214,15 +365,7 @@ return view.extend({
 			if (!result.accepted && !result.busy)
 				throw new Error(result.message || _('The operation could not be started'));
 			if (result.accepted && !result.busy)
-				return call(queryCommand, [ 'status' ]).then(function(status) {
-					dom.content(self.statusBox, self.statusNodes(status));
-					self.policySupported = status.version === 'v2';
-					if (self.policySelect) {
-						self.policySelect.value = policyValue(status);
-						self.policyDirty = false;
-					}
-					self.setBusy(false, result);
-				});
+				return self.refreshPanels().then(function() { self.setBusy(false, result); });
 		}).catch(function(error) {
 			/* The launch response may have been lost after the job was accepted.
 			 * Polling will safely determine when controls may be re-enabled. */
@@ -253,16 +396,40 @@ return view.extend({
 		]);
 	},
 
+	confirmDatabaseInstall: function() {
+		var self = this;
+		if (self.busy || !self.databaseStatus || !self.databaseStatus.update_available)
+			return;
+		ui.showModal(_('Install provider database update'), [
+			E('p', {}, [ _('Install signed provider database package %s?').format(self.databaseStatus.available_package_version) ]),
+			E('p', {}, [ _('Only the provider database package will be updated. The active APN and mobile connection will not be changed.') ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-positive important',
+					'click': function() {
+						ui.hideModal();
+						self.startAction('database-install');
+					}
+				}, [ _('Install update') ])
+			])
+		]);
+	},
+
 	render: function(data) {
 		var self = this;
 		var status = data[1];
 		var action = data[2];
-		var m = new form.Map('apn-autoconfig', _('Configuration'),
-			_('Automatic APN selection for a ModemManager mobile interface. Long operations run in the background and cannot overlap.'));
-		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Settings'));
+		var database = data[3];
+		var m = new form.Map('apn-autoconfig', _('Settings'),
+			_('Automatic APN selection for a ModemManager mobile interface.'));
+		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
 		self.policySupported = status && status.version === 'v2';
 		self.policyDirty = false;
+		self.databaseStatus = database;
+		self.currentStatus = status;
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -327,8 +494,6 @@ return view.extend({
 		o.default = 'https://connectivitycheck.gstatic.com/generate_204';
 		o.rmempty = false;
 
-		self.statusBox = E('div', { 'class': 'cbi-section' }, self.statusNodes(status));
-		self.actionStatus = E('p', { 'class': 'notice' }, [ self.actionDescription(action) ]);
 		self.reconcileButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',
@@ -339,6 +504,16 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
 		}, [ _('Power-cycle modem and re-read SIM') ]);
+		self.databaseCheckButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.startAction('database-check'); }
+		}, [ _('Check for updates') ]);
+		self.databaseInstallButton = E('button', {
+			'class': 'btn cbi-button cbi-button-positive',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmDatabaseInstall(); }
+		}, [ _('Install update') ]);
 		self.policySelect = E('select', {
 			'class': 'cbi-input-select',
 			'change': function() {
@@ -359,31 +534,58 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmRoamingPolicy(); }
 		}, [ _('Apply roaming policy') ]);
+
+		self.connectionBox = E('div', {}, self.connectionNodes(status));
+		self.apnBox = E('div', {}, self.apnNodes(status));
+		self.databaseBox = E('div', {}, self.databaseNodes(database, status));
+		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
 		poll.add(function() { return self.refreshStatus(); }, 2);
 
 		return m.render().then(function(mapNode) {
-			return E([], [
+			return E('div', { 'class': 'apn-autoconfig-page' }, [
+				E('style', { 'type': 'text/css' }, [
+					'.apn-autoconfig-page .apn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(22rem,1fr));gap:1rem;margin-bottom:1rem}' +
+					'.apn-autoconfig-page .apn-card{margin:0!important;padding:1rem}' +
+					'.apn-autoconfig-page .apn-card>h3{margin-top:0}' +
+					'.apn-autoconfig-page .apn-full{grid-column:1/-1}' +
+					'.apn-autoconfig-page .apn-label strong{font-weight:600}' +
+					'.apn-autoconfig-page .apn-details{margin-top:.75rem}' +
+					'.apn-autoconfig-page .apn-details summary{cursor:pointer;font-weight:600;padding:.35rem 0}' +
+					'.apn-autoconfig-page .apn-signal{display:grid;grid-template-columns:minmax(8rem,1fr) auto;align-items:center;gap:.65rem}' +
+					'.apn-autoconfig-page .apn-signal-value{font-weight:600;min-width:3.2em;text-align:right}' +
+					'.apn-autoconfig-page .apn-button-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}' +
+					'.apn-autoconfig-page .apn-policy-controls{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:1rem}' +
+					'.apn-autoconfig-page .apn-state-good{color:#2d8a43;font-weight:600}' +
+					'.apn-autoconfig-page .apn-state-bad{color:#b11;font-weight:600}' +
+					'.apn-autoconfig-page .apn-action-status{min-height:1.5em}' +
+					'@media(max-width:600px){.apn-autoconfig-page .apn-grid{grid-template-columns:1fr}.apn-autoconfig-page .apn-card{padding:.75rem}.apn-autoconfig-page .apn-table .apn-label{width:45%!important}}'
+				]),
 				E('h2', {}, [ _('APN Auto-Config') ]),
-				E('div', { 'class': 'cbi-section' }, [
-					E('h3', {}, [ _('Current SIM and APN') ]),
-					self.statusBox
-				]),
-				E('div', { 'class': 'cbi-section' }, [
-					E('h3', {}, [ _('Roaming data policy') ]),
-					E('p', {}, [ _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(status.interface || 'wwan') ]),
-					self.policySelect,
-					' ',
-					self.policyButton
-				]),
-				E('div', { 'class': 'cbi-section' }, [
-					E('h3', {}, [ _('Actions') ]),
-					self.actionStatus,
-					E('div', { 'class': 'cbi-page-actions' }, [
-						self.reconcileButton,
-						' ',
-						self.resetButton
+				E('div', { 'class': 'apn-grid' }, [
+					E('section', { 'class': 'cbi-section apn-card' }, [
+						E('h3', {}, [ _('Mobile connection') ]),
+						self.connectionBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card' }, [
+						E('h3', {}, [ _('Current APN') ]),
+						self.apnBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
+						E('h3', {}, [ _('Provider database') ]),
+						E('p', {}, [ _('The signed provider package can be checked and updated independently from the program and LuCI. Updating it does not change the active APN.') ]),
+						self.databaseBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card' }, [
+						E('h3', {}, [ _('Roaming data policy') ]),
+						E('p', {}, [ _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(status.interface || 'wwan') ]),
+						E('div', { 'class': 'apn-policy-controls' }, [ self.policySelect, self.policyButton ])
+					]),
+					E('section', { 'class': 'cbi-section apn-card' }, [
+						E('h3', {}, [ _('Actions') ]),
+						self.actionStatus,
+						E('div', { 'class': 'apn-button-row' }, [ self.reconcileButton, self.resetButton ])
 					])
 				]),
 				mapNode

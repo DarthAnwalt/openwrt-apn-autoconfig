@@ -1,0 +1,434 @@
+#!/bin/sh
+
+# Narrow provider-database package updater for LuCI and CLI integrations.
+# It trusts only a repository already configured in apk and a pinned public key.
+
+umask 077
+
+PROG="apn-autoconfig-database"
+PACKAGE="apn-autoconfig-providers"
+DATABASE="${APN_DATABASE_FILE:-/usr/share/apn-autoconfig/providers.tsv}"
+STATE_FILE="${APN_DATABASE_STATE_FILE:-/etc/apn-autoconfig/database-update.tsv}"
+LOCK_DIR="${APN_DATABASE_LOCK_DIR:-/var/lock/apn-autoconfig.lock}"
+REPOSITORIES_DIR="${APN_DATABASE_REPOSITORIES_DIR:-/etc/apk/repositories.d}"
+REPOSITORIES_FILE="${APN_DATABASE_REPOSITORIES_FILE:-/etc/apk/repositories}"
+KEYS_DIR="${APN_DATABASE_KEYS_DIR:-/etc/apk/keys}"
+FEED_URL="${APN_DATABASE_FEED_URL:-https://darthanwalt.github.io/openwrt-apn-autoconfig/25.12/noarch/packages.adb}"
+KEY_SHA256="${APN_DATABASE_KEY_SHA256:-0d4d6d383c84205c8fa16fafdf341ff80de24c63574a1d7d938cfb532fa458d3}"
+APK="${APN_DATABASE_APK:-apk}"
+TMP_BASE="${APN_DATABASE_TMP_BASE:-/tmp/apn-autoconfig-database.$$}"
+REPO_FILE="$TMP_BASE/repositories"
+CACHE_DIR="$TMP_BASE/cache"
+DOWNLOAD_DIR="$TMP_BASE/download"
+EXTRACT_DIR="$TMP_BASE/extract"
+APK_STDOUT="$TMP_BASE/apk.stdout"
+APK_STDERR="$TMP_BASE/apk.stderr"
+LOCK_HELD=0
+
+STATE="never"
+CHECKED_AT=""
+INSTALLED_AT=""
+RECORDED_INSTALLED_VERSION=""
+AVAILABLE_VERSION=""
+MESSAGE="Database updates have not been checked yet"
+
+timestamp() {
+	date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
+}
+
+sanitize() {
+	printf '%s' "$*" | tr '\t\r\n' '   '
+}
+
+log() {
+	level="$1"
+	shift
+	logger -t "$PROG" -p "user.$level" -- "$*" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$*" >&2
+}
+
+cleanup() {
+	rm -rf "$TMP_BASE"
+	if [ "$LOCK_HELD" -eq 1 ]; then
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || :
+		LOCK_HELD=0
+	fi
+}
+
+trap cleanup 0 HUP INT TERM
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+acquire_lock() {
+	mkdir -p "$(dirname "$LOCK_DIR")" || return 1
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+		if process_is_alive "$old_pid"; then
+			log warning "another APN or database operation is already running (PID $old_pid)"
+			return 3
+		fi
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || return 1
+		mkdir "$LOCK_DIR" 2>/dev/null || return 1
+	fi
+	printf '%s\n' "$$" >"$LOCK_DIR/pid" || return 1
+	LOCK_HELD=1
+}
+
+load_config() {
+	command -v uci >/dev/null 2>&1 || return 0
+	value="$(uci -q get apn-autoconfig.main.database 2>/dev/null || :)"
+	[ -n "${APN_DATABASE_FILE+x}" ] || { [ -z "$value" ] || DATABASE="$value"; }
+	value="$(uci -q get apn-autoconfig.main.state_dir 2>/dev/null || :)"
+	[ -n "${APN_DATABASE_STATE_FILE+x}" ] || { [ -z "$value" ] || STATE_FILE="$value/database-update.tsv"; }
+	value="$(uci -q get apn-autoconfig.main.lock_dir 2>/dev/null || :)"
+	[ -n "${APN_DATABASE_LOCK_DIR+x}" ] || { [ -z "$value" ] || LOCK_DIR="$value"; }
+	value="$(uci -q get apn-autoconfig.main.database_feed 2>/dev/null || :)"
+	[ -n "${APN_DATABASE_FEED_URL+x}" ] || { [ -z "$value" ] || FEED_URL="$value"; }
+}
+
+validate_paths() {
+	case "$DATABASE" in /|*/../*|*/..) return 1 ;; /*) : ;; *) return 1 ;; esac
+	case "$STATE_FILE" in /|*/../*|*/..) return 1 ;; /*) : ;; *) return 1 ;; esac
+	case "$LOCK_DIR" in /|*/../*|*/..) return 1 ;; /*) : ;; *) return 1 ;; esac
+	case "$FEED_URL" in https://*) : ;; *) return 1 ;; esac
+	case "$FEED_URL" in *[!A-Za-z0-9:/._?=%+\&-]*) return 1 ;; esac
+	case "$KEY_SHA256" in *[!0-9a-f]*|'') return 1 ;; esac
+	[ "${#KEY_SHA256}" -eq 64 ]
+}
+
+load_state() {
+	[ -r "$STATE_FILE" ] || return 0
+	version="$(awk -F '\t' 'NR == 1 { print $1; exit }' "$STATE_FILE")"
+	STATE="$(awk -F '\t' 'NR == 1 { print $2; exit }' "$STATE_FILE")"
+	CHECKED_AT="$(awk -F '\t' 'NR == 1 { print $3; exit }' "$STATE_FILE")"
+	INSTALLED_AT="$(awk -F '\t' 'NR == 1 { print $4; exit }' "$STATE_FILE")"
+	RECORDED_INSTALLED_VERSION="$(awk -F '\t' 'NR == 1 { print $5; exit }' "$STATE_FILE")"
+	AVAILABLE_VERSION="$(awk -F '\t' 'NR == 1 { print $6; exit }' "$STATE_FILE")"
+	MESSAGE="$(awk -F '\t' 'NR == 1 { print $7; exit }' "$STATE_FILE")"
+	[ "$CHECKED_AT" = - ] && CHECKED_AT=""
+	[ "$INSTALLED_AT" = - ] && INSTALLED_AT=""
+	[ "$RECORDED_INSTALLED_VERSION" = - ] && RECORDED_INSTALLED_VERSION=""
+	[ "$AVAILABLE_VERSION" = - ] && AVAILABLE_VERSION=""
+	[ "$version" = v1 ] || {
+		STATE="never"
+		CHECKED_AT=""
+		INSTALLED_AT=""
+		RECORDED_INSTALLED_VERSION=""
+		AVAILABLE_VERSION=""
+		MESSAGE="Database update state is invalid"
+	}
+}
+
+write_state() {
+	STATE="$1"
+	CHECKED_AT="$2"
+	INSTALLED_AT="$3"
+	RECORDED_INSTALLED_VERSION="$4"
+	AVAILABLE_VERSION="$5"
+	MESSAGE="$(sanitize "$6")"
+	checked_field="${CHECKED_AT:--}"
+	installed_at_field="${INSTALLED_AT:--}"
+	recorded_version_field="${RECORDED_INSTALLED_VERSION:--}"
+	available_version_field="${AVAILABLE_VERSION:--}"
+	mkdir -p "$(dirname "$STATE_FILE")" || return 1
+	tmp="$STATE_FILE.tmp.$$"
+	printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$STATE" "$checked_field" "$installed_at_field" \
+		"$recorded_version_field" "$available_version_field" "$MESSAGE" >"$tmp" || return 1
+	mv "$tmp" "$STATE_FILE"
+}
+
+package_version_from_line() {
+	line="$1"
+	case "$line" in "$PACKAGE"-*) : ;; *) return 1 ;; esac
+	version="${line#"$PACKAGE"-}"
+	printf '%s\n' "${version%% *}"
+}
+
+installed_version() {
+	line="$($APK list --installed "$PACKAGE" 2>/dev/null | sed -n '1p')"
+	package_version_from_line "$line"
+}
+
+database_metadata() {
+	key="$1"
+	awk -v prefix="# ${key}: " '
+		index($0, prefix) == 1 { print substr($0, length(prefix) + 1); exit }
+	' "$2"
+}
+
+database_is_valid() {
+	file="$1"
+	expected_package_version="$2"
+	[ -r "$file" ] || return 1
+	format="$(database_metadata database-format "$file")"
+	version="$(database_metadata database-version "$file")"
+	[ "$format" = 2 ] || return 1
+	expected_database_version="${expected_package_version%-r[0-9]*}"
+	[ "$version" = "$expected_database_version" ] || return 1
+	awk -F '\t' '
+		/^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+		NF != 12 { exit 1 }
+		$1 !~ /^[0-9][0-9][0-9][0-9][0-9][0-9]?$/ { exit 1 }
+		$7 !~ /^[A-Za-z0-9._-]+$/ { exit 1 }
+		$8 !~ /^[0-9]+$/ { exit 1 }
+		{ found=1 }
+		END { exit found ? 0 : 1 }
+	' "$file"
+}
+
+feed_is_configured() {
+	for file in "$REPOSITORIES_FILE" "$REPOSITORIES_DIR"/*; do
+		[ -f "$file" ] || continue
+		awk -v wanted="$FEED_URL" '
+			{ sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") }
+			$0 == wanted { found=1 }
+			END { exit found ? 0 : 1 }
+		' "$file" && return 0
+	done
+	return 1
+}
+
+key_is_trusted() {
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	for key in "$KEYS_DIR"/*; do
+		[ -f "$key" ] || continue
+		fingerprint="$(sha256sum "$key" 2>/dev/null | awk '{ print $1 }')"
+		[ "$fingerprint" = "$KEY_SHA256" ] && return 0
+	done
+	return 1
+}
+
+json_escape() {
+	awk 'BEGIN { ORS="" }
+	{
+		if (NR > 1) printf "\\n"
+		gsub(/\\/, "\\\\")
+		gsub(/\"/, "\\\"")
+		gsub(/\t/, "\\t")
+		gsub(/\r/, "\\r")
+		printf "%s", $0
+	}'
+}
+
+json_string() {
+	printf '"'
+	printf '%s' "$1" | json_escape
+	printf '"'
+}
+
+json_key_string() {
+	printf '"%s":' "$1"
+	json_string "$2"
+}
+
+status_json() {
+	load_state
+	installed="$(installed_version 2>/dev/null || :)"
+	database_version="$(database_metadata database-version "$DATABASE" 2>/dev/null || :)"
+	database_format="$(database_metadata database-format "$DATABASE" 2>/dev/null || :)"
+	feed_configured=false
+	key_trusted=false
+	feed_is_configured && feed_configured=true
+	key_is_trusted && key_trusted=true
+	update_available=false
+	[ -n "$AVAILABLE_VERSION" ] && [ "$AVAILABLE_VERSION" != "$installed" ] && \
+		case "$STATE" in update-available|install-failed) update_available=true ;; esac
+	if [ -n "$AVAILABLE_VERSION" ] && [ "$AVAILABLE_VERSION" = "$installed" ] && \
+		[ "$STATE" = update-available ]; then
+		STATE="current"
+		MESSAGE="The provider database is up to date"
+	fi
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string state "$STATE"; printf ','
+	json_key_string installed_package_version "$installed"; printf ','
+	json_key_string database_version "$database_version"; printf ','
+	json_key_string database_format "$database_format"; printf ','
+	json_key_string available_package_version "$AVAILABLE_VERSION"; printf ','
+	json_key_string checked_at "$CHECKED_AT"; printf ','
+	json_key_string installed_at "$INSTALLED_AT"; printf ','
+	printf '"feed_configured":%s,' "$feed_configured"
+	printf '"key_trusted":%s,' "$key_trusted"
+	printf '"update_available":%s,' "$update_available"
+	json_key_string feed_url "$FEED_URL"; printf ','
+	json_key_string message "$MESSAGE"
+	printf '}\n'
+}
+
+last_apk_error() {
+	message="$(sed -n '$p' "$APK_STDERR" 2>/dev/null || :)"
+	[ -n "$message" ] || message="$(sed -n '$p' "$APK_STDOUT" 2>/dev/null || :)"
+	[ -n "$message" ] || message="apk operation failed"
+	printf '%s\n' "$message"
+}
+
+prepare_repository() {
+	feed_is_configured || return 4
+	key_is_trusted || return 5
+	command -v "$APK" >/dev/null 2>&1 || return 127
+	mkdir -p "$CACHE_DIR" "$DOWNLOAD_DIR" "$EXTRACT_DIR" || return 1
+	printf '%s\n' "$FEED_URL" >"$REPO_FILE" || return 1
+	"$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+		--cache-dir "$CACHE_DIR" --force-refresh update \
+		>"$APK_STDOUT" 2>"$APK_STDERR"
+}
+
+available_update_version() {
+	line="$($APK --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+		--cache-dir "$CACHE_DIR" list --upgradable "$PACKAGE" 2>"$APK_STDERR" | sed -n '1p')"
+	[ -n "$line" ] || return 1
+	package_version_from_line "$line"
+}
+
+record_prepare_failure() {
+	status="$1"
+	checked="$2"
+	installed="$3"
+	case "$status" in
+		4) message="The signed APN Auto-Config feed is not configured" ;;
+		5) message="The trusted APN Auto-Config repository key is not installed" ;;
+		127) message="apk is not available" ;;
+		*) message="$(last_apk_error)" ;;
+	esac
+	write_state check-failed "$checked" "$INSTALLED_AT" "$installed" "" "$message" || :
+	log err "$message"
+}
+
+check_cmd() {
+	acquire_lock || return $?
+	load_state
+	checked="$(timestamp)"
+	installed="$(installed_version 2>/dev/null || :)"
+	write_state checking "$checked" "$INSTALLED_AT" "$installed" "" "Checking the signed repository" || return 1
+	if prepare_repository; then
+		:
+	else
+		status=$?
+		record_prepare_failure "$status" "$checked" "$installed"
+		return "$status"
+	fi
+	available="$(available_update_version 2>/dev/null || :)"
+	if [ -n "$available" ]; then
+		write_state update-available "$checked" "$INSTALLED_AT" "$installed" "$available" \
+			"Provider database update $available is available" || return 1
+		log notice "provider database update available: ${installed:--} -> $available"
+	else
+		write_state current "$checked" "$INSTALLED_AT" "$installed" "$installed" \
+			"The provider database is up to date" || return 1
+		log notice "provider database is current: ${installed:--}"
+	fi
+}
+
+stage_candidate() {
+	available="$1"
+	"$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+		--cache-dir "$CACHE_DIR" fetch --output "$DOWNLOAD_DIR" "$PACKAGE" \
+		>"$APK_STDOUT" 2>"$APK_STDERR" || return 1
+	set -- "$DOWNLOAD_DIR"/"$PACKAGE"-*.apk
+	[ "$#" -eq 1 ] && [ -f "$1" ] || return 1
+	case "$1" in *"/$PACKAGE-$available.apk") : ;; *) return 1 ;; esac
+	# The APK payload is authenticated by the signed repository index used by
+	# `apk fetch`. OpenWrt packages are not individually signed, so standalone
+	# extraction needs --allow-untrusted; the real installation below does not.
+	"$APK" --allow-untrusted extract --destination "$EXTRACT_DIR" --no-chown "$1" \
+		>"$APK_STDOUT" 2>"$APK_STDERR" || return 1
+	database_is_valid "$EXTRACT_DIR/usr/share/apn-autoconfig/providers.tsv" "$available"
+}
+
+install_cmd() {
+	acquire_lock || return $?
+	load_state
+	checked="$(timestamp)"
+	installed="$(installed_version 2>/dev/null || :)"
+	write_state checking "$checked" "$INSTALLED_AT" "$installed" "" \
+		"Refreshing the signed repository before installation" || return 1
+	if prepare_repository; then
+		:
+	else
+		status=$?
+		record_prepare_failure "$status" "$checked" "$installed"
+		return "$status"
+	fi
+	available="$(available_update_version 2>/dev/null || :)"
+	if [ -z "$available" ]; then
+		write_state current "$checked" "$INSTALLED_AT" "$installed" "$installed" \
+			"The provider database is already up to date" || return 1
+		return 0
+	fi
+	write_state installing "$checked" "$INSTALLED_AT" "$installed" "$available" \
+		"Validating and installing provider database $available" || return 1
+	if ! stage_candidate "$available"; then
+		message="The downloaded provider database package failed validation"
+		write_state install-failed "$checked" "$INSTALLED_AT" "$installed" "$available" "$message" || :
+		log err "$message"
+		return 1
+	fi
+	if ! "$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+		--cache-dir "$CACHE_DIR" add --simulate "$PACKAGE" \
+		>"$APK_STDOUT" 2>"$APK_STDERR"; then
+		message="$(last_apk_error)"
+		write_state install-failed "$checked" "$INSTALLED_AT" "$installed" "$available" "$message" || :
+		log err "$message"
+		return 1
+	fi
+	# `apk add` also removes legacy checksum-bound world constraints left by a
+	# local-file installation. The following targeted upgrade remains limited
+	# to the provider package and its (currently empty) dependency set.
+	if ! "$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+		--cache-dir "$CACHE_DIR" add "$PACKAGE" \
+		>"$APK_STDOUT" 2>"$APK_STDERR"; then
+		message="$(last_apk_error)"
+		write_state install-failed "$checked" "$INSTALLED_AT" "$installed" "$available" "$message" || :
+		log err "$message"
+		return 1
+	fi
+	new_installed="$(installed_version 2>/dev/null || :)"
+	if [ "$new_installed" != "$available" ]; then
+		if ! "$APK" --keys-dir "$KEYS_DIR" --repositories-file "$REPO_FILE" \
+			--cache-dir "$CACHE_DIR" upgrade "$PACKAGE" \
+			>"$APK_STDOUT" 2>"$APK_STDERR"; then
+			message="$(last_apk_error)"
+			write_state install-failed "$checked" "$INSTALLED_AT" "$installed" "$available" "$message" || :
+			log err "$message"
+			return 1
+		fi
+		new_installed="$(installed_version 2>/dev/null || :)"
+	fi
+	if [ "$new_installed" != "$available" ] || ! database_is_valid "$DATABASE" "$available"; then
+		message="The installed provider database did not pass post-install validation"
+		write_state install-failed "$checked" "$INSTALLED_AT" "$new_installed" "$available" "$message" || :
+		log err "$message"
+		return 1
+	fi
+	installed_at="$(timestamp)"
+	write_state updated "$checked" "$installed_at" "$new_installed" "$new_installed" \
+		"Provider database $new_installed was installed successfully" || return 1
+	log notice "provider database updated successfully: $installed -> $new_installed"
+}
+
+usage() {
+	printf 'Usage: %s <status-json|check|install>\n' "$PROG"
+}
+
+main() {
+	load_config
+	validate_paths || {
+		log err "invalid database updater configuration"
+		exit 1
+	}
+	case "${1:-}" in
+		status-json) status_json ;;
+		check) check_cmd ;;
+		install) install_cmd ;;
+		-h|--help|help|'') usage ;;
+		*) usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

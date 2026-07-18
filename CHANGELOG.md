@@ -1,5 +1,22 @@
 # Changelog
 
+## apn-autoconfig 0.8.5 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.4.0
+
+- Add manual provider-database update checks and installations through LuCI,
+  limited to the independently versioned `apn-autoconfig-providers` package.
+- Require the configured project feed and pinned trusted key, refresh only that
+  signed repository, and validate a staged database package before installation.
+- Serialize database package work with APN, roaming-policy and modem operations
+  through the existing background dispatcher and operation lock.
+- Persist the last check, available version, result and successful LuCI
+  installation time without storing SIM or APN credentials.
+- Redesign the LuCI page into distinct mobile-connection, APN, provider-database,
+  roaming-policy, action and configuration sections.
+- Add bold status labels, native LuCI signal-quality progress visualization,
+  responsive spacing and collapsible technical details.
+- Preserve the 0.8.2 roaming-policy selection fix and expand its regression test
+  to cover the new grouped layout and database controls.
+
 ## apn-autoconfig 0.8.2 / apn-autoconfig-providers 2026.07.16 / luci-app-apn-autoconfig 0.3.1
 
 - Correct the initial LuCI roaming-policy selection so the browser cannot

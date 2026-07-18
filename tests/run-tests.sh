@@ -558,6 +558,22 @@ grep -F -x -q 'roaming-policy-set allow' "$STATE/policy-action-args" || fail 'ro
 policy_action_json="$(sh "$SCRIPT" action-status)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "success" and d["busy"] is False' "$policy_action_json" || fail 'roaming policy action did not complete'
 
+printf '%s\n' 'TEST database actions map to the narrow updater command'
+cat >"$MOCKBIN/apn-autoconfig-database-command" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >"$TEST_STATE/database-action-args"
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-database-command"
+rm -rf "$TEST_ACTION_STATE"
+rm -f "$STATE/database-action-args"
+APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" \
+	APN_AUTOCONFIG_DATABASE_COMMAND="$MOCKBIN/apn-autoconfig-database-command" \
+	sh "$SCRIPT" action-start database-check >"$STATE/action-database-start.json"
+/bin/sleep 1
+grep -F -x -q 'check' "$STATE/database-action-args" || fail 'database-check action used the wrong command'
+database_action_json="$(sh "$SCRIPT" action-status)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "success" and d["busy"] is False and d["action"] == "database-check"' "$database_action_json" || fail 'database check action did not complete'
+
 printf '%s\n' 'TEST failed background action reaches a terminal state and releases GUI controls'
 rm -rf "$TEST_ACTION_STATE"
 ACTION_EXIT=7 APN_AUTOCONFIG_ACTION_WORKER="$BASE/files/usr/libexec/apn-autoconfig-action" \

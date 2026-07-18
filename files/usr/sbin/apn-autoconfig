@@ -941,7 +941,7 @@ action_status_cmd() {
 action_start_cmd() {
 	action="${1:-}"
 	case "$action" in
-		reconcile|modem-reset|roaming-default|roaming-allow|roaming-block) : ;;
+		reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;;
 		*) die "unsupported background action: $action" ;;
 	esac
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
@@ -1524,7 +1524,7 @@ Commands:
   modem-reset  Power-cycle the modem GPIO, wait for SIM, then reconcile APN
   status   Show SIM identity, configured/cached APN and last result
   status-json  Machine-readable status output for LuCI and integrations
-  action-start <reconcile|modem-reset|roaming-default|roaming-allow|roaming-block>
+  action-start <reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install>
            Start one operation in background
   action-status  Show background/external operation state as JSON
   roaming-policy-set <default|allow|block>  Change OpenWrt's canonical policy

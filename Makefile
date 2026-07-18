@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.8.2
+PKG_VERSION:=0.8.5
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -45,6 +45,7 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-action $(1)/usr/libexec/apn-autoconfig-action
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-query $(1)/usr/libexec/apn-autoconfig-query
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-control $(1)/usr/libexec/apn-autoconfig-control
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-database $(1)/usr/libexec/apn-autoconfig-database
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/button
 	$(INSTALL_BIN) ./files/etc/hotplug.d/button/50-apn-autoconfig $(1)/etc/hotplug.d/button/50-apn-autoconfig
 endef

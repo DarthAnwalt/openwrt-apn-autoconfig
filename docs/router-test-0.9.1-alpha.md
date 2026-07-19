@@ -52,8 +52,8 @@ complete installation:
 ```sh
 apk add --simulate --allow-untrusted \
   /tmp/apn-autoconfig-alpha/apn-autoconfig-providers-*.apk \
-  /tmp/apn-autoconfig-alpha/apn-autoconfig-0.9.1_alpha.1-r1.apk \
-  /tmp/apn-autoconfig-alpha/luci-app-apn-autoconfig-0.6.0_alpha.1-r1.apk \
+  /tmp/apn-autoconfig-alpha/apn-autoconfig-0.9.1_alpha1-r1.apk \
+  /tmp/apn-autoconfig-alpha/luci-app-apn-autoconfig-0.6.0_alpha1-r1.apk \
   /tmp/apn-autoconfig-alpha/apn-autoconfig-integration-huasifei-wh3000-*.apk
 ```
 

@@ -274,8 +274,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1-alpha.1-r1.apk \
-  ./luci-app-apn-autoconfig-0.6.0-alpha.1-r1.apk
+  ./apn-autoconfig-0.9.1_alpha1-r1.apk \
+  ./luci-app-apn-autoconfig-0.6.0_alpha1-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -341,7 +341,7 @@ active APN, or restart the mobile interface. The candidate package is fetched
 through APK's signed index and its TSV metadata and rows are validated before
 installation.
 
-Version 0.6.0-alpha.1 retains the policy-selection fix: the Apply button remains
+Version 0.6.0_alpha1 retains the policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts

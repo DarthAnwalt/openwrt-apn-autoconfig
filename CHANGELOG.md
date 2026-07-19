@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.9.1-alpha.1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0-alpha.1 (unreleased)
+## apn-autoconfig 0.9.1_alpha1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0_alpha1 (unreleased)
 
 - Added a bounded read-only QMI identity helper using only `uqmi` ICCID, IMSI
   and serving-system queries; QMI profile mutation remains unavailable.

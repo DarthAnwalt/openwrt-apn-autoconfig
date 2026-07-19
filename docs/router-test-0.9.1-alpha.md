@@ -53,7 +53,7 @@ complete installation:
 apk add --simulate --allow-untrusted \
   /tmp/apn-autoconfig-alpha/apn-autoconfig-providers-*.apk \
   /tmp/apn-autoconfig-alpha/apn-autoconfig-0.9.1_alpha1-r1.apk \
-  /tmp/apn-autoconfig-alpha/luci-app-apn-autoconfig-0.6.0_alpha1-r1.apk \
+  /tmp/apn-autoconfig-alpha/luci-app-apn-autoconfig-0.6.0_alpha1-r2.apk \
   /tmp/apn-autoconfig-alpha/apn-autoconfig-integration-huasifei-wh3000-*.apk
 ```
 
@@ -85,6 +85,15 @@ button flow.
 
 Do not continue after any unexpected target selection, package removal, UCI
 change, loss of the management path or rollback warning.
+
+## Observed WH3000 result (2026-07-19)
+
+The optional integration package received one `BTN_0` release and queued one
+background `modem-reset`. The engine stopped `wwan`, held modem power off for
+the configured five seconds, restored power, found ModemManager and the SIM
+again after 44 seconds, and completed reconciliation after 55 seconds total.
+`wwan0` returned up, the configured APN was unchanged, the operation lock was
+released and `uci changes` remained empty.
 
 ## Rollback
 

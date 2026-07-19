@@ -27,6 +27,7 @@ function element(tag, attrs, children) {
 		return { tag: 'fragment', children: children };
 
 	var node = { tag: tag, attrs: {}, children: children, style: {} };
+	node.setAttribute = function(key, value) { this.attrs[key] = String(value); };
 	Object.keys(attrs).forEach(function(key) {
 		var value = attrs[key];
 		if (value == null)
@@ -169,6 +170,10 @@ async function verifyLayout() {
 		access_technologies: 'lte,5gnr',
 		signal_quality: '81',
 		configured_apn: 'fixture.apn',
+		iccid: '89492031246010483050',
+		imsi: '262021234567890',
+		eid: '89049032000000000000000000000001',
+		reconciled_iccid: '89492031246010483050',
 		database_format: '2',
 		database_sources: 'fixture',
 		database_revisions: 'fixture@1234567',
@@ -205,6 +210,29 @@ async function verifyLayout() {
 	assert.ok(nodes.some(function(node) {
 		return node.tag === 'strong' && node.children.join('') === 'Signal quality';
 	}), 'status row labels must be bold');
+	var sensitiveDisplays = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-sensitive-value') !== -1;
+	});
+	var sensitiveToggles = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-sensitive-toggle') !== -1;
+	});
+	assert.strictEqual(sensitiveDisplays.length, 4,
+		'ICCID, IMSI, EID and reconciled SIM must be masked independently');
+	assert.strictEqual(sensitiveToggles.length, 4,
+		'each masked identifier must have its own reveal control');
+	assert.ok(sensitiveDisplays.every(function(node) {
+		return node.children.join('').indexOf('89492031246010483050') === -1;
+	}), 'full identifiers must not be rendered before an explicit reveal');
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '•••• 3050',
+		'masked reconciled SIM must retain only the final four digits');
+	sensitiveToggles[3].click({ preventDefault: function() {} });
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '89492031246010483050',
+		'reveal control must show the complete reconciled SIM identifier');
+	assert.strictEqual(sensitiveToggles[3].children.join(''), 'Hide',
+		'reveal control must become an explicit hide control');
+	sensitiveToggles[3].click({ preventDefault: function() {} });
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '•••• 3050',
+		'hide control must restore masking');
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');
 	assert.strictEqual(app.databaseInstallButton.disabled, false,

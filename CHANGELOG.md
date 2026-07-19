@@ -19,6 +19,8 @@
   reset without a supported integration marker, and LuCI hides those controls.
 - Kept QMI `apply`, `reconcile` and policy mutation behind exit code 4 before
   UCI, persistent-state or netifd mutation.
+- Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
+  each value now has an explicit accessible Show/Hide control.
 - Added synthetic QMI home/roaming fixtures and tests for unavailable adapters,
   command failure, malformed identity, unsafe device paths and mutating-command
   isolation while retaining the full ModemManager regression suite.

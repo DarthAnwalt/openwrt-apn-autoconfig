@@ -32,6 +32,38 @@ function valueNode(value) {
 	return value != null && typeof value === 'object' ? value : text(value);
 }
 
+function maskedIdentifier(value) {
+	var identifier = value == null ? '' : String(value);
+	if (!identifier)
+		return '—';
+	return identifier.length > 4 ? '•••• ' + identifier.slice(-4) : '••••';
+}
+
+function sensitiveIdentifier(value, label) {
+	var identifier = value == null ? '' : String(value);
+	if (!identifier)
+		return text(value);
+
+	var revealed = false;
+	var display = E('span', { 'class': 'apn-sensitive-value' }, [ maskedIdentifier(identifier) ]);
+	var button = E('button', {
+		'class': 'btn cbi-button cbi-button-neutral apn-sensitive-toggle',
+		'type': 'button',
+		'title': _('Show full %s').format(label),
+		'aria-label': _('Show full %s').format(label),
+		'click': function(ev) {
+			ev.preventDefault();
+			revealed = !revealed;
+			dom.content(display, [ revealed ? identifier : maskedIdentifier(identifier) ]);
+			dom.content(button, [ revealed ? _('Hide') : _('Show') ]);
+			button.setAttribute('title', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
+			button.setAttribute('aria-label', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
+		}
+	}, [ _('Show') ]);
+
+	return E('span', { 'class': 'apn-sensitive-identifier' }, [ display, ' ', button ]);
+}
+
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
 		E('td', { 'class': 'td left apn-label', 'style': 'width:40%' }, [ E('strong', {}, [ label ]) ]),
@@ -150,9 +182,9 @@ return view.extend({
 			E('details', { 'class': 'apn-details' }, [
 				E('summary', {}, [ _('SIM and modem details') ]),
 				table([
-					row(_('ICCID'), status.iccid),
-					row(_('IMSI'), status.imsi),
-					row(_('EID'), status.eid),
+					row(_('ICCID'), sensitiveIdentifier(status.iccid, _('ICCID'))),
+					row(_('IMSI'), sensitiveIdentifier(status.imsi, _('IMSI'))),
+					row(_('EID'), sensitiveIdentifier(status.eid, _('EID'))),
 					row(_('SIM slot / backend index'), status.sim_index),
 					row(_('Modem / control identifier'), status.modem_index),
 					row(_('Engine target'), status.target_id),
@@ -175,7 +207,7 @@ return view.extend({
 			row(_('Cached APN for this SIM'), status.cached_apn),
 			row(_('Last result'), status.last_result),
 			row(_('Reconciled APN'), status.reconciled_apn),
-			row(_('Reconciled SIM'), status.reconciled_iccid)
+			row(_('Reconciled SIM'), sensitiveIdentifier(status.reconciled_iccid, _('SIM identifier')))
 		]) ];
 	},
 

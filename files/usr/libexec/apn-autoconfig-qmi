@@ -6,13 +6,14 @@
 umask 077
 
 UQMI="${APN_AUTOCONFIG_UQMI:-uqmi}"
+TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
 capabilities() {
-	command_exists "$UQMI" && command_exists jsonfilter && command_exists timeout
+	command_exists "$UQMI" && command_exists jsonfilter
 }
 
 safe_single_line() {
@@ -42,7 +43,14 @@ json_value() {
 run_uqmi() {
 	device="$1"
 	shift
-	timeout 6 "$UQMI" -s -d "$device" -t 3000 "$@"
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" 6 "$UQMI" -s -d "$device" -t 3000 "$@"
+	else
+		# uqmi has its own per-request timeout. Minimal OpenWrt images do not
+		# necessarily provide a separate timeout command, so keep QMI identity
+		# available while retaining the bounded backend request.
+		"$UQMI" -s -d "$device" -t 3000 "$@"
+	fi
 }
 
 normalize_registration() {

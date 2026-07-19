@@ -6,6 +6,8 @@
   and serving-system queries; QMI profile mutation remains unavailable.
 - Added strict QMI control-device validation and deterministic resolution of a
   single official-style netifd `devpath`; ambiguous paths fail closed.
+- Kept QMI identity available on minimal OpenWrt images without an external
+  `timeout` command by falling back to uqmi's bounded per-request timeout.
 - Added `targets-json` v2 evidence fields so alpha/synthetic implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

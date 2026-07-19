@@ -70,13 +70,17 @@ if find "$ROOT" -path "$ROOT/.git" -prune -o -type f \
 fi
 database_version="$(sed -n '1p' "$ROOT/apn-autoconfig-providers/VERSION")"
 core_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile")"
+core_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile")"
 luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
+luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
 [ -n "$core_version" ]
+[ -n "$core_release" ]
 [ -n "$luci_version" ]
+[ -n "$luci_release" ]
 grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
 	"$ROOT/CHANGELOG.md"
-grep -F -q "./apn-autoconfig-$core_version-r1.apk" "$ROOT/README.md"
-grep -F -q "./luci-app-apn-autoconfig-$luci_version-r1.apk" "$ROOT/README.md"
+grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
+grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
 	printf 'Release tag %s does not match core package version %s.\n' \
 		"$EXPECTED_RELEASE_TAG" "$core_version" >&2

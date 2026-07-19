@@ -324,6 +324,8 @@ qmi_unavailable_json="$(APN_AUTOCONFIG_QMI_ADAPTER="$TESTROOT/missing-qmi-adapte
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False; assert q["implementation_state"] == "alpha"; assert q["unavailable_reason"] == "adapter-unavailable"' "$qmi_unavailable_json" || fail 'missing QMI adapter was reported as available'
 qmi_command_unavailable_json="$(APN_AUTOCONFIG_UQMI="$TESTROOT/missing-uqmi" sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False and q["unavailable_reason"] == "backend-command-unavailable"' "$qmi_command_unavailable_json" || fail 'missing uqmi command was reported as available'
+qmi_without_external_timeout_json="$(APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi" and d["target_capabilities"]["identity"] is True; assert d["registration_state"] == "home"' "$qmi_without_external_timeout_json" || fail 'QMI identity required an undeclared external timeout command'
 
 printf '%s\n' 'TEST QMI alpha identity is read-only and matches candidates from fixture output'
 : >"$STATE/events"

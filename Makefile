@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
 PKG_VERSION:=0.9.1_alpha1
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=DarthAnwalt
@@ -15,16 +15,16 @@ define Package/apn-autoconfig
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Target-aware automatic APN selection
-  DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +jsonfilter +netifd +ubus +uci
+  DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +jsonfilter +netifd +sms-tool +ubus +uci
   PKGARCH:=all
 endef
 
 define Package/apn-autoconfig/description
  POSIX-shell cellular profile detection and testing engine for OpenWrt.
  Its complete write/apply backend uses an already installed ModemManager. The 0.9.1 alpha also
- provides synthetically tested, read-only QMI identity through an optional
- installed uqmi command, while reporting that QMI profile application is not
- hardware-validated. It matches SIM identity against a worldwide local TSV database,
+ provides read-only QMI identity through an installed uqmi command with a
+ same-USB-device AT fallback through sms-tool, while reporting that QMI profile
+ application is not hardware-validated. It matches SIM identity against a worldwide local TSV database,
  verifies real Internet access, caches successful profiles per ICCID and safely
  rolls back failures.
 endef

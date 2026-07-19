@@ -3,8 +3,9 @@
 `apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
 0.9.1 alpha discovers configured cellular netifd interfaces and publishes both
 their runtime capabilities and validation level through a GUI-independent API.
-Its complete operational backend is ModemManager. QMI has a synthetically
-tested, read-only identity adapter when `uqmi` is installed, but deliberately
+Its complete operational backend is ModemManager. QMI has a read-only identity
+adapter using `uqmi` with a same-USB-device AT fallback through `sms-tool`, but
+deliberately
 cannot mutate profiles before live hardware validation; MBIM, Fibocom and
 selected AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
 candidates in a worldwide local TSV database, restarts only the selected mobile
@@ -84,6 +85,7 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 ## Requirements
 
 - vanilla OpenWrt 25.12
+- `sms-tool`, installed automatically as the common read-only AT transport
 - `modemmanager` / `mmcli` for the stable write/apply backend; it is no longer
   pulled into GUI-independent core installations automatically
 - optional `uqmi` for the synthetically tested, read-only QMI identity alpha
@@ -274,7 +276,7 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1_alpha1-r2.apk \
+  ./apn-autoconfig-0.9.1_alpha1-r3.apk \
   ./luci-app-apn-autoconfig-0.6.0_alpha1-r4.apk
 ```
 
@@ -756,8 +758,10 @@ submission has been implemented and tested.
   settings change and some MVNOs do not expose a usable SIM discriminator.
 - Automatic SIM resolution requires ModemManager to expose a primary SIM path;
   a configured numeric `sim_index` is used only when resolution is impossible.
-- QMI identity in 0.9.1-alpha is based on synthetic upstream-format fixtures,
-  not physical hardware. QMI profile operations plus all MBIM, Fibocom and
+- The QMI identity adapter has synthetic coverage; its native `uqmi` identity
+  calls are not supported by the reference RM520N, so the same-device AT
+  fallback still requires an end-to-end packaged hardware test. QMI profile
+  operations plus all MBIM, Fibocom and
   AT-managed operations remain unavailable; mutating commands exit 4 before
   changing UCI, state or network interfaces.
 - The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses

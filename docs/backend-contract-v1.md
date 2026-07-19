@@ -21,7 +21,7 @@ and validation state:
   test gate.
 
 An installed parser is not hardware support. A missing runtime command such as
-`mmcli` or `uqmi` makes the corresponding capability false without hiding the
+`mmcli`, `uqmi` or the core dependency `sms_tool` makes the corresponding capability false without hiding the
 configured cellular target.
 
 ## Read-only QMI identity adapter
@@ -39,13 +39,32 @@ The core can obtain that name from an explicit netifd `device` or resolve
 exactly one matching control channel below a validated OpenWrt `devpath` in
 sysfs. Zero or multiple matches fail closed instead of selecting by enumeration
 order.
-It invokes only bounded, read-only `uqmi` operations:
+It first invokes only bounded, read-only `uqmi` operations:
 
 ```text
 --get-iccid
 --get-imsi
 --get-serving-system
 ```
+
+Some QMI modem firmware, including the tested RM520N, reports `Not supported`
+for the native ICCID and IMSI operations while serving-system queries work. In
+that case the adapter resolves `ttyUSB*`/`ttyACM*` class devices whose canonical
+sysfs path belongs to the same physical USB device as the selected QMI control
+channel. It probes those ports in deterministic order through `sms_tool` using
+only this fixed read-only allowlist:
+
+```text
+AT+CCID
+AT+QCCID
+AT+CIMI
+```
+
+The standard ICCID command is tried before the Quectel-compatible variant. A
+port is accepted only when it returns one valid ICCID and one valid IMSI.
+Symlinks outside the configured sysfs root, ports belonging to another USB
+device, non-numeric suffixes and malformed modem output fail closed. No AT
+command is accepted from UCI, the environment, the GUI or another caller.
 
 It does not verify a PIN, change SIM power, register a network, edit a QMI
 profile or start/stop a bearer. Connection ownership remains in OpenWrt netifd.

@@ -2,8 +2,13 @@
 
 ## apn-autoconfig 0.9.1_alpha1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0_alpha1 (unreleased)
 
-- Added a bounded read-only QMI identity helper using only `uqmi` ICCID, IMSI
-  and serving-system queries; QMI profile mutation remains unavailable.
+- Added a read-only QMI identity helper using `uqmi` ICCID, IMSI and
+  serving-system queries; QMI profile mutation remains unavailable.
+- Added `sms-tool` as the small common core dependency and a strictly
+  allow-listed `AT+CCID`/`AT+QCCID`/`AT+CIMI` fallback for QMI devices whose
+  firmware rejects native QMI ICCID/IMSI operations.
+- Restricted automatic AT probing to validated `ttyUSB`/`ttyACM` ports below
+  the same physical USB device as the selected QMI control channel.
 - Added strict QMI control-device validation and deterministic resolution of a
   single official-style netifd `devpath`; ambiguous paths fail closed.
 - Kept QMI identity available on minimal OpenWrt images without an external
@@ -24,8 +29,9 @@
 - Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
   each value now has an explicit accessible Show/Hide control whose position
   remains fixed while the same-width masked and revealed values are toggled.
-- Added synthetic QMI home/roaming fixtures and tests for unavailable adapters,
-  command failure, malformed identity, unsafe device paths and mutating-command
+- Added synthetic QMI home/roaming and same-device AT fixtures and tests for
+  unavailable adapters, command failure, malformed identity, sysfs escapes,
+  unsafe device paths and mutating-command
   isolation while retaining the full ModemManager regression suite.
 - Documented backend contract v1, the evidence ladder and the remaining live
   hardware gate. This alpha is not a stable QMI implementation.

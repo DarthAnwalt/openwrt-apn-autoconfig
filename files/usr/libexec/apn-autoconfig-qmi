@@ -6,14 +6,17 @@
 umask 077
 
 UQMI="${APN_AUTOCONFIG_UQMI:-uqmi}"
+SMS_TOOL="${APN_AUTOCONFIG_SMS_TOOL:-sms_tool}"
 TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
+SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
 capabilities() {
-	command_exists "$UQMI" && command_exists jsonfilter
+	command_exists "$UQMI" && command_exists "$SMS_TOOL" && \
+		command_exists jsonfilter && command_exists readlink
 }
 
 safe_single_line() {
@@ -51,6 +54,103 @@ run_uqmi() {
 		# available while retaining the bounded backend request.
 		"$UQMI" -s -d "$device" -t 3000 "$@"
 	fi
+}
+
+usb_device_path() {
+	path="$1"
+	while [ "$path" != "$SYSFS_ROOT" ] && [ "$path" != / ] && [ -n "$path" ]; do
+		name="${path##*/}"
+		case "$name" in
+			*:1.*)
+				printf '%s\n' "${path%/*}"
+				return 0
+			;;
+		esac
+		path="${path%/*}"
+	done
+	return 1
+}
+
+control_usb_device() {
+	device_name="${1#/dev/}"
+	case "$device_name" in
+		cdc-wdm*) class=usbmisc ;;
+		wwan*qmi*) class=wwan ;;
+		*) return 1 ;;
+	esac
+	class_device="$SYSFS_ROOT/class/$class/$device_name/device"
+	[ -e "$class_device" ] || return 1
+	resolved="$(readlink -f "$class_device" 2>/dev/null)" || return 1
+	case "$resolved" in "$SYSFS_ROOT"/devices/*) : ;; *) return 1 ;; esac
+	usb_device_path "$resolved"
+}
+
+related_at_devices() {
+	normalized_sysfs="$(readlink -f "$SYSFS_ROOT" 2>/dev/null)" || return 1
+	SYSFS_ROOT="$normalized_sysfs"
+	control_usb="$(control_usb_device "$1")" || return 1
+	for class_device in \
+		"$SYSFS_ROOT"/class/tty/ttyUSB*/device \
+		"$SYSFS_ROOT"/class/tty/ttyACM*/device
+	do
+		[ -e "$class_device" ] || continue
+		resolved="$(readlink -f "$class_device" 2>/dev/null)" || continue
+		case "$resolved" in "$SYSFS_ROOT"/devices/*) : ;; *) continue ;; esac
+		candidate_usb="$(usb_device_path "$resolved")" || continue
+		[ "$candidate_usb" = "$control_usb" ] || continue
+		device_name="${class_device%/device}"
+		device_name="${device_name##*/}"
+		case "$device_name" in
+			ttyUSB*) index="${device_name#ttyUSB}" ;;
+			ttyACM*) index="${device_name#ttyACM}" ;;
+			*) continue ;;
+		esac
+		case "$index" in ''|*[!0-9]*) continue ;; esac
+		printf '/dev/%s\n' "$device_name"
+	done
+}
+
+at_digits() {
+	kind="$1"
+	awk -v kind="$kind" '
+		{
+			gsub(/\r/, "")
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+			if (kind == "iccid") sub(/^\+(Q)?CCID:[[:space:]]*/, "")
+			if ($0 !~ /^[0-9]+$/) next
+			lengths_ok = (kind == "iccid" && length($0) >= 10 && length($0) <= 32) ||
+				(kind == "imsi" && length($0) >= 5 && length($0) <= 18)
+			if (!lengths_ok) next
+			value = $0
+			count++
+		}
+		END {
+			if (count != 1) exit 1
+			print value
+		}
+	'
+}
+
+run_at() {
+	device="$1"
+	command="$2"
+	"$SMS_TOOL" -d "$device" at "$command" 2>/dev/null
+}
+
+at_identity() {
+	control_device="$1"
+	for at_device in $(related_at_devices "$control_device"); do
+		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_output=""
+		iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
+			iccid_output="$(run_at "$at_device" 'AT+QCCID')" || iccid_output=""
+			iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || continue
+		}
+		imsi_output="$(run_at "$at_device" 'AT+CIMI')" || continue
+		imsi="$(printf '%s\n' "$imsi_output" | at_digits imsi)" || continue
+		printf '%s\n%s\n' "$iccid" "$imsi"
+		return 0
+	done
+	return 1
 }
 
 normalize_registration() {
@@ -100,10 +200,18 @@ identity() {
 		*) return 1 ;;
 	esac
 
-	iccid_json="$(run_uqmi "$device" --get-iccid 2>/dev/null)" || return 3
-	imsi_json="$(run_uqmi "$device" --get-imsi 2>/dev/null)" || return 3
-	iccid="$(json_digits "$iccid_json")" || return 1
-	imsi="$(json_digits "$imsi_json")" || return 1
+	iccid_status=0
+	iccid_json="$(run_uqmi "$device" --get-iccid 2>/dev/null)" || iccid_status=$?
+	imsi_status=0
+	imsi_json="$(run_uqmi "$device" --get-imsi 2>/dev/null)" || imsi_status=$?
+	if [ "$iccid_status" -eq 0 ] && [ "$imsi_status" -eq 0 ]; then
+		iccid="$(json_digits "$iccid_json")" || return 1
+		imsi="$(json_digits "$imsi_json")" || return 1
+	else
+		at_values="$(at_identity "$device")" || return 3
+		iccid="$(printf '%s\n' "$at_values" | sed -n '1p')"
+		imsi="$(printf '%s\n' "$at_values" | sed -n '2p')"
+	fi
 	[ "${#iccid}" -ge 10 ] && [ "${#iccid}" -le 32 ] || return 1
 	[ "${#imsi}" -ge 5 ] && [ "${#imsi}" -le 18 ] || return 1
 

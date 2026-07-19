@@ -16,6 +16,8 @@ Every change must pass:
 - missing adapter, failed command, malformed ICCID and unsafe-device failures;
 - single and ambiguous official-style QMI `devpath` resolution;
 - an allow-list assertion that QMI identity issues no mutating `uqmi` command;
+- a same-physical-USB AT fallback fixture using only fixed read-only commands;
+- rejection of unrelated serial ports, sysfs escapes and malformed AT output;
 - the existing ambiguity, state migration, rollback, locking, URL, UCI and
   command-injection tests.
 
@@ -30,7 +32,8 @@ secrets have been replaced consistently.
 Before an alpha package is offered for router testing, it must also:
 
 - build with the official OpenWrt 25.12 SDK;
-- install with and without `modemmanager` and `uqmi` present;
+- install with and without `modemmanager` and `uqmi` present, while always
+  declaring and installing the small common `sms-tool` dependency;
 - expose unavailable backends without selecting them as writable targets;
 - preserve upgrade and removal behavior for an existing 0.9.0 baseline;
 - contain no undeclared executable or library dependency;
@@ -47,7 +50,8 @@ usable by another GUI or integration without pulling an unrelated manager.
 The following work is blocked on the isolated router and must not be simulated
 away:
 
-- confirm the actual RM520N control-device and `uqmi` response variants;
+- retain the observed RM520N behavior: serving-system and UIM state succeed,
+  native QMI ICCID/IMSI return `Not supported`, and read-only AT identity works;
 - verify SIM/PIN/not-present and registration transitions;
 - determine exact QMI profile/authentication/IP-family UCI mappings;
 - test netifd ownership, dynamic IPv4/IPv6 interfaces and reconnect timing;
@@ -57,6 +61,23 @@ away:
 
 Until that gate passes, QMI must keep `profile_apply: false`,
 `validation_state: synthetic` and `hardware_validated: false`.
+
+## RM520N read-only observation (2026-07-19)
+
+The reference Huasifei/RM520N exposed `/dev/cdc-wdm0` through `qmi_wwan` and
+four sibling `ttyUSB` ports. With ModemManager temporarily stopped, native
+`uqmi --get-iccid` and `--get-imsi` returned `Not supported`, while
+`--get-serving-system` and `--uim-get-sim-state` succeeded. The packaged
+OpenWrt `sms-tool` returned valid ICCID and IMSI responses for the fixed
+`AT+QCCID` and `AT+CIMI` queries on a sibling AT port.
+
+The new adapter file was then exercised directly from `/tmp`. It resolved the
+serial port from canonical sysfs paths, returned the expected identity contract
+and home registration, and did not alter the QMI profile, UCI configuration or
+AutoAPN persistent state. ModemManager and the existing `wwan` bearer returned
+successfully afterward. This validates the read-only helper path on one modem;
+the public evidence fields remain synthetic until the built `r3` package passes
+the complete target API test and does not imply QMI profile-apply support.
 
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing

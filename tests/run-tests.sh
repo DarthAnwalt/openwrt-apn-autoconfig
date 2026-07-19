@@ -278,6 +278,43 @@ fi
 cat "$QMI_FIXTURE_DIR/$operation.json"
 EOF
 
+cat >"$MOCKBIN/sms_tool" <<'EOF'
+#!/bin/sh
+device=
+command=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-d) device="$2"; shift 2 ;;
+		at) command="$2"; shift 2 ;;
+		*) exit 2 ;;
+	esac
+done
+printf '%s\t%s\n' "$device" "$command" >>"$TEST_STATE/sms-tool-calls"
+[ "$device" = "${SMS_TOOL_EXPECT_DEVICE:-/dev/ttyUSB2}" ] || exit 1
+case "$command" in
+	AT+CCID)
+		[ "${SMS_TOOL_QCCID_ONLY:-0}" != 1 ] || exit 1
+		if [ -n "${SMS_TOOL_MALFORMED_ICCID:-}" ]; then
+			printf '\r\n+CCID: %s\r\n\r\n' "$SMS_TOOL_MALFORMED_ICCID"
+			exit 0
+		fi
+		printf '\r\n+CCID: 89490200002186275443\r\n\r\n'
+	;;
+	AT+QCCID)
+		[ -z "${SMS_TOOL_MALFORMED_ICCID:-}" ] || exit 1
+		printf '\r\n+QCCID: 89490200002186275443\r\n\r\n'
+	;;
+	AT+CIMI) printf '\r\n262014740651867\r\n\r\n' ;;
+	*) exit 2 ;;
+esac
+EOF
+
+cat >"$MOCKBIN/readlink" <<'EOF'
+#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = -f ] || exit 2
+python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$2"
+EOF
+
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROOT/lock" TEST_PERSIST="$PERSIST"
@@ -324,8 +361,38 @@ qmi_unavailable_json="$(APN_AUTOCONFIG_QMI_ADAPTER="$TESTROOT/missing-qmi-adapte
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False; assert q["implementation_state"] == "alpha"; assert q["unavailable_reason"] == "adapter-unavailable"' "$qmi_unavailable_json" || fail 'missing QMI adapter was reported as available'
 qmi_command_unavailable_json="$(APN_AUTOCONFIG_UQMI="$TESTROOT/missing-uqmi" sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False and q["unavailable_reason"] == "backend-command-unavailable"' "$qmi_command_unavailable_json" || fail 'missing uqmi command was reported as available'
+qmi_at_command_unavailable_json="$(APN_AUTOCONFIG_SMS_TOOL="$TESTROOT/missing-sms-tool" sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False and q["unavailable_reason"] == "backend-command-unavailable"' "$qmi_at_command_unavailable_json" || fail 'missing mandatory sms-tool command was reported as available'
 qmi_without_external_timeout_json="$(APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi" and d["target_capabilities"]["identity"] is True; assert d["registration_state"] == "home"' "$qmi_without_external_timeout_json" || fail 'QMI identity required an undeclared external timeout command'
+
+printf '%s\n' 'TEST QMI identity falls back to read-only AT ports on the same USB modem'
+qmi_at_usb="$TESTROOT/sys/devices/platform/mock-usb/2-1"
+mkdir -p \
+	"$qmi_at_usb/2-1:1.2/ttyUSB2" \
+	"$qmi_at_usb/2-1:1.4/usbmisc" \
+	"$TESTROOT/sys/devices/platform/mock-usb/3-1/3-1:1.2/ttyUSB9" \
+	"$TESTROOT/outside-sysfs/ttyUSB8" \
+	"$TESTROOT/sys/class/usbmisc/cdc-wdm0" \
+	"$TESTROOT/sys/class/tty/ttyUSB2" \
+	"$TESTROOT/sys/class/tty/ttyUSB8" \
+	"$TESTROOT/sys/class/tty/ttyUSB9"
+: >"$qmi_at_usb/2-1:1.4/usbmisc/cdc-wdm0"
+ln -s "$qmi_at_usb/2-1:1.4" "$TESTROOT/sys/class/usbmisc/cdc-wdm0/device"
+ln -s "$qmi_at_usb/2-1:1.2/ttyUSB2" "$TESTROOT/sys/class/tty/ttyUSB2/device"
+ln -s "$TESTROOT/outside-sysfs/ttyUSB8" "$TESTROOT/sys/class/tty/ttyUSB8/device"
+ln -s "$TESTROOT/sys/devices/platform/mock-usb/3-1/3-1:1.2/ttyUSB9" \
+	"$TESTROOT/sys/class/tty/ttyUSB9/device"
+: >"$STATE/sms-tool-calls"
+qmi_at_json="$(QMI_FAIL_OPERATION=get-iccid SMS_TOOL_QCCID_ONLY=1 \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["registration_state"] == "home"' "$qmi_at_json" || fail 'QMI AT identity fallback returned invalid data'
+grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+CCID')" "$STATE/sms-tool-calls" || fail 'standard ICCID command was not attempted first'
+grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+QCCID')" "$STATE/sms-tool-calls" || fail 'Quectel ICCID fallback was not attempted'
+grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+CIMI')" "$STATE/sms-tool-calls" || fail 'standard IMSI command was not attempted'
+if grep -E -q '/dev/ttyUSB(8|9)' "$STATE/sms-tool-calls"; then
+	fail 'QMI identity probed an AT port belonging to another USB modem'
+fi
 
 printf '%s\n' 'TEST QMI alpha identity is read-only and matches candidates from fixture output'
 : >"$STATE/events"
@@ -365,7 +432,8 @@ else
 fi
 
 printf '%s\n' 'TEST QMI timeout, malformed identity and unsafe devices fail closed'
-if QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+if QMI_FAIL_OPERATION=get-iccid SMS_TOOL_EXPECT_DEVICE=/dev/ttyUSB99 \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
 	fail 'QMI timeout unexpectedly returned identity'
 else
 	[ "$?" -eq 3 ] || fail 'QMI timeout was not classified as retryable'
@@ -381,6 +449,14 @@ else
 	[ "$?" -eq 4 ] || fail 'unsafe QMI device path did not use the target-contract exit code'
 fi
 [ ! -e "$TESTROOT/qmi-device-injection" ] || fail 'QMI device path executed shell content'
+rm -f "$TESTROOT/qmi-at-injection"
+if QMI_FAIL_OPERATION=get-iccid SMS_TOOL_MALFORMED_ICCID="89;touch$TESTROOT/qmi-at-injection" \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'malformed AT ICCID was accepted'
+else
+	[ "$?" -eq 3 ] || fail 'malformed AT ICCID did not fail closed as retryable identity'
+fi
+[ ! -e "$TESTROOT/qmi-at-injection" ] || fail 'AT modem output executed shell content'
 
 printf '%s\n' 'TEST narrow integration wrappers preserve and validate target IDs'
 cat >"$MOCKBIN/apn-autoconfig-wrapper-command" <<'EOF'

@@ -92,6 +92,7 @@ python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["database_versi
 	"$ROOT/data/providers-report.json" "$database_version"
 grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
 grep -F -q '+jsonfilter ' "$ROOT/Makefile"
+grep -F -q '+sms-tool ' "$ROOT/Makefile"
 grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
 [ -f "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000" ]
 [ "$(sed -n '1p' "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000")" = \

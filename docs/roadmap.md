@@ -7,6 +7,15 @@ binding: never mutate an ambiguous target, never claim a capability that is
 not implemented, verify connectivity before keeping a profile, and restore the
 previous profile after failure.
 
+All protocol adapters ship inside one `apn-autoconfig` engine package so a
+travel-router user can replace a USB modem without first choosing another
+AutoAPN package. The adapters remain separate internal modules and activate
+from the selected netifd target plus available runtime commands. Modem-specific
+managers, protocol tools and kernel drivers are supplied by the user's OpenWrt
+modem configuration; the small `sms-tool` transport is a common core dependency
+because the read-only AT fallback is shared across protocol families. LuCI and
+board-specific physical controls remain separate optional packages.
+
 ## 0.9.0 — adapter foundation
 
 0.9.0 separates the APN selection engine from modem discovery, SIM identity
@@ -54,8 +63,9 @@ backend is a normal inventory result, not a partially functional fallback.
 ## 0.9.1 — native QMI adapter
 
 Development started as 0.9.1-alpha. The hardware-independent phase adds a
-bounded read-only `uqmi` identity adapter, a backend contract, runtime/evidence
-states and synthetic home, roaming, malformed-output and injection coverage.
+read-only `uqmi` identity adapter with a same-device `sms-tool` fallback, a
+backend contract, runtime/evidence states and synthetic home, roaming,
+malformed-output and injection coverage.
 It also removes the core package's hard dependency on a particular modem
 manager. QMI profile write/apply remains false until netifd option mapping,
 rollback and live hardware validation pass on the isolated test router.
@@ -65,10 +75,11 @@ rollback and live hardware validation pass on the isolated test router.
 Planned for a separate task. Add MBIM SIM identity collection, profile mapping
 and correct handling of dynamically created IPv4/IPv6 child interfaces.
 
-## 0.9.3 — generic AT identity
+## 0.9.3 — extend generic AT identity
 
-Planned for a separate task. Add a bounded AT transport and normalized SIM and
-registration identity without coupling the APN matcher to vendor commands.
+Planned for a separate task. Extend the fixed read-only AT identity transport
+introduced for QMI to AT-managed backends and normalized registration identity
+without coupling the APN matcher to vendor commands.
 
 ## 1.0 — stable multi-backend engine
 

@@ -90,6 +90,13 @@ function policyValue(status) {
 	}
 }
 
+function targetCapability(status, name) {
+	/* A staggered upgrade from 0.9.0 has no target_capabilities yet and keeps
+	 * the previously available ModemManager controls until status is refreshed
+	 * from the new core. */
+	return !status || !status.target_capabilities || status.target_capabilities[name] === true;
+}
+
 function trustLabel(value, positive, negative) {
 	return E('span', { 'class': value ? 'apn-state-good' : 'apn-state-bad' }, [ value ? positive : negative ]);
 }
@@ -146,10 +153,13 @@ return view.extend({
 					row(_('ICCID'), status.iccid),
 					row(_('IMSI'), status.imsi),
 					row(_('EID'), status.eid),
-					row(_('ModemManager SIM index'), status.sim_index),
-					row(_('ModemManager modem index'), status.modem_index),
+					row(_('SIM slot / backend index'), status.sim_index),
+					row(_('Modem / control identifier'), status.modem_index),
 					row(_('Engine target'), status.target_id),
 					row(_('Protocol / backend'), '%s / %s'.format(status.target_protocol, status.target_backend)),
+					row(_('Implementation / validation'), '%s / %s'.format(
+						status.target_implementation_state || '—', status.target_validation_state || '—')),
+					row(_('Hardware validated'), status.target_hardware_validated ? _('yes') : _('no')),
 					row(_('Effective data device'), status.l3_device || status.device),
 					row(_('Manual operator lock (PLMN)'), status.configured_plmn)
 				])
@@ -248,9 +258,9 @@ return view.extend({
 	setBusy: function(busy, action) {
 		this.busy = !!busy;
 		if (this.reconcileButton)
-			this.reconcileButton.disabled = this.busy;
+			this.reconcileButton.disabled = this.busy || !this.profileApplySupported;
 		if (this.resetButton)
-			this.resetButton.disabled = this.busy;
+			this.resetButton.disabled = this.busy || !this.profileApplySupported;
 		this.updatePolicyControls();
 		this.updateDatabaseControls();
 		if (this.actionStatus)
@@ -301,7 +311,9 @@ return view.extend({
 			var status = values[0];
 			dom.content(self.connectionBox, self.connectionNodes(status));
 			dom.content(self.apnBox, self.apnNodes(status));
-			self.policySupported = status && !status.error && status.version === 'v2';
+			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
+			self.policySupported = status && !status.error && status.version === 'v2' &&
+				targetCapability(status, 'profile_write');
 			if (self.policySelect && self.policySupported) {
 				self.policySelect.value = policyValue(status);
 				self.policyDirty = false;
@@ -377,6 +389,8 @@ return view.extend({
 
 	confirmAction: function(action) {
 		var self = this;
+		if (self.busy || !self.profileApplySupported)
+			return;
 		var reset = action === 'modem-reset';
 		ui.showModal(reset ? _('Power-cycle modem') : _('Re-detect APN'), [
 			E('p', {}, [ reset
@@ -428,10 +442,13 @@ return view.extend({
 			_('Automatic APN selection through the target-aware cellular engine.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
-		self.policySupported = status && status.version === 'v2';
+		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
+		self.policySupported = status && !status.error && status.version === 'v2' &&
+			targetCapability(status, 'profile_write');
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
+		self.hardwareIntegration = status && status.hardware_integration || '';
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -441,10 +458,12 @@ return view.extend({
 		o.rmempty = false;
 		o.description = _('After boot, wait for the configured delay and reconcile the current SIM and mobile profile. The service remains inert when this option is disabled.');
 
-		o = s.taboption('general', form.Flag, 'button_enabled', _('Enable physical modem-reset button'));
-		o.default = o.disabled;
-		o.rmempty = false;
-		o.description = _('On the tested WH3000 Pro, releasing BTN_0 power-cycles the modem and then reconciles the APN. Keep disabled on unverified hardware.');
+		if (self.hardwareIntegration) {
+			o = s.taboption('general', form.Flag, 'button_enabled', _('Enable WH3000 modem-reset button'));
+			o.default = o.disabled;
+			o.rmempty = false;
+			o.description = _('Provided by the separately installed Huasifei WH3000 board integration. Releasing BTN_0 power-cycles the modem and then reconciles the APN.');
+		}
 
 		o = s.taboption('general', form.ListValue, 'interface', _('Mobile target'));
 		o.value('auto', _('Automatic (only one writable target)'));
@@ -453,8 +472,12 @@ return view.extend({
 		var configuredTargetListed = configuredTarget === 'auto';
 		if (targets && Array.isArray(targets.targets))
 			targets.targets.forEach(function(target) {
+				var capabilityLabel = target.capabilities.profile_apply ? _('APN supported') :
+					target.capabilities.identity ? _('read-only identity') : _('inventory only');
+				var validationLabel = target.validation_state && target.validation_state !== 'none'
+					? ', %s'.format(target.validation_state) : '';
 				o.value(target.interface, '%s — %s (%s)'.format(target.interface, target.protocol,
-					target.capabilities.profile_apply ? _('APN supported') : _('inventory only')));
+					capabilityLabel + validationLabel));
 				if (target.interface === configuredTarget)
 					configuredTargetListed = true;
 			});
@@ -476,19 +499,21 @@ return view.extend({
 		o.value('never', _('Never use mwan3'));
 		o.default = 'auto';
 
-		o = s.taboption('advanced', form.Value, 'button_name', _('Button event name'));
-		o.default = 'BTN_0';
-		o.rmempty = false;
+		if (self.hardwareIntegration) {
+			o = s.taboption('advanced', form.Value, 'button_name', _('Button event name'));
+			o.default = 'BTN_0';
+			o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'modem_power_path', _('Modem power GPIO value path'));
-		o.default = '/sys/class/gpio/modem_power/value';
-		o.rmempty = false;
-		o.description = _('Board-specific exported GPIO path. This is not a raw GPIO pin number.');
+			o = s.taboption('advanced', form.Value, 'modem_power_path', _('Modem power GPIO value path'));
+			o.default = '/sys/class/gpio/modem_power/value';
+			o.rmempty = false;
+			o.description = _('Huasifei board integration path. This is not a raw GPIO pin number.');
 
-		o = s.taboption('advanced', form.Value, 'modem_power_off_seconds', _('Power-off duration'));
-		o.default = '5';
-		o.datatype = 'uinteger';
-		o.rmempty = false;
+			o = s.taboption('advanced', form.Value, 'modem_power_off_seconds', _('Power-off duration'));
+			o.default = '5';
+			o.datatype = 'uinteger';
+			o.rmempty = false;
+		}
 
 		o = s.taboption('advanced', form.Value, 'modem_wait_seconds', _('Maximum modem return wait'));
 		o.default = '90';
@@ -515,11 +540,13 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('reconcile'); }
 		}, [ _('Re-detect and verify APN') ]);
-		self.resetButton = E('button', {
-			'class': 'btn cbi-button cbi-button-negative',
-			'type': 'button',
-			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
-		}, [ _('Power-cycle modem and re-read SIM') ]);
+		self.resetButton = null;
+		if (self.hardwareIntegration)
+			self.resetButton = E('button', {
+				'class': 'btn cbi-button cbi-button-negative',
+				'type': 'button',
+				'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
+			}, [ _('Power-cycle WH3000 modem and re-read SIM') ]);
 		self.databaseCheckButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',
@@ -560,6 +587,9 @@ return view.extend({
 		poll.add(function() { return self.refreshStatus(); }, 2);
 
 		return m.render().then(function(mapNode) {
+			var mobileActionButtons = [ self.reconcileButton ];
+			if (self.resetButton)
+				mobileActionButtons.push(self.resetButton);
 			return E('div', { 'class': 'apn-autoconfig-page' }, [
 				E('style', { 'type': 'text/css' }, [
 					'.apn-autoconfig-page .apn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(22rem,1fr));gap:1rem;margin-bottom:1rem}' +
@@ -599,7 +629,7 @@ return view.extend({
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Actions') ]),
 						self.actionStatus,
-						E('div', { 'class': 'apn-button-row' }, [ self.reconcileButton, self.resetButton ])
+						E('div', { 'class': 'apn-button-row' }, mobileActionButtons)
 					])
 				]),
 				mapNode

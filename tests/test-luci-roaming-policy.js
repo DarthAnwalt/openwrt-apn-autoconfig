@@ -158,6 +158,7 @@ async function verifyLayout() {
 		version: 'v2',
 		roaming_policy: 'default-allow',
 		interface: 'wwan',
+		hardware_integration: 'huasifei-wh3000-gpio-v1',
 		interface_up: true,
 		operator_name: 'Fixture Mobile',
 		home_operator_name: 'Fixture Home',
@@ -215,11 +216,41 @@ async function verifyLayout() {
 		'database installation must require confirmation');
 }
 
+async function verifyReadOnlyTarget() {
+	var app = loadView();
+	var status = {
+		version: 'v2',
+		interface: 'cellqmi',
+		target_backend: 'qmi',
+		target_implementation_state: 'alpha',
+		target_validation_state: 'synthetic',
+		target_hardware_validated: false,
+		target_capabilities: {
+			identity: true,
+			profile_read: false,
+			profile_write: false,
+			profile_apply: false
+		},
+		roaming_policy: 'default-allow'
+	};
+	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual(app.reconcileButton.disabled, true,
+		'read-only target must disable APN reconciliation');
+	assert.strictEqual(app.resetButton, null,
+		'modem reset must be hidden without an installed board integration');
+	assert.strictEqual(app.policySelect.disabled, true,
+		'read-only target must disable roaming profile writes');
+	app.confirmAction('reconcile');
+	assert.strictEqual(app.testUi.modalCalls, 0,
+		'read-only target must not reach a mutating confirmation dialog');
+}
+
 Promise.all([
 	verifyPolicy('default-allow', 'default'),
 	verifyPolicy('explicit-allow', 'allow'),
 	verifyPolicy('explicit-block', 'block'),
-	verifyLayout()
+	verifyLayout(),
+	verifyReadOnlyTarget()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');
 }).catch(function(error) {

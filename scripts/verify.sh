@@ -9,6 +9,7 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-action"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-query"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-control"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
+sh -n "$ROOT/files/usr/libexec/apn-autoconfig-qmi"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
 sh -n "$ROOT/tests/run-tests.sh"
@@ -86,6 +87,18 @@ grep -F -q "# database-version: $database_version" \
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["database_version"] == sys.argv[2]' \
 	"$ROOT/data/providers-report.json" "$database_version"
 grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
+grep -F -q '+jsonfilter ' "$ROOT/Makefile"
+grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
+[ -f "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000" ]
+[ "$(sed -n '1p' "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000")" = \
+	'huasifei-wh3000-gpio-v1' ]
+core_depends="$(sed -n 's/^[[:space:]]*DEPENDS:=//p' "$ROOT/Makefile" | sed -n '1p')"
+case "$core_depends" in
+	*modemmanager*|*uqmi*|*umbim*|*kmod-button-hotplug*)
+		printf '%s\n' 'The GUI-independent core has a backend- or board-specific hard dependency.' >&2
+		exit 1
+	;;
+esac
 if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
 	printf '%s\n' 'The core package still owns the provider database.' >&2
 	exit 1

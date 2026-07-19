@@ -215,7 +215,9 @@ fi
 "$APK" add "$TARGET_PACKAGE"
 
 printf '\nInstallation completed successfully.\n'
-printf 'Automatic APN reconciliation and the hardware button remain disabled by default.\n'
+printf 'Automatic APN reconciliation remains disabled by default.\n'
+printf 'No router-specific hardware-button integration was installed.\n'
+printf 'On a tested Huasifei WH3000, install apn-autoconfig-integration-huasifei-wh3000 separately.\n'
 if [ "$INSTALL_LUCI" = yes ]; then
 	printf 'Open LuCI and navigate to Network -> APN Auto-Config.\n'
 else

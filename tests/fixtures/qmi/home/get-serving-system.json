@@ -1,0 +1,8 @@
+{
+  "registration": "registered",
+  "radio_interface": ["lte", "5gnr"],
+  "plmn_mcc": 262,
+  "plmn_mnc": 1,
+  "plmn_description": "Telekom Test",
+  "roaming": false
+}

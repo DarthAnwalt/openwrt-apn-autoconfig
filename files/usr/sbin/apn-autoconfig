@@ -19,6 +19,9 @@ TARGET_PROFILE_READ=false
 TARGET_PROFILE_WRITE=false
 TARGET_PROFILE_APPLY=false
 TARGET_REASON=""
+TARGET_IMPLEMENTATION_STATE="unimplemented"
+TARGET_VALIDATION_STATE="none"
+TARGET_HARDWARE_VALIDATED=false
 COMMAND_NAME=""
 SIM_INDEX_FALLBACK="0"
 SIM_INDEX=""
@@ -26,6 +29,7 @@ MODEM_INDEX=""
 DEVICE="wwan0"
 L3_DEVICE=""
 NETWORK_DEVICE=""
+NETWORK_DEVPATH=""
 DATABASE="/usr/share/apn-autoconfig/providers.tsv"
 CACHE_DIR="/etc/apn-autoconfig/cache"
 STATE_DIR="/etc/apn-autoconfig"
@@ -46,6 +50,8 @@ MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
 MODEM_POLL_SECONDS="2"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
+QMI_ADAPTER="${APN_AUTOCONFIG_QMI_ADAPTER:-/usr/libexec/apn-autoconfig-qmi}"
+HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn-autoconfig/integrations/huasifei-wh3000}"
 
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
 ACTION_STATE_DIR="/tmp/apn-autoconfig-action"
@@ -285,16 +291,38 @@ target_protocol_capabilities() {
 	TARGET_PROFILE_WRITE=false
 	TARGET_PROFILE_APPLY=false
 	TARGET_REASON="backend-not-implemented"
+	TARGET_IMPLEMENTATION_STATE="unimplemented"
+	TARGET_VALIDATION_STATE="none"
+	TARGET_HARDWARE_VALIDATED=false
 	case "$protocol" in
 		modemmanager)
 			TARGET_BACKEND="modemmanager"
-			TARGET_IDENTITY=true
-			TARGET_PROFILE_READ=true
-			TARGET_PROFILE_WRITE=true
-			TARGET_PROFILE_APPLY=true
-			TARGET_REASON=""
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
+			if command_exists mmcli; then
+				TARGET_IDENTITY=true
+				TARGET_PROFILE_READ=true
+				TARGET_PROFILE_WRITE=true
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
+			else
+				TARGET_REASON="backend-command-unavailable"
+			fi
 		;;
-		qmi|uqmi) TARGET_BACKEND="qmi" ;;
+		qmi|uqmi)
+			TARGET_BACKEND="qmi"
+			TARGET_IMPLEMENTATION_STATE="alpha"
+			TARGET_VALIDATION_STATE="synthetic"
+			if [ ! -x "$QMI_ADAPTER" ]; then
+				TARGET_REASON="adapter-unavailable"
+			elif "$QMI_ADAPTER" capabilities >/dev/null 2>&1; then
+				TARGET_IDENTITY=true
+				TARGET_REASON="profile-apply-not-implemented"
+			else
+				TARGET_REASON="backend-command-unavailable"
+			fi
+		;;
 		mbim|umbim) TARGET_BACKEND="mbim" ;;
 		fibocom) TARGET_BACKEND="fibocom" ;;
 		atc|xmm|ncm|wwan|3g) TARGET_BACKEND="at" ;;
@@ -363,6 +391,8 @@ select_target() {
 	fi
 	value="$(uci -q get "network.${INTERFACE}.device" 2>/dev/null || :)"
 	[ -n "$value" ] && NETWORK_DEVICE="$value"
+	value="$(uci -q get "network.${INTERFACE}.devpath" 2>/dev/null || :)"
+	[ -n "$value" ] && NETWORK_DEVPATH="$value"
 	TARGET_STATE_DIR="$STATE_DIR/targets/network_${INTERFACE}"
 	BASELINE_FILE="$TARGET_STATE_DIR/baseline.tsv"
 	ACTIVE_FILE="$TARGET_STATE_DIR/active.tsv"
@@ -417,6 +447,17 @@ require_target_capability() {
 	[ "$available" = true ] || die_code 4 "target $TARGET_ID ($TARGET_PROTOCOL) does not implement $capability in this release"
 }
 
+hardware_integration_name() {
+	[ -r "$HARDWARE_INTEGRATION_FILE" ] || return 1
+	name="$(sed -n '1p' "$HARDWARE_INTEGRATION_FILE")"
+	case "$name" in huasifei-wh3000-gpio-v1) printf '%s\n' "$name" ;; *) return 1 ;; esac
+}
+
+require_hardware_integration() {
+	hardware_integration_name >/dev/null 2>&1 || \
+		die_code 4 "modem-reset requires an installed, supported board integration"
+}
+
 validate_config() {
 	case "$INTERFACE" in *[!A-Za-z0-9_]*) die "invalid interface name: $INTERFACE" ;; esac
 	case "$SIM_INDEX_FALLBACK" in auto) : ;; ''|*[!0-9]*) die "sim_index must be auto or numeric" ;; esac
@@ -450,7 +491,10 @@ validate_config() {
 				''|2) : ;;
 				*) die "unsupported provider database format: $database_format" ;;
 			esac
-			command_exists mmcli || die "mmcli is required"
+			case "$TARGET_BACKEND" in
+				modemmanager) command_exists mmcli || die "mmcli is required" ;;
+				qmi) [ -x "$QMI_ADAPTER" ] || die "QMI identity adapter is not executable" ;;
+			esac
 		;;
 	esac
 	case "$COMMAND_NAME" in apply|reconcile|modem-reset) command_exists curl || die "curl is required" ;; esac
@@ -649,9 +693,116 @@ modemmanager_read_sim() {
 	refresh_modem_status || :
 }
 
+qmi_identity_value() {
+	key="$1"
+	awk -F '\t' -v wanted="$key" '
+		NR == 1 { next }
+		$1 == wanted { print substr($0, length($1) + 2); exit }
+	' "$SIM_DATA"
+}
+
+qmi_control_device_is_safe() {
+	device="$1"
+	case "$device" in /dev/*) : ;; *) return 1 ;; esac
+	device_name="${device#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$device_name" in
+		cdc-wdm*)
+			index="${device_name#cdc-wdm}"
+			case "$index" in ''|*[!0-9]*) return 1 ;; esac
+		;;
+		wwan*qmi*)
+			wwan_index="${device_name#wwan}"
+			wwan_index="${wwan_index%%qmi*}"
+			qmi_index="${device_name##*qmi}"
+			case "$wwan_index:$qmi_index" in *[!0-9:]*) return 1 ;; esac
+			[ -n "$wwan_index" ] && [ -n "$qmi_index" ] || return 1
+			[ "$device_name" = "wwan${wwan_index}qmi${qmi_index}" ] || return 1
+		;;
+		*) return 1 ;;
+	esac
+}
+
+qmi_resolve_control_device() {
+	if [ -n "$NETWORK_DEVICE" ]; then
+		qmi_control_device_is_safe "$NETWORK_DEVICE"
+		return $?
+	fi
+	case "$NETWORK_DEVPATH" in
+		"$SYSFS_ROOT"/devices/?*) : ;;
+		*) return 1 ;;
+	esac
+	case "$NETWORK_DEVPATH" in *'/../'*|*'/..') return 1 ;; esac
+
+	resolved=""
+	count=0
+	for candidate in \
+		"$NETWORK_DEVPATH"/usbmisc/cdc-wdm* \
+		"$NETWORK_DEVPATH"/*/usbmisc/cdc-wdm* \
+		"$NETWORK_DEVPATH"/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]* \
+		"$NETWORK_DEVPATH"/*/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]*
+	do
+		[ -e "$candidate" ] || continue
+		device="/dev/${candidate##*/}"
+		qmi_control_device_is_safe "$device" || continue
+		[ "$device" = "$resolved" ] && continue
+		resolved="$device"
+		count=$((count + 1))
+	done
+	[ "$count" -eq 1 ] || return 1
+	NETWORK_DEVICE="$resolved"
+}
+
+qmi_read_sim() {
+	qmi_resolve_control_device || \
+		die_code 4 "QMI target $TARGET_ID requires a safe control device path"
+
+	if "$QMI_ADAPTER" identity "$NETWORK_DEVICE" >"$SIM_DATA"; then
+		:
+	else
+		status=$?
+		case "$status" in
+			3) die_code 3 "cannot yet read QMI SIM identity for $TARGET_ID" ;;
+			*) die "QMI identity adapter returned invalid or incomplete data" ;;
+		esac
+	fi
+	[ "$(sed -n '1p' "$SIM_DATA")" = "v1" ] || die "unsupported QMI identity contract"
+
+	SIM_INDEX="$(qmi_identity_value sim_index)"
+	MODEM_INDEX="$(qmi_identity_value modem_index)"
+	ICCID="$(qmi_identity_value iccid)"
+	IMSI="$(qmi_identity_value imsi)"
+	EID="$(qmi_identity_value eid)"
+	OPERATOR_ID="$(qmi_identity_value operator_id)"
+	OPERATOR_NAME="$(qmi_identity_value operator_name)"
+	GID1="$(qmi_identity_value gid1)"
+	GID2="$(qmi_identity_value gid2)"
+	MODEM_STATE="$(qmi_identity_value modem_state)"
+	REGISTRATION_STATE="$(qmi_identity_value registration_state)"
+	ROAMING_STATUS="$(qmi_identity_value roaming)"
+	SERVING_OPERATOR_ID="$(qmi_identity_value serving_operator_id)"
+	SERVING_OPERATOR_NAME="$(qmi_identity_value serving_operator_name)"
+	ACCESS_TECHNOLOGIES="$(qmi_identity_value access_technologies)"
+	SIGNAL_QUALITY="$(qmi_identity_value signal_quality)"
+	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	read_roaming_policy
+
+	case "$SIM_INDEX" in ''|*[!0-9]*) die "invalid QMI SIM index" ;; esac
+	case "$ICCID" in ''|*[!0-9]*) die "unexpected QMI ICCID format" ;; esac
+	case "$IMSI" in ''|*[!0-9]*) [ -z "$IMSI" ] || die "unexpected QMI IMSI format" ;; esac
+	case "$OPERATOR_ID" in ''|*[!0-9]*) [ -z "$OPERATOR_ID" ] || die "unexpected QMI operator ID format" ;; esac
+	case "$ROAMING_STATUS" in true|false|unknown) : ;; *) die "unexpected QMI roaming status" ;; esac
+	for value in "$MODEM_INDEX" "$EID" "$OPERATOR_NAME" "$GID1" "$GID2" \
+		"$MODEM_STATE" "$REGISTRATION_STATE" "$SERVING_OPERATOR_ID" \
+		"$SERVING_OPERATOR_NAME" "$ACCESS_TECHNOLOGIES" "$SIGNAL_QUALITY"; do
+		state_value_is_safe "$value" || die "unsafe value returned by QMI identity adapter"
+	done
+}
+
 read_sim() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_read_sim ;;
+		qmi) qmi_read_sim ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read SIM identity" ;;
 	esac
 }
@@ -989,7 +1140,7 @@ json_key_boolean_or_null() {
 targets_json_cmd() {
 	discover_targets
 	printf '{'
-	json_key_string version "v1"; printf ','
+	json_key_string version "v2"; printf ','
 	json_key_string configured_target "$([ "$CONFIGURED_INTERFACE" = auto ] && printf auto || printf 'network:%s' "$CONFIGURED_INTERFACE")"; printf ','
 	printf '"targets":['
 	separator=""
@@ -1008,6 +1159,9 @@ targets_json_cmd() {
 		printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
 		printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
 		printf '},'
+		json_key_string implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+		json_key_string validation_state "$TARGET_VALIDATION_STATE"; printf ','
+		printf '"hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
 		json_key_string unavailable_reason "$TARGET_REASON"
 		printf '}'
 		separator=','
@@ -1042,6 +1196,7 @@ status_json_cmd() {
 	refresh_l3_device || :
 	autostart="$(uci -q get "${CONFIG}.main.autostart" 2>/dev/null || printf '0')"
 	button_enabled="$(uci -q get "${CONFIG}.main.button_enabled" 2>/dev/null || printf '0')"
+	hardware_integration="$(hardware_integration_name 2>/dev/null || :)"
 
 	printf '{'
 	json_key_string version "v2"; printf ','
@@ -1049,6 +1204,15 @@ status_json_cmd() {
 	json_key_string target_id "$TARGET_ID"; printf ','
 	json_key_string target_protocol "$TARGET_PROTOCOL"; printf ','
 	json_key_string target_backend "$TARGET_BACKEND"; printf ','
+	printf '"target_capabilities":{'
+	printf '"identity":%s,' "$TARGET_IDENTITY"
+	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
+	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
+	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '},'
+	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
+	printf '"target_hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
 	json_key_string sim_index "$SIM_INDEX"; printf ','
 	json_key_string modem_index "$MODEM_INDEX"; printf ','
 	json_key_string iccid "$ICCID"; printf ','
@@ -1086,7 +1250,8 @@ status_json_cmd() {
 	json_key_string reconciled_iccid "$reconciled_iccid"; printf ','
 	json_key_string reconciled_apn "$reconciled_apn"; printf ','
 	printf '"autostart":%s,' "$([ "$autostart" = 1 ] && printf true || printf false)"
-	printf '"button_enabled":%s' "$([ "$button_enabled" = 1 ] && printf true || printf false)"
+	printf '"button_enabled":%s,' "$([ "$button_enabled" = 1 ] && printf true || printf false)"
+	json_key_string hardware_integration "$hardware_integration"
 	printf '}\n'
 }
 
@@ -1101,6 +1266,15 @@ detect_json_cmd() {
 	json_key_string target_id "$TARGET_ID"; printf ','
 	json_key_string target_protocol "$TARGET_PROTOCOL"; printf ','
 	json_key_string target_backend "$TARGET_BACKEND"; printf ','
+	printf '"target_capabilities":{'
+	printf '"identity":%s,' "$TARGET_IDENTITY"
+	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
+	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
+	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '},'
+	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
+	printf '"target_hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
 	json_key_string sim_index "$SIM_INDEX"; printf ','
 	json_key_string modem_index "$MODEM_INDEX"; printf ','
 	json_key_string iccid "$ICCID"; printf ','
@@ -1886,6 +2060,9 @@ main() {
 		esac
 	fi
 	select_target
+	case "$COMMAND_NAME:$command_argument" in
+		modem-reset:*|action-start:modem-reset) require_hardware_integration ;;
+	esac
 	case "$COMMAND_NAME" in
 		detect|detect-json|status|status-json) require_target_capability identity ;;
 		apply|reconcile|modem-reset) require_target_capability profile-apply ;;

@@ -1,5 +1,30 @@
 # Changelog
 
+## apn-autoconfig 0.9.1-alpha.1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0-alpha.1 (unreleased)
+
+- Added a bounded read-only QMI identity helper using only `uqmi` ICCID, IMSI
+  and serving-system queries; QMI profile mutation remains unavailable.
+- Added strict QMI control-device validation and deterministic resolution of a
+  single official-style netifd `devpath`; ambiguous paths fail closed.
+- Added `targets-json` v2 evidence fields so alpha/synthetic implementation is
+  distinguishable from hardware-validated support.
+- Added the same capability/evidence state to status and detect output; LuCI
+  uses it to label QMI as read-only and disable unsupported mutating controls.
+- Removed hard dependencies on ModemManager and button-hotplug support from the
+  GUI-independent core; runtime capabilities now reflect installed backend
+  commands, while configured unavailable targets remain visible.
+- Moved the verified WH3000 BTN_0 hotplug handler and its
+  `kmod-button-hotplug` dependency into the optional
+  `apn-autoconfig-integration-huasifei-wh3000` package. The core rejects GPIO
+  reset without a supported integration marker, and LuCI hides those controls.
+- Kept QMI `apply`, `reconcile` and policy mutation behind exit code 4 before
+  UCI, persistent-state or netifd mutation.
+- Added synthetic QMI home/roaming fixtures and tests for unavailable adapters,
+  command failure, malformed identity, unsafe device paths and mutating-command
+  isolation while retaining the full ModemManager regression suite.
+- Documented backend contract v1, the evidence ladder and the remaining live
+  hardware gate. This alpha is not a stable QMI implementation.
+
 ## apn-autoconfig 0.9.0 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.5.0
 
 - Added a versioned `targets-json` inventory with stable `network:<section>`

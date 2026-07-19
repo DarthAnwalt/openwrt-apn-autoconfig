@@ -1,0 +1,151 @@
+#!/bin/sh
+
+# Read-only QMI identity adapter for the 0.9.1 alpha contract.
+# It never modifies a profile, registration state, SIM state or netifd state.
+
+umask 077
+
+UQMI="${APN_AUTOCONFIG_UQMI:-uqmi}"
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+capabilities() {
+	command_exists "$UQMI" && command_exists jsonfilter && command_exists timeout
+}
+
+safe_single_line() {
+	value="$1"
+	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
+}
+
+json_digits() {
+	value="$1"
+	case "$value" in
+		\"*\") value="${value#\"}"; value="${value%\"}" ;;
+	esac
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$value"
+}
+
+json_value() {
+	document="$1"
+	expression="$2"
+	jsonfilter -s "$document" -e "$expression" 2>/dev/null
+}
+
+run_uqmi() {
+	device="$1"
+	shift
+	timeout 6 "$UQMI" -s -d "$device" -t 3000 "$@"
+}
+
+normalize_registration() {
+	registration="$1"
+	roaming="$2"
+	case "$registration" in
+		registered)
+			case "$roaming" in true) printf '%s\n' roaming ;; false) printf '%s\n' home ;; *) printf '%s\n' registered ;; esac
+		;;
+		not_registered) printf '%s\n' idle ;;
+		searching) printf '%s\n' searching ;;
+		registering_denied|registration_denied) printf '%s\n' denied ;;
+		*) printf '%s\n' unknown ;;
+	esac
+}
+
+serving_operator_id() {
+	mcc="$1"
+	mnc="$2"
+	case "$mcc" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) : ;; *) return 0 ;; esac
+	case "$mnc" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) : ;; *) return 0 ;; esac
+	if [ "$mnc" -lt 100 ]; then
+		printf '%03d%02d\n' "$mcc" "$mnc"
+	else
+		printf '%03d%03d\n' "$mcc" "$mnc"
+	fi
+}
+
+identity() {
+	device="$1"
+	case "$device" in /dev/*) : ;; *) return 1 ;; esac
+	device_name="${device#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$device_name" in
+		cdc-wdm*)
+			device_index="${device_name#cdc-wdm}"
+			case "$device_index" in ''|*[!0-9]*) return 1 ;; esac
+		;;
+		wwan*qmi*)
+			wwan_index="${device_name#wwan}"
+			wwan_index="${wwan_index%%qmi*}"
+			qmi_index="${device_name##*qmi}"
+			case "$wwan_index" in ''|*[!0-9]*) return 1 ;; esac
+			case "$qmi_index" in ''|*[!0-9]*) return 1 ;; esac
+			[ "$device_name" = "wwan${wwan_index}qmi${qmi_index}" ] || return 1
+		;;
+		*) return 1 ;;
+	esac
+
+	iccid_json="$(run_uqmi "$device" --get-iccid 2>/dev/null)" || return 3
+	imsi_json="$(run_uqmi "$device" --get-imsi 2>/dev/null)" || return 3
+	iccid="$(json_digits "$iccid_json")" || return 1
+	imsi="$(json_digits "$imsi_json")" || return 1
+	[ "${#iccid}" -ge 10 ] && [ "${#iccid}" -le 32 ] || return 1
+	[ "${#imsi}" -ge 5 ] && [ "${#imsi}" -le 18 ] || return 1
+
+	serving="$(run_uqmi "$device" --get-serving-system 2>/dev/null || printf '{}')"
+	registration="$(json_value "$serving" '@.registration')"
+	roaming="$(json_value "$serving" '@.roaming')"
+	case "$roaming" in 1|true) roaming=true ;; 0|false) roaming=false ;; *) roaming=unknown ;; esac
+	mcc="$(json_value "$serving" '@.plmn_mcc')"
+	mnc="$(json_value "$serving" '@.plmn_mnc')"
+	serving_id="$(serving_operator_id "$mcc" "$mnc")"
+	serving_name="$(json_value "$serving" '@.plmn_description')"
+	access="$(json_value "$serving" '@.radio_interface[0]')"
+	registration="$(normalize_registration "$registration" "$roaming")"
+	case "$registration" in home|roaming) modem_state=connected ;; *) modem_state=enabled ;; esac
+
+	for value in "$serving_id" "$serving_name" "$access" "$registration"; do
+		safe_single_line "$value" || return 1
+	done
+	case "$serving_id" in ''|*[!0-9]*) [ -z "$serving_id" ] || return 1 ;; esac
+
+	printf '%s\n' v1
+	printf 'sim_index\t%s\n' 1
+	printf 'modem_index\t%s\n' "$device"
+	printf 'iccid\t%s\n' "$iccid"
+	printf 'imsi\t%s\n' "$imsi"
+	printf 'eid\t\n'
+	# uqmi does not expose a reliable home PLMN; the engine can still match the
+	# MCC/MNC prefix in IMSI without confusing a roaming serving PLMN for home.
+	printf 'operator_id\t\n'
+	printf 'operator_name\t\n'
+	printf 'gid1\t\n'
+	printf 'gid2\t\n'
+	printf 'modem_state\t%s\n' "$modem_state"
+	printf 'registration_state\t%s\n' "$registration"
+	printf 'roaming\t%s\n' "$roaming"
+	printf 'serving_operator_id\t%s\n' "$serving_id"
+	printf 'serving_operator_name\t%s\n' "$serving_name"
+	printf 'access_technologies\t%s\n' "$access"
+	printf 'signal_quality\t\n'
+}
+
+case "${1:-}" in
+	capabilities)
+		[ "$#" -eq 1 ] || exit 2
+		capabilities
+	;;
+	identity)
+		[ "$#" -eq 2 ] || exit 2
+		capabilities || exit 3
+		identity "$2"
+	;;
+	*) exit 2 ;;
+esac

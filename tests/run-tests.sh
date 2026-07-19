@@ -4,6 +4,7 @@ set -eu
 BASE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 TESTROOT="${TMPDIR:-/tmp}/apn-autoconfig-test.$$"
 TEST_ACTION_STATE="/tmp/apn-autoconfig-action-test.$$"
+HARDWARE_MARKER="$TESTROOT/huasifei-wh3000-integration"
 MOCKBIN="$TESTROOT/bin"
 STATE="$TESTROOT/state"
 DB="$TESTROOT/providers.tsv"
@@ -22,6 +23,7 @@ cleanup() {
 trap cleanup 0 HUP INT TERM
 
 mkdir -p "$MOCKBIN" "$STATE" "$CACHE" "$PERSIST"
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
 mkdir -p "$TESTROOT/sys/class/gpio/modem_power"
 printf '%s\n' '0' >"$TESTROOT/sys/class/gpio/modem_power/value"
 
@@ -89,6 +91,8 @@ get:network.wwan.device) printf '%s\n' '/sys/devices/mock-modem' ;;
 get:network.wwan.proto) printf '%s\n' modemmanager ;;
 get:network.wwan2.proto) printf '%s\n' modemmanager ;;
 get:network.cellqmi.proto) printf '%s\n' qmi ;;
+get:network.cellqmi.device) [ "${TEST_QMI_USE_DEVPATH:-0}" = 1 ] || printf '%s\n' "${TEST_QMI_DEVICE:-/dev/cdc-wdm0}" ;;
+get:network.cellqmi.devpath) [ "${TEST_QMI_USE_DEVPATH:-0}" = 1 ] && printf '%s\n' "$TEST_QMI_DEVPATH" ;;
 get:network.cellmbim.proto) printf '%s\n' mbim ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
@@ -219,11 +223,69 @@ cat >"$MOCKBIN/sleep" <<'EOF'
 exit 0
 EOF
 
+cat >"$MOCKBIN/timeout" <<'EOF'
+#!/bin/sh
+shift
+exec "$@"
+EOF
+
+cat >"$MOCKBIN/jsonfilter" <<'EOF'
+#!/bin/sh
+document=
+expression=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-s) document="$2"; shift 2 ;;
+		-e) expression="$2"; shift 2 ;;
+		*) exit 2 ;;
+	esac
+done
+python3 -c '
+import json, sys
+value = json.loads(sys.argv[1])
+path = sys.argv[2]
+if not path.startswith("@."):
+    raise SystemExit(1)
+for part in path[2:].split("."):
+    if part.endswith("[0]"):
+        value = value[part[:-3]][0]
+    else:
+        value = value[part]
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is not None:
+    print(value)
+' "$document" "$expression" 2>/dev/null
+EOF
+
+cat >"$MOCKBIN/uqmi" <<'EOF'
+#!/bin/sh
+operation=
+for argument in "$@"; do
+	case "$argument" in
+		--get-iccid) operation=get-iccid ;;
+		--get-imsi) operation=get-imsi ;;
+		--get-serving-system) operation=get-serving-system ;;
+	esac
+done
+[ -n "$operation" ] || exit 2
+printf '%s\n' "$*" >>"$TEST_STATE/uqmi-calls"
+[ "${QMI_FAIL_OPERATION:-}" != "$operation" ] || exit 1
+if [ "$operation" = get-iccid ] && [ -n "${QMI_MALFORMED_ICCID:-}" ]; then
+	printf '"%s"\n' "$QMI_MALFORMED_ICCID"
+	exit 0
+fi
+cat "$QMI_FIXTURE_DIR/$operation.json"
+EOF
+
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROOT/lock" TEST_PERSIST="$PERSIST"
 export TEST_GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
 export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
+export APN_AUTOCONFIG_QMI_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-qmi"
+export QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
+export APN_AUTOCONFIG_HARDWARE_INTEGRATION="$HARDWARE_MARKER"
 
 cat >"$MOCKBIN/apn-autoconfig-command" <<'EOF'
 #!/bin/sh
@@ -256,7 +318,67 @@ assert_contains() {
 
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v1"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and t["network:cellqmi"]["capabilities"]["profile_apply"] is False; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and t["network:cellqmi"]["capabilities"]["identity"] is True and t["network:cellqmi"]["capabilities"]["profile_apply"] is False; assert t["network:cellqmi"]["implementation_state"] == "alpha" and t["network:cellqmi"]["validation_state"] == "synthetic" and t["network:cellqmi"]["hardware_validated"] is False; assert t["network:cellqmi"]["unavailable_reason"] == "profile-apply-not-implemented"; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
+
+qmi_unavailable_json="$(APN_AUTOCONFIG_QMI_ADAPTER="$TESTROOT/missing-qmi-adapter" sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False; assert q["implementation_state"] == "alpha"; assert q["unavailable_reason"] == "adapter-unavailable"' "$qmi_unavailable_json" || fail 'missing QMI adapter was reported as available'
+qmi_command_unavailable_json="$(APN_AUTOCONFIG_UQMI="$TESTROOT/missing-uqmi" sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False and q["unavailable_reason"] == "backend-command-unavailable"' "$qmi_command_unavailable_json" || fail 'missing uqmi command was reported as available'
+
+printf '%s\n' 'TEST QMI alpha identity is read-only and matches candidates from fixture output'
+: >"$STATE/events"
+: >"$STATE/uqmi-calls"
+before="$(cat "$STATE/apn")"
+qmi_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert d["target_capabilities"] == {"identity": True, "profile_read": False, "profile_write": False, "profile_apply": False}; assert d["target_implementation_state"] == "alpha" and d["target_validation_state"] == "synthetic" and d["target_hardware_validated"] is False; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
+[ "$(cat "$STATE/apn")" = "$before" ] || fail 'QMI identity changed the ModemManager APN'
+[ ! -s "$STATE/events" ] || fail 'QMI identity cycled a network interface'
+[ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 3 ] || fail 'QMI identity issued an unexpected command count'
+if grep -E -- '--(start-network|modify-profile|set-|stop-network|verify|power)' "$STATE/uqmi-calls" >/dev/null; then
+	fail 'QMI identity issued a mutating uqmi command'
+fi
+
+printf '%s\n' 'TEST QMI roaming keeps home identity separate from serving PLMN'
+QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/roaming"
+export QMI_FIXTURE_DIR
+qmi_roaming_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["imsi"].startswith("25506"); assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26202"; assert d["serving_operator_name"] == "Vodafone.de"; assert d["registration_state"] == "roaming" and d["roaming"] is True' "$qmi_roaming_json" || fail 'QMI roaming confused home and serving networks'
+QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
+export QMI_FIXTURE_DIR
+
+printf '%s\n' 'TEST QMI resolves one stable OpenWrt devpath and rejects ambiguity'
+qmi_devpath="$TESTROOT/sys/devices/platform/mock-usb/1-2"
+mkdir -p "$qmi_devpath/1-2:1.4/usbmisc"
+: >"$qmi_devpath/1-2:1.4/usbmisc/cdc-wdm7"
+: >"$STATE/uqmi-calls"
+TEST_QMI_USE_DEVPATH=1 TEST_QMI_DEVPATH="$qmi_devpath" TEST_INTERFACE=cellqmi \
+	sh "$SCRIPT" detect-json >/dev/null
+grep -F -q -- '-d /dev/cdc-wdm7 ' "$STATE/uqmi-calls" || fail 'QMI devpath resolved the wrong control device'
+: >"$qmi_devpath/1-2:1.4/usbmisc/cdc-wdm8"
+if TEST_QMI_USE_DEVPATH=1 TEST_QMI_DEVPATH="$qmi_devpath" TEST_INTERFACE=cellqmi \
+	sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'ambiguous QMI devpath was accepted'
+else
+	[ "$?" -eq 4 ] || fail 'ambiguous QMI devpath did not use the target-contract exit code'
+fi
+
+printf '%s\n' 'TEST QMI timeout, malformed identity and unsafe devices fail closed'
+if QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'QMI timeout unexpectedly returned identity'
+else
+	[ "$?" -eq 3 ] || fail 'QMI timeout was not classified as retryable'
+fi
+if QMI_MALFORMED_ICCID='89;touch/tmp/pwn' TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'malformed QMI ICCID was accepted'
+fi
+rm -f "$TESTROOT/qmi-device-injection"
+if TEST_QMI_DEVICE="/dev/cdc-wdm0;$TESTROOT/qmi-device-injection" TEST_INTERFACE=cellqmi \
+	sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'unsafe QMI device path was accepted'
+else
+	[ "$?" -eq 4 ] || fail 'unsafe QMI device path did not use the target-contract exit code'
+fi
+[ ! -e "$TESTROOT/qmi-device-injection" ] || fail 'QMI device path executed shell content'
 
 printf '%s\n' 'TEST narrow integration wrappers preserve and validate target IDs'
 cat >"$MOCKBIN/apn-autoconfig-wrapper-command" <<'EOF'
@@ -480,7 +602,7 @@ assert_contains "$status_output" 'APN database:    2026.07.16 (format v2)'
 printf '%s\n' 'TEST machine-readable status and detect output are valid JSON'
 status_json="$(sh "$SCRIPT" status-json)"
 detect_json="$(sh "$SCRIPT" detect-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["roaming_policy"] == "default-allow"; assert d["serving_operator_id"] == "26201"; assert d["database_version"] == "2026.07.16"; assert d["database_format"] == "2"; assert d["database_sources"] == "fixture"; assert d["database_revisions"] == "fixture@1234567"; assert d["database_path"] == sys.argv[2]' "$status_json" "$DB" || fail 'invalid status JSON'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["target_capabilities"]["profile_apply"] is True and d["target_implementation_state"] == "stable" and d["target_hardware_validated"] is True; assert d["hardware_integration"] == "huasifei-wh3000-gpio-v1"; assert d["configured_apn"] == "rollback.apn"; assert d["interface_up"] is True; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["roaming_policy"] == "default-allow"; assert d["serving_operator_id"] == "26201"; assert d["database_version"] == "2026.07.16"; assert d["database_format"] == "2"; assert d["database_sources"] == "fixture"; assert d["database_revisions"] == "fixture@1234567"; assert d["database_path"] == sys.argv[2]' "$status_json" "$DB" || fail 'invalid status JSON'
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["version"] == "v2"; assert d["iccid"] == "89490200002186275443"; assert d["database_version"] == "2026.07.16"; assert len(d["candidates"]) == 2; assert all(x["apn"] == "internet.telekom" for x in d["candidates"]); assert d["candidates"][0]["provider"] == "Kaufland Mobil"; assert d["candidates"][0]["username_required"] is True; assert d["candidates"][0]["authentication"] == "pap-or-chap"; assert d["candidates"][0]["ip_type"] == "ipv4v6"' "$detect_json" || fail 'invalid detect JSON'
 
 printf '%s\n' 'TEST an explicitly unsupported provider database format is rejected'
@@ -732,6 +854,16 @@ sh "$SCRIPT" modem-reset >/dev/null 2>&1
 [ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'modem reset did not reconcile APN'
 grep -F -q 'down wwan' "$STATE/events" || fail 'modem reset did not stop WWAN'
 grep -F -q 'up wwan' "$STATE/events" || fail 'modem reset did not restore WWAN'
+
+printf '%s\n' 'TEST modem reset is unavailable without a board integration package'
+: >"$STATE/events"
+if APN_AUTOCONFIG_HARDWARE_INTEGRATION="$TESTROOT/missing-hardware-integration" \
+	sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+	fail 'modem reset ran without a board integration'
+else
+	[ "$?" -eq 4 ] || fail 'missing board integration did not use the target-contract exit code'
+fi
+[ ! -s "$STATE/events" ] || fail 'missing board integration changed network state'
 
 printf '%s\n' 'TEST failed modem return leaves power on and attempts WWAN recovery'
 : >"$STATE/events"

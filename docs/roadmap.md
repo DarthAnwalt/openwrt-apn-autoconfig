@@ -53,9 +53,12 @@ backend is a normal inventory result, not a partially functional fallback.
 
 ## 0.9.1 — native QMI adapter
 
-Planned for a separate task after 0.9.0. Add QMI SIM identity collection,
-netifd option mapping and live hardware validation while keeping connection
-ownership in netifd.
+Development started as 0.9.1-alpha. The hardware-independent phase adds a
+bounded read-only `uqmi` identity adapter, a backend contract, runtime/evidence
+states and synthetic home, roaming, malformed-output and injection coverage.
+It also removes the core package's hard dependency on a particular modem
+manager. QMI profile write/apply remains false until netifd option mapping,
+rollback and live hardware validation pass on the isolated test router.
 
 ## 0.9.2 — native MBIM adapter
 

@@ -40,6 +40,7 @@ single_package() {
 CORE_PACKAGE="$(single_package 'apn-autoconfig-[0-9]*.apk')"
 PROVIDER_PACKAGE="$(single_package 'apn-autoconfig-providers-*.apk')"
 LUCI_PACKAGE="$(single_package 'luci-app-apn-autoconfig-*.apk')"
+WH3000_PACKAGE="$(single_package 'apn-autoconfig-integration-huasifei-wh3000-*.apk')"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apn-autoconfig-repository.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
@@ -58,7 +59,7 @@ cp "$PUBLIC_KEY" "$SITE_DIR/public-key.pem"
 cp "$INSTALLER" "$SITE_DIR/install.sh"
 chmod 0755 "$SITE_DIR/install.sh"
 cp "$PUBLIC_KEY" "$KEYS_DIR/apn-autoconfig.pem"
-cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$FEED_DIR/"
+cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$WH3000_PACKAGE" "$FEED_DIR/"
 
 (
 	cd "$FEED_DIR"
@@ -74,6 +75,7 @@ cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$FEED_DIR/"
 
 for package_name in \
 	apn-autoconfig \
+	apn-autoconfig-integration-huasifei-wh3000 \
 	apn-autoconfig-providers \
 	luci-app-apn-autoconfig
 do

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.9.0
+PKG_VERSION:=0.9.1-alpha.1
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -15,16 +15,33 @@ define Package/apn-autoconfig
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Target-aware automatic APN selection
-  DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +modemmanager +netifd +ubus +uci +kmod-button-hotplug
+  DEPENDS:=+apn-autoconfig-providers +ca-bundle +curl +jsonfilter +netifd +ubus +uci
   PKGARCH:=all
 endef
 
 define Package/apn-autoconfig/description
  POSIX-shell cellular profile detection and testing engine for OpenWrt.
- Its complete 0.9 backend uses ModemManager, while other cellular protocols
- are exposed through a capability-aware inventory. It matches SIM identity against a worldwide local TSV database,
+ Its complete write/apply backend uses an already installed ModemManager. The 0.9.1 alpha also
+ provides synthetically tested, read-only QMI identity through an optional
+ installed uqmi command, while reporting that QMI profile application is not
+ hardware-validated. It matches SIM identity against a worldwide local TSV database,
  verifies real Internet access, caches successful profiles per ICCID and safely
  rolls back failures.
+endef
+
+define Package/apn-autoconfig-integration-huasifei-wh3000
+  SECTION:=net
+  CATEGORY:=Network
+  SUBMENU:=WWAN
+  TITLE:=Huasifei WH3000 modem-reset button integration
+  DEPENDS:=+apn-autoconfig +kmod-button-hotplug
+  PKGARCH:=all
+endef
+
+define Package/apn-autoconfig-integration-huasifei-wh3000/description
+ Optional board integration for the tested Huasifei WH3000 Pro setup. It maps
+ the BTN_0 release event to the guarded GPIO modem power-cycle and APN
+ reconciliation action. It is not a generic router-button implementation.
 endef
 
 define Package/apn-autoconfig/conffiles
@@ -49,8 +66,18 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-query $(1)/usr/libexec/apn-autoconfig-query
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-control $(1)/usr/libexec/apn-autoconfig-control
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-database $(1)/usr/libexec/apn-autoconfig-database
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-qmi $(1)/usr/libexec/apn-autoconfig-qmi
+endef
+
+define Package/apn-autoconfig-integration-huasifei-wh3000/install
+	$(INSTALL_DIR) $(1)/usr/share/licenses/apn-autoconfig-integration-huasifei-wh3000
+	$(INSTALL_DATA) ./LICENSE \
+		$(1)/usr/share/licenses/apn-autoconfig-integration-huasifei-wh3000/LICENSE
 	$(INSTALL_DIR) $(1)/etc/hotplug.d/button
 	$(INSTALL_BIN) ./files/etc/hotplug.d/button/50-apn-autoconfig $(1)/etc/hotplug.d/button/50-apn-autoconfig
+	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig/integrations
+	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig/integrations/huasifei-wh3000 \
+		$(1)/usr/share/apn-autoconfig/integrations/huasifei-wh3000
 endef
 
 # A real removal restores the mobile profile baseline first. A failed reset aborts
@@ -91,3 +118,4 @@ exit 0
 endef
 
 $(eval $(call BuildPackage,apn-autoconfig))
+$(eval $(call BuildPackage,apn-autoconfig-integration-huasifei-wh3000))

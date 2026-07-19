@@ -75,9 +75,34 @@ The new adapter file was then exercised directly from `/tmp`. It resolved the
 serial port from canonical sysfs paths, returned the expected identity contract
 and home registration, and did not alter the QMI profile, UCI configuration or
 AutoAPN persistent state. ModemManager and the existing `wwan` bearer returned
-successfully afterward. This validates the read-only helper path on one modem;
-the public evidence fields remain synthetic until the built `r3` package passes
-the complete target API test and does not imply QMI profile-apply support.
+successfully afterward. This validated the direct read-only helper path on one
+modem but did not yet change the public evidence fields or imply QMI
+profile-apply support.
+
+The CI-built and installed `r3` package subsequently passed `targets-json`,
+`detect-json` and `status-json` through that same live QMI/AT path. The identity
+lengths and home registration were correct, `reconcile` stopped at the expected
+unsupported profile-apply gate (exit 4), and the modem profile, UCI files and
+AutoAPN state were unchanged.
+
+The current evidence flag is target-wide rather than capability-specific, so it
+remains conservative (`synthetic`/false) while QMI profile-apply is absent even
+though identity now has reference-hardware evidence.
+
+A separate short netifd bearer test exposed an IP-family distinction. With the
+existing `ipv4v6` setting, Vodafone accepted IPv4 but rejected the IPv6 QMI
+session. ModemManager normally retains the working IPv4 bearer, whereas the
+OpenWrt 25.12 `qmi.sh` treated the IPv6 failure as fatal, tore down IPv4 and
+entered a reconnect loop. With `pdptype=ipv4`, the same official QMI protocol
+handler came up, exposed an L3 device with one IPv4 address and returned HTTP
+204 through the selected mwan3 path. The test then returned to ModemManager;
+after allowing asynchronous netifd teardown to release the control channel,
+profile 1 matched the saved JSON baseline byte-for-byte and UCI was clean.
+
+This proves a working IPv4 QMI bearer on the reference modem, not long-term
+stability. Dual-stack fallback policy, profile mutation/rollback inside the
+engine, hot-unplug, reboot and soak tests remain required before QMI can
+advertise profile-apply or replace ModemManager on the production router.
 
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing

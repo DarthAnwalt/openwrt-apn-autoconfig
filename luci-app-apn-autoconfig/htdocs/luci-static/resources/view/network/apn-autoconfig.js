@@ -36,7 +36,8 @@ function maskedIdentifier(value) {
 	var identifier = value == null ? '' : String(value);
 	if (!identifier)
 		return '—';
-	return identifier.length > 4 ? '•••• ' + identifier.slice(-4) : '••••';
+	var visible = identifier.length > 4 ? identifier.slice(-4) : '';
+	return new Array(identifier.length - visible.length + 1).join('•') + visible;
 }
 
 function sensitiveIdentifier(value, label) {
@@ -45,7 +46,10 @@ function sensitiveIdentifier(value, label) {
 		return text(value);
 
 	var revealed = false;
-	var display = E('span', { 'class': 'apn-sensitive-value' }, [ maskedIdentifier(identifier) ]);
+	var display = E('span', {
+		'class': 'apn-sensitive-value',
+		'style': 'display:inline-block;width:%sch;font-family:monospace;white-space:nowrap'.format(identifier.length)
+	}, [ maskedIdentifier(identifier) ]);
 	var button = E('button', {
 		'class': 'btn cbi-button cbi-button-neutral apn-sensitive-toggle',
 		'type': 'button',
@@ -61,7 +65,10 @@ function sensitiveIdentifier(value, label) {
 		}
 	}, [ _('Show') ]);
 
-	return E('span', { 'class': 'apn-sensitive-identifier' }, [ display, ' ', button ]);
+	return E('span', {
+		'class': 'apn-sensitive-identifier',
+		'style': 'display:inline-flex;align-items:center;gap:.5em;white-space:nowrap'
+	}, [ display, button ]);
 }
 
 function row(label, value) {

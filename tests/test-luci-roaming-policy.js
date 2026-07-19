@@ -223,15 +223,19 @@ async function verifyLayout() {
 	assert.ok(sensitiveDisplays.every(function(node) {
 		return node.children.join('').indexOf('89492031246010483050') === -1;
 	}), 'full identifiers must not be rendered before an explicit reveal');
-	assert.strictEqual(sensitiveDisplays[3].children.join(''), '•••• 3050',
-		'masked reconciled SIM must retain only the final four digits');
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
+		'masked reconciled SIM must retain its full character width and final four digits');
+	assert.strictEqual(sensitiveDisplays[3].children.join('').length, '89492031246010483050'.length,
+		'masked and revealed identifiers must have equal character counts');
+	assert.ok((sensitiveDisplays[3].attrs.style || '').indexOf('font-family:monospace') !== -1,
+		'sensitive identifiers must use fixed-width glyphs so the toggle does not move');
 	sensitiveToggles[3].click({ preventDefault: function() {} });
 	assert.strictEqual(sensitiveDisplays[3].children.join(''), '89492031246010483050',
 		'reveal control must show the complete reconciled SIM identifier');
 	assert.strictEqual(sensitiveToggles[3].children.join(''), 'Hide',
 		'reveal control must become an explicit hide control');
 	sensitiveToggles[3].click({ preventDefault: function() {} });
-	assert.strictEqual(sensitiveDisplays[3].children.join(''), '•••• 3050',
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
 		'hide control must restore masking');
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');

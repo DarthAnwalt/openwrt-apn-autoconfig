@@ -232,11 +232,19 @@ async function verifyLayout() {
 	sensitiveToggles[3].click({ preventDefault: function() {} });
 	assert.strictEqual(sensitiveDisplays[3].children.join(''), '89492031246010483050',
 		'reveal control must show the complete reconciled SIM identifier');
-	assert.strictEqual(sensitiveToggles[3].children.join(''), 'Hide',
-		'reveal control must become an explicit hide control');
+	assert.strictEqual(sensitiveToggles[3].attrs['aria-label'], 'Hide SIM identifier',
+		'reveal control must become an explicitly labelled hide control');
+	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'hidden',
+		'Show label must be visually hidden after revealing');
+	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'visible',
+		'Hide label must be visible after revealing');
 	sensitiveToggles[3].click({ preventDefault: function() {} });
 	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
 		'hide control must restore masking');
+	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'visible',
+		'Show label must be visible after hiding again');
+	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'hidden',
+		'Hide label must keep contributing width while visually hidden');
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');
 	assert.strictEqual(app.databaseInstallButton.disabled, false,

@@ -50,20 +50,28 @@ function sensitiveIdentifier(value, label) {
 		'class': 'apn-sensitive-value',
 		'style': 'display:inline-block;width:%sch;font-family:monospace;white-space:nowrap'.format(identifier.length)
 	}, [ maskedIdentifier(identifier) ]);
+	var showLabel = E('span', { 'class': 'apn-sensitive-show-label', 'aria-hidden': 'true' }, [ _('Show') ]);
+	var hideLabel = E('span', { 'class': 'apn-sensitive-hide-label', 'aria-hidden': 'true' }, [ _('Hide') ]);
+	showLabel.style.gridArea = '1 / 1';
+	hideLabel.style.gridArea = '1 / 1';
+	showLabel.style.visibility = 'visible';
+	hideLabel.style.visibility = 'hidden';
 	var button = E('button', {
 		'class': 'btn cbi-button cbi-button-neutral apn-sensitive-toggle',
 		'type': 'button',
+		'style': 'display:inline-grid',
 		'title': _('Show full %s').format(label),
 		'aria-label': _('Show full %s').format(label),
 		'click': function(ev) {
 			ev.preventDefault();
 			revealed = !revealed;
 			dom.content(display, [ revealed ? identifier : maskedIdentifier(identifier) ]);
-			dom.content(button, [ revealed ? _('Hide') : _('Show') ]);
+			showLabel.style.visibility = revealed ? 'hidden' : 'visible';
+			hideLabel.style.visibility = revealed ? 'visible' : 'hidden';
 			button.setAttribute('title', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
 			button.setAttribute('aria-label', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
 		}
-	}, [ _('Show') ]);
+	}, [ showLabel, hideLabel ]);
 
 	return E('span', {
 		'class': 'apn-sensitive-identifier',

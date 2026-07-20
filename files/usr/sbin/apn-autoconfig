@@ -163,9 +163,33 @@ modemmanager_capture_old_profile() {
 	fi
 }
 
+qmi_capture_old_profile() {
+	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
+		OLD_APN_SET=1
+		OLD_APN="$(uci -q get "network.${INTERFACE}.apn")"
+	fi
+	if uci -q get "network.${INTERFACE}.username" >/dev/null 2>&1; then
+		OLD_USERNAME_SET=1
+		OLD_USERNAME="$(uci -q get "network.${INTERFACE}.username")"
+	fi
+	if uci -q get "network.${INTERFACE}.password" >/dev/null 2>&1; then
+		OLD_PASSWORD_SET=1
+		OLD_PASSWORD="$(uci -q get "network.${INTERFACE}.password")"
+	fi
+	if uci -q get "network.${INTERFACE}.auth" >/dev/null 2>&1; then
+		OLD_ALLOWEDAUTH_SET=1
+		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.auth")"
+	fi
+	if uci -q get "network.${INTERFACE}.pdptype" >/dev/null 2>&1; then
+		OLD_IPTYPE_SET=1
+		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.pdptype")"
+	fi
+}
+
 capture_old_profile() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_capture_old_profile ;;
+		qmi) qmi_capture_old_profile ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read APN profiles" ;;
 	esac
 }
@@ -183,9 +207,24 @@ modemmanager_restore_old_profile() {
 	ifup "$INTERFACE" >/dev/null 2>&1 || :
 }
 
+qmi_restore_old_profile() {
+	log warning "restoring previous QMI profile for interface $INTERFACE"
+	set_or_delete_option apn "$OLD_APN_SET" "$OLD_APN" || return 1
+	set_or_delete_option username "$OLD_USERNAME_SET" "$OLD_USERNAME" || return 1
+	set_or_delete_option password "$OLD_PASSWORD_SET" "$OLD_PASSWORD" || return 1
+	set_or_delete_option auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
+	set_or_delete_option pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
+	uci commit network >/dev/null 2>&1 || return 1
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
+	sleep 2
+	ifup "$INTERFACE" >/dev/null 2>&1 || :
+}
+
 restore_old_profile() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_restore_old_profile ;;
+		qmi) qmi_restore_old_profile ;;
 		*) return 1 ;;
 	esac
 }
@@ -227,9 +266,47 @@ modemmanager_set_profile() {
 	uci commit network >/dev/null 2>&1
 }
 
+qmi_set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+
+	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
+	if [ "$username" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$password" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
+	fi
+	case "$auth" in
+		-) uci -q delete "network.${INTERFACE}.auth" >/dev/null 2>&1 || : ;;
+		pap-or-chap) uci set "network.${INTERFACE}.auth=both" >/dev/null 2>&1 || return 1 ;;
+		*) uci set "network.${INTERFACE}.auth=$auth" >/dev/null 2>&1 || return 1 ;;
+	esac
+	case "$ip_type" in
+		-) uci -q delete "network.${INTERFACE}.pdptype" >/dev/null 2>&1 || : ;;
+		ipv4) uci set "network.${INTERFACE}.pdptype=ip" >/dev/null 2>&1 || return 1 ;;
+		*) uci set "network.${INTERFACE}.pdptype=$ip_type" >/dev/null 2>&1 || return 1 ;;
+	esac
+	uci commit network >/dev/null 2>&1
+}
+
 set_profile() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_set_profile "$@" ;;
+		qmi) qmi_set_profile "$@" ;;
 		*) return 1 ;;
 	esac
 }
@@ -318,7 +395,10 @@ target_protocol_capabilities() {
 				TARGET_REASON="adapter-unavailable"
 			elif "$QMI_ADAPTER" capabilities >/dev/null 2>&1; then
 				TARGET_IDENTITY=true
-				TARGET_REASON="profile-apply-not-implemented"
+				TARGET_PROFILE_READ=true
+				TARGET_PROFILE_WRITE=true
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
 			else
 				TARGET_REASON="backend-command-unavailable"
 			fi
@@ -834,7 +914,11 @@ cached_profile_field() {
 	file="$(cache_file)"
 	[ -r "$file" ] || return 1
 	awk -F '\t' -v column="$column" '
-		NR == 1 && $1 == "v2" { value=$column; print value == "" ? "-" : value; exit }
+		NR == 1 && $1 == "v2" {
+			result=$column
+			if (result == "") print "-"; else print result
+			exit
+		}
 		NR == 1 && $1 == "v1" { print "-"; exit }
 	' "$file"
 }
@@ -941,6 +1025,8 @@ write_baseline_option() {
 migrate_legacy_baseline() {
 	[ -r "$BASELINE_FILE" ] || return 0
 	[ "$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")" = "v1" ] || return 0
+	[ "$TARGET_BACKEND" = modemmanager ] || \
+		die "a legacy ModemManager baseline cannot be migrated to backend $TARGET_BACKEND"
 	legacy_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
 	legacy_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
 	legacy_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
@@ -972,8 +1058,17 @@ save_baseline() {
 	write_baseline_option "$tmp" apn "$OLD_APN_SET" "$OLD_APN"
 	write_baseline_option "$tmp" username "$OLD_USERNAME_SET" "$OLD_USERNAME"
 	write_baseline_option "$tmp" password "$OLD_PASSWORD_SET" "$OLD_PASSWORD"
-	write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
-	write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+			write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+		;;
+		qmi)
+			write_baseline_option "$tmp" auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+			write_baseline_option "$tmp" pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+		;;
+		*) die "cannot save a baseline for backend $TARGET_BACKEND" ;;
+	esac
 	mv "$tmp" "$BASELINE_FILE" || die "cannot install baseline"
 	log notice "saved original mobile profile for interface $INTERFACE"
 }
@@ -990,13 +1085,18 @@ reset_cmd() {
 	fi
 	baseline_version="$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")"
 	baseline_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
+	baseline_backend=""
 	case "$baseline_interface" in ''|*[!A-Za-z0-9_]*) die "invalid interface in baseline" ;; esac
+	case "$baseline_version" in
+		v1|v2) [ "$TARGET_BACKEND" = modemmanager ] || die "legacy baseline is only valid for a ModemManager target" ;;
+	esac
 	if [ "$baseline_version" = v3 ]; then
 		baseline_target="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
 		baseline_backend="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
 		[ "$baseline_target" = "network:$baseline_interface" ] || die "v3 baseline target does not match its interface"
 		[ "$baseline_target" = "$TARGET_ID" ] || die "v3 baseline belongs to another target"
-		[ "$baseline_backend" = modemmanager ] || die "unsupported backend in v3 baseline"
+		case "$baseline_backend" in modemmanager|qmi) : ;; *) die "unsupported backend in v3 baseline" ;; esac
+		[ "$baseline_backend" = "$TARGET_BACKEND" ] || die "v3 baseline backend does not match the selected target"
 	fi
 
 	INTERFACE="$baseline_interface"
@@ -1012,9 +1112,19 @@ reset_cmd() {
 		v2|v3)
 			while IFS="$(printf '\t')" read -r kind option set_flag value; do
 				[ "$kind" = "option" ] || continue
-				case "$option" in apn|username|password|allowedauth|iptype) : ;; *) die "invalid option in baseline" ;; esac
+				case "$baseline_version:$baseline_backend:$option" in
+					v2::apn|v2::username|v2::password|v2::allowedauth|v2::iptype) : ;;
+					v3:modemmanager:apn|v3:modemmanager:username|v3:modemmanager:password|v3:modemmanager:allowedauth|v3:modemmanager:iptype) : ;;
+					v3:qmi:apn|v3:qmi:username|v3:qmi:password|v3:qmi:auth|v3:qmi:pdptype) : ;;
+					*) die "invalid option in baseline" ;;
+				esac
 				case "$set_flag" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
 				state_value_is_safe "$value" || die "unsafe value in baseline"
+			done <"$BASELINE_FILE"
+			# Validate the complete file before the first UCI write so a malformed
+			# trailing record can never cause a partial baseline restore.
+			while IFS="$(printf '\t')" read -r kind option set_flag value; do
+				[ "$kind" = "option" ] || continue
 				set_or_delete_option "$option" "$set_flag" "$value" || die "cannot restore baseline $option"
 			done <"$BASELINE_FILE"
 		;;
@@ -1022,6 +1132,7 @@ reset_cmd() {
 	esac
 	uci commit network >/dev/null 2>&1 || die "cannot commit restored mobile profile"
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	[ "$TARGET_BACKEND" != qmi ] || sleep 2
 	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
 	rm -rf "$CACHE_DIR"
 	rm -f "$ACTIVE_FILE"
@@ -1567,6 +1678,9 @@ build_apply_candidates() {
 
 restart_interface() {
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	# netifd's QMI handler tears down client IDs asynchronously. A short bounded
+	# settle avoids racing the next uqmi session after a rejected bearer.
+	[ "$TARGET_BACKEND" != qmi ] || sleep 2
 	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
 	return 0
 }
@@ -1731,13 +1845,18 @@ save_active_state() {
 	mkdir -p "$TARGET_STATE_DIR" || return 1
 	tmp="$TARGET_STATE_DIR/.active.tmp.$$"
 	active_apn="${apn:-<empty>}"
-	case "$auth" in
-		-) allowedauth="-" ;;
-		pap-or-chap) allowedauth="pap chap" ;;
+	case "$TARGET_BACKEND:$auth" in
+		*:-) allowedauth="-" ;;
+		modemmanager:pap-or-chap) allowedauth="pap chap" ;;
+		qmi:pap-or-chap) allowedauth="both" ;;
 		*) allowedauth="$auth" ;;
 	esac
+	case "$TARGET_BACKEND:$ip_type" in
+		qmi:ipv4) configured_iptype="ip" ;;
+		*) configured_iptype="$ip_type" ;;
+	esac
 	printf 'v3\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ICCID" "$active_apn" \
-		"$username" "$password" "$allowedauth" "$ip_type" "$TARGET_ID" "$TARGET_BACKEND" >"$tmp" || return 1
+		"$username" "$password" "$allowedauth" "$configured_iptype" "$TARGET_ID" "$TARGET_BACKEND" >"$tmp" || return 1
 	mv "$tmp" "$ACTIVE_FILE"
 }
 
@@ -1767,12 +1886,30 @@ configured_profile_matches_active() {
 	active_iptype="$(awk -F '\t' 'NR == 1 { print $7 }' "$file")"
 	configured_username="$(uci -q get "network.${INTERFACE}.username" 2>/dev/null || printf '%s' -)"
 	configured_password="$(uci -q get "network.${INTERFACE}.password" 2>/dev/null || printf '%s' -)"
-	configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
-	configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
+			configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+		;;
+		qmi)
+			configured_allowedauth="$(uci -q get "network.${INTERFACE}.auth" 2>/dev/null || printf '%s' -)"
+			configured_iptype="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)"
+		;;
+		*) return 1 ;;
+	esac
 	[ "$configured_username" = "$active_username" ] && \
 		[ "$configured_password" = "$active_password" ] && \
 		[ "$configured_allowedauth" = "$active_allowedauth" ] && \
 		[ "$configured_iptype" = "$active_iptype" ]
+}
+
+configured_connectivity_ip_type() {
+	case "$TARGET_BACKEND" in
+		modemmanager) value="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)" ;;
+		qmi) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' ip)" ;;
+		*) value="-" ;;
+	esac
+	case "$value" in ip|ipv4) printf '%s\n' ipv4 ;; ipv6|ipv4v6) printf '%s\n' "$value" ;; *) printf '%s\n' - ;; esac
 }
 
 apply_cmd() {
@@ -1794,15 +1931,30 @@ apply_cmd() {
 		[ "$apn" = "<empty>" ] && apn=""
 		display_apn="${apn:-<empty>}"
 		log notice "trying APN '$display_apn' ($provider)"
-		if ! set_profile "$apn" "$username" "$password" "$auth" "$ip_type"; then
-			log err "failed to write mobile profile for APN '$display_apn'"
-			continue
-		fi
-		if ! restart_interface; then
-			log warning "interface $INTERFACE did not restart for APN '$display_apn'"
-			continue
-		fi
-		if ! wait_for_interface; then
+		attempt_types="$ip_type"
+		[ "$TARGET_BACKEND:$ip_type" != qmi:ipv4v6 ] || attempt_types="ipv4v6 ipv4"
+		bearer_ready=0
+		effective_ip_type="$ip_type"
+		for attempt_ip_type in $attempt_types; do
+			effective_ip_type="$attempt_ip_type"
+			if [ "$TARGET_BACKEND:$ip_type:$attempt_ip_type" = qmi:ipv4v6:ipv4 ]; then
+				log warning "QMI dual-stack bearer was rejected; retrying APN '$display_apn' with IPv4 only"
+			fi
+			if ! set_profile "$apn" "$username" "$password" "$auth" "$attempt_ip_type"; then
+				log err "failed to write mobile profile for APN '$display_apn'"
+				break
+			fi
+			if ! restart_interface; then
+				log warning "interface $INTERFACE did not restart for APN '$display_apn'"
+				continue
+			fi
+			if wait_for_interface; then
+				bearer_ready=1
+				break
+			fi
+			log warning "mobile data session did not become ready within ${WAIT_SECONDS}s for profile '$display_apn' ($attempt_ip_type)"
+		done
+		if [ "$bearer_ready" -ne 1 ]; then
 			refresh_modem_status || :
 			case "$REGISTRATION_STATE" in
 				roaming)
@@ -1819,7 +1971,6 @@ apply_cmd() {
 					die "registration state became $REGISTRATION_STATE; stopping profile testing"
 				;;
 			esac
-			log warning "mobile data session did not become ready within ${WAIT_SECONDS}s for profile '$display_apn'"
 			continue
 		fi
 		saw_bearer_up=1
@@ -1830,10 +1981,10 @@ apply_cmd() {
 				"blocked: registration changed to roaming while data roaming is disabled"
 			die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
 		fi
-		if test_connectivity "$ip_type"; then
-			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$ip_type" || \
+		if test_connectivity "$effective_ip_type"; then
+			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$effective_ip_type" || \
 				log warning "APN worked, but cache could not be written"
-			save_active_state "$apn" "$username" "$password" "$auth" "$ip_type" || \
+			save_active_state "$apn" "$username" "$password" "$auth" "$effective_ip_type" || \
 				log warning "APN worked, but reconciled SIM state could not be written"
 			write_last_result success "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
@@ -1867,7 +2018,7 @@ reconcile_cmd() {
 	   [ "$previous_iccid" = "$ICCID" ] && \
 	   configured_profile_matches_active && \
 	   interface_is_up && \
-	   test_connectivity "$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"; then
+	   test_connectivity "$(configured_connectivity_ip_type)"; then
 		write_last_result success "success: ${configured_apn:-<empty>} (reconciled connectivity verified)"
 		log notice "SIM $ICCID is already reconciled with APN '${configured_apn:-<empty>}'; no changes"
 		return 0
@@ -1889,6 +2040,8 @@ reconcile_cmd() {
 roaming_policy_set_cmd() {
 	requested="${1:-}"
 	case "$requested" in default|allow|block) : ;; *) die "roaming policy must be default, allow or block" ;; esac
+	[ "$TARGET_BACKEND" = modemmanager ] || \
+		die_code 4 "roaming policy control is not implemented for backend $TARGET_BACKEND"
 	acquire_lock
 	migrate_target_state
 	was_up=0
@@ -1940,15 +2093,23 @@ write_modem_power() {
 wait_for_modem() {
 	remaining="$MODEM_WAIT_SECONDS"
 	while [ "$remaining" -gt 0 ]; do
-		SIM_INDEX=""
-		if resolve_sim_index && \
-		   mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
-			ready_iccid="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
-			case "$ready_iccid" in
-				''|*[!0-9]*) : ;;
-				*) return 0 ;;
-			esac
-		fi
+		case "$TARGET_BACKEND" in
+			modemmanager)
+				SIM_INDEX=""
+				if resolve_sim_index && \
+				   mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+					ready_iccid="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
+					case "$ready_iccid" in ''|*[!0-9]*) : ;; *) return 0 ;; esac
+				fi
+			;;
+			qmi)
+				if qmi_resolve_control_device && \
+				   "$QMI_ADAPTER" identity "$NETWORK_DEVICE" >"$SIM_DATA" 2>/dev/null; then
+					ready_iccid="$(qmi_identity_value iccid)"
+					case "$ready_iccid" in ''|*[!0-9]*) : ;; *) return 0 ;; esac
+				fi
+			;;
+		esac
 		sleep "$MODEM_POLL_SECONDS"
 		remaining=$((remaining - MODEM_POLL_SECONDS))
 	done
@@ -1970,7 +2131,7 @@ modem_reset_cmd() {
 	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
 	MODEM_POWER_OFF_ARMED=0
 
-	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for ModemManager and SIM"
+	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for the modem backend and SIM"
 	if ! wait_for_modem; then
 		die "modem or SIM did not return within ${MODEM_WAIT_SECONDS}s"
 	fi

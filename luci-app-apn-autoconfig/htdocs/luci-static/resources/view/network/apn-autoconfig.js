@@ -360,7 +360,7 @@ return view.extend({
 			dom.content(self.apnBox, self.apnNodes(status));
 			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
 			self.policySupported = status && !status.error && status.version === 'v2' &&
-				targetCapability(status, 'profile_write');
+				status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write');
 			if (self.policySelect && self.policySupported) {
 				self.policySelect.value = policyValue(status);
 				self.policyDirty = false;
@@ -491,7 +491,7 @@ return view.extend({
 		var o;
 		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
 		self.policySupported = status && !status.error && status.version === 'v2' &&
-			targetCapability(status, 'profile_write');
+			status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write');
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;

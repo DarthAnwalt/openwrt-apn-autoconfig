@@ -104,14 +104,11 @@ Exit codes are:
 - `2`: invalid adapter invocation;
 - `3`: dependency/device temporarily unavailable or a bounded command failed.
 
-The core maps temporary identity failures to its retryable exit code 3. QMI
-profile mutations remain unavailable and use the target-contract exit code 4
-before UCI, persistent state, `ifdown` or `ifup` can be reached.
+The core maps temporary identity failures to its retryable exit code 3.
 
-## Future write/apply operations
+## QMI profile write/apply
 
-A backend may advertise profile mutation only after it implements all of these
-operations as one rollback-safe unit:
+The QMI backend implements these operations as one rollback-safe unit:
 
 1. read the complete profile fields owned by the backend;
 2. validate a normalized candidate without shell evaluation;
@@ -121,5 +118,19 @@ operations as one rollback-safe unit:
 6. expose the effective layer-3 device for common verification;
 7. restore the exact previous profile and target state after every failure.
 
-The QMI alpha deliberately stops before this boundary. Hardware observations
-may change QMI option mapping without changing the common APN engine.
+The core captures and restores exactly the owned QMI netifd options `apn`,
+`username`, `password`, `auth` and `pdptype`. Normalized `pap-or-chap` maps to
+uqmi's `both`; normalized IPv4 maps to qmi.sh's canonical `ip`. The baseline is
+written atomically with mode constrained by `umask 077`, names the target and
+backend, and is fully validated before reset performs its first UCI write.
+
+Connection ownership remains in OpenWrt netifd. The adapter does not invoke
+`--start-network`, `--stop-network` or `--modify-profile`; after UCI commit the
+core asks netifd to restart only the selected target. If a requested
+`ipv4v6` bearer does not become ready, QMI makes one explicit retry with IPv4
+and records IPv4 as the effective cached profile when it succeeds. Other IP
+families are not silently changed.
+
+QMI does not inherit ModemManager's `allow_roaming` control. Until a portable,
+tested QMI policy mapping exists, the GUI hides that control and the command
+fails with target-contract exit code 4 without mutation.

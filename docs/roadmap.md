@@ -62,13 +62,15 @@ backend is a normal inventory result, not a partially functional fallback.
 
 ## 0.9.1 — native QMI adapter
 
-Development started as 0.9.1-alpha. The hardware-independent phase adds a
-read-only `uqmi` identity adapter with a same-device `sms-tool` fallback, a
+Development started as 0.9.1-alpha. It adds a native `uqmi` identity adapter
+with a same-device `sms-tool` fallback, a
 backend contract, runtime/evidence states and synthetic home, roaming,
 malformed-output and injection coverage.
 It also removes the core package's hard dependency on a particular modem
-manager. QMI profile write/apply remains false until netifd option mapping,
-rollback and live hardware validation pass on the isolated test router.
+manager. QMI profile capture/write/apply, exact rollback and a bounded
+dual-stack-to-IPv4 fallback are implemented through the configured netifd
+target. Stable 0.9.1 remains gated on packaged live failure, reboot, button,
+removal and ModemManager regression tests.
 
 ## 0.9.2 — native MBIM adapter
 

@@ -44,6 +44,11 @@ printf '%s\n' 'old-user' >"$STATE/username"
 printf '%s\n' 'old-pass' >"$STATE/password"
 printf '%s\n' 'chap' >"$STATE/allowedauth"
 printf '%s\n' 'ipv4' >"$STATE/iptype"
+printf '%s\n' 'qmi.old' >"$STATE/qmi-apn"
+printf '%s\n' 'qmi-user' >"$STATE/qmi-username"
+printf '%s\n' 'qmi-pass' >"$STATE/qmi-password"
+printf '%s\n' 'chap' >"$STATE/qmi-auth"
+printf '%s\n' 'ip' >"$STATE/qmi-pdptype"
 
 cat >"$MOCKBIN/uci" <<'EOF'
 #!/bin/sh
@@ -93,6 +98,11 @@ get:network.wwan2.proto) printf '%s\n' modemmanager ;;
 get:network.cellqmi.proto) printf '%s\n' qmi ;;
 get:network.cellqmi.device) [ "${TEST_QMI_USE_DEVPATH:-0}" = 1 ] || printf '%s\n' "${TEST_QMI_DEVICE:-/dev/cdc-wdm0}" ;;
 get:network.cellqmi.devpath) [ "${TEST_QMI_USE_DEVPATH:-0}" = 1 ] && printf '%s\n' "$TEST_QMI_DEVPATH" ;;
+get:network.cellqmi.apn) cat "$TEST_STATE/qmi-apn" ;;
+get:network.cellqmi.username) cat "$TEST_STATE/qmi-username" ;;
+get:network.cellqmi.password) cat "$TEST_STATE/qmi-password" ;;
+get:network.cellqmi.auth) cat "$TEST_STATE/qmi-auth" ;;
+get:network.cellqmi.pdptype) cat "$TEST_STATE/qmi-pdptype" ;;
 get:network.cellmbim.proto) printf '%s\n' mbim ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
@@ -111,6 +121,12 @@ set:*)
 			case "$option" in apn|username|password|allowedauth|iptype|allow_roaming) printf '%s\n' "$value" >"$TEST_STATE/$option" ;; *) exit 1 ;; esac
 		;;
 		network.wwan2.apn=*) printf '%s\n' "${2#network.wwan2.apn=}" >"$TEST_STATE/apn-wwan2" ;;
+		network.cellqmi.*=*)
+			option="${2#network.cellqmi.}"
+			value="${option#*=}"
+			option="${option%%=*}"
+			case "$option" in apn|username|password|auth|pdptype) printf '%s\n' "$value" >"$TEST_STATE/qmi-$option" ;; *) exit 1 ;; esac
+		;;
 		*) exit 1 ;;
 	esac
 ;;
@@ -121,6 +137,11 @@ delete:network.wwan.allowedauth) rm -f "$TEST_STATE/allowedauth" ;;
 delete:network.wwan.iptype) rm -f "$TEST_STATE/iptype" ;;
 delete:network.wwan.allow_roaming) rm -f "$TEST_STATE/allow_roaming" ;;
 delete:network.wwan2.apn) rm -f "$TEST_STATE/apn-wwan2" ;;
+delete:network.cellqmi.apn) rm -f "$TEST_STATE/qmi-apn" ;;
+delete:network.cellqmi.username) rm -f "$TEST_STATE/qmi-username" ;;
+delete:network.cellqmi.password) rm -f "$TEST_STATE/qmi-password" ;;
+delete:network.cellqmi.auth) rm -f "$TEST_STATE/qmi-auth" ;;
+delete:network.cellqmi.pdptype) rm -f "$TEST_STATE/qmi-pdptype" ;;
 commit:network) : ;;
 *) exit 1 ;;
 esac
@@ -173,7 +194,9 @@ cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
 suffix=""
 [ -z "${UBUS_L3_DEVICE:-}" ] || suffix=", \"l3_device\": \"$UBUS_L3_DEVICE\""
-if [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
+if [ "${QMI_DUALSTACK_REJECT:-0}" = 1 ] && [ "$(cat "$TEST_STATE/qmi-pdptype" 2>/dev/null || :)" = ipv4v6 ]; then
+	printf '{ "up": false%s }\n' "$suffix"
+elif [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
 	printf '{ "up": true%s }\n' "$suffix"
 elif [ "${UBUS_UP:-1}" = 1 ]; then
 	printf '{ "up": true%s }\n' "$suffix"
@@ -210,6 +233,7 @@ for argument in "$@"; do
 	previous="$argument"
 done
 current="$(cat "$TEST_STATE/apn" 2>/dev/null || :)"
+[ "${TEST_INTERFACE:-wwan}" != cellqmi ] || current="$(cat "$TEST_STATE/qmi-apn" 2>/dev/null || :)"
 [ "$current" = "${CURL_SUCCESS_APN:-internet.telekom}" ]
 EOF
 
@@ -355,7 +379,7 @@ assert_contains() {
 
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and t["network:cellqmi"]["capabilities"]["identity"] is True and t["network:cellqmi"]["capabilities"]["profile_apply"] is False; assert t["network:cellqmi"]["implementation_state"] == "alpha" and t["network:cellqmi"]["validation_state"] == "synthetic" and t["network:cellqmi"]["hardware_validated"] is False; assert t["network:cellqmi"]["unavailable_reason"] == "profile-apply-not-implemented"; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and all(t["network:cellqmi"]["capabilities"].values()); assert t["network:cellqmi"]["implementation_state"] == "alpha" and t["network:cellqmi"]["validation_state"] == "synthetic" and t["network:cellqmi"]["hardware_validated"] is False; assert t["network:cellqmi"]["unavailable_reason"] == ""; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
 
 qmi_unavailable_json="$(APN_AUTOCONFIG_QMI_ADAPTER="$TESTROOT/missing-qmi-adapter" sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False; assert q["implementation_state"] == "alpha"; assert q["unavailable_reason"] == "adapter-unavailable"' "$qmi_unavailable_json" || fail 'missing QMI adapter was reported as available'
@@ -394,12 +418,12 @@ if grep -E -q '/dev/ttyUSB(8|9)' "$STATE/sms-tool-calls"; then
 	fail 'QMI identity probed an AT port belonging to another USB modem'
 fi
 
-printf '%s\n' 'TEST QMI alpha identity is read-only and matches candidates from fixture output'
+printf '%s\n' 'TEST QMI identity is read-only and matches candidates from fixture output'
 : >"$STATE/events"
 : >"$STATE/uqmi-calls"
 before="$(cat "$STATE/apn")"
 qmi_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert d["target_capabilities"] == {"identity": True, "profile_read": False, "profile_write": False, "profile_apply": False}; assert d["target_implementation_state"] == "alpha" and d["target_validation_state"] == "synthetic" and d["target_hardware_validated"] is False; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"].values()); assert d["target_implementation_state"] == "alpha" and d["target_validation_state"] == "synthetic" and d["target_hardware_validated"] is False; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'QMI identity changed the ModemManager APN'
 [ ! -s "$STATE/events" ] || fail 'QMI identity cycled a network interface'
 [ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 3 ] || fail 'QMI identity issued an unexpected command count'
@@ -483,8 +507,8 @@ fi
 printf '%s\n' 'TEST unsupported backends fail before any profile or network mutation'
 : >"$STATE/events"
 before="$(cat "$STATE/apn")"
-if unsupported_target_output="$(sh "$SCRIPT" apply --target network:cellqmi 2>&1)"; then
-	fail 'QMI target was allowed to apply a profile'
+if unsupported_target_output="$(sh "$SCRIPT" apply --target network:cellmbim 2>&1)"; then
+	fail 'MBIM target was allowed to apply a profile'
 else
 	unsupported_target_status=$?
 fi
@@ -492,7 +516,7 @@ fi
 assert_contains "$unsupported_target_output" 'does not implement profile-apply'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'unsupported target changed APN'
 [ ! -s "$STATE/events" ] || fail 'unsupported target cycled a network interface'
-[ ! -e "$PERSIST/targets/network_cellqmi" ] || fail 'unsupported target created persistent state'
+[ ! -e "$PERSIST/targets/network_cellmbim" ] || fail 'unsupported target created persistent state'
 
 printf '%s\n' 'TEST unsafe and ambiguous target selection fails closed'
 if sh "$SCRIPT" status-json --target 'network:../../tmp/x' >/dev/null 2>&1; then
@@ -500,15 +524,92 @@ if sh "$SCRIPT" status-json --target 'network:../../tmp/x' >/dev/null 2>&1; then
 else
 	[ "$?" -eq 4 ] || fail 'unsafe target ID did not use the target-contract exit code'
 fi
-auto_json="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_id"] == "network:wwan" and d["target_backend"] == "modemmanager"' "$auto_json" || fail 'single writable target was not selected automatically'
 : >"$STATE/events"
-if TEST_INTERFACE=auto TEST_SECOND_MM=1 sh "$SCRIPT" apply >/dev/null 2>&1; then
+if TEST_INTERFACE=auto sh "$SCRIPT" apply >/dev/null 2>&1; then
 	fail 'ambiguous automatic target selection was accepted'
 else
 	[ "$?" -eq 4 ] || fail 'ambiguous target did not use the target-contract exit code'
 fi
 [ ! -s "$STATE/events" ] || fail 'ambiguous selection changed network state'
+
+printf '%s\n' 'TEST QMI refuses legacy baselines that have no backend identity'
+mkdir -p "$PERSIST/targets/network_cellqmi"
+printf 'v2\tcellqmi\noption\tapn\t1\tlegacy.mm.apn\n' \
+	>"$PERSIST/targets/network_cellqmi/baseline.tsv"
+: >"$STATE/events"
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1; then
+	fail 'QMI reset accepted a backend-less legacy baseline'
+fi
+[ "$(cat "$STATE/qmi-apn")" = qmi.old ] || fail 'legacy baseline changed the QMI APN'
+[ ! -s "$STATE/events" ] || fail 'legacy baseline cycled the QMI interface'
+rm -f "$PERSIST/targets/network_cellqmi/baseline.tsv"
+rmdir "$PERSIST/targets/network_cellqmi"
+
+printf '%s\n' 'TEST QMI applies the netifd profile and reset restores every owned option'
+: >"$STATE/events"
+mkdir -p "$CACHE"
+printf 'v2\tinternet.telekom\tQMI cached fixture\t2026-01-01T00:00:00Z\tfixture-user\tfixture-pass\tpap-or-chap\tipv4v6\n' \
+	>"$CACHE/89490200002186275443.tsv"
+TEST_INTERFACE=cellqmi sh "$SCRIPT" apply >/dev/null 2>&1
+[ "$(cat "$STATE/qmi-apn")" = internet.telekom ] || fail 'QMI apply did not set APN'
+[ "$(cat "$STATE/qmi-username")" = fixture-user ] || fail 'QMI apply did not set username'
+[ "$(cat "$STATE/qmi-password")" = fixture-pass ] || fail 'QMI apply did not set password'
+[ "$(cat "$STATE/qmi-auth")" = both ] || fail 'QMI apply did not map pap-or-chap to uqmi both'
+[ "$(cat "$STATE/qmi-pdptype")" = ipv4v6 ] || fail 'QMI apply did not keep a working dual-stack profile'
+grep -F -q "$(printf 'option\tauth\t1\tchap')" "$PERSIST/targets/network_cellqmi/baseline.tsv" || \
+	fail 'QMI baseline did not use the backend auth option'
+grep -F -q "$(printf 'option\tpdptype\t1\tip')" "$PERSIST/targets/network_cellqmi/baseline.tsv" || \
+	fail 'QMI baseline did not use the backend PDP option'
+: >"$STATE/events"
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reconcile >/dev/null 2>&1
+[ ! -s "$STATE/events" ] || fail 'QMI reconcile cycled an already verified profile'
+cp "$PERSIST/targets/network_cellqmi/baseline.tsv" "$STATE/qmi-baseline.valid"
+printf 'option\tallowedauth\t1\tpap chap\n' >>"$PERSIST/targets/network_cellqmi/baseline.tsv"
+: >"$STATE/events"
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1; then
+	fail 'QMI reset accepted a ModemManager-only baseline option'
+fi
+[ "$(cat "$STATE/qmi-apn")" = internet.telekom ] || fail 'invalid QMI baseline partially changed the profile'
+[ ! -s "$STATE/events" ] || fail 'invalid QMI baseline cycled the interface'
+cp "$STATE/qmi-baseline.valid" "$PERSIST/targets/network_cellqmi/baseline.tsv"
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+[ "$(cat "$STATE/qmi-apn")" = qmi.old ] || fail 'QMI reset did not restore APN'
+[ "$(cat "$STATE/qmi-username")" = qmi-user ] || fail 'QMI reset did not restore username'
+[ "$(cat "$STATE/qmi-password")" = qmi-pass ] || fail 'QMI reset did not restore password'
+[ "$(cat "$STATE/qmi-auth")" = chap ] || fail 'QMI reset did not restore auth'
+[ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'QMI reset did not restore PDP type'
+
+printf '%s\n' 'TEST QMI retries a rejected dual-stack bearer once with IPv4'
+: >"$STATE/events"
+mkdir -p "$CACHE"
+printf 'v2\tinternet.telekom\tQMI dual-stack fixture\t2026-01-01T00:00:00Z\t-\t-\t-\tipv4v6\n' \
+	>"$CACHE/89490200002186275443.tsv"
+QMI_DUALSTACK_REJECT=1 TEST_INTERFACE=cellqmi sh "$SCRIPT" apply >/dev/null 2>&1
+[ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'QMI dual-stack fallback did not keep canonical IPv4 pdptype'
+[ "$(awk -F '\t' 'NR == 1 { print $8 }' "$CACHE/89490200002186275443.tsv")" = ipv4 ] || \
+	fail 'QMI dual-stack fallback did not cache the effective IP family'
+[ "$(grep -F -c 'up cellqmi' "$STATE/events")" -eq 2 ] || fail 'QMI fallback did not make exactly two bearer attempts'
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+
+printf '%s\n' 'TEST failed QMI apply rolls back exactly and rejects ModemManager-only policy control'
+CURL_SUCCESS_APN=never.matches
+export CURL_SUCCESS_APN
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" apply >/dev/null 2>&1; then
+	fail 'failed QMI candidates unexpectedly succeeded'
+fi
+[ "$(cat "$STATE/qmi-apn")" = qmi.old ] || fail 'failed QMI apply did not restore APN'
+[ "$(cat "$STATE/qmi-username")" = qmi-user ] || fail 'failed QMI apply did not restore username'
+[ "$(cat "$STATE/qmi-password")" = qmi-pass ] || fail 'failed QMI apply did not restore password'
+[ "$(cat "$STATE/qmi-auth")" = chap ] || fail 'failed QMI apply did not restore auth'
+[ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'failed QMI apply did not restore PDP type'
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" roaming-policy-set block >/dev/null 2>&1; then
+	fail 'QMI target accepted ModemManager-only roaming policy control'
+else
+	[ "$?" -eq 4 ] || fail 'unsupported QMI roaming policy returned the wrong status'
+fi
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+CURL_SUCCESS_APN=internet.telekom
+export CURL_SUCCESS_APN
 
 printf '%s\n' 'TEST connectivity URL rejects non-HTTP schemes'
 if invalid_url_output="$(TEST_CONFIG_URL=file:///etc/passwd sh "$SCRIPT" status 2>&1)"; then
@@ -932,6 +1033,15 @@ sh "$SCRIPT" modem-reset >/dev/null 2>&1
 [ "$(cat "$STATE/apn")" = 'internet.telekom' ] || fail 'modem reset did not reconcile APN'
 grep -F -q 'down wwan' "$STATE/events" || fail 'modem reset did not stop WWAN'
 grep -F -q 'up wwan' "$STATE/events" || fail 'modem reset did not restore WWAN'
+
+printf '%s\n' 'TEST board modem reset uses the selected QMI backend after power returns'
+: >"$STATE/events"
+TEST_INTERFACE=cellqmi sh "$SCRIPT" modem-reset >/dev/null 2>&1
+[ "$(cat "$TEST_GPIO")" = 0 ] || fail 'QMI modem reset left modem power off'
+[ "$(cat "$STATE/qmi-apn")" = internet.telekom ] || fail 'QMI modem reset did not reconcile APN'
+grep -F -q 'down cellqmi' "$STATE/events" || fail 'QMI modem reset did not stop its selected target'
+grep -F -q 'up cellqmi' "$STATE/events" || fail 'QMI modem reset did not restore its selected target'
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
 
 printf '%s\n' 'TEST modem reset is unavailable without a board integration package'
 : >"$STATE/events"

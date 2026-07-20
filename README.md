@@ -3,10 +3,9 @@
 `apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
 0.9.1 alpha discovers configured cellular netifd interfaces and publishes both
 their runtime capabilities and validation level through a GUI-independent API.
-Its complete operational backend is ModemManager. QMI has a read-only identity
-adapter using `uqmi` with a same-USB-device AT fallback through `sms-tool`, but
-deliberately
-cannot mutate profiles before live hardware validation; MBIM, Fibocom and
+Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
+uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
+application is delegated to the configured netifd `qmi.sh` target. MBIM, Fibocom and
 selected AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
 candidates in a worldwide local TSV database, restarts only the selected mobile
 interface, verifies real Internet access through netifd's current layer-3 device, caches
@@ -45,15 +44,16 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 - `detect` and `status` are read-only.
 - Normal APN operations never write `network.<interface>.allow_roaming`; the
   existing OpenWrt network option remains the sole source of roaming policy.
-- In the 0.9.1 alpha, `apply` edits only the ModemManager profile options `apn`, `username`,
-  `password`, `allowedauth` and `iptype` under `network.<interface>`.
+- `apply` edits only the selected backend's owned profile options under
+  `network.<interface>`: `apn`, `username`, `password`, `allowedauth`, `iptype`
+  for ModemManager, or `apn`, `username`, `password`, `auth`, `pdptype` for QMI.
 - It calls only `ifdown <selected-target>` / `ifup <selected-target>`; it does not reload or restart the
   whole network.
 - It does not edit mwan3 interfaces, members, policies, rules, or metrics.
 - If mwan3 is available, the connectivity test is run using
   `mwan3 use wwan curl ...` so the test follows the selected WAN routing table.
 - An interrupted or failed `apply` restores the prior mobile profile and restarts only
-  `wwan`.
+  the selected target.
 - Before the first `apply`, the original profile state is stored persistently in
   `/etc/apn-autoconfig/targets/network_<interface>/baseline.tsv`.
 - Baseline, active-profile and ICCID-cache files may contain APN usernames and
@@ -88,10 +88,11 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 - `sms-tool`, installed automatically as the common read-only AT transport
 - `modemmanager` / `mmcli` for the stable write/apply backend; it is no longer
   pulled into GUI-independent core installations automatically
-- optional `uqmi` for the synthetically tested, read-only QMI identity alpha
+- `uqmi` for a configured QMI target; it is normally supplied with OpenWrt's
+  QMI protocol support and is not pulled into unrelated core installations
 - `curl`
-- at least one configured netifd ModemManager interface; its name is discovered
-  automatically when it is the only writable cellular target
+- at least one configured netifd ModemManager or QMI interface; its name is
+  discovered automatically when it is the only writable cellular target
 - optional: `mwan3`
 - optional `apn-autoconfig-integration-huasifei-wh3000`, which pulls
   `kmod-button-hotplug`, only for the tested Huasifei button/GPIO flow
@@ -99,7 +100,7 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 `option device 'wwan0'` is only a fallback for systems whose netifd status does
 not expose `l3_device`. The hardware-reset GPIO defaults still match only the
 Huasifei WH3000 Pro + Quectel RM520N-GL setup for which the MVP was prepared.
-For read-only QMI identity, the control channel is taken from the selected
+For QMI identity, the control channel is taken from the selected
 target's `/dev/cdc-wdm*`/`/dev/wwan*qmi*` `device`, or from exactly one safe
 match below its official OpenWrt `devpath`; this is separate from the layer-3
 data device used for connectivity checks.
@@ -276,8 +277,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1_alpha1-r3.apk \
-  ./luci-app-apn-autoconfig-0.6.0_alpha1-r4.apk
+  ./apn-autoconfig-0.9.1_alpha1-r4.apk \
+  ./luci-app-apn-autoconfig-0.6.0_alpha1-r5.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -413,10 +414,9 @@ apn-autoconfig detect
 ```
 
 `targets-json` is the authoritative way to distinguish discovery from actual
-support. In the 0.9.1 alpha only targets with an available ModemManager backend
-report `profile_apply: true`. QMI may report read-only `identity: true` when its
-helper dependencies are installed, but remains `alpha`, `synthetic`,
-`hardware_validated: false` and `profile_apply: false`.
+support. ModemManager and QMI targets report `profile_apply: true` only when
+their required runtime commands are available. This alpha reports the QMI
+implementation and hardware evidence separately from its runtime capability.
 Use `--target network:<section>` with status, detect or mutating commands when
 more than one writable target is configured.
 
@@ -756,14 +756,14 @@ submission has been implemented and tested.
 
 - Worldwide coverage is broad but cannot be mathematically complete: carrier
   settings change and some MVNOs do not expose a usable SIM discriminator.
-- Automatic SIM resolution requires ModemManager to expose a primary SIM path;
-  a configured numeric `sim_index` is used only when resolution is impossible.
-- The QMI identity adapter has synthetic coverage; its native `uqmi` identity
-  calls are not supported by the reference RM520N, so the same-device AT
-  fallback still requires an end-to-end packaged hardware test. QMI profile
-  operations plus all MBIM, Fibocom and
-  AT-managed operations remain unavailable; mutating commands exit 4 before
-  changing UCI, state or network interfaces.
+- ModemManager SIM resolution requires a primary SIM path; a configured numeric
+  `sim_index` is used only when resolution is impossible. QMI currently targets
+  the primary SIM exposed by its control channel.
+- The reference RM520N rejects native `uqmi` ICCID/IMSI calls, so QMI identity
+  uses the strictly same-device AT fallback. Packaged QMI apply, failure,
+  reboot and soak gates must pass before the alpha becomes stable.
+- MBIM, Fibocom and AT-managed profile operations remain unavailable; mutating
+  commands for those targets exit 4 before changing UCI, state or interfaces.
 - The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses
   the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
 - Boot and hardware-button automation are independently opt-in and exposed as

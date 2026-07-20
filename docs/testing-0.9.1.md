@@ -18,6 +18,11 @@ Every change must pass:
 - an allow-list assertion that QMI identity issues no mutating `uqmi` command;
 - a same-physical-USB AT fallback fixture using only fixed read-only commands;
 - rejection of unrelated serial ports, sysfs escapes and malformed AT output;
+- QMI authentication/IP-family mapping, successful apply, idempotent reconcile,
+  dual-stack-to-IPv4 fallback, automatic failure rollback and explicit reset;
+- full-file baseline validation before any UCI mutation and rejection of
+  cross-backend option names;
+- QMI execution of the optional board reset flow after modem power returns;
 - the existing ambiguity, state migration, rollback, locking, URL, UCI and
   command-injection tests.
 
@@ -45,7 +50,7 @@ manager required by a configured target (`modemmanager`, later `uqmi` or
 `umbim`) is installed by that OpenWrt configuration, while the core remains
 usable by another GUI or integration without pulling an unrelated manager.
 
-## Hardware gate still required for QMI write/apply
+## Remaining hardware gate for stable QMI write/apply
 
 The following work is blocked on the isolated router and must not be simulated
 away:
@@ -53,14 +58,15 @@ away:
 - retain the observed RM520N behavior: serving-system and UIM state succeed,
   native QMI ICCID/IMSI return `Not supported`, and read-only AT identity works;
 - verify SIM/PIN/not-present and registration transitions;
-- determine exact QMI profile/authentication/IP-family UCI mappings;
-- test netifd ownership, dynamic IPv4/IPv6 interfaces and reconnect timing;
+- confirm the implemented QMI profile/authentication/IP-family UCI mappings;
+- test packaged netifd ownership, dynamic IPv4/IPv6 interfaces and reconnect timing;
 - force bearer rejection, timeout, hot-unplug and power interruption;
 - prove exact profile rollback, repeated reboot and removal recovery;
 - repeat the complete ModemManager live regression after the QMI changes.
 
-Until that gate passes, QMI must keep `profile_apply: false`,
-`validation_state: synthetic` and `hardware_validated: false`.
+The alpha can expose its implemented runtime capability while remaining
+`implementation_state: alpha`. It must not become stable 0.9.1 until the
+remaining packaged hardware gate passes.
 
 ## RM520N read-only observation (2026-07-19)
 
@@ -85,9 +91,10 @@ lengths and home registration were correct, `reconcile` stopped at the expected
 unsupported profile-apply gate (exit 4), and the modem profile, UCI files and
 AutoAPN state were unchanged.
 
-The current evidence flag is target-wide rather than capability-specific, so it
-remains conservative (`synthetic`/false) while QMI profile-apply is absent even
-though identity now has reference-hardware evidence.
+At that earlier read-only milestone the evidence flag remained conservative
+(`synthetic`/false), because it is target-wide rather than capability-specific.
+The later write/apply implementation supersedes that interim state and requires
+the additional gates above.
 
 A separate short netifd bearer test exposed an IP-family distinction. With the
 existing `ipv4v6` setting, Vodafone accepted IPv4 but rejected the IPv6 QMI
@@ -100,9 +107,10 @@ after allowing asynchronous netifd teardown to release the control channel,
 profile 1 matched the saved JSON baseline byte-for-byte and UCI was clean.
 
 This proves a working IPv4 QMI bearer on the reference modem, not long-term
-stability. Dual-stack fallback policy, profile mutation/rollback inside the
-engine, hot-unplug, reboot and soak tests remain required before QMI can
-advertise profile-apply or replace ModemManager on the production router.
+stability. The engine now implements the observed dual-stack fallback and
+profile rollback synthetically; packaged failure, hot-unplug, reboot and soak
+tests remain required before the backend becomes stable or replaces
+ModemManager on the production router.
 
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing

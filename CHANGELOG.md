@@ -2,8 +2,13 @@
 
 ## apn-autoconfig 0.9.1_alpha1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0_alpha1 (unreleased)
 
-- Added a read-only QMI identity helper using `uqmi` ICCID, IMSI and
-  serving-system queries; QMI profile mutation remains unavailable.
+- Added a native QMI backend: identity through `uqmi`/same-device AT fallback,
+  backend-specific profile capture, UCI mapping, netifd apply, reconciliation,
+  automatic failure rollback and persistent reset.
+- Mapped normalized authentication to QMI `auth` (`pap-or-chap` becomes
+  `both`) and IP family to `pdptype` (`ipv4` becomes canonical `ip`).
+- Added one bounded `ipv4v6` to IPv4 retry when OpenWrt's QMI handler rejects
+  the dual-stack bearer, and cache the effective working family explicitly.
 - Added `sms-tool` as the small common core dependency and a strictly
   allow-listed `AT+CCID`/`AT+QCCID`/`AT+CIMI` fallback for QMI devices whose
   firmware rejects native QMI ICCID/IMSI operations.
@@ -13,10 +18,10 @@
   single official-style netifd `devpath`; ambiguous paths fail closed.
 - Kept QMI identity available on minimal OpenWrt images without an external
   `timeout` command by falling back to uqmi's bounded per-request timeout.
-- Added `targets-json` v2 evidence fields so alpha/synthetic implementation is
+- Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI
-  uses it to label QMI as read-only and disable unsupported mutating controls.
+  enables QMI APN actions while keeping ModemManager-only roaming controls hidden.
 - Removed hard dependencies on ModemManager and button-hotplug support from the
   GUI-independent core; runtime capabilities now reflect installed backend
   commands, while configured unavailable targets remain visible.
@@ -24,17 +29,25 @@
   `kmod-button-hotplug` dependency into the optional
   `apn-autoconfig-integration-huasifei-wh3000` package. The core rejects GPIO
   reset without a supported integration marker, and LuCI hides those controls.
-- Kept QMI `apply`, `reconcile` and policy mutation behind exit code 4 before
-  UCI, persistent-state or netifd mutation.
+- Kept QMI connection ownership in official netifd `qmi.sh`; the engine never
+  starts a bearer directly and does not change USB, radio, PIN or SIM state.
+- Kept roaming-policy mutation explicitly ModemManager-only instead of
+  pretending its UCI option has portable QMI semantics.
 - Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
   each value now has an explicit accessible Show/Hide control whose position
   remains fixed while the same-width masked and revealed values are toggled.
-- Added synthetic QMI home/roaming and same-device AT fixtures and tests for
+- Added synthetic QMI apply, dual-stack fallback, idempotency, button flow,
+  exact reset/failure rollback and malformed cross-backend baseline tests,
+  alongside home/roaming and same-device AT fixtures and tests for
   unavailable adapters, command failure, malformed identity, sysfs escapes,
   unsafe device paths and mutating-command
   isolation while retaining the full ModemManager regression suite.
-- Documented backend contract v1, the evidence ladder and the remaining live
-  hardware gate. This alpha is not a stable QMI implementation.
+- Made baseline reset validate every record before its first UCI write, so a
+  malformed trailing record cannot produce a partial restore.
+- Fixed portable reading of optional cached profile fields across BusyBox and
+  BSD awk implementations.
+- Documented the remaining packaged end-to-end, failure, reboot and soak gates.
+  This alpha is not yet the stable 0.9.1 release.
 
 ## apn-autoconfig 0.9.0 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.5.0
 

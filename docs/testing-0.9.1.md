@@ -226,8 +226,18 @@ The final candidate closed the remaining lifecycle and user-interface gates:
   `wwan0`, home registration and LTE status were correct, APN reconciliation
   succeeded, roaming policy remained unset and Internet connectivity passed.
 
-The final SDK-built stable packages must repeat package metadata, install and
-smoke checks, but no functional hardware gate remains open for 0.9.1. The old
+GitHub Actions run `29922205315` repeated the full verification suite and built
+the stable packages with the official OpenWrt 25.12.5 SDK. The downloaded
+artifacts matched their CI `SHA256SUMS`; `apk add --simulate` proposed only the
+three expected alpha-to-stable upgrades. The real transaction installed
+`apn-autoconfig 0.9.1-r1`, LuCI `0.6.0-r1` and the Huasifei integration
+`0.9.1-r1` without changing either saved UCI file. Installed target evidence
+reported `stable`/`hardware`/`true`, boot reconciliation was idempotent, the
+mwan3-routed connectivity check returned HTTP 204, and the final LuCI page
+rendered complete ModemManager status and controls. The verified APKs and
+checksums are also stored in the router's persistent recovery set.
+
+No functional or packaging gate remains open for 0.9.1. The old
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md) is retained as the
 historical pre-QMI production-router procedure and is not the final evidence
 record.

@@ -39,6 +39,10 @@
 - Increased the bounded QMI teardown quiet period after live RM520N testing
   showed that a two-second restart could race client-ID cleanup and trigger an
   unnecessary SIM power cycle in netifd's `qmi.sh`.
+- Ordered QMI board-reset recovery as identity readiness, bounded client
+  settle, netifd interface recovery, then APN reconciliation. This prevents a
+  direct identity query immediately before `qmi.sh` initialization and avoids
+  a redundant recovery `ifup` after the interface is already back.
 - Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
   each value now has an explicit accessible Show/Hide control whose position
   remains fixed while the same-width masked and revealed values are toggled.

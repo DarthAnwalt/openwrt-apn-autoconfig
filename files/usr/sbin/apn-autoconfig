@@ -2147,11 +2147,27 @@ modem_reset_cmd() {
 	if ! wait_for_modem; then
 		die "modem or SIM did not return within ${MODEM_WAIT_SECONDS}s"
 	fi
+	if [ "$TARGET_BACKEND" = qmi ]; then
+		# wait_for_modem ends with a direct identity transaction. Let that QMI
+		# client close before handing the control device back to netifd, then
+		# wait for qmi.sh to own initialization before reconcile queries status.
+		settle_after_ifdown
+		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface; then
+			INTERFACE_RESTORE_ARMED=0
+			log notice "QMI interface $INTERFACE is ready after modem power return"
+		else
+			log warning "QMI interface $INTERFACE did not become ready before APN reconciliation"
+			ifdown "$INTERFACE" >/dev/null 2>&1 || :
+			settle_after_ifdown
+		fi
+	fi
 	log notice "modem and SIM are available again; reconciling APN"
 	reconcile_cmd
 	status=$?
 	if [ "$status" -ne 0 ]; then
-		[ "$status" -eq 2 ] && INTERFACE_RESTORE_ARMED=0
+		if [ "$status" -eq 2 ] || interface_is_up; then
+			INTERFACE_RESTORE_ARMED=0
+		fi
 		return "$status"
 	fi
 	INTERFACE_RESTORE_ARMED=0

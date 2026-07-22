@@ -214,6 +214,7 @@ EOF
 cat >"$MOCKBIN/ifup" <<'EOF'
 #!/bin/sh
 printf 'up %s\n' "$1" >>"$TEST_STATE/events"
+[ "${QMI_TRACE_RESET_ORDER:-0}" != 1 ] || printf '%s\n' up >>"$TEST_STATE/qmi-reset-order"
 touch "$TEST_STATE/ifup-seen"
 EOF
 
@@ -295,6 +296,9 @@ for argument in "$@"; do
 done
 [ -n "$operation" ] || exit 2
 printf '%s\n' "$*" >>"$TEST_STATE/uqmi-calls"
+if [ "${QMI_TRACE_RESET_ORDER:-0}" = 1 ] && [ "$operation" = get-iccid ]; then
+	printf '%s\n' identity >>"$TEST_STATE/qmi-reset-order"
+fi
 [ "${QMI_FAIL_OPERATION:-}" != "$operation" ] || exit 1
 if [ "$operation" = get-iccid ] && [ -n "${QMI_MALFORMED_ICCID:-}" ]; then
 	printf '"%s"\n' "$QMI_MALFORMED_ICCID"
@@ -1039,11 +1043,17 @@ grep -F -q 'up wwan' "$STATE/events" || fail 'modem reset did not restore WWAN'
 
 printf '%s\n' 'TEST board modem reset uses the selected QMI backend after power returns'
 : >"$STATE/events"
+rm -f "$STATE/qmi-reset-order" "$STATE/ifup-seen"
+QMI_TRACE_RESET_ORDER=1
+export QMI_TRACE_RESET_ORDER
 TEST_INTERFACE=cellqmi sh "$SCRIPT" modem-reset >/dev/null 2>&1
 [ "$(cat "$TEST_GPIO")" = 0 ] || fail 'QMI modem reset left modem power off'
 [ "$(cat "$STATE/qmi-apn")" = internet.telekom ] || fail 'QMI modem reset did not reconcile APN'
 grep -F -q 'down cellqmi' "$STATE/events" || fail 'QMI modem reset did not stop its selected target'
 grep -F -q 'up cellqmi' "$STATE/events" || fail 'QMI modem reset did not restore its selected target'
+[ "$(sed -n '1p' "$STATE/qmi-reset-order")" = identity ] || fail 'QMI modem reset did not first wait for SIM identity'
+[ "$(sed -n '2p' "$STATE/qmi-reset-order")" = up ] || fail 'QMI modem reset queried identity again before handing control to netifd'
+unset QMI_TRACE_RESET_ORDER
 TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
 
 printf '%s\n' 'TEST modem reset is unavailable without a board integration package'

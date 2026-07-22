@@ -199,10 +199,14 @@ run_at() {
 	# serial port. Minimal OpenWrt images do not necessarily install an external
 	# timeout command, so retain a local watchdog instead of allowing status-json
 	# (and therefore LuCI) to hang indefinitely.
+	mkdir -p "$AT_CACHE_DIR" 2>/dev/null || return 1
+	timeout_marker="$AT_CACHE_DIR/.at-timeout.$$"
+	rm -f "$timeout_marker" 2>/dev/null || return 1
 	"$SMS_TOOL" -d "$device" at "$command" 2>/dev/null &
 	at_pid=$!
 	(
 		"$SLEEP" "$AT_TIMEOUT_SECONDS"
+		: >"$timeout_marker" 2>/dev/null || :
 		kill "$at_pid" 2>/dev/null || exit 0
 		"$SLEEP" 1
 		kill -9 "$at_pid" 2>/dev/null || :
@@ -213,6 +217,10 @@ run_at() {
 	wait "$at_pid" || at_status=$?
 	kill "$watchdog_pid" 2>/dev/null || :
 	wait "$watchdog_pid" 2>/dev/null || :
+	if [ -e "$timeout_marker" ]; then
+		rm -f "$timeout_marker" 2>/dev/null || :
+		return 124
+	fi
 	return "$at_status"
 }
 

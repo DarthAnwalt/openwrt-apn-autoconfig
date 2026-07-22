@@ -170,6 +170,27 @@ button event dispatch should also be repeated with QMI active even though the
 same guarded reset command and the release-only hotplug mapping have each been
 tested independently.
 
+## QMI LuCI concurrency finding (2026-07-22)
+
+The pre-reboot LuCI gate exposed a hardware-only serial contention path. On the
+minimal OpenWrt image, no external `timeout` command was installed and a
+QMI-to-AT identity fallback could leave `sms_tool` blocked, causing LuCI's RPC
+request to time out. The first bounded fix prevented indefinite processes, but
+simultaneous boot reconciliation and LuCI status still contended for the same
+AT port and made a cold scan exceed the RPC window.
+
+The corrected adapter combines an internal TERM/KILL watchdog, a bounded
+per-control-device identity lock, a root-owned volatile cache of the validated
+sibling AT port, sysfs revalidation before reuse, and suppression of a
+redundant vendor ICCID attempt after the standard command itself times out.
+Signal-info collection is also bounded and optional: malformed telemetry does
+not invalidate otherwise complete SIM identity.
+
+Synthetic tests force a hanging `sms_tool`, two concurrent identity callers,
+an unrelated USB serial port and a timed-out earlier sibling port. The final
+packaged hardware gate must repeat cold boot reconciliation and LuCI loading
+with the volatile port cache absent, then prove normal repeated status polling.
+
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing
 ModemManager configuration and prove rollback to the locally staged 0.9.0 APKs

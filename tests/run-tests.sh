@@ -326,7 +326,11 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 printf '%s\t%s\n' "$device" "$command" >>"$TEST_STATE/sms-tool-calls"
-[ "$device" != "${SMS_TOOL_BLOCK_DEVICE:-}" ] || exec /bin/sleep 10
+if [ "$device" = "${SMS_TOOL_BLOCK_DEVICE:-}" ]; then
+	trap 'exit 1' TERM
+	/bin/sleep 10
+	exit 1
+fi
 [ "$device" = "${SMS_TOOL_EXPECT_DEVICE:-/dev/ttyUSB2}" ] || exit 1
 [ "${SMS_TOOL_HANG:-0}" != 1 ] || exec /bin/sleep 10
 if [ "${SMS_TOOL_REQUIRE_SERIAL:-0}" = 1 ]; then

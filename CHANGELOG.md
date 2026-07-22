@@ -32,6 +32,9 @@
   request reached its timeout. Ports that answer immediately with an error or
   unrecognized output still receive the Quectel-compatible fallback, while a
   cold multi-port scan no longer doubles every non-responsive-port delay.
+- Classify the internal AT timeout with a root-only watchdog marker rather than
+  the terminated process's exit status. This covers `sms_tool` builds that
+  catch SIGTERM and return a generic command error instead of signal status.
 - Added bounded QMI signal-info collection and a deterministic percentage from
   the best reported RSRP, with RSSI fallback when RSRP is unavailable.
 - When QMI confirms home registration but cannot report a separate home/SPN

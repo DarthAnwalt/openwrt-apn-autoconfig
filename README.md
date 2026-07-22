@@ -277,8 +277,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1_alpha1-r7.apk \
-  ./luci-app-apn-autoconfig-0.6.0_alpha1-r7.apk
+  ./apn-autoconfig-0.9.1_alpha1-r8.apk \
+  ./luci-app-apn-autoconfig-0.6.0_alpha1-r8.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -783,3 +783,14 @@ submission has been implemented and tested.
 
 The database is designed to improve continuously without making router package
 builds or runtime behavior depend on upstream availability.
+
+## Maintainer documentation
+
+New maintainers and coding assistants should start with
+[`docs/development-handoff.md`](docs/development-handoff.md). It records the
+project boundary, package map, binding safety invariants, public integration
+surface, backend-extension checklist and required release workflow. Detailed
+QMI/API semantics, evidence gates and future adapter direction remain in
+[`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
+[`docs/testing-0.9.1.md`](docs/testing-0.9.1.md) and
+[`docs/roadmap.md`](docs/roadmap.md).

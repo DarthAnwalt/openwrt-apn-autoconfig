@@ -319,6 +319,7 @@ while [ "$#" -gt 0 ]; do
 	esac
 done
 printf '%s\t%s\n' "$device" "$command" >>"$TEST_STATE/sms-tool-calls"
+[ "$device" != "${SMS_TOOL_BLOCK_DEVICE:-}" ] || exec /bin/sleep 10
 [ "$device" = "${SMS_TOOL_EXPECT_DEVICE:-/dev/ttyUSB2}" ] || exit 1
 [ "${SMS_TOOL_HANG:-0}" != 1 ] || exec /bin/sleep 10
 if [ "${SMS_TOOL_REQUIRE_SERIAL:-0}" = 1 ]; then
@@ -441,11 +442,15 @@ ln -s "$TESTROOT/sys/devices/platform/mock-usb/3-1/3-1:1.2/ttyUSB9" \
 	"$TESTROOT/sys/class/tty/ttyUSB9/device"
 : >"$STATE/sms-tool-calls"
 qmi_at_json="$(QMI_FAIL_OPERATION=get-iccid SMS_TOOL_QCCID_ONLY=1 \
+	SMS_TOOL_BLOCK_DEVICE=/dev/ttyUSB0 \
+	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
+	APN_AUTOCONFIG_SLEEP=/bin/sleep APN_AUTOCONFIG_AT_TIMEOUT_SECONDS=1 \
 	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["registration_state"] == "home"' "$qmi_at_json" || fail 'QMI AT identity fallback returned invalid data'
 grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+CCID')" "$STATE/sms-tool-calls" || fail 'standard ICCID command was not attempted first'
 grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+QCCID')" "$STATE/sms-tool-calls" || fail 'Quectel ICCID fallback was not attempted'
 grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+CIMI')" "$STATE/sms-tool-calls" || fail 'standard IMSI command was not attempted'
+[ "$(grep -F -c '/dev/ttyUSB0' "$STATE/sms-tool-calls")" -eq 1 ] || fail 'timed-out AT port received a redundant vendor command'
 if grep -E -q '/dev/ttyUSB(8|9)' "$STATE/sms-tool-calls"; then
 	fail 'QMI identity probed an AT port belonging to another USB modem'
 fi

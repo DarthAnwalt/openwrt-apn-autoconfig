@@ -233,8 +233,13 @@ at_identity() {
 }$at_device"
 	done
 	for at_device in $ordered_devices; do
-		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_output=""
+		iccid_status=0
+		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_status=$?
 		iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
+			# A timed-out serial port is not an AT command channel. Trying the
+			# vendor spelling there would only repeat the same bounded delay.
+			# Immediate command errors still get the Quectel-compatible fallback.
+			case "$iccid_status" in 124|137|143) continue ;; esac
 			iccid_output="$(run_at "$at_device" 'AT+QCCID')" || iccid_output=""
 			iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || continue
 		}

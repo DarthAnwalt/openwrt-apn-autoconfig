@@ -28,6 +28,10 @@
   boot reconciliation and LuCI polling can no longer contend for the same
   serial port, while every cached port is revalidated against the selected
   modem's current sysfs topology before use.
+- Do not repeat the vendor ICCID command on a serial port whose standard ICCID
+  request reached its timeout. Ports that answer immediately with an error or
+  unrecognized output still receive the Quectel-compatible fallback, while a
+  cold multi-port scan no longer doubles every non-responsive-port delay.
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

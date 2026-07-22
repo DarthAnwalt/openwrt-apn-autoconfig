@@ -134,4 +134,6 @@ families are not silently changed.
 QMI does not inherit ModemManager's `allow_roaming` control. Until a portable,
 tested QMI policy mapping exists, the GUI keeps that control visible but
 disabled with an explanation, and the command fails with target-contract exit
-code 4 without mutation.
+code 4 without mutation. Status still reports the observed roaming state, but
+uses `roaming_policy: "unsupported"`; APN operations ignore any stale
+`network.<interface>.allow_roaming` value owned by another connection stack.

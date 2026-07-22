@@ -103,6 +103,7 @@ get:network.cellqmi.username) cat "$TEST_STATE/qmi-username" ;;
 get:network.cellqmi.password) cat "$TEST_STATE/qmi-password" ;;
 get:network.cellqmi.auth) cat "$TEST_STATE/qmi-auth" ;;
 get:network.cellqmi.pdptype) cat "$TEST_STATE/qmi-pdptype" ;;
+get:network.cellqmi.allow_roaming) cat "$TEST_STATE/qmi-allow_roaming" ;;
 get:network.cellmbim.proto) printf '%s\n' mbim ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
@@ -434,8 +435,10 @@ fi
 printf '%s\n' 'TEST QMI roaming keeps home identity separate from serving PLMN'
 QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/roaming"
 export QMI_FIXTURE_DIR
+printf '%s\n' 0 >"$STATE/qmi-allow_roaming"
 qmi_roaming_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" status-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["imsi"].startswith("25506"); assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26202"; assert d["serving_operator_name"] == "Vodafone.de"; assert d["registration_state"] == "roaming" and d["roaming"] is True' "$qmi_roaming_json" || fail 'QMI roaming confused home and serving networks'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["imsi"].startswith("25506"); assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26202"; assert d["serving_operator_name"] == "Vodafone.de"; assert d["registration_state"] == "roaming" and d["roaming"] is True; assert d["roaming_policy"] == "unsupported" and d["roaming_allowed"] is True' "$qmi_roaming_json" || fail 'QMI roaming confused home and serving networks or inherited an unsupported policy'
+rm -f "$STATE/qmi-allow_roaming"
 QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
 export QMI_FIXTURE_DIR
 

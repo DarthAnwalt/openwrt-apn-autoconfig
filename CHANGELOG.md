@@ -33,7 +33,12 @@
 - Kept QMI connection ownership in official netifd `qmi.sh`; the engine never
   starts a bearer directly and does not change USB, radio, PIN or SIM state.
 - Kept roaming-policy mutation explicitly ModemManager-only instead of
-  pretending its UCI option has portable QMI semantics.
+  pretending its UCI option has portable QMI semantics. QMI reports the
+  observed roaming state but explicitly marks policy as unsupported and never
+  lets a stale `allow_roaming` option block APN detection.
+- Increased the bounded QMI teardown quiet period after live RM520N testing
+  showed that a two-second restart could race client-ID cleanup and trigger an
+  unnecessary SIM power cycle in netifd's `qmi.sh`.
 - Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
   each value now has an explicit accessible Show/Hide control whose position
   remains fixed while the same-width masked and revealed values are toggled.

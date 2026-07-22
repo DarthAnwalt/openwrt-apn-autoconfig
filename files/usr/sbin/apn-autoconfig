@@ -217,7 +217,7 @@ qmi_restore_old_profile() {
 	uci commit network >/dev/null 2>&1 || return 1
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
-	sleep 2
+	settle_after_ifdown
 	ifup "$INTERFACE" >/dev/null 2>&1 || :
 }
 
@@ -686,6 +686,13 @@ resolve_sim_index() {
 
 read_roaming_policy() {
 	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	if [ "$TARGET_BACKEND" != modemmanager ]; then
+		# Roaming policy belongs to the connection manager. Only OpenWrt's
+		# ModemManager protocol has a tested allow_roaming contract here.
+		ROAMING_POLICY="unsupported"
+		ROAMING_ALLOWED=true
+		return 0
+	fi
 	if value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null)"; then
 		case "$value" in
 			0)
@@ -1132,7 +1139,7 @@ reset_cmd() {
 	esac
 	uci commit network >/dev/null 2>&1 || die "cannot commit restored mobile profile"
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
-	[ "$TARGET_BACKEND" != qmi ] || sleep 2
+	settle_after_ifdown
 	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
 	rm -rf "$CACHE_DIR"
 	rm -f "$ACTIVE_FILE"
@@ -1678,11 +1685,16 @@ build_apply_candidates() {
 
 restart_interface() {
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
-	# netifd's QMI handler tears down client IDs asynchronously. A short bounded
-	# settle avoids racing the next uqmi session after a rejected bearer.
-	[ "$TARGET_BACKEND" != qmi ] || sleep 2
+	settle_after_ifdown
 	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
 	return 0
+}
+
+settle_after_ifdown() {
+	# netifd's QMI handler releases client IDs asynchronously. RM520N hardware
+	# needs this bounded quiet period; a two-second delay can race SIM queries
+	# and make qmi.sh power-cycle an otherwise healthy SIM.
+	[ "$TARGET_BACKEND" != qmi ] || sleep 6
 }
 
 wait_for_interface() {

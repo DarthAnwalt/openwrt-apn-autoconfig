@@ -18,6 +18,10 @@
   single official-style netifd `devpath`; ambiguous paths fail closed.
 - Kept QMI identity available on minimal OpenWrt images without an external
   `timeout` command by falling back to uqmi's bounded per-request timeout.
+- Added an internal bounded watchdog for the `sms_tool` AT identity fallback
+  when minimal OpenWrt images have no external `timeout` command. A blocked
+  serial port now returns a retryable identity result instead of accumulating
+  processes and leaving LuCI on an XHR timeout.
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

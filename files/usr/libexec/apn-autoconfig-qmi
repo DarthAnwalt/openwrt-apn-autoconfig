@@ -1,6 +1,6 @@
 #!/bin/sh
 
-# Read-only QMI identity adapter for the 0.9.1 alpha contract.
+# Read-only QMI identity adapter for the backend contract.
 # It never modifies a profile, registration state, SIM state or netifd state.
 
 umask 077
@@ -8,7 +8,14 @@ umask 077
 UQMI="${APN_AUTOCONFIG_UQMI:-uqmi}"
 SMS_TOOL="${APN_AUTOCONFIG_SMS_TOOL:-sms_tool}"
 TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
+SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
+AT_TIMEOUT_SECONDS="${APN_AUTOCONFIG_AT_TIMEOUT_SECONDS:-6}"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
+
+case "$AT_TIMEOUT_SECONDS" in
+	''|*[!0-9]*) AT_TIMEOUT_SECONDS=6 ;;
+	*) [ "$AT_TIMEOUT_SECONDS" -ge 1 ] && [ "$AT_TIMEOUT_SECONDS" -le 30 ] || AT_TIMEOUT_SECONDS=6 ;;
+esac
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
@@ -134,7 +141,30 @@ at_digits() {
 run_at() {
 	device="$1"
 	command="$2"
-	"$SMS_TOOL" -d "$device" at "$command" 2>/dev/null
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" "$AT_TIMEOUT_SECONDS" "$SMS_TOOL" -d "$device" at "$command" 2>/dev/null
+		return
+	fi
+
+	# BusyBox sms_tool has no request-timeout option and can remain blocked on a
+	# serial port. Minimal OpenWrt images do not necessarily install an external
+	# timeout command, so retain a local watchdog instead of allowing status-json
+	# (and therefore LuCI) to hang indefinitely.
+	"$SMS_TOOL" -d "$device" at "$command" 2>/dev/null &
+	at_pid=$!
+	(
+		"$SLEEP" "$AT_TIMEOUT_SECONDS"
+		kill "$at_pid" 2>/dev/null || exit 0
+		"$SLEEP" 1
+		kill -9 "$at_pid" 2>/dev/null || :
+	) 2>/dev/null &
+	watchdog_pid=$!
+
+	at_status=0
+	wait "$at_pid" || at_status=$?
+	kill "$watchdog_pid" 2>/dev/null || :
+	wait "$watchdog_pid" 2>/dev/null || :
+	return "$at_status"
 }
 
 at_identity() {

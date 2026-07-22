@@ -320,6 +320,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s\t%s\n' "$device" "$command" >>"$TEST_STATE/sms-tool-calls"
 [ "$device" = "${SMS_TOOL_EXPECT_DEVICE:-/dev/ttyUSB2}" ] || exit 1
+[ "${SMS_TOOL_HANG:-0}" != 1 ] || exec /bin/sleep 10
 case "$command" in
 	AT+CCID)
 		[ "${SMS_TOOL_QCCID_ONLY:-0}" != 1 ] || exit 1
@@ -394,6 +395,19 @@ qmi_at_command_unavailable_json="$(APN_AUTOCONFIG_SMS_TOOL="$TESTROOT/missing-sm
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False and q["unavailable_reason"] == "backend-command-unavailable"' "$qmi_at_command_unavailable_json" || fail 'missing mandatory sms-tool command was reported as available'
 qmi_without_external_timeout_json="$(APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi" and d["target_capabilities"]["identity"] is True; assert d["registration_state"] == "home"' "$qmi_without_external_timeout_json" || fail 'QMI identity required an undeclared external timeout command'
+
+printf '%s\n' 'TEST QMI AT fallback remains bounded without an external timeout command'
+qmi_at_timeout_start="$(date +%s)"
+if QMI_FAIL_OPERATION=get-iccid SMS_TOOL_HANG=1 \
+	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
+	APN_AUTOCONFIG_SLEEP=/bin/sleep APN_AUTOCONFIG_AT_TIMEOUT_SECONDS=1 \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'hung QMI AT fallback unexpectedly returned identity'
+else
+	[ "$?" -eq 3 ] || fail 'hung QMI AT fallback was not classified as retryable'
+fi
+qmi_at_timeout_elapsed=$(( $(date +%s) - qmi_at_timeout_start ))
+[ "$qmi_at_timeout_elapsed" -le 5 ] || fail 'QMI AT fallback exceeded its bounded timeout'
 
 printf '%s\n' 'TEST QMI identity falls back to read-only AT ports on the same USB modem'
 qmi_at_usb="$TESTROOT/sys/devices/platform/mock-usb/2-1"

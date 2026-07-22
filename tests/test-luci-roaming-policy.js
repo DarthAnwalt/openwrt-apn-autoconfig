@@ -303,12 +303,33 @@ async function verifyBackendSpecificPolicy() {
 		'unsupported roaming policy must not reach a mutating confirmation dialog');
 }
 
+async function verifyUnavailableConfiguredTargetGuidance() {
+	var app = loadView();
+	var targets = {
+		configured_target: 'network:wwan',
+		targets: [
+			{ id: 'network:wwan', interface: 'wwan', protocol: 'modemmanager', capabilities: { identity: true } },
+			{ id: 'network:qmitest', interface: 'qmitest', protocol: 'qmi', capabilities: { identity: true } }
+		]
+	};
+	var page = await app.render([ {}, { error: 'cannot resolve SIM for interface wwan' },
+		{ state: 'idle', busy: false }, {}, targets ]);
+	var content = nodeText(page);
+	assert.match(content, /qmitest \(qmi\)/i,
+		'unavailable configured target must name discovered cellular alternatives');
+	assert.match(content, /Settings.*Mobile target/i,
+		'unavailable configured target must explain how to select an alternative');
+	assert.match(content, /not switch targets silently/i,
+		'target guidance must make the fail-closed behavior explicit');
+}
+
 Promise.all([
 	verifyPolicy('default-allow', 'default'),
 	verifyPolicy('explicit-allow', 'allow'),
 	verifyPolicy('explicit-block', 'block'),
 	verifyLayout(),
-	verifyBackendSpecificPolicy()
+	verifyBackendSpecificPolicy(),
+	verifyUnavailableConfiguredTargetGuidance()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');
 }).catch(function(error) {

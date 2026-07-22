@@ -112,6 +112,64 @@ profile rollback synthetically; packaged failure, hot-unplug, reboot and soak
 tests remain required before the backend becomes stable or replaces
 ModemManager on the production router.
 
+## RM520N packaged write/apply gate (2026-07-22)
+
+Official OpenWrt 25.12.5 SDK artifacts were installed on the reference
+Huasifei/RM520N after verifying their CI `SHA256SUMS`. The production
+ModemManager configuration and persistent AutoAPN state were copied to the
+router's recovery partition first; QMI used a separate `qmitest` UCI section
+and a temporary state/cache directory.
+
+The packaged QMI backend passed:
+
+- target discovery and read-only SIM/operator detection through the native
+  QMI plus same-device AT identity path;
+- successful APN apply, real HTTP connectivity through the selected QMI L3
+  device, and idempotent reconcile without an interface restart;
+- reset to the exact target-scoped UCI baseline;
+- a forced all-candidates failure followed by automatic rollback: the UCI
+  section SHA-256 and physical profile JSON matched their pre-test snapshots;
+- a live `ipv4v6` rejection followed by exactly one IPv4 retry, successful
+  connectivity, canonical `pdptype=ip`, and cached effective family `ipv4`;
+- backend policy isolation: a staged `allow_roaming=0` was ignored, status
+  reported `roaming_policy: unsupported`, and the policy command remained
+  unavailable without mutation;
+- guarded Huasifei GPIO modem power-cycle, QMI device/SIM return, netifd
+  recovery, APN reconciliation and real connectivity.
+
+The first browser observation still targeted the preserved production
+`network:wwan` ModemManager section while the isolated bearer was deliberately
+named `network:qmitest`; therefore LuCI correctly reported the configured
+target as unavailable even though explicit QMI CLI queries succeeded. Future
+isolated GUI gates must temporarily select `qmitest` under Settings → Mobile
+target, verify operator/APN/status and target-scoped actions, then restore the
+saved configuration. LuCI now names discovered alternatives in this error
+state instead of leaving a generic unavailable message.
+
+Hardware testing found two restart races that the synthetic suite had not
+exposed. A two-second QMI teardown delay allowed netifd to query the SIM before
+old client IDs were fully released; the RM520N then entered qmi.sh's illegal
+SIM recovery path. A six-second bounded quiet period removed the timeout and
+unnecessary SIM power-cycle across apply, reset and rollback. Cold GPIO reset
+also originally performed a direct identity query immediately before handing
+the device to qmi.sh. Recovery now follows identity readiness, bounded settle,
+netifd interface readiness, and only then APN reconciliation. The corrected
+`r6` modem-reset completed with exit 0, GPIO power-on, home registration,
+successful HTTP, and no QMI request timeout or internal SIM power-cycle.
+
+At the end of the gate, the temporary engine state was reset, `qmitest` was
+stopped, QMI profile 1 matched the pre-experiment JSON byte-for-byte, and the
+saved `network` and `apn-autoconfig` files matched their snapshots by SHA-256.
+ModemManager then returned to home registration and `web.vodafone.de`; its
+reconcile was idempotent and UCI was clean.
+
+This is strong single-device hardware evidence, but the public QMI evidence
+flag remains conservative until the remaining stable gates cover reboot,
+hot-unplug/replug, package removal/reset-all and a bounded soak. Physical
+button event dispatch should also be repeated with QMI active even though the
+same guarded reset command and the release-only hotplug mapping have each been
+tested independently.
+
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing
 ModemManager configuration and prove rollback to the locally staged 0.9.0 APKs

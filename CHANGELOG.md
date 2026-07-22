@@ -43,6 +43,10 @@
   settle, netifd interface recovery, then APN reconciliation. This prevents a
   direct identity query immediately before `qmi.sh` initialization and avoids
   a redundant recovery `ifup` after the interface is already back.
+- When the configured mobile target is unavailable, LuCI now lists discovered
+  cellular alternatives and points to Settings → Mobile target. It remains
+  fail-closed and never redirects status or mutating actions to another modem
+  silently.
 - Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
   each value now has an explicit accessible Show/Hide control whose position
   remains fixed while the same-width masked and revealed values are toggled.

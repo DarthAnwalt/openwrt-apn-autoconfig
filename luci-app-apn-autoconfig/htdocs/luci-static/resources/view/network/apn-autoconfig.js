@@ -174,10 +174,23 @@ return view.extend({
 
 	statusWarnings: function(status) {
 		var nodes = [];
-		if (!status || status.error)
-			return [ E('div', { 'class': 'alert-message warning' }, [
+		if (!status || status.error) {
+			var alternatives = this.targetInventory && Array.isArray(this.targetInventory.targets)
+				? this.targetInventory.targets.filter(function(target) {
+					return target.capabilities && target.capabilities.identity === true &&
+						target.id !== (this.targetInventory.configured_target || '');
+				}, this).map(function(target) {
+					return '%s (%s)'.format(target.interface, target.protocol);
+				}) : [];
+			var messages = [
 				_('Status is temporarily unavailable: %s').format(status && status.error || _('unknown error'))
-			]) ];
+			];
+			if (alternatives.length)
+				messages.push(_('Other cellular targets were discovered: %s. To inspect or control one of them, select it under Settings → Mobile target and save. APN Auto-Config will not switch targets silently.').format(alternatives.join(', ')));
+			return [ E('div', { 'class': 'alert-message warning' }, messages.map(function(message) {
+				return E('p', {}, [ message ]);
+			})) ];
+		}
 
 		if (status.roaming === true)
 			nodes.push(E('div', { 'class': status.roaming_allowed ? 'alert-message notice' : 'alert-message warning' }, [
@@ -508,6 +521,7 @@ return view.extend({
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
+		self.targetInventory = targets;
 		self.hardwareIntegration = status && status.hardware_integration || '';
 
 		s.tab('general', _('General'));

@@ -34,7 +34,7 @@ secrets have been replaced consistently.
 
 ## OpenWrt integration gate
 
-Before an alpha package is offered for router testing, it must also:
+Every packaged release candidate must also:
 
 - build with the official OpenWrt 25.12 SDK;
 - install with and without `modemmanager` and `uqmi` present, while always
@@ -50,23 +50,25 @@ manager required by a configured target (`modemmanager`, later `uqmi` or
 `umbim`) is installed by that OpenWrt configuration, while the core remains
 usable by another GUI or integration without pulling an unrelated manager.
 
-## Remaining hardware gate for stable QMI write/apply
+## Stable QMI hardware gate
 
-The following work is blocked on the isolated router and must not be simulated
-away:
+The stable evidence decision required the following work on the isolated
+reference configuration; fixture results alone were not accepted:
 
 - retain the observed RM520N behavior: serving-system and UIM state succeed,
   native QMI ICCID/IMSI return `Not supported`, and read-only AT identity works;
 - verify SIM/PIN/not-present and registration transitions;
 - confirm the implemented QMI profile/authentication/IP-family UCI mappings;
 - test packaged netifd ownership, dynamic IPv4/IPv6 interfaces and reconnect timing;
-- force bearer rejection, timeout, hot-unplug and power interruption;
+- force bearer rejection and timeout, and exercise real device disappearance
+  and return through the guarded hardware power cycle;
 - prove exact profile rollback, repeated reboot and removal recovery;
 - repeat the complete ModemManager live regression after the QMI changes.
 
-The alpha can expose its implemented runtime capability while remaining
-`implementation_state: alpha`. It must not become stable 0.9.1 until the
-remaining packaged hardware gate passes.
+These gates passed by the final r13 candidate. Stable 0.9.1 therefore reports
+`implementation_state: stable`, `validation_state: hardware` and
+`hardware_validated: true` for QMI, while runtime capability still becomes
+false when the required adapter command or device is unavailable.
 
 ## RM520N read-only observation (2026-07-19)
 
@@ -106,11 +108,10 @@ handler came up, exposed an L3 device with one IPv4 address and returned HTTP
 after allowing asynchronous netifd teardown to release the control channel,
 profile 1 matched the saved JSON baseline byte-for-byte and UCI was clean.
 
-This proves a working IPv4 QMI bearer on the reference modem, not long-term
-stability. The engine now implements the observed dual-stack fallback and
-profile rollback synthetically; packaged failure, hot-unplug, reboot and soak
-tests remain required before the backend becomes stable or replaces
-ModemManager on the production router.
+This proved the initial working IPv4 QMI bearer on the reference modem. The
+later packaged gate below added failure rollback, reboot, soak, package
+lifecycle and physical power-cycle evidence before the backend was marked
+stable.
 
 ## RM520N packaged write/apply gate (2026-07-22)
 
@@ -163,12 +164,10 @@ saved `network` and `apn-autoconfig` files matched their snapshots by SHA-256.
 ModemManager then returned to home registration and `web.vodafone.de`; its
 reconcile was idempotent and UCI was clean.
 
-This is strong single-device hardware evidence, but the public QMI evidence
-flag remains conservative until the remaining stable gates cover reboot,
-hot-unplug/replug, package removal/reset-all and a bounded soak. Physical
-button event dispatch should also be repeated with QMI active even though the
-same guarded reset command and the release-only hotplug mapping have each been
-tested independently.
+This was strong single-device hardware evidence. The final r13 gate below then
+covered reboot, package removal/reset-all, reinstall, bounded soak and the
+physical button event with QMI active before changing the public evidence
+state.
 
 ## QMI LuCI concurrency finding (2026-07-22)
 
@@ -187,9 +186,9 @@ Signal-info collection is also bounded and optional: malformed telemetry does
 not invalidate otherwise complete SIM identity.
 
 Synthetic tests force a hanging `sms_tool`, two concurrent identity callers,
-an unrelated USB serial port and a timed-out earlier sibling port. The final
-packaged hardware gate must repeat cold boot reconciliation and LuCI loading
-with the volatile port cache absent, then prove normal repeated status polling.
+an unrelated USB serial port and a timed-out earlier sibling port. The packaged
+hardware gate repeated cold boot reconciliation and LuCI loading with the
+volatile port cache absent, then proved bounded repeated status behavior.
 
 The packaged `r11` gate completed that test. With the volatile AT-port cache
 removed, boot reconciliation and LuCI status ran concurrently; LuCI rendered
@@ -203,7 +202,32 @@ disabled/inactive, `qmitest` returned on its dynamic `wwan0` L3 device, boot
 reconciliation was idempotent, HTTP returned 204 through that device, and UCI
 had no pending changes.
 
-The production Huasifei regression is deliberately narrower. It must follow
-[`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing
-ModemManager configuration and prove rollback to the locally staged 0.9.0 APKs
-before installing the alpha.
+## Final r13 release gate (2026-07-22)
+
+The final candidate closed the remaining lifecycle and user-interface gates:
+
+- a complete initial QMI LuCI status rendered the SIM provider, home and
+  serving networks, registration, LTE, signal quality and APN; continuous
+  polling remained limited to cheap action state, with no periodic QMI/AT
+  identity traffic after a complete load;
+- three consecutive full read-only status cycles retained registration and
+  HTTP connectivity, left the physical QMI profile unchanged and produced no
+  pending UCI changes;
+- actual removal of LuCI, the Huasifei integration and the core invoked
+  `reset-all`, restored the saved profile, removed only project-owned state and
+  left the provider database installed; reinstall from verified recovery APKs
+  restored QMI operation and completed boot reconciliation;
+- one physical `BTN_0` release queued exactly one guarded action, held modem
+  power off for five seconds, recovered the QMI interface after 57 seconds and
+  completed APN reconciliation after 77 seconds total. The APN profile stayed
+  unchanged, HTTP returned successfully and UCI remained clean;
+- the saved pre-QMI hardware profile and production configuration were then
+  restored. ModemManager rediscovered the RM520N-GL, `wwan` returned through
+  `wwan0`, home registration and LTE status were correct, APN reconciliation
+  succeeded, roaming policy remained unset and Internet connectivity passed.
+
+The final SDK-built stable packages must repeat package metadata, install and
+smoke checks, but no functional hardware gate remains open for 0.9.1. The old
+[`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md) is retained as the
+historical pre-QMI production-router procedure and is not the final evidence
+record.

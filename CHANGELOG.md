@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.9.1_alpha1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0_alpha1 (unreleased)
+## apn-autoconfig 0.9.1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0 (2026-07-22)
 
 - Added a native QMI backend: identity through `uqmi`/same-device AT fallback,
   backend-specific profile capture, UCI mapping, netifd apply, reconciliation,
@@ -44,7 +44,7 @@
   initial LuCI load is incomplete. Continuous polling remains limited to cheap
   action state, avoiding periodic QMI/AT identity traffic; completed actions
   still trigger one immediate panel refresh.
-- Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
+- Added `targets-json` v2 evidence fields so unvalidated implementations are
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI
   enables QMI APN actions while disabling ModemManager-only roaming controls
@@ -86,8 +86,11 @@
   malformed trailing record cannot produce a partial restore.
 - Fixed portable reading of optional cached profile fields across BusyBox and
   BSD awk implementations.
-- Documented the remaining packaged end-to-end, failure, reboot and soak gates.
-  This alpha is not yet the stable 0.9.1 release.
+- Completed the packaged RM520N QMI gate: apply, exact failure rollback,
+  dual-stack fallback, reboot, cold LuCI concurrency, bounded read-only soak,
+  physical BTN_0/GPIO recovery, `reset-all`, actual package removal and
+  reinstall. Restored the production ModemManager configuration afterward and
+  repeated registration, APN reconciliation and Internet-connectivity checks.
 
 ## apn-autoconfig 0.9.0 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.5.0
 

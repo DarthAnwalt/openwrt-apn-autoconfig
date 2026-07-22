@@ -389,8 +389,9 @@ target_protocol_capabilities() {
 		;;
 		qmi|uqmi)
 			TARGET_BACKEND="qmi"
-			TARGET_IMPLEMENTATION_STATE="alpha"
-			TARGET_VALIDATION_STATE="synthetic"
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
 			if [ ! -x "$QMI_ADAPTER" ]; then
 				TARGET_REASON="adapter-unavailable"
 			elif "$QMI_ADAPTER" capabilities >/dev/null 2>&1; then

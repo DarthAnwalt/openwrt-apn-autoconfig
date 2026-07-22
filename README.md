@@ -1,7 +1,7 @@
 # apn-autoconfig — OpenWrt source packages
 
 `apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
-0.9.1 alpha discovers configured cellular netifd interfaces and publishes both
+0.9.1 discovers configured cellular netifd interfaces and publishes both
 their runtime capabilities and validation level through a GUI-independent API.
 Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
 uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
@@ -277,8 +277,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1_alpha1-r13.apk \
-  ./luci-app-apn-autoconfig-0.6.0_alpha1-r13.apk
+  ./apn-autoconfig-0.9.1-r1.apk \
+  ./luci-app-apn-autoconfig-0.6.0-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -344,7 +344,7 @@ active APN, or restart the mobile interface. The candidate package is fetched
 through APK's signed index and its TSV metadata and rows are validated before
 installation.
 
-Version 0.6.0_alpha1 retains the policy-selection fix: the Apply button remains
+Version 0.6.0 retains the policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
@@ -415,8 +415,9 @@ apn-autoconfig detect
 
 `targets-json` is the authoritative way to distinguish discovery from actual
 support. ModemManager and QMI targets report `profile_apply: true` only when
-their required runtime commands are available. This alpha reports the QMI
-implementation and hardware evidence separately from its runtime capability.
+their required runtime commands are available. The stable QMI backend reports
+hardware validation separately from its current runtime capability, so a
+missing `uqmi` or `sms_tool` still disables operations truthfully.
 Use `--target network:<section>` with status, detect or mutating commands when
 more than one writable target is configured.
 
@@ -763,8 +764,9 @@ submission has been implemented and tested.
   `sim_index` is used only when resolution is impossible. QMI currently targets
   the primary SIM exposed by its control channel.
 - The reference RM520N rejects native `uqmi` ICCID/IMSI calls, so QMI identity
-  uses the strictly same-device AT fallback. Packaged QMI apply, failure,
-  reboot and soak gates must pass before the alpha becomes stable.
+  uses the strictly same-device AT fallback. This path is hardware-validated
+  on one Huasifei WH3000 Pro + RM520N-GL; other modem/board combinations still
+  require compatibility reports and should not be inferred from that evidence.
 - MBIM, Fibocom and AT-managed profile operations remain unavailable; mutating
   commands for those targets exit 4 before changing UCI, state or interfaces.
 - The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses

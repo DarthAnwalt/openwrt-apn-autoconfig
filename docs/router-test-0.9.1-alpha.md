@@ -1,4 +1,9 @@
-# 0.9.1 alpha production-router compatibility test
+# Archived 0.9.1 alpha production-router compatibility test
+
+This is a historical procedure from before the native QMI gate. The completed
+stable evidence and final release checks are recorded in
+[`testing-0.9.1.md`](testing-0.9.1.md); do not use the package filenames below
+as current installation instructions.
 
 This procedure is only a regression check for the already validated Huasifei
 WH3000 Pro + RM520N + ModemManager setup. It is not evidence that the QMI alpha

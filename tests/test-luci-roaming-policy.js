@@ -274,9 +274,9 @@ async function verifyBackendSpecificPolicy() {
 		version: 'v2',
 		interface: 'cellqmi',
 		target_backend: 'qmi',
-		target_implementation_state: 'alpha',
-		target_validation_state: 'synthetic',
-		target_hardware_validated: false,
+		target_implementation_state: 'stable',
+		target_validation_state: 'hardware',
+		target_hardware_validated: true,
 		target_capabilities: {
 			identity: true,
 			profile_read: true,

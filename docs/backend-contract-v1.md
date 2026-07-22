@@ -24,9 +24,9 @@ An installed parser is not hardware support. A missing runtime command such as
 `mmcli`, `uqmi` or the core dependency `sms_tool` makes the corresponding capability false without hiding the
 configured cellular target.
 
-## Read-only QMI identity adapter
+## Native QMI adapter identity path
 
-The 0.9.1 alpha ships `/usr/libexec/apn-autoconfig-qmi`. Its public operations
+Stable 0.9.1 ships `/usr/libexec/apn-autoconfig-qmi`. Its public operations
 are deliberately limited to:
 
 ```text

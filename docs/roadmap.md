@@ -62,15 +62,17 @@ backend is a normal inventory result, not a partially functional fallback.
 
 ## 0.9.1 — native QMI adapter
 
-Development started as 0.9.1-alpha. It adds a native `uqmi` identity adapter
+Released as stable 0.9.1. It adds a native `uqmi` identity adapter
 with a same-device `sms-tool` fallback, a
 backend contract, runtime/evidence states and synthetic home, roaming,
 malformed-output and injection coverage.
 It also removes the core package's hard dependency on a particular modem
 manager. QMI profile capture/write/apply, exact rollback and a bounded
 dual-stack-to-IPv4 fallback are implemented through the configured netifd
-target. Stable 0.9.1 remains gated on packaged live failure, reboot, button,
-removal and ModemManager regression tests.
+target. The packaged live apply/failure, reboot, cold LuCI, button, removal,
+reinstall and ModemManager regression gates passed on the reference
+Huasifei WH3000 Pro + RM520N-GL. This is hardware evidence for that tested
+combination, not a claim that every QMI modem behaves identically.
 
 ## 0.9.2 — native MBIM adapter
 

@@ -22,6 +22,12 @@
   when minimal OpenWrt images have no external `timeout` command. A blocked
   serial port now returns a retryable identity result instead of accumulating
   processes and leaving LuCI on an XHR timeout.
+- Serialized QMI identity transactions per control device and cache the
+  successfully validated sibling AT port in root-owned volatile `/var/run`
+  state. Concurrent
+  boot reconciliation and LuCI polling can no longer contend for the same
+  serial port, while every cached port is revalidated against the selected
+  modem's current sysfs topology before use.
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

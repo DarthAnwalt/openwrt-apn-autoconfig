@@ -321,6 +321,14 @@ done
 printf '%s\t%s\n' "$device" "$command" >>"$TEST_STATE/sms-tool-calls"
 [ "$device" = "${SMS_TOOL_EXPECT_DEVICE:-/dev/ttyUSB2}" ] || exit 1
 [ "${SMS_TOOL_HANG:-0}" != 1 ] || exec /bin/sleep 10
+if [ "${SMS_TOOL_REQUIRE_SERIAL:-0}" = 1 ]; then
+	if ! mkdir "$TEST_STATE/sms-tool-active" 2>/dev/null; then
+		printf '%s\n' collision >>"$TEST_STATE/sms-tool-collisions"
+		exit 1
+	fi
+	trap 'rmdir "$TEST_STATE/sms-tool-active"' EXIT HUP INT TERM
+	/bin/sleep 0.2
+fi
 case "$command" in
 	AT+CCID)
 		[ "${SMS_TOOL_QCCID_ONLY:-0}" != 1 ] || exit 1
@@ -351,6 +359,8 @@ export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROO
 export TEST_GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
 export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
 export APN_AUTOCONFIG_QMI_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-qmi"
+export APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/qmi-identity-lock"
+export APN_AUTOCONFIG_QMI_AT_CACHE_DIR="$TESTROOT/qmi-at-cache"
 export QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
 export APN_AUTOCONFIG_HARDWARE_INTEGRATION="$HARDWARE_MARKER"
 
@@ -412,16 +422,19 @@ qmi_at_timeout_elapsed=$(( $(date +%s) - qmi_at_timeout_start ))
 printf '%s\n' 'TEST QMI identity falls back to read-only AT ports on the same USB modem'
 qmi_at_usb="$TESTROOT/sys/devices/platform/mock-usb/2-1"
 mkdir -p \
+	"$qmi_at_usb/2-1:1.1/ttyUSB0" \
 	"$qmi_at_usb/2-1:1.2/ttyUSB2" \
 	"$qmi_at_usb/2-1:1.4/usbmisc" \
 	"$TESTROOT/sys/devices/platform/mock-usb/3-1/3-1:1.2/ttyUSB9" \
 	"$TESTROOT/outside-sysfs/ttyUSB8" \
 	"$TESTROOT/sys/class/usbmisc/cdc-wdm0" \
+	"$TESTROOT/sys/class/tty/ttyUSB0" \
 	"$TESTROOT/sys/class/tty/ttyUSB2" \
 	"$TESTROOT/sys/class/tty/ttyUSB8" \
 	"$TESTROOT/sys/class/tty/ttyUSB9"
 : >"$qmi_at_usb/2-1:1.4/usbmisc/cdc-wdm0"
 ln -s "$qmi_at_usb/2-1:1.4" "$TESTROOT/sys/class/usbmisc/cdc-wdm0/device"
+ln -s "$qmi_at_usb/2-1:1.1/ttyUSB0" "$TESTROOT/sys/class/tty/ttyUSB0/device"
 ln -s "$qmi_at_usb/2-1:1.2/ttyUSB2" "$TESTROOT/sys/class/tty/ttyUSB2/device"
 ln -s "$TESTROOT/outside-sysfs/ttyUSB8" "$TESTROOT/sys/class/tty/ttyUSB8/device"
 ln -s "$TESTROOT/sys/devices/platform/mock-usb/3-1/3-1:1.2/ttyUSB9" \
@@ -436,6 +449,26 @@ grep -F -x -q "$(printf '/dev/ttyUSB2\tAT+CIMI')" "$STATE/sms-tool-calls" || fai
 if grep -E -q '/dev/ttyUSB(8|9)' "$STATE/sms-tool-calls"; then
 	fail 'QMI identity probed an AT port belonging to another USB modem'
 fi
+[ "$(cat "$TESTROOT/qmi-at-cache/cdc-wdm0.at-device")" = /dev/ttyUSB2 ] || fail 'successful QMI AT port was not cached'
+: >"$STATE/sms-tool-calls"
+QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null
+if grep -F -q '/dev/ttyUSB0' "$STATE/sms-tool-calls"; then
+	fail 'cached QMI AT identity retried an earlier non-responsive port'
+fi
+
+printf '%s\n' 'TEST concurrent QMI identity calls serialize access to the AT port'
+rm -f "$STATE/sms-tool-collisions"
+QMI_FAIL_OPERATION=get-iccid SMS_TOOL_REQUIRE_SERIAL=1 APN_AUTOCONFIG_SLEEP=/bin/sleep \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >"$STATE/qmi-concurrent-1.json" &
+qmi_first_pid=$!
+/bin/sleep 0.05
+QMI_FAIL_OPERATION=get-iccid SMS_TOOL_REQUIRE_SERIAL=1 APN_AUTOCONFIG_SLEEP=/bin/sleep \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >"$STATE/qmi-concurrent-2.json" &
+qmi_second_pid=$!
+wait "$qmi_first_pid" || fail 'first concurrent QMI identity call failed'
+wait "$qmi_second_pid" || fail 'second concurrent QMI identity call failed'
+[ ! -e "$STATE/sms-tool-collisions" ] || fail 'concurrent QMI identity calls overlapped on the AT port'
+[ ! -d "$TESTROOT/qmi-identity-lock.cdc-wdm0" ] || fail 'QMI identity lock remained after successful calls'
 
 printf '%s\n' 'TEST QMI identity is read-only and matches candidates from fixture output'
 : >"$STATE/events"

@@ -11,6 +11,9 @@ TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
 SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
 AT_TIMEOUT_SECONDS="${APN_AUTOCONFIG_AT_TIMEOUT_SECONDS:-6}"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
+IDENTITY_LOCK_ROOT="${APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT:-/var/lock/apn-autoconfig-qmi-identity}"
+AT_CACHE_DIR="${APN_AUTOCONFIG_QMI_AT_CACHE_DIR:-/var/run/apn-autoconfig-qmi}"
+IDENTITY_LOCK_DIR=
 
 case "$AT_TIMEOUT_SECONDS" in
 	''|*[!0-9]*) AT_TIMEOUT_SECONDS=6 ;;
@@ -19,6 +22,52 @@ esac
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
+}
+
+release_identity_lock() {
+	[ -n "$IDENTITY_LOCK_DIR" ] || return 0
+	rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
+	rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+	IDENTITY_LOCK_DIR=
+}
+
+identity_signal() {
+	release_identity_lock
+	exit 3
+}
+
+acquire_identity_lock() {
+	device_name="${1#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	IDENTITY_LOCK_DIR="$IDENTITY_LOCK_ROOT.$device_name"
+	waited=0
+	while ! mkdir "$IDENTITY_LOCK_DIR" 2>/dev/null; do
+		owner="$(sed -n '1p' "$IDENTITY_LOCK_DIR/pid" 2>/dev/null)"
+		case "$owner" in
+			''|*[!0-9]*) owner= ;;
+		esac
+		if [ -z "$owner" ] && [ "$waited" -eq 0 ]; then
+			"$SLEEP" 1
+			waited=1
+			continue
+		fi
+		if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+			rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
+			rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+			continue
+		fi
+		[ "$waited" -lt 15 ] || {
+			IDENTITY_LOCK_DIR=
+			return 1
+		}
+		"$SLEEP" 1
+		waited=$((waited + 1))
+	done
+	printf '%s\n' "$$" >"$IDENTITY_LOCK_DIR/pid" || {
+		release_identity_lock
+		return 1
+	}
+	trap identity_signal HUP INT TERM
 }
 
 capabilities() {
@@ -169,7 +218,21 @@ run_at() {
 
 at_identity() {
 	control_device="$1"
-	for at_device in $(related_at_devices "$control_device"); do
+	device_name="${control_device#/dev/}"
+	cache_file="$AT_CACHE_DIR/$device_name.at-device"
+	related_devices="$(related_at_devices "$control_device")" || return 1
+	cached_device="$(sed -n '1p' "$cache_file" 2>/dev/null)"
+	case "$cached_device" in /dev/ttyUSB[0-9]*|/dev/ttyACM[0-9]*) : ;; *) cached_device= ;; esac
+	if [ -n "$cached_device" ] && ! printf '%s\n' "$related_devices" | grep -F -x -q "$cached_device"; then
+		cached_device=
+	fi
+	ordered_devices=
+	[ -z "$cached_device" ] || ordered_devices="$cached_device"
+	for at_device in $related_devices; do
+		[ "$at_device" = "$cached_device" ] || ordered_devices="${ordered_devices}${ordered_devices:+
+}$at_device"
+	done
+	for at_device in $ordered_devices; do
 		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_output=""
 		iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
 			iccid_output="$(run_at "$at_device" 'AT+QCCID')" || iccid_output=""
@@ -177,6 +240,12 @@ at_identity() {
 		}
 		imsi_output="$(run_at "$at_device" 'AT+CIMI')" || continue
 		imsi="$(printf '%s\n' "$imsi_output" | at_digits imsi)" || continue
+		mkdir -p "$AT_CACHE_DIR" 2>/dev/null || :
+		if [ -d "$AT_CACHE_DIR" ]; then
+			printf '%s\n' "$at_device" >"$cache_file.$$" 2>/dev/null &&
+				mv -f "$cache_file.$$" "$cache_file" 2>/dev/null ||
+				rm -f "$cache_file.$$" 2>/dev/null || :
+		fi
 		printf '%s\n%s\n' "$iccid" "$imsi"
 		return 0
 	done
@@ -209,7 +278,7 @@ serving_operator_id() {
 	fi
 }
 
-identity() {
+identity_locked() {
 	device="$1"
 	case "$device" in /dev/*) : ;; *) return 1 ;; esac
 	device_name="${device#/dev/}"
@@ -281,6 +350,15 @@ identity() {
 	printf 'serving_operator_name\t%s\n' "$serving_name"
 	printf 'access_technologies\t%s\n' "$access"
 	printf 'signal_quality\t\n'
+}
+
+identity() {
+	acquire_identity_lock "$1" || return 3
+	identity_status=0
+	identity_locked "$@" || identity_status=$?
+	release_identity_lock
+	trap - HUP INT TERM
+	return "$identity_status"
 }
 
 case "${1:-}" in

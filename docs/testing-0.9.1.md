@@ -191,6 +191,18 @@ an unrelated USB serial port and a timed-out earlier sibling port. The final
 packaged hardware gate must repeat cold boot reconciliation and LuCI loading
 with the volatile port cache absent, then prove normal repeated status polling.
 
+The packaged `r11` gate completed that test. With the volatile AT-port cache
+removed, boot reconciliation and LuCI status ran concurrently; LuCI rendered
+SIMon mobile as the confirmed home/serving network, the working APN and QMI
+signal quality without an RPC error. Reconciliation completed in 13 seconds,
+left no identity process or lock behind, and retained HTTP 204 connectivity.
+
+A subsequent real router reboot preserved byte-identical `network` and
+`apn-autoconfig` files and an exact QMI profile JSON. ModemManager remained
+disabled/inactive, `qmitest` returned on its dynamic `wwan0` L3 device, boot
+reconciliation was idempotent, HTTP returned 204 through that device, and UCI
+had no pending changes.
+
 The production Huasifei regression is deliberately narrower. It must follow
 [`router-test-0.9.1-alpha.md`](router-test-0.9.1-alpha.md), keep the existing
 ModemManager configuration and prove rollback to the locally staged 0.9.0 APKs

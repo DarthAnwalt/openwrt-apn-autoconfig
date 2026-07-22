@@ -422,14 +422,16 @@ return view.extend({
 
 			if (wasBusy && !action.busy) {
 				self.panelPollCount = 0;
+				self.panelRetryPending = false;
 				return self.refreshPanels().then(function() { self.setBusy(false, action); });
 			}
 			if (action.busy && databaseAction)
 				return self.refreshDatabase().then(function() { self.setBusy(true, action); });
-			if (!action.busy) {
+			if (!action.busy && self.panelRetryPending) {
 				self.panelPollCount++;
 				if (self.panelPollCount >= 5) {
 					self.panelPollCount = 0;
+					self.panelRetryPending = false;
 					return self.refreshPanels().then(function() { self.setBusy(false, action); });
 				}
 			}
@@ -684,10 +686,12 @@ return view.extend({
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
-		/* Poll cheap action state every two seconds, but also refresh live modem,
-		 * APN and signal panels every ten seconds while idle. Additional modem
-		 * reads are suppressed for the duration of a mutating operation. */
+		/* Poll only cheap action state continuously. A page loaded during modem
+		 * return gets one delayed full-status retry; complete initial state does
+		 * not cause periodic QMI/AT identity traffic. */
 		self.panelPollCount = 0;
+		self.panelRetryPending = !status || !!status.error ||
+			status.signal_quality == null || status.signal_quality === '';
 		poll.add(function() { return self.refreshStatus(); }, 2);
 
 		return m.render().then(function(mapNode) {

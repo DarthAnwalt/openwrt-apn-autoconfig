@@ -40,9 +40,10 @@
 - When QMI confirms home registration but cannot report a separate home/SPN
   identity, LuCI safely reuses the serving name for the SIM-provider and home
   network rows. It never applies that fallback while roaming.
-- Refresh the live modem, APN and signal panels every ten seconds while LuCI is
-  idle, instead of polling only background-action state. Panel polling remains
-  suppressed while a mutating operation is running.
+- Retry the full modem/APN/signal status once after ten seconds only when the
+  initial LuCI load is incomplete. Continuous polling remains limited to cheap
+  action state, avoiding periodic QMI/AT identity traffic; completed actions
+  still trigger one immediate panel refresh.
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

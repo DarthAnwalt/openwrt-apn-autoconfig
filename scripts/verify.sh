@@ -9,6 +9,7 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-action"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-query"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-control"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
+sh -n "$ROOT/files/usr/libexec/apn-autoconfig-qmi"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
 sh -n "$ROOT/tests/run-tests.sh"
@@ -69,13 +70,17 @@ if find "$ROOT" -path "$ROOT/.git" -prune -o -type f \
 fi
 database_version="$(sed -n '1p' "$ROOT/apn-autoconfig-providers/VERSION")"
 core_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile")"
+core_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile")"
 luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
+luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
 [ -n "$core_version" ]
+[ -n "$core_release" ]
 [ -n "$luci_version" ]
+[ -n "$luci_release" ]
 grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
 	"$ROOT/CHANGELOG.md"
-grep -F -q "./apn-autoconfig-$core_version-r1.apk" "$ROOT/README.md"
-grep -F -q "./luci-app-apn-autoconfig-$luci_version-r1.apk" "$ROOT/README.md"
+grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
+grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
 	printf 'Release tag %s does not match core package version %s.\n' \
 		"$EXPECTED_RELEASE_TAG" "$core_version" >&2
@@ -86,6 +91,19 @@ grep -F -q "# database-version: $database_version" \
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["database_version"] == sys.argv[2]' \
 	"$ROOT/data/providers-report.json" "$database_version"
 grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
+grep -F -q '+jsonfilter ' "$ROOT/Makefile"
+grep -F -q '+sms-tool ' "$ROOT/Makefile"
+grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
+[ -f "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000" ]
+[ "$(sed -n '1p' "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000")" = \
+	'huasifei-wh3000-gpio-v1' ]
+core_depends="$(sed -n 's/^[[:space:]]*DEPENDS:=//p' "$ROOT/Makefile" | sed -n '1p')"
+case "$core_depends" in
+	*modemmanager*|*uqmi*|*umbim*|*kmod-button-hotplug*)
+		printf '%s\n' 'The GUI-independent core has a backend- or board-specific hard dependency.' >&2
+		exit 1
+	;;
+esac
 if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
 	printf '%s\n' 'The core package still owns the provider database.' >&2
 	exit 1

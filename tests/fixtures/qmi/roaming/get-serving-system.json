@@ -1,0 +1,8 @@
+{
+  "registration": "registered",
+  "radio_interface": ["5gnr"],
+  "plmn_mcc": 262,
+  "plmn_mnc": 2,
+  "plmn_description": "Vodafone.de",
+  "roaming": true
+}

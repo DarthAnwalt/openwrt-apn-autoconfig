@@ -32,6 +32,53 @@ function valueNode(value) {
 	return value != null && typeof value === 'object' ? value : text(value);
 }
 
+function maskedIdentifier(value) {
+	var identifier = value == null ? '' : String(value);
+	if (!identifier)
+		return '—';
+	var visible = identifier.length > 4 ? identifier.slice(-4) : '';
+	return new Array(identifier.length - visible.length + 1).join('•') + visible;
+}
+
+function sensitiveIdentifier(value, label) {
+	var identifier = value == null ? '' : String(value);
+	if (!identifier)
+		return text(value);
+
+	var revealed = false;
+	var display = E('span', {
+		'class': 'apn-sensitive-value',
+		'style': 'display:inline-block;width:%sch;font-family:monospace;white-space:nowrap'.format(identifier.length)
+	}, [ maskedIdentifier(identifier) ]);
+	var showLabel = E('span', { 'class': 'apn-sensitive-show-label', 'aria-hidden': 'true' }, [ _('Show') ]);
+	var hideLabel = E('span', { 'class': 'apn-sensitive-hide-label', 'aria-hidden': 'true' }, [ _('Hide') ]);
+	showLabel.style.gridArea = '1 / 1';
+	hideLabel.style.gridArea = '1 / 1';
+	showLabel.style.visibility = 'visible';
+	hideLabel.style.visibility = 'hidden';
+	var button = E('button', {
+		'class': 'btn cbi-button cbi-button-neutral apn-sensitive-toggle',
+		'type': 'button',
+		'style': 'display:inline-grid',
+		'title': _('Show full %s').format(label),
+		'aria-label': _('Show full %s').format(label),
+		'click': function(ev) {
+			ev.preventDefault();
+			revealed = !revealed;
+			dom.content(display, [ revealed ? identifier : maskedIdentifier(identifier) ]);
+			showLabel.style.visibility = revealed ? 'hidden' : 'visible';
+			hideLabel.style.visibility = revealed ? 'visible' : 'hidden';
+			button.setAttribute('title', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
+			button.setAttribute('aria-label', revealed ? _('Hide %s').format(label) : _('Show full %s').format(label));
+		}
+	}, [ showLabel, hideLabel ]);
+
+	return E('span', {
+		'class': 'apn-sensitive-identifier',
+		'style': 'display:inline-flex;align-items:center;gap:.5em;white-space:nowrap'
+	}, [ display, button ]);
+}
+
 function row(label, value) {
 	return E('tr', { 'class': 'tr' }, [
 		E('td', { 'class': 'td left apn-label', 'style': 'width:40%' }, [ E('strong', {}, [ label ]) ]),
@@ -47,6 +94,22 @@ function networkLabel(name, id) {
 	if (name && id)
 		return '%s (%s)'.format(name, id);
 	return name || id || '';
+}
+
+function simProviderLabel(status) {
+	if (status && status.operator_name)
+		return status.operator_name;
+	return status && status.registration_state === 'home' ? status.serving_operator_name : '';
+}
+
+function homeNetworkLabel(status) {
+	if (!status)
+		return '';
+	if (status.home_operator_name || status.home_operator_id)
+		return networkLabel(status.home_operator_name, status.home_operator_id);
+	if (status.registration_state === 'home')
+		return networkLabel(status.serving_operator_name, status.serving_operator_id);
+	return '';
 }
 
 function formatTimestamp(value) {
@@ -90,6 +153,26 @@ function policyValue(status) {
 	}
 }
 
+function targetCapability(status, name) {
+	/* A staggered upgrade from 0.9.0 has no target_capabilities yet and keeps
+	 * the previously available ModemManager controls until status is refreshed
+	 * from the new core. */
+	return !status || !status.target_capabilities || status.target_capabilities[name] === true;
+}
+
+function roamingPolicySupported(status) {
+	return !!(status && !status.error && status.version === 'v2' &&
+		status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write'));
+}
+
+function roamingPolicyDescription(status) {
+	var target = status && status.interface || 'wwan';
+	var backend = status && status.target_backend || _('unknown');
+	if (roamingPolicySupported(status))
+		return _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(target);
+	return _('Roaming policy control is unavailable for the selected %s backend. APN Auto-Config manages only APN profiles; configure roaming in the package or interface that manages this connection.').format(backend);
+}
+
 function trustLabel(value, positive, negative) {
 	return E('span', { 'class': value ? 'apn-state-good' : 'apn-state-bad' }, [ value ? positive : negative ]);
 }
@@ -107,10 +190,23 @@ return view.extend({
 
 	statusWarnings: function(status) {
 		var nodes = [];
-		if (!status || status.error)
-			return [ E('div', { 'class': 'alert-message warning' }, [
+		if (!status || status.error) {
+			var alternatives = this.targetInventory && Array.isArray(this.targetInventory.targets)
+				? this.targetInventory.targets.filter(function(target) {
+					return target.capabilities && target.capabilities.identity === true &&
+						target.id !== (this.targetInventory.configured_target || '');
+				}, this).map(function(target) {
+					return '%s (%s)'.format(target.interface, target.protocol);
+				}) : [];
+			var messages = [
 				_('Status is temporarily unavailable: %s').format(status && status.error || _('unknown error'))
-			]) ];
+			];
+			if (alternatives.length)
+				messages.push(_('Other cellular targets were discovered: %s. To inspect or control one of them, select it under Settings → Mobile target and save. APN Auto-Config will not switch targets silently.').format(alternatives.join(', ')));
+			return [ E('div', { 'class': 'alert-message warning' }, messages.map(function(message) {
+				return E('p', {}, [ message ]);
+			})) ];
+		}
 
 		if (status.roaming === true)
 			nodes.push(E('div', { 'class': status.roaming_allowed ? 'alert-message notice' : 'alert-message warning' }, [
@@ -132,8 +228,8 @@ return view.extend({
 			return this.statusWarnings(status);
 		return this.statusWarnings(status).concat([
 			table([
-				row(_('SIM / eSIM provider'), status.operator_name),
-				row(_('Home network'), networkLabel(status.home_operator_name, status.home_operator_id)),
+				row(_('SIM / eSIM provider'), simProviderLabel(status)),
+				row(_('Home network'), homeNetworkLabel(status)),
 				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id)),
 				row(_('Registration'), status.registration_state),
 				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
@@ -143,13 +239,16 @@ return view.extend({
 			E('details', { 'class': 'apn-details' }, [
 				E('summary', {}, [ _('SIM and modem details') ]),
 				table([
-					row(_('ICCID'), status.iccid),
-					row(_('IMSI'), status.imsi),
-					row(_('EID'), status.eid),
-					row(_('ModemManager SIM index'), status.sim_index),
-					row(_('ModemManager modem index'), status.modem_index),
+					row(_('ICCID'), sensitiveIdentifier(status.iccid, _('ICCID'))),
+					row(_('IMSI'), sensitiveIdentifier(status.imsi, _('IMSI'))),
+					row(_('EID'), sensitiveIdentifier(status.eid, _('EID'))),
+					row(_('SIM slot / backend index'), status.sim_index),
+					row(_('Modem / control identifier'), status.modem_index),
 					row(_('Engine target'), status.target_id),
 					row(_('Protocol / backend'), '%s / %s'.format(status.target_protocol, status.target_backend)),
+					row(_('Implementation / validation'), '%s / %s'.format(
+						status.target_implementation_state || '—', status.target_validation_state || '—')),
+					row(_('Hardware validated'), status.target_hardware_validated ? _('yes') : _('no')),
 					row(_('Effective data device'), status.l3_device || status.device),
 					row(_('Manual operator lock (PLMN)'), status.configured_plmn)
 				])
@@ -165,7 +264,7 @@ return view.extend({
 			row(_('Cached APN for this SIM'), status.cached_apn),
 			row(_('Last result'), status.last_result),
 			row(_('Reconciled APN'), status.reconciled_apn),
-			row(_('Reconciled SIM'), status.reconciled_iccid)
+			row(_('Reconciled SIM'), sensitiveIdentifier(status.reconciled_iccid, _('SIM identifier')))
 		]) ];
 	},
 
@@ -248,9 +347,9 @@ return view.extend({
 	setBusy: function(busy, action) {
 		this.busy = !!busy;
 		if (this.reconcileButton)
-			this.reconcileButton.disabled = this.busy;
+			this.reconcileButton.disabled = this.busy || !this.profileApplySupported;
 		if (this.resetButton)
-			this.resetButton.disabled = this.busy;
+			this.resetButton.disabled = this.busy || !this.profileApplySupported;
 		this.updatePolicyControls();
 		this.updateDatabaseControls();
 		if (this.actionStatus)
@@ -301,11 +400,14 @@ return view.extend({
 			var status = values[0];
 			dom.content(self.connectionBox, self.connectionNodes(status));
 			dom.content(self.apnBox, self.apnNodes(status));
-			self.policySupported = status && !status.error && status.version === 'v2';
+			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
+			self.policySupported = roamingPolicySupported(status);
 			if (self.policySelect && self.policySupported) {
 				self.policySelect.value = policyValue(status);
 				self.policyDirty = false;
 			}
+			if (self.policyDescription)
+				dom.content(self.policyDescription, [ roamingPolicyDescription(status) ]);
 			self.setDatabaseStatus(values[1], status);
 			self.updatePolicyControls();
 		});
@@ -318,10 +420,21 @@ return view.extend({
 			var databaseAction = action.action === 'database-check' || action.action === 'database-install';
 			self.setBusy(action.busy, action);
 
-			if (wasBusy && !action.busy)
+			if (wasBusy && !action.busy) {
+				self.panelPollCount = 0;
+				self.panelRetryPending = false;
 				return self.refreshPanels().then(function() { self.setBusy(false, action); });
+			}
 			if (action.busy && databaseAction)
 				return self.refreshDatabase().then(function() { self.setBusy(true, action); });
+			if (!action.busy && self.panelRetryPending) {
+				self.panelPollCount++;
+				if (self.panelPollCount >= 5) {
+					self.panelPollCount = 0;
+					self.panelRetryPending = false;
+					return self.refreshPanels().then(function() { self.setBusy(false, action); });
+				}
+			}
 		}).catch(function(error) {
 			/* A transient polling failure is not evidence that a long-running
 			 * operation ended. Keep controls disabled until the core says so. */
@@ -377,6 +490,8 @@ return view.extend({
 
 	confirmAction: function(action) {
 		var self = this;
+		if (self.busy || !self.profileApplySupported)
+			return;
 		var reset = action === 'modem-reset';
 		ui.showModal(reset ? _('Power-cycle modem') : _('Re-detect APN'), [
 			E('p', {}, [ reset
@@ -428,10 +543,13 @@ return view.extend({
 			_('Automatic APN selection through the target-aware cellular engine.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
-		self.policySupported = status && status.version === 'v2';
+		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
+		self.policySupported = roamingPolicySupported(status);
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
+		self.targetInventory = targets;
+		self.hardwareIntegration = status && status.hardware_integration || '';
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -441,10 +559,12 @@ return view.extend({
 		o.rmempty = false;
 		o.description = _('After boot, wait for the configured delay and reconcile the current SIM and mobile profile. The service remains inert when this option is disabled.');
 
-		o = s.taboption('general', form.Flag, 'button_enabled', _('Enable physical modem-reset button'));
-		o.default = o.disabled;
-		o.rmempty = false;
-		o.description = _('On the tested WH3000 Pro, releasing BTN_0 power-cycles the modem and then reconciles the APN. Keep disabled on unverified hardware.');
+		if (self.hardwareIntegration) {
+			o = s.taboption('general', form.Flag, 'button_enabled', _('Enable WH3000 modem-reset button'));
+			o.default = o.disabled;
+			o.rmempty = false;
+			o.description = _('Provided by the separately installed Huasifei WH3000 board integration. Releasing BTN_0 power-cycles the modem and then reconciles the APN.');
+		}
 
 		o = s.taboption('general', form.ListValue, 'interface', _('Mobile target'));
 		o.value('auto', _('Automatic (only one writable target)'));
@@ -453,8 +573,12 @@ return view.extend({
 		var configuredTargetListed = configuredTarget === 'auto';
 		if (targets && Array.isArray(targets.targets))
 			targets.targets.forEach(function(target) {
+				var capabilityLabel = target.capabilities.profile_apply ? _('APN supported') :
+					target.capabilities.identity ? _('read-only identity') : _('inventory only');
+				var validationLabel = target.validation_state && target.validation_state !== 'none'
+					? ', %s'.format(target.validation_state) : '';
 				o.value(target.interface, '%s — %s (%s)'.format(target.interface, target.protocol,
-					target.capabilities.profile_apply ? _('APN supported') : _('inventory only')));
+					capabilityLabel + validationLabel));
 				if (target.interface === configuredTarget)
 					configuredTargetListed = true;
 			});
@@ -476,19 +600,21 @@ return view.extend({
 		o.value('never', _('Never use mwan3'));
 		o.default = 'auto';
 
-		o = s.taboption('advanced', form.Value, 'button_name', _('Button event name'));
-		o.default = 'BTN_0';
-		o.rmempty = false;
+		if (self.hardwareIntegration) {
+			o = s.taboption('advanced', form.Value, 'button_name', _('Button event name'));
+			o.default = 'BTN_0';
+			o.rmempty = false;
 
-		o = s.taboption('advanced', form.Value, 'modem_power_path', _('Modem power GPIO value path'));
-		o.default = '/sys/class/gpio/modem_power/value';
-		o.rmempty = false;
-		o.description = _('Board-specific exported GPIO path. This is not a raw GPIO pin number.');
+			o = s.taboption('advanced', form.Value, 'modem_power_path', _('Modem power GPIO value path'));
+			o.default = '/sys/class/gpio/modem_power/value';
+			o.rmempty = false;
+			o.description = _('Huasifei board integration path. This is not a raw GPIO pin number.');
 
-		o = s.taboption('advanced', form.Value, 'modem_power_off_seconds', _('Power-off duration'));
-		o.default = '5';
-		o.datatype = 'uinteger';
-		o.rmempty = false;
+			o = s.taboption('advanced', form.Value, 'modem_power_off_seconds', _('Power-off duration'));
+			o.default = '5';
+			o.datatype = 'uinteger';
+			o.rmempty = false;
+		}
 
 		o = s.taboption('advanced', form.Value, 'modem_wait_seconds', _('Maximum modem return wait'));
 		o.default = '90';
@@ -515,11 +641,13 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('reconcile'); }
 		}, [ _('Re-detect and verify APN') ]);
-		self.resetButton = E('button', {
-			'class': 'btn cbi-button cbi-button-negative',
-			'type': 'button',
-			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
-		}, [ _('Power-cycle modem and re-read SIM') ]);
+		self.resetButton = null;
+		if (self.hardwareIntegration)
+			self.resetButton = E('button', {
+				'class': 'btn cbi-button cbi-button-negative',
+				'type': 'button',
+				'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
+			}, [ _('Power-cycle WH3000 modem and re-read SIM') ]);
 		self.databaseCheckButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',
@@ -550,6 +678,7 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmRoamingPolicy(); }
 		}, [ _('Apply roaming policy') ]);
+		self.policyDescription = E('p', {}, [ roamingPolicyDescription(status) ]);
 
 		self.connectionBox = E('div', {}, self.connectionNodes(status));
 		self.apnBox = E('div', {}, self.apnNodes(status));
@@ -557,9 +686,18 @@ return view.extend({
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
+		/* Poll only cheap action state continuously. A page loaded during modem
+		 * return gets one delayed full-status retry; complete initial state does
+		 * not cause periodic QMI/AT identity traffic. */
+		self.panelPollCount = 0;
+		self.panelRetryPending = !status || !!status.error ||
+			status.signal_quality == null || status.signal_quality === '';
 		poll.add(function() { return self.refreshStatus(); }, 2);
 
 		return m.render().then(function(mapNode) {
+			var mobileActionButtons = [ self.reconcileButton ];
+			if (self.resetButton)
+				mobileActionButtons.push(self.resetButton);
 			return E('div', { 'class': 'apn-autoconfig-page' }, [
 				E('style', { 'type': 'text/css' }, [
 					'.apn-autoconfig-page .apn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(22rem,1fr));gap:1rem;margin-bottom:1rem}' +
@@ -593,13 +731,13 @@ return view.extend({
 					]),
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Roaming data policy') ]),
-						E('p', {}, [ _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(status.interface || 'wwan') ]),
+						self.policyDescription,
 						E('div', { 'class': 'apn-policy-controls' }, [ self.policySelect, self.policyButton ])
 					]),
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Actions') ]),
 						self.actionStatus,
-						E('div', { 'class': 'apn-button-row' }, [ self.reconcileButton, self.resetButton ])
+						E('div', { 'class': 'apn-button-row' }, mobileActionButtons)
 					])
 				]),
 				mapNode

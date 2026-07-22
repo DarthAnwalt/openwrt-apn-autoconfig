@@ -1,5 +1,97 @@
 # Changelog
 
+## apn-autoconfig 0.9.1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0 (2026-07-22)
+
+- Added a native QMI backend: identity through `uqmi`/same-device AT fallback,
+  backend-specific profile capture, UCI mapping, netifd apply, reconciliation,
+  automatic failure rollback and persistent reset.
+- Mapped normalized authentication to QMI `auth` (`pap-or-chap` becomes
+  `both`) and IP family to `pdptype` (`ipv4` becomes canonical `ip`).
+- Added one bounded `ipv4v6` to IPv4 retry when OpenWrt's QMI handler rejects
+  the dual-stack bearer, and cache the effective working family explicitly.
+- Added `sms-tool` as the small common core dependency and a strictly
+  allow-listed `AT+CCID`/`AT+QCCID`/`AT+CIMI` fallback for QMI devices whose
+  firmware rejects native QMI ICCID/IMSI operations.
+- Restricted automatic AT probing to validated `ttyUSB`/`ttyACM` ports below
+  the same physical USB device as the selected QMI control channel.
+- Added strict QMI control-device validation and deterministic resolution of a
+  single official-style netifd `devpath`; ambiguous paths fail closed.
+- Kept QMI identity available on minimal OpenWrt images without an external
+  `timeout` command by falling back to uqmi's bounded per-request timeout.
+- Added an internal bounded watchdog for the `sms_tool` AT identity fallback
+  when minimal OpenWrt images have no external `timeout` command. A blocked
+  serial port now returns a retryable identity result instead of accumulating
+  processes and leaving LuCI on an XHR timeout.
+- Serialized QMI identity transactions per control device and cache the
+  successfully validated sibling AT port in root-owned volatile `/var/run`
+  state. Concurrent
+  boot reconciliation and LuCI polling can no longer contend for the same
+  serial port, while every cached port is revalidated against the selected
+  modem's current sysfs topology before use.
+- Do not repeat the vendor ICCID command on a serial port whose standard ICCID
+  request reached its timeout. Ports that answer immediately with an error or
+  unrecognized output still receive the Quectel-compatible fallback, while a
+  cold multi-port scan no longer doubles every non-responsive-port delay.
+- Classify the internal AT timeout with a root-only watchdog marker rather than
+  the terminated process's exit status. This covers `sms_tool` builds that
+  catch SIGTERM and return a generic command error instead of signal status.
+- Added bounded QMI signal-info collection and a deterministic percentage from
+  the best reported RSRP, with RSSI fallback when RSRP is unavailable.
+- When QMI confirms home registration but cannot report a separate home/SPN
+  identity, LuCI safely reuses the serving name for the SIM-provider and home
+  network rows. It never applies that fallback while roaming.
+- Retry the full modem/APN/signal status once after ten seconds only when the
+  initial LuCI load is incomplete. Continuous polling remains limited to cheap
+  action state, avoiding periodic QMI/AT identity traffic; completed actions
+  still trigger one immediate panel refresh.
+- Added `targets-json` v2 evidence fields so unvalidated implementations are
+  distinguishable from hardware-validated support.
+- Added the same capability/evidence state to status and detect output; LuCI
+  enables QMI APN actions while disabling ModemManager-only roaming controls
+  with an explicit backend-specific explanation.
+- Removed hard dependencies on ModemManager and button-hotplug support from the
+  GUI-independent core; runtime capabilities now reflect installed backend
+  commands, while configured unavailable targets remain visible.
+- Moved the verified WH3000 BTN_0 hotplug handler and its
+  `kmod-button-hotplug` dependency into the optional
+  `apn-autoconfig-integration-huasifei-wh3000` package. The core rejects GPIO
+  reset without a supported integration marker, and LuCI hides those controls.
+- Kept QMI connection ownership in official netifd `qmi.sh`; the engine never
+  starts a bearer directly and does not change USB, radio, PIN or SIM state.
+- Kept roaming-policy mutation explicitly ModemManager-only instead of
+  pretending its UCI option has portable QMI semantics. QMI reports the
+  observed roaming state but explicitly marks policy as unsupported and never
+  lets a stale `allow_roaming` option block APN detection.
+- Increased the bounded QMI teardown quiet period after live RM520N testing
+  showed that a two-second restart could race client-ID cleanup and trigger an
+  unnecessary SIM power cycle in netifd's `qmi.sh`.
+- Ordered QMI board-reset recovery as identity readiness, bounded client
+  settle, netifd interface recovery, then APN reconciliation. This prevents a
+  direct identity query immediately before `qmi.sh` initialization and avoids
+  a redundant recovery `ifup` after the interface is already back.
+- When the configured mobile target is unavailable, LuCI now lists discovered
+  cellular alternatives and points to Settings → Mobile target. It remains
+  fail-closed and never redirects status or mutating actions to another modem
+  silently.
+- Masked ICCID, IMSI, EID and reconciled SIM identifiers in LuCI by default;
+  each value now has an explicit accessible Show/Hide control whose position
+  remains fixed while the same-width masked and revealed values are toggled.
+- Added synthetic QMI apply, dual-stack fallback, idempotency, button flow,
+  exact reset/failure rollback and malformed cross-backend baseline tests,
+  alongside home/roaming and same-device AT fixtures and tests for
+  unavailable adapters, command failure, malformed identity, sysfs escapes,
+  unsafe device paths and mutating-command
+  isolation while retaining the full ModemManager regression suite.
+- Made baseline reset validate every record before its first UCI write, so a
+  malformed trailing record cannot produce a partial restore.
+- Fixed portable reading of optional cached profile fields across BusyBox and
+  BSD awk implementations.
+- Completed the packaged RM520N QMI gate: apply, exact failure rollback,
+  dual-stack fallback, reboot, cold LuCI concurrency, bounded read-only soak,
+  physical BTN_0/GPIO recovery, `reset-all`, actual package removal and
+  reinstall. Restored the production ModemManager configuration afterward and
+  repeated registration, APN reconciliation and Internet-connectivity checks.
+
 ## apn-autoconfig 0.9.0 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.5.0
 
 - Added a versioned `targets-json` inventory with stable `network:<section>`

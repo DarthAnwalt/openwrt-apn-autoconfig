@@ -49,6 +49,7 @@ cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 (
 	cd "$SDK_DIR"
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig=m' >>.config
+	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-integration-huasifei-wh3000=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-providers=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
 	make defconfig
@@ -61,15 +62,18 @@ cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 )
 
 rm -f "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
+	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
 	"$OUTPUT"/luci-app-apn-autoconfig-*.apk
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-[0-9]*.apk' -exec cp {} "$OUTPUT/" \;
+find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-integration-huasifei-wh3000-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-providers-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
 set -- "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
-	"$OUTPUT"/luci-app-apn-autoconfig-*.apk
-[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] || {
+	"$OUTPUT"/luci-app-apn-autoconfig-*.apk \
+	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk
+[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] && [ -f "$4" ] || {
 	printf '%s\n' 'One or more APKs were not produced' >&2
 	exit 1
 }
@@ -126,13 +130,20 @@ inspect_package "$1" apn-autoconfig 13 \
 	usr/libexec/apn-autoconfig-query \
 	usr/libexec/apn-autoconfig-control \
 	usr/libexec/apn-autoconfig-database \
+	usr/libexec/apn-autoconfig-qmi \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
-	etc/hotplug.d/button/50-apn-autoconfig \
 	usr/share/licenses/apn-autoconfig/LICENSE \
 	lib/apk/packages/apn-autoconfig.list \
 	lib/apk/packages/apn-autoconfig.conffiles \
 	lib/apk/packages/apn-autoconfig.conffiles_static
+
+for forbidden_dependency in modemmanager uqmi umbim kmod-button-hotplug; do
+	if grep -F -q '"'"$forbidden_dependency"'"' "$BUILD_ROOT/apn-autoconfig-adbdump.json"; then
+		printf 'GUI-independent core unexpectedly depends on %s.\n' "$forbidden_dependency" >&2
+		exit 1
+	fi
+done
 
 inspect_package "$2" apn-autoconfig-providers 5 \
 	usr/share/apn-autoconfig/providers.tsv \
@@ -153,8 +164,8 @@ for executable in \
 	usr/libexec/apn-autoconfig-query \
 	usr/libexec/apn-autoconfig-control \
 	usr/libexec/apn-autoconfig-database \
-	etc/init.d/apn-autoconfig \
-	etc/hotplug.d/button/50-apn-autoconfig
+	usr/libexec/apn-autoconfig-qmi \
+	etc/init.d/apn-autoconfig
 do
 	[ -x "$BUILD_ROOT/inspect-apn-autoconfig/$executable" ] || {
 		printf 'Package file is not executable: /%s\n' "$executable" >&2
@@ -169,8 +180,19 @@ inspect_package "$3" luci-app-apn-autoconfig 5 \
 	usr/share/licenses/luci-app-apn-autoconfig/LICENSE \
 	lib/apk/packages/luci-app-apn-autoconfig.list
 
+inspect_package "$4" apn-autoconfig-integration-huasifei-wh3000 4 \
+	etc/hotplug.d/button/50-apn-autoconfig \
+	usr/share/apn-autoconfig/integrations/huasifei-wh3000 \
+	usr/share/licenses/apn-autoconfig-integration-huasifei-wh3000/LICENSE \
+	lib/apk/packages/apn-autoconfig-integration-huasifei-wh3000.list
+[ -x "$BUILD_ROOT/inspect-apn-autoconfig-integration-huasifei-wh3000/etc/hotplug.d/button/50-apn-autoconfig" ] || {
+	printf '%s\n' 'WH3000 integration hotplug handler is not executable.' >&2
+	exit 1
+}
+
 (cd "$OUTPUT" && sha256sum \
 	apn-autoconfig-[0-9]*.apk \
+	apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	apn-autoconfig-providers-*.apk \
 	luci-app-apn-autoconfig-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'

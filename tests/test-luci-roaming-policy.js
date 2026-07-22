@@ -27,6 +27,7 @@ function element(tag, attrs, children) {
 		return { tag: 'fragment', children: children };
 
 	var node = { tag: tag, attrs: {}, children: children, style: {} };
+	node.setAttribute = function(key, value) { this.attrs[key] = String(value); };
 	Object.keys(attrs).forEach(function(key) {
 		var value = attrs[key];
 		if (value == null)
@@ -117,7 +118,9 @@ async function verifyPolicy(roamingPolicy, expectedValue) {
 	var status = {
 		version: 'v2',
 		roaming_policy: roamingPolicy,
-		interface: 'wwan'
+		interface: 'wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true }
 	};
 	var action = { state: 'idle', busy: false };
 
@@ -158,6 +161,9 @@ async function verifyLayout() {
 		version: 'v2',
 		roaming_policy: 'default-allow',
 		interface: 'wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true },
+		hardware_integration: 'huasifei-wh3000-gpio-v1',
 		interface_up: true,
 		operator_name: 'Fixture Mobile',
 		home_operator_name: 'Fixture Home',
@@ -168,6 +174,10 @@ async function verifyLayout() {
 		access_technologies: 'lte,5gnr',
 		signal_quality: '81',
 		configured_apn: 'fixture.apn',
+		iccid: '89492031246010483050',
+		imsi: '262021234567890',
+		eid: '89049032000000000000000000000001',
+		reconciled_iccid: '89492031246010483050',
 		database_format: '2',
 		database_sources: 'fixture',
 		database_revisions: 'fixture@1234567',
@@ -204,6 +214,41 @@ async function verifyLayout() {
 	assert.ok(nodes.some(function(node) {
 		return node.tag === 'strong' && node.children.join('') === 'Signal quality';
 	}), 'status row labels must be bold');
+	var sensitiveDisplays = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-sensitive-value') !== -1;
+	});
+	var sensitiveToggles = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-sensitive-toggle') !== -1;
+	});
+	assert.strictEqual(sensitiveDisplays.length, 4,
+		'ICCID, IMSI, EID and reconciled SIM must be masked independently');
+	assert.strictEqual(sensitiveToggles.length, 4,
+		'each masked identifier must have its own reveal control');
+	assert.ok(sensitiveDisplays.every(function(node) {
+		return node.children.join('').indexOf('89492031246010483050') === -1;
+	}), 'full identifiers must not be rendered before an explicit reveal');
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
+		'masked reconciled SIM must retain its full character width and final four digits');
+	assert.strictEqual(sensitiveDisplays[3].children.join('').length, '89492031246010483050'.length,
+		'masked and revealed identifiers must have equal character counts');
+	assert.ok((sensitiveDisplays[3].attrs.style || '').indexOf('font-family:monospace') !== -1,
+		'sensitive identifiers must use fixed-width glyphs so the toggle does not move');
+	sensitiveToggles[3].click({ preventDefault: function() {} });
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '89492031246010483050',
+		'reveal control must show the complete reconciled SIM identifier');
+	assert.strictEqual(sensitiveToggles[3].attrs['aria-label'], 'Hide SIM identifier',
+		'reveal control must become an explicitly labelled hide control');
+	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'hidden',
+		'Show label must be visually hidden after revealing');
+	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'visible',
+		'Hide label must be visible after revealing');
+	sensitiveToggles[3].click({ preventDefault: function() {} });
+	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
+		'hide control must restore masking');
+	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'visible',
+		'Show label must be visible after hiding again');
+	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'hidden',
+		'Hide label must keep contributing width while visually hidden');
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');
 	assert.strictEqual(app.databaseInstallButton.disabled, false,
@@ -215,11 +260,91 @@ async function verifyLayout() {
 		'database installation must require confirmation');
 }
 
+function nodeText(node) {
+	return descendants(node).reduce(function(text, descendant) {
+		return text + (Array.isArray(descendant.children) ? descendant.children.filter(function(child) {
+			return typeof child === 'string';
+		}).join(' ') : '');
+	}, '');
+}
+
+async function verifyBackendSpecificPolicy() {
+	var app = loadView();
+	var status = {
+		version: 'v2',
+		interface: 'cellqmi',
+		target_backend: 'qmi',
+		target_implementation_state: 'stable',
+		target_validation_state: 'hardware',
+		target_hardware_validated: true,
+		target_capabilities: {
+			identity: true,
+			profile_read: true,
+			profile_write: true,
+			profile_apply: true
+		},
+		operator_name: '',
+		home_operator_name: '',
+		home_operator_id: '',
+		serving_operator_name: 'SIMon mobile',
+		serving_operator_id: '26202',
+		registration_state: 'home',
+		roaming_policy: 'default-allow'
+	};
+	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual((nodeText(app.connectionBox).match(/SIMon mobile/g) || []).length, 3,
+		'home registration must safely reuse the serving name for SIM provider and home-network display');
+	assert.strictEqual(app.reconcileButton.disabled, false,
+		'QMI APN support must remain enabled independently of roaming policy control');
+	assert.strictEqual(app.resetButton, null,
+		'modem reset must be hidden without an installed board integration');
+	assert.strictEqual(app.policySelect.disabled, true,
+		'QMI target must disable unsupported roaming policy control');
+	assert.strictEqual(app.policyButton.disabled, true,
+		'QMI target must disable the roaming policy Apply button');
+	assert.match(nodeText(app.policyDescription), /unavailable.*QMI|unavailable.*qmi/i,
+		'disabled roaming controls must explain which backend lacks support');
+	assert.match(nodeText(app.policyDescription), /manages only APN profiles/i,
+		'disabled roaming controls must explain the APN-only responsibility boundary');
+	app.confirmRoamingPolicy();
+	assert.strictEqual(app.testUi.modalCalls, 0,
+		'unsupported roaming policy must not reach a mutating confirmation dialog');
+
+	var roamingApp = loadView();
+	status.registration_state = 'roaming';
+	status.serving_operator_name = 'Vodafone.de';
+	await roamingApp.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual((nodeText(roamingApp.connectionBox).match(/Vodafone\.de/g) || []).length, 1,
+		'roaming serving network must not be presented as SIM provider or home network');
+}
+
+async function verifyUnavailableConfiguredTargetGuidance() {
+	var app = loadView();
+	var targets = {
+		configured_target: 'network:wwan',
+		targets: [
+			{ id: 'network:wwan', interface: 'wwan', protocol: 'modemmanager', capabilities: { identity: true } },
+			{ id: 'network:qmitest', interface: 'qmitest', protocol: 'qmi', capabilities: { identity: true } }
+		]
+	};
+	var page = await app.render([ {}, { error: 'cannot resolve SIM for interface wwan' },
+		{ state: 'idle', busy: false }, {}, targets ]);
+	var content = nodeText(page);
+	assert.match(content, /qmitest \(qmi\)/i,
+		'unavailable configured target must name discovered cellular alternatives');
+	assert.match(content, /Settings.*Mobile target/i,
+		'unavailable configured target must explain how to select an alternative');
+	assert.match(content, /not switch targets silently/i,
+		'target guidance must make the fail-closed behavior explicit');
+}
+
 Promise.all([
 	verifyPolicy('default-allow', 'default'),
 	verifyPolicy('explicit-allow', 'allow'),
 	verifyPolicy('explicit-block', 'block'),
-	verifyLayout()
+	verifyLayout(),
+	verifyBackendSpecificPolicy(),
+	verifyUnavailableConfiguredTargetGuidance()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');
 }).catch(function(error) {

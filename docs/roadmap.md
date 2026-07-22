@@ -7,6 +7,15 @@ binding: never mutate an ambiguous target, never claim a capability that is
 not implemented, verify connectivity before keeping a profile, and restore the
 previous profile after failure.
 
+All protocol adapters ship inside one `apn-autoconfig` engine package so a
+travel-router user can replace a USB modem without first choosing another
+AutoAPN package. The adapters remain separate internal modules and activate
+from the selected netifd target plus available runtime commands. Modem-specific
+managers, protocol tools and kernel drivers are supplied by the user's OpenWrt
+modem configuration; the small `sms-tool` transport is a common core dependency
+because the read-only AT fallback is shared across protocol families. LuCI and
+board-specific physical controls remain separate optional packages.
+
 ## 0.9.0 — adapter foundation
 
 0.9.0 separates the APN selection engine from modem discovery, SIM identity
@@ -53,19 +62,28 @@ backend is a normal inventory result, not a partially functional fallback.
 
 ## 0.9.1 — native QMI adapter
 
-Planned for a separate task after 0.9.0. Add QMI SIM identity collection,
-netifd option mapping and live hardware validation while keeping connection
-ownership in netifd.
+Released as stable 0.9.1. It adds a native `uqmi` identity adapter
+with a same-device `sms-tool` fallback, a
+backend contract, runtime/evidence states and synthetic home, roaming,
+malformed-output and injection coverage.
+It also removes the core package's hard dependency on a particular modem
+manager. QMI profile capture/write/apply, exact rollback and a bounded
+dual-stack-to-IPv4 fallback are implemented through the configured netifd
+target. The packaged live apply/failure, reboot, cold LuCI, button, removal,
+reinstall and ModemManager regression gates passed on the reference
+Huasifei WH3000 Pro + RM520N-GL. This is hardware evidence for that tested
+combination, not a claim that every QMI modem behaves identically.
 
 ## 0.9.2 — native MBIM adapter
 
 Planned for a separate task. Add MBIM SIM identity collection, profile mapping
 and correct handling of dynamically created IPv4/IPv6 child interfaces.
 
-## 0.9.3 — generic AT identity
+## 0.9.3 — extend generic AT identity
 
-Planned for a separate task. Add a bounded AT transport and normalized SIM and
-registration identity without coupling the APN matcher to vendor commands.
+Planned for a separate task. Extend the fixed read-only AT identity transport
+introduced for QMI to AT-managed backends and normalized registration identity
+without coupling the APN matcher to vendor commands.
 
 ## 1.0 — stable multi-backend engine
 

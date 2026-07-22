@@ -1,28 +1,31 @@
 # apn-autoconfig — OpenWrt source packages
 
-`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. Version
-0.9.0 discovers configured cellular netifd interfaces and publishes their exact
-capabilities through a GUI-independent API. Its complete operational backend is
-ModemManager; QMI, MBIM, Fibocom and selected AT-managed protocols are visible
-in inventory but deliberately cannot mutate profiles until later adapters are
-implemented. The engine resolves the active SIM, finds mobile profile
+`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
+0.9.1 discovers configured cellular netifd interfaces and publishes both
+their runtime capabilities and validation level through a GUI-independent API.
+Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
+uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
+application is delegated to the configured netifd `qmi.sh` target. MBIM, Fibocom and
+selected AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
 candidates in a worldwide local TSV database, restarts only the selected mobile
 interface, verifies real Internet access through netifd's current layer-3 device, caches
 the successful profile by ICCID, and restores the previous profile when all candidates
 fail. It distinguishes the SIM's home operator from the serving network,
 honors OpenWrt's canonical data-roaming policy before changing any APN, and
 reports registration failures separately from profile failures. It includes an idempotent `reconcile` command for SIM transitions and an
-opt-in delayed boot service. It can also power-cycle a modem through an
-exported GPIO and reconcile
-the APN after the modem returns. Boot and hardware-button automation are both
-disabled by default.
+opt-in delayed boot service. A separately installed Huasifei board integration
+can power-cycle the modem through its verified exported GPIO and reconcile the
+APN after the modem returns. Boot automation is disabled by default; physical
+controls are not treated as a generic router capability.
 
-This repository contains three OpenWrt source packages. It builds normal `.apk`
+This repository contains four OpenWrt packages. It builds normal `.apk`
 packages with the official OpenWrt 25.12 SDK:
 
 - `apn-autoconfig`, the POSIX-shell core;
 - `apn-autoconfig-providers`, the independently versioned provider database;
-- `luci-app-apn-autoconfig`, the optional web interface.
+- `luci-app-apn-autoconfig`, the optional web interface;
+- `apn-autoconfig-integration-huasifei-wh3000`, the optional, board-specific
+  BTN_0/GPIO integration tested on the Huasifei WH3000 Pro.
 
 The generated provider database combines GNOME mobile-broadband-provider-info,
 the AOSP sample APN database and locally verified overrides. Large upstream XML
@@ -41,15 +44,16 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 - `detect` and `status` are read-only.
 - Normal APN operations never write `network.<interface>.allow_roaming`; the
   existing OpenWrt network option remains the sole source of roaming policy.
-- On 0.9.0, `apply` edits only the ModemManager profile options `apn`, `username`,
-  `password`, `allowedauth` and `iptype` under `network.<interface>`.
+- `apply` edits only the selected backend's owned profile options under
+  `network.<interface>`: `apn`, `username`, `password`, `allowedauth`, `iptype`
+  for ModemManager, or `apn`, `username`, `password`, `auth`, `pdptype` for QMI.
 - It calls only `ifdown <selected-target>` / `ifup <selected-target>`; it does not reload or restart the
   whole network.
 - It does not edit mwan3 interfaces, members, policies, rules, or metrics.
 - If mwan3 is available, the connectivity test is run using
   `mwan3 use wwan curl ...` so the test follows the selected WAN routing table.
 - An interrupted or failed `apply` restores the prior mobile profile and restarts only
-  `wwan`.
+  the selected target.
 - Before the first `apply`, the original profile state is stored persistently in
   `/etc/apn-autoconfig/targets/network_<interface>/baseline.tsv`.
 - Baseline, active-profile and ICCID-cache files may contain APN usernames and
@@ -62,8 +66,8 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 - A lock prevents two simultaneous `apply` runs.
 - The boot service is installed but inert while `option autostart '0'` remains
   configured.
-- The button handler is installed but inert while `option button_enabled '0'`
-  remains configured.
+- The core installs no physical-button handler. The optional Huasifei package
+  installs one, and it remains inert while `option button_enabled '0'` is set.
 - A modem reset uses the same operation lock as APN changes. Repeated button
   presses cannot start overlapping resets.
 - LuCI starts long operations in the background. Both virtual action buttons
@@ -81,16 +85,25 @@ while APNs are tested. Other working mwan3 uplinks should remain available.
 ## Requirements
 
 - vanilla OpenWrt 25.12
-- `modemmanager` / `mmcli` for the functional 0.9.0 APN backend
+- `sms-tool`, installed automatically as the common read-only AT transport
+- `modemmanager` / `mmcli` for the stable write/apply backend; it is no longer
+  pulled into GUI-independent core installations automatically
+- `uqmi` for a configured QMI target; it is normally supplied with OpenWrt's
+  QMI protocol support and is not pulled into unrelated core installations
 - `curl`
-- at least one configured netifd ModemManager interface; its name is discovered
-  automatically when it is the only writable cellular target
+- at least one configured netifd ModemManager or QMI interface; its name is
+  discovered automatically when it is the only writable cellular target
 - optional: `mwan3`
-- `kmod-button-hotplug` when the hardware-button integration is enabled
+- optional `apn-autoconfig-integration-huasifei-wh3000`, which pulls
+  `kmod-button-hotplug`, only for the tested Huasifei button/GPIO flow
 
 `option device 'wwan0'` is only a fallback for systems whose netifd status does
 not expose `l3_device`. The hardware-reset GPIO defaults still match only the
 Huasifei WH3000 Pro + Quectel RM520N-GL setup for which the MVP was prepared.
+For QMI identity, the control channel is taken from the selected
+target's `/dev/cdc-wdm*`/`/dev/wwan*qmi*` `device`, or from exactly one safe
+match below its official OpenWrt `devpath`; this is separate from the layer-3
+data device used for connectivity checks.
 
 The complete button flow was tested on that hardware with a live physical SIM
 change from SIMon mobile/Vodafone Germany to Kaufland Mobil/Telekom Germany.
@@ -109,7 +122,8 @@ profile without reapplying it.
 
 ## Signed package repository
 
-OpenWrt 25.12 routers can install and upgrade all three packages from the
+OpenWrt 25.12 routers can install and upgrade the core, database, LuCI and
+optional Huasifei integration packages from the
 project's signed APK repository.
 
 ### Quick installer
@@ -166,9 +180,9 @@ sh /tmp/install.sh
 rm -f /tmp/install.sh /tmp/install.sha256 /tmp/apn-autoconfig-SHA256SUMS
 ```
 
-Both modes leave automatic APN reconciliation and the physical modem-reset
-button disabled. After installation, enable and operate them deliberately from
-LuCI or UCI. Package upgrades should use LuCI or `apk`; there is no advantage
+Both modes leave automatic APN reconciliation disabled and do not install a
+physical-button integration. After installation, enable automation deliberately.
+Package upgrades should use LuCI or `apk`; there is no advantage
 to downloading and rerunning the bootstrap installer.
 
 ### Manual repository setup
@@ -197,6 +211,13 @@ For a command-line-only installation, use this final command instead:
 
 ```sh
 apk add apn-autoconfig
+```
+
+Only on the tested Huasifei WH3000 Pro, install the separate board adapter if
+the BTN_0/GPIO modem-reset flow is desired:
+
+```sh
+apk add apn-autoconfig-integration-huasifei-wh3000
 ```
 
 The public-key SHA-256 fingerprint is:
@@ -256,8 +277,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.0-r1.apk \
-  ./luci-app-apn-autoconfig-0.5.0-r1.apk
+  ./apn-autoconfig-0.9.1-r1.apk \
+  ./luci-app-apn-autoconfig-0.6.0-r1.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
@@ -275,9 +296,9 @@ The core package owns:
 /usr/libexec/apn-autoconfig-query
 /usr/libexec/apn-autoconfig-control
 /usr/libexec/apn-autoconfig-database
+/usr/libexec/apn-autoconfig-qmi
 /etc/config/apn-autoconfig
 /etc/init.d/apn-autoconfig
-/etc/hotplug.d/button/50-apn-autoconfig
 ```
 
 The provider package owns:
@@ -292,12 +313,21 @@ created later under `/etc/apn-autoconfig/cache/`.
 The LuCI package adds **Network → APN Auto-Config**. It owns only its view,
 menu and ACL files and can be removed independently from the core.
 
+The optional Huasifei integration owns only:
+
+```text
+/etc/hotplug.d/button/50-apn-autoconfig
+/usr/share/apn-autoconfig/integrations/huasifei-wh3000
+/usr/share/licenses/apn-autoconfig-integration-huasifei-wh3000/LICENSE
+```
+
 ## LuCI actions and operation state
 
-The web interface provides two APN/modem actions:
+The web interface always provides the backend-supported APN action:
 
 - **Re-detect and verify APN** runs `reconcile`;
-- **Power-cycle modem and re-read SIM** runs `modem-reset`.
+- **Power-cycle WH3000 modem and re-read SIM** appears only when the separate
+  Huasifei board integration is installed and runs the guarded `modem-reset`.
 
 It groups mobile registration and signal, the current APN, provider-database
 state, roaming policy and actions into separate responsive sections. Technical
@@ -314,7 +344,7 @@ active APN, or restart the mobile interface. The candidate package is fetched
 through APK's signed index and its TSV metadata and rows are validated before
 installation.
 
-Version 0.5.0 retains the policy-selection fix: the Apply button remains
+Version 0.6.0 retains the policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
 Both show a confirmation first. After confirmation the HTTP request only starts
@@ -360,8 +390,9 @@ apn-autoconfig action-start database-install
 apn-autoconfig action-status
 ```
 
-The v1 target schema reports each stable target ID, protocol, normalized
-backend and exact read/write/apply capabilities. The v2 status schema remains
+The v2 target schema reports each stable target ID, protocol, normalized
+backend, exact read/write/apply capabilities and separate implementation,
+validation and hardware-evidence states. The v2 status schema remains
 backward compatible and adds `engine_api: v1`, target/backend fields and the
 effective layer-3 device. It includes modem and registration states, separate home and
 serving operators, roaming state and effective policy, manual PLMN lock,
@@ -383,8 +414,10 @@ apn-autoconfig detect
 ```
 
 `targets-json` is the authoritative way to distinguish discovery from actual
-support. In 0.9.0 only targets with backend `modemmanager` report
-`profile_apply: true`; QMI, MBIM, Fibocom and AT entries are inventory-only.
+support. ModemManager and QMI targets report `profile_apply: true` only when
+their required runtime commands are available. The stable QMI backend reports
+hardware validation separately from its current runtime capability, so a
+missing `uqmi` or `sms_tool` still disables operations truthfully.
 Use `--target network:<section>` with status, detect or mutating commands when
 more than one writable target is configured.
 
@@ -428,13 +461,16 @@ the canonical persistent policy:
 - `option allow_roaming '0'`: explicitly blocked.
 
 Normal APN detection, reconciliation, reset and package removal only read this
-option. The LuCI page exposes an explicit travel-router control which edits
-only that same canonical network option under the normal operation lock.
+option. For a ModemManager target, the LuCI page exposes an explicit
+travel-router control which edits only that same canonical network option under
+the normal operation lock. With QMI or another backend that does not implement
+this mapping, the section remains visible but disabled and explains that
+roaming must be configured in the package or interface managing the connection.
 Blocking data while already roaming stops the mobile interface. Allowing data
 when the interface is down starts and reconciles it. Technical permission does
 not imply that roaming is included in the tariff or free of charge.
 
-Equivalent explicit CLI operations are:
+Equivalent explicit CLI operations for ModemManager targets are:
 
 ```sh
 apn-autoconfig roaming-policy-set default
@@ -461,9 +497,19 @@ Logs use the tag `apn-autoconfig`:
 logread | grep apn-autoconfig
 ```
 
-## Hardware modem reset and button
+## Optional Huasifei hardware modem reset and button
 
-The reset command is deliberately available before the button is enabled:
+This is not a generic router-button feature. Install the separately packaged
+integration only on the tested Huasifei WH3000 Pro:
+
+```sh
+apk add apn-autoconfig-integration-huasifei-wh3000
+```
+
+The integration installs `kmod-button-hotplug`, a BTN_0 hotplug adapter and a
+marker that unlocks the guarded reset command and the corresponding LuCI
+controls. Without it, `modem-reset` exits with target-contract code 4 before
+touching GPIO or the network. After installation, test the manual command:
 
 ```sh
 apn-autoconfig modem-reset
@@ -492,7 +538,7 @@ uci set apn-autoconfig.main.button_enabled='1'
 uci commit apn-autoconfig
 ```
 
-The handler accepts only `BUTTON=BTN_0` with `ACTION=released`. Press events
+The packaged handler accepts only `BUTTON=BTN_0` with `ACTION=released`. Press events
 are ignored, preventing a press/release pair from triggering two resets. The
 action runs in the background so the OpenWrt hotplug dispatcher is not blocked.
 
@@ -698,8 +744,10 @@ Removal deliberately deletes this package's modified UCI configuration instead
 of leaving a package-manager configuration remnant. It does not modify mwan3,
 Travelmate, firewall, DNS, WireGuard, ZeroTier or any unrelated interface.
 
-Package removal also removes the button handler. It does not leave a hotplug
-script or enable any APN automation outside this package.
+Removing the core does not remove or rewrite files owned by the optional board
+integration. Removing `apn-autoconfig-integration-huasifei-wh3000` removes its
+button handler and marker; APK also prevents leaving it installed without its
+core dependency. Neither package enables button handling in UCI by default.
 
 ## Attended sysupgrade
 
@@ -712,11 +760,15 @@ submission has been implemented and tested.
 
 - Worldwide coverage is broad but cannot be mathematically complete: carrier
   settings change and some MVNOs do not expose a usable SIM discriminator.
-- Automatic SIM resolution requires ModemManager to expose a primary SIM path;
-  a configured numeric `sim_index` is used only when resolution is impossible.
-- QMI, MBIM, Fibocom and AT-managed targets are inventory-only in 0.9.0. Their
-  identity and profile capabilities are false, and mutating commands exit 4
-  before changing UCI, state or network interfaces.
+- ModemManager SIM resolution requires a primary SIM path; a configured numeric
+  `sim_index` is used only when resolution is impossible. QMI currently targets
+  the primary SIM exposed by its control channel.
+- The reference RM520N rejects native `uqmi` ICCID/IMSI calls, so QMI identity
+  uses the strictly same-device AT fallback. This path is hardware-validated
+  on one Huasifei WH3000 Pro + RM520N-GL; other modem/board combinations still
+  require compatibility reports and should not be inferred from that evidence.
+- MBIM, Fibocom and AT-managed profile operations remain unavailable; mutating
+  commands for those targets exit 4 before changing UCI, state or interfaces.
 - The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses
   the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
 - Boot and hardware-button automation are independently opt-in and exposed as
@@ -733,3 +785,14 @@ submission has been implemented and tested.
 
 The database is designed to improve continuously without making router package
 builds or runtime behavior depend on upstream availability.
+
+## Maintainer documentation
+
+New maintainers and coding assistants should start with
+[`docs/development-handoff.md`](docs/development-handoff.md). It records the
+project boundary, package map, binding safety invariants, public integration
+surface, backend-extension checklist and required release workflow. Detailed
+QMI/API semantics, evidence gates and future adapter direction remain in
+[`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
+[`docs/testing-0.9.1.md`](docs/testing-0.9.1.md) and
+[`docs/roadmap.md`](docs/roadmap.md).

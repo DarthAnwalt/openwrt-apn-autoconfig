@@ -132,5 +132,6 @@ and records IPv4 as the effective cached profile when it succeeds. Other IP
 families are not silently changed.
 
 QMI does not inherit ModemManager's `allow_roaming` control. Until a portable,
-tested QMI policy mapping exists, the GUI hides that control and the command
-fails with target-contract exit code 4 without mutation.
+tested QMI policy mapping exists, the GUI keeps that control visible but
+disabled with an explanation, and the command fails with target-contract exit
+code 4 without mutation.

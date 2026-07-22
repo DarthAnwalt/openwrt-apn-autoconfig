@@ -144,6 +144,19 @@ function targetCapability(status, name) {
 	return !status || !status.target_capabilities || status.target_capabilities[name] === true;
 }
 
+function roamingPolicySupported(status) {
+	return !!(status && !status.error && status.version === 'v2' &&
+		status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write'));
+}
+
+function roamingPolicyDescription(status) {
+	var target = status && status.interface || 'wwan';
+	var backend = status && status.target_backend || _('unknown');
+	if (roamingPolicySupported(status))
+		return _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(target);
+	return _('Roaming policy control is unavailable for the selected %s backend. APN Auto-Config manages only APN profiles; configure roaming in the package or interface that manages this connection.').format(backend);
+}
+
 function trustLabel(value, positive, negative) {
 	return E('span', { 'class': value ? 'apn-state-good' : 'apn-state-bad' }, [ value ? positive : negative ]);
 }
@@ -359,12 +372,13 @@ return view.extend({
 			dom.content(self.connectionBox, self.connectionNodes(status));
 			dom.content(self.apnBox, self.apnNodes(status));
 			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
-			self.policySupported = status && !status.error && status.version === 'v2' &&
-				status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write');
+			self.policySupported = roamingPolicySupported(status);
 			if (self.policySelect && self.policySupported) {
 				self.policySelect.value = policyValue(status);
 				self.policyDirty = false;
 			}
+			if (self.policyDescription)
+				dom.content(self.policyDescription, [ roamingPolicyDescription(status) ]);
 			self.setDatabaseStatus(values[1], status);
 			self.updatePolicyControls();
 		});
@@ -490,8 +504,7 @@ return view.extend({
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
 		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
-		self.policySupported = status && !status.error && status.version === 'v2' &&
-			status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write');
+		self.policySupported = roamingPolicySupported(status);
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
@@ -624,6 +637,7 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmRoamingPolicy(); }
 		}, [ _('Apply roaming policy') ]);
+		self.policyDescription = E('p', {}, [ roamingPolicyDescription(status) ]);
 
 		self.connectionBox = E('div', {}, self.connectionNodes(status));
 		self.apnBox = E('div', {}, self.apnNodes(status));
@@ -670,7 +684,7 @@ return view.extend({
 					]),
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Roaming data policy') ]),
-						E('p', {}, [ _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(status.interface || 'wwan') ]),
+						self.policyDescription,
 						E('div', { 'class': 'apn-policy-controls' }, [ self.policySelect, self.policyButton ])
 					]),
 					E('section', { 'class': 'cbi-section apn-card' }, [

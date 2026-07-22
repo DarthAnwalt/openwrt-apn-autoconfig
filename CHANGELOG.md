@@ -21,7 +21,8 @@
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI
-  enables QMI APN actions while keeping ModemManager-only roaming controls hidden.
+  enables QMI APN actions while disabling ModemManager-only roaming controls
+  with an explicit backend-specific explanation.
 - Removed hard dependencies on ModemManager and button-hotplug support from the
   GUI-independent core; runtime capabilities now reflect installed backend
   commands, while configured unavailable targets remain visible.

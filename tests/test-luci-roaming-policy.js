@@ -118,7 +118,9 @@ async function verifyPolicy(roamingPolicy, expectedValue) {
 	var status = {
 		version: 'v2',
 		roaming_policy: roamingPolicy,
-		interface: 'wwan'
+		interface: 'wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true }
 	};
 	var action = { state: 'idle', busy: false };
 
@@ -159,6 +161,8 @@ async function verifyLayout() {
 		version: 'v2',
 		roaming_policy: 'default-allow',
 		interface: 'wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true },
 		hardware_integration: 'huasifei-wh3000-gpio-v1',
 		interface_up: true,
 		operator_name: 'Fixture Mobile',
@@ -256,7 +260,15 @@ async function verifyLayout() {
 		'database installation must require confirmation');
 }
 
-async function verifyReadOnlyTarget() {
+function nodeText(node) {
+	return descendants(node).reduce(function(text, descendant) {
+		return text + (Array.isArray(descendant.children) ? descendant.children.filter(function(child) {
+			return typeof child === 'string';
+		}).join(' ') : '');
+	}, '');
+}
+
+async function verifyBackendSpecificPolicy() {
 	var app = loadView();
 	var status = {
 		version: 'v2',
@@ -267,22 +279,28 @@ async function verifyReadOnlyTarget() {
 		target_hardware_validated: false,
 		target_capabilities: {
 			identity: true,
-			profile_read: false,
-			profile_write: false,
-			profile_apply: false
+			profile_read: true,
+			profile_write: true,
+			profile_apply: true
 		},
 		roaming_policy: 'default-allow'
 	};
 	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
-	assert.strictEqual(app.reconcileButton.disabled, true,
-		'read-only target must disable APN reconciliation');
+	assert.strictEqual(app.reconcileButton.disabled, false,
+		'QMI APN support must remain enabled independently of roaming policy control');
 	assert.strictEqual(app.resetButton, null,
 		'modem reset must be hidden without an installed board integration');
 	assert.strictEqual(app.policySelect.disabled, true,
-		'read-only target must disable roaming profile writes');
-	app.confirmAction('reconcile');
+		'QMI target must disable unsupported roaming policy control');
+	assert.strictEqual(app.policyButton.disabled, true,
+		'QMI target must disable the roaming policy Apply button');
+	assert.match(nodeText(app.policyDescription), /unavailable.*QMI|unavailable.*qmi/i,
+		'disabled roaming controls must explain which backend lacks support');
+	assert.match(nodeText(app.policyDescription), /manages only APN profiles/i,
+		'disabled roaming controls must explain the APN-only responsibility boundary');
+	app.confirmRoamingPolicy();
 	assert.strictEqual(app.testUi.modalCalls, 0,
-		'read-only target must not reach a mutating confirmation dialog');
+		'unsupported roaming policy must not reach a mutating confirmation dialog');
 }
 
 Promise.all([
@@ -290,7 +308,7 @@ Promise.all([
 	verifyPolicy('explicit-allow', 'allow'),
 	verifyPolicy('explicit-block', 'block'),
 	verifyLayout(),
-	verifyReadOnlyTarget()
+	verifyBackendSpecificPolicy()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');
 }).catch(function(error) {

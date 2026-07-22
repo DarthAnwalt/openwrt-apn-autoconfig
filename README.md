@@ -460,13 +460,16 @@ the canonical persistent policy:
 - `option allow_roaming '0'`: explicitly blocked.
 
 Normal APN detection, reconciliation, reset and package removal only read this
-option. The LuCI page exposes an explicit travel-router control which edits
-only that same canonical network option under the normal operation lock.
+option. For a ModemManager target, the LuCI page exposes an explicit
+travel-router control which edits only that same canonical network option under
+the normal operation lock. With QMI or another backend that does not implement
+this mapping, the section remains visible but disabled and explains that
+roaming must be configured in the package or interface managing the connection.
 Blocking data while already roaming stops the mobile interface. Allowing data
 when the interface is down starts and reconciles it. Technical permission does
 not imply that roaming is included in the tariff or free of charge.
 
-Equivalent explicit CLI operations are:
+Equivalent explicit CLI operations for ModemManager targets are:
 
 ```sh
 apn-autoconfig roaming-policy-set default

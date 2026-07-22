@@ -283,6 +283,42 @@ serving_operator_id() {
 	fi
 }
 
+signal_quality_percent() {
+	document="$1"
+	rsrp_values="$(json_value "$document" '@[*].rsrp')"
+	quality="$(printf '%s\n' "$rsrp_values" | awk '
+		$0 ~ /^-?[0-9]+([.][0-9]+)?$/ {
+			if (!found || $0 > best) best=$0
+			found=1
+		}
+		END {
+			if (!found) exit 1
+			value=(best + 120) * 2.5
+			if (value < 0) value=0
+			if (value > 100) value=100
+			printf "%d\n", int(value + 0.5)
+		}
+	' 2>/dev/null)" && {
+		printf '%s\n' "$quality"
+		return 0
+	}
+
+	rssi_values="$(json_value "$document" '@[*].rssi')"
+	printf '%s\n' "$rssi_values" | awk '
+		$0 ~ /^-?[0-9]+([.][0-9]+)?$/ {
+			if (!found || $0 > best) best=$0
+			found=1
+		}
+		END {
+			if (!found) exit 1
+			value=(best + 110) * (100 / 60)
+			if (value < 0) value=0
+			if (value > 100) value=100
+			printf "%d\n", int(value + 0.5)
+		}
+	'
+}
+
 identity_locked() {
 	device="$1"
 	case "$device" in /dev/*) : ;; *) return 1 ;; esac
@@ -328,6 +364,8 @@ identity_locked() {
 	serving_id="$(serving_operator_id "$mcc" "$mnc")"
 	serving_name="$(json_value "$serving" '@.plmn_description')"
 	access="$(json_value "$serving" '@.radio_interface[0]')"
+	signal="$(run_uqmi "$device" --get-signal-info 2>/dev/null || printf '[]')"
+	signal_quality="$(signal_quality_percent "$signal" 2>/dev/null || :)"
 	registration="$(normalize_registration "$registration" "$roaming")"
 	case "$registration" in home|roaming) modem_state=connected ;; *) modem_state=enabled ;; esac
 
@@ -354,7 +392,7 @@ identity_locked() {
 	printf 'serving_operator_id\t%s\n' "$serving_id"
 	printf 'serving_operator_name\t%s\n' "$serving_name"
 	printf 'access_technologies\t%s\n' "$access"
-	printf 'signal_quality\t\n'
+	printf 'signal_quality\t%s\n' "$signal_quality"
 }
 
 identity() {

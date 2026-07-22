@@ -277,8 +277,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1_alpha1-r9.apk \
-  ./luci-app-apn-autoconfig-0.6.0_alpha1-r9.apk
+  ./apn-autoconfig-0.9.1_alpha1-r10.apk \
+  ./luci-app-apn-autoconfig-0.6.0_alpha1-r10.apk
 ```
 
 Use the same single transaction when upgrading from 0.7.0. It transfers

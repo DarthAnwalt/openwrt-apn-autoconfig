@@ -270,6 +270,12 @@ python3 -c '
 import json, sys
 value = json.loads(sys.argv[1])
 path = sys.argv[2]
+if path.startswith("@[*]."):
+    key = path[5:]
+    for item in value:
+        if key in item and item[key] is not None:
+            print(item[key])
+    raise SystemExit(0)
 if not path.startswith("@."):
     raise SystemExit(1)
 for part in path[2:].split("."):
@@ -292,6 +298,7 @@ for argument in "$@"; do
 		--get-iccid) operation=get-iccid ;;
 		--get-imsi) operation=get-imsi ;;
 		--get-serving-system) operation=get-serving-system ;;
+		--get-signal-info) operation=get-signal-info ;;
 	esac
 done
 [ -n "$operation" ] || exit 2
@@ -483,17 +490,20 @@ qmi_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"].values()); assert d["target_implementation_state"] == "alpha" and d["target_validation_state"] == "synthetic" and d["target_hardware_validated"] is False; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'QMI identity changed the ModemManager APN'
 [ ! -s "$STATE/events" ] || fail 'QMI identity cycled a network interface'
-[ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 3 ] || fail 'QMI identity issued an unexpected command count'
+[ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 4 ] || fail 'QMI identity issued an unexpected command count'
 if grep -E -- '--(start-network|modify-profile|set-|stop-network|verify|power)' "$STATE/uqmi-calls" >/dev/null; then
 	fail 'QMI identity issued a mutating uqmi command'
 fi
+qmi_status_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["signal_quality"] == "43"' \
+	"$qmi_status_json" || fail 'QMI status did not normalize the best RSRP signal quality'
 
 printf '%s\n' 'TEST QMI roaming keeps home identity separate from serving PLMN'
 QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/roaming"
 export QMI_FIXTURE_DIR
 printf '%s\n' 0 >"$STATE/qmi-allow_roaming"
 qmi_roaming_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" status-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["imsi"].startswith("25506"); assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26202"; assert d["serving_operator_name"] == "Vodafone.de"; assert d["registration_state"] == "roaming" and d["roaming"] is True; assert d["roaming_policy"] == "unsupported" and d["roaming_allowed"] is True' "$qmi_roaming_json" || fail 'QMI roaming confused home and serving networks or inherited an unsupported policy'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["imsi"].startswith("25506"); assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26202"; assert d["serving_operator_name"] == "Vodafone.de"; assert d["registration_state"] == "roaming" and d["roaming"] is True; assert d["roaming_policy"] == "unsupported" and d["roaming_allowed"] is True; assert d["signal_quality"] == "63"' "$qmi_roaming_json" || fail 'QMI roaming confused home and serving networks or inherited an unsupported policy'
 rm -f "$STATE/qmi-allow_roaming"
 QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
 export QMI_FIXTURE_DIR

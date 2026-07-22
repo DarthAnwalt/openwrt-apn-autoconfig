@@ -32,6 +32,11 @@
   request reached its timeout. Ports that answer immediately with an error or
   unrecognized output still receive the Quectel-compatible fallback, while a
   cold multi-port scan no longer doubles every non-responsive-port delay.
+- Added bounded QMI signal-info collection and a deterministic percentage from
+  the best reported RSRP, with RSSI fallback when RSRP is unavailable.
+- When QMI confirms home registration but cannot report a separate home/SPN
+  identity, LuCI safely reuses the serving name for the SIM-provider and home
+  network rows. It never applies that fallback while roaming.
 - Added `targets-json` v2 evidence fields so alpha and unvalidated implementation is
   distinguishable from hardware-validated support.
 - Added the same capability/evidence state to status and detect output; LuCI

@@ -45,6 +45,7 @@ It first invokes only bounded, read-only `uqmi` operations:
 --get-iccid
 --get-imsi
 --get-serving-system
+--get-signal-info
 ```
 
 Some QMI modem firmware, including the tested RM520N, reports `Not supported`
@@ -88,7 +89,7 @@ roaming<TAB>true|false|unknown
 serving_operator_id<TAB>digits-or-empty
 serving_operator_name<TAB>text-or-empty
 access_technologies<TAB>text-or-empty
-signal_quality<TAB>
+signal_quality<TAB>0-100-or-empty
 ```
 
 Unknown values are empty instead of guessed. In particular, current `uqmi`
@@ -96,6 +97,15 @@ does not expose a reliable home operator through the operations used here. The
 adapter therefore leaves `operator_id` empty, and the candidate matcher uses
 the IMSI MCC/MNC prefix. A roaming serving PLMN is never presented as the SIM's
 home operator.
+
+Signal information is optional. The adapter maps the best numeric RSRP from
+all reported radio technologies linearly from -120 dBm (0%) to -80 dBm (100%),
+clamps the result, and uses RSSI from -110 dBm to -50 dBm only when no RSRP is
+available. Missing or malformed signal data leaves `signal_quality` empty and
+does not make otherwise valid SIM identity unavailable. LuCI may reuse the
+serving operator label for its SIM-provider and home-network rows only when
+`registration_state` is explicitly `home`; it must never make that inference
+while roaming.
 
 Exit codes are:
 

@@ -1,0 +1,4 @@
+[
+  { "type": "lte", "rssi": -67, "rsrq": -17, "rsrp": -103, "snr": -3.6 },
+  { "type": "5gnr", "rsrq": -12, "rsrp": -103, "snr": 11 }
+]

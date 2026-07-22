@@ -96,6 +96,22 @@ function networkLabel(name, id) {
 	return name || id || '';
 }
 
+function simProviderLabel(status) {
+	if (status && status.operator_name)
+		return status.operator_name;
+	return status && status.registration_state === 'home' ? status.serving_operator_name : '';
+}
+
+function homeNetworkLabel(status) {
+	if (!status)
+		return '';
+	if (status.home_operator_name || status.home_operator_id)
+		return networkLabel(status.home_operator_name, status.home_operator_id);
+	if (status.registration_state === 'home')
+		return networkLabel(status.serving_operator_name, status.serving_operator_id);
+	return '';
+}
+
 function formatTimestamp(value) {
 	if (!value)
 		return '';
@@ -212,8 +228,8 @@ return view.extend({
 			return this.statusWarnings(status);
 		return this.statusWarnings(status).concat([
 			table([
-				row(_('SIM / eSIM provider'), status.operator_name),
-				row(_('Home network'), networkLabel(status.home_operator_name, status.home_operator_id)),
+				row(_('SIM / eSIM provider'), simProviderLabel(status)),
+				row(_('Home network'), homeNetworkLabel(status)),
 				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id)),
 				row(_('Registration'), status.registration_state),
 				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),

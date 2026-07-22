@@ -283,9 +283,17 @@ async function verifyBackendSpecificPolicy() {
 			profile_write: true,
 			profile_apply: true
 		},
+		operator_name: '',
+		home_operator_name: '',
+		home_operator_id: '',
+		serving_operator_name: 'SIMon mobile',
+		serving_operator_id: '26202',
+		registration_state: 'home',
 		roaming_policy: 'default-allow'
 	};
 	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual((nodeText(app.connectionBox).match(/SIMon mobile/g) || []).length, 3,
+		'home registration must safely reuse the serving name for SIM provider and home-network display');
 	assert.strictEqual(app.reconcileButton.disabled, false,
 		'QMI APN support must remain enabled independently of roaming policy control');
 	assert.strictEqual(app.resetButton, null,
@@ -301,6 +309,13 @@ async function verifyBackendSpecificPolicy() {
 	app.confirmRoamingPolicy();
 	assert.strictEqual(app.testUi.modalCalls, 0,
 		'unsupported roaming policy must not reach a mutating confirmation dialog');
+
+	var roamingApp = loadView();
+	status.registration_state = 'roaming';
+	status.serving_operator_name = 'Vodafone.de';
+	await roamingApp.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual((nodeText(roamingApp.connectionBox).match(/Vodafone\.de/g) || []).length, 1,
+		'roaming serving network must not be presented as SIM provider or home network');
 }
 
 async function verifyUnavailableConfiguredTargetGuidance() {

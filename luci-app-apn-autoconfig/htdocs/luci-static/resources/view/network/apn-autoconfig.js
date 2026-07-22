@@ -420,10 +420,19 @@ return view.extend({
 			var databaseAction = action.action === 'database-check' || action.action === 'database-install';
 			self.setBusy(action.busy, action);
 
-			if (wasBusy && !action.busy)
+			if (wasBusy && !action.busy) {
+				self.panelPollCount = 0;
 				return self.refreshPanels().then(function() { self.setBusy(false, action); });
+			}
 			if (action.busy && databaseAction)
 				return self.refreshDatabase().then(function() { self.setBusy(true, action); });
+			if (!action.busy) {
+				self.panelPollCount++;
+				if (self.panelPollCount >= 5) {
+					self.panelPollCount = 0;
+					return self.refreshPanels().then(function() { self.setBusy(false, action); });
+				}
+			}
 		}).catch(function(error) {
 			/* A transient polling failure is not evidence that a long-running
 			 * operation ended. Keep controls disabled until the core says so. */
@@ -675,6 +684,10 @@ return view.extend({
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
+		/* Poll cheap action state every two seconds, but also refresh live modem,
+		 * APN and signal panels every ten seconds while idle. Additional modem
+		 * reads are suppressed for the duration of a mutating operation. */
+		self.panelPollCount = 0;
 		poll.add(function() { return self.refreshStatus(); }, 2);
 
 		return m.render().then(function(mapNode) {

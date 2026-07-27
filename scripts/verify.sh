@@ -3,6 +3,19 @@ set -eu
 
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 
+verify_release_changelog=true
+case "${1:-}" in
+	'')
+		;;
+	--allow-unreleased-provider-version)
+		verify_release_changelog=false
+		;;
+	*)
+		printf 'Usage: %s [--allow-unreleased-provider-version]\n' "$0" >&2
+		exit 2
+		;;
+esac
+
 sh -n "$ROOT/files/usr/sbin/apn-autoconfig"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-boot"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-action"
@@ -77,8 +90,10 @@ luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Make
 [ -n "$core_release" ]
 [ -n "$luci_version" ]
 [ -n "$luci_release" ]
-grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
-	"$ROOT/CHANGELOG.md"
+if [ "$verify_release_changelog" = true ]; then
+	grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
+		"$ROOT/CHANGELOG.md"
+fi
 grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
 grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
@@ -128,6 +143,8 @@ grep -F -q 'gh release create "$RELEASE_TAG"' "$ROOT/.github/workflows/build.yml
 grep -F -q -- '--verify-tag' "$ROOT/.github/workflows/build.yml"
 grep -F -q 'actions: write' "$ROOT/.github/workflows/update-provider-database.yml"
 grep -F -q 'publish_repository=true' "$ROOT/.github/workflows/update-provider-database.yml"
+grep -F -q 'sh scripts/verify.sh --allow-unreleased-provider-version' \
+	"$ROOT/.github/workflows/update-provider-database.yml"
 if grep -R -E 'uses:[[:space:]]+actions/[^@]+@v[0-9]+' "$ROOT/.github/workflows"; then
 	printf '%s\n' 'A GitHub-maintained Action is not pinned to an immutable commit.' >&2
 	exit 1

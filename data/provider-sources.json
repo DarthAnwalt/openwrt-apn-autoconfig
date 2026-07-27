@@ -4,7 +4,7 @@
     "mbpi": {
       "name": "GNOME mobile-broadband-provider-info",
       "repository": "https://gitlab.gnome.org/GNOME/mobile-broadband-provider-info.git",
-      "revision": "052f1e6999f205ba88cc3557627f260b9ae0840e",
+      "revision": "573dd936e6383169608a53d07b44ba1e7d4b7d89",
       "path": "serviceproviders.xml",
       "license": "CC-PDDC"
     },

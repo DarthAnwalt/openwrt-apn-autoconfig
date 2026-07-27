@@ -24,9 +24,7 @@ jobs:
       - name: Refresh trusted provider sources
         run: sh scripts/refresh-providers.sh
       - name: Verify generated database and package behavior
-        # A scheduled provider snapshot has not been added to the product
-        # release changelog yet. All database and package checks still run.
-        run: sh scripts/verify.sh --allow-unreleased-provider-version
+        run: sh scripts/verify.sh
       - name: Commit safe update
         id: commit
         run: |

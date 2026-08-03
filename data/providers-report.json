@@ -1,11 +1,11 @@
 {
   "credential_profiles": 884,
   "database_format": 2,
-  "database_version": "2026.07.27",
+  "database_version": "2026.08.03",
   "format": 1,
   "mccmnc": 1459,
   "mvno_specific_profiles": 429,
-  "profiles": 3252,
+  "profiles": 3255,
   "sources": {
     "aosp": {
       "license": "Apache-2.0",
@@ -13,7 +13,7 @@
     },
     "mbpi": {
       "license": "CC-PDDC",
-      "revision": "573dd936e6383169608a53d07b44ba1e7d4b7d89"
+      "revision": "73b2f9b4b9bcb230a61a0bd317fa72349f7e1527"
     }
   },
   "stats": {
@@ -23,11 +23,12 @@
     "aosp_non_internet": 1587,
     "aosp_skipped": 86,
     "aosp_test_network": 6,
-    "mbpi_accepted": 1510,
-    "mbpi_duplicates": 81,
-    "mbpi_non_internet": 350,
-    "mbpi_skipped": 17,
-    "overrides_accepted": 4
+    "mbpi_accepted": 1506,
+    "mbpi_duplicates": 80,
+    "mbpi_non_internet": 352,
+    "mbpi_skipped": 16,
+    "overrides_accepted": 4,
+    "previous_retained": 7
   },
   "unique_apns": 1040,
   "warnings": [
@@ -45,7 +46,6 @@
     "mbpi: Tele Greenland A/S: no network-id",
     "mbpi: Invitel: no network-id",
     "mbpi: XS4ALL Mobiel Internet: no network-id",
-    "mbpi: Altibox: no network-id",
     "mbpi: TelstraClear: no network-id",
     "mbpi: Orcon: no network-id",
     "aosp: Vf Mobile LTE: invalid APN ''",

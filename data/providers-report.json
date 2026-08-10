@@ -1,11 +1,11 @@
 {
   "credential_profiles": 884,
   "database_format": 2,
-  "database_version": "2026.08.03",
+  "database_version": "2026.08.10",
   "format": 1,
-  "mccmnc": 1459,
-  "mvno_specific_profiles": 429,
-  "profiles": 3255,
+  "mccmnc": 1461,
+  "mvno_specific_profiles": 440,
+  "profiles": 3266,
   "sources": {
     "aosp": {
       "license": "Apache-2.0",
@@ -13,7 +13,7 @@
     },
     "mbpi": {
       "license": "CC-PDDC",
-      "revision": "73b2f9b4b9bcb230a61a0bd317fa72349f7e1527"
+      "revision": "70bf4a223ad19d2d23a693967066da3e19494770"
     }
   },
   "stats": {
@@ -23,14 +23,14 @@
     "aosp_non_internet": 1587,
     "aosp_skipped": 86,
     "aosp_test_network": 6,
-    "mbpi_accepted": 1506,
+    "mbpi_accepted": 1517,
     "mbpi_duplicates": 80,
     "mbpi_non_internet": 352,
     "mbpi_skipped": 16,
     "overrides_accepted": 4,
     "previous_retained": 7
   },
-  "unique_apns": 1040,
+  "unique_apns": 1041,
   "warnings": [
     "mbpi: Velox: no network-id",
     "mbpi: eTb: no network-id",

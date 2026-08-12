@@ -42,5 +42,39 @@ synthetic suite or SDK build alone is not sufficient to publish 0.9.2.
 
 - Synthetic/fixture gate: passed locally on 2026-08-11 with
   `sh scripts/verify.sh` (`Static and behavioral verification passed`).
-- Official SDK and APK simulation: pending.
-- Reference-router hardware gate: pending.
+- Official SDK and APK simulation: passed in GitHub Actions run
+  `31598055359` for commit `4018653e64a0409b8c85104e13281c5838b0bdda`.
+  The downloaded artifact digest was
+  `sha256:255b9d5fe61e378e13c90a1a71de367aa46854a55696e5ddf35dae0733b58d8d`;
+  every APK matched the included `SHA256SUMS`. Router-side simulation proposed
+  only the expected core, integration and provider-database upgrades.
+- Reference-router partial gate on 2026-08-12: upgrading the production
+  ModemManager installation from core/integration 0.9.1 to 0.9.2 and providers
+  2026.07.27 to 2026.08.10 left `network`, `apn-autoconfig`, `mwan3` and
+  `travelmate` byte-identical and UCI clean. Travelmate and LTE both returned
+  HTTP 204 after the transaction.
+- Isolated QMI apply and real Internet verification passed on the reference
+  RM520N-GL. A forced single invalid APN failed as intended, restored all QMI
+  UCI values, restored the physical 3GPP profile byte-for-byte and returned the
+  bearer with HTTP 204.
+- Stopping the procd service after the invalid APN had been written forwarded
+  termination to the active engine. It restored the original UCI and physical
+  profile, restarted QMI and left no worker or adapter process behind. The
+  rollback issued the recovery `ifup` after its six-second quiet period;
+  subsequent RM520N registration and DHCP completed 36 seconds after stop.
+- The packaged background reconcile action completed successfully against the
+  isolated QMI target and recorded the final v2 action state as `success`.
+- The reboot experiment with deliberately volatile target state was not a
+  valid idempotent-reconcile gate: `/tmp` state disappeared at boot and an
+  intentionally shortened ten-second delay started a full candidate cycle
+  before the RM520N had settled. Rollback retained a working QMI profile and
+  HTTP connectivity. A later attempt to prepare persistent isolated state was
+  stopped after QMI identity stalled; no reboot evidence is claimed from it.
+  The production ModemManager configuration was restored byte-for-byte, both
+  Travelmate and LTE returned online, HTTP succeeded through both paths and
+  UCI was clean after a final router reboot.
+
+The reference-router gate therefore remains open for a clean reboot with
+persistent isolated state, BTN_0 recovery, `reset-all`/package removal and the
+final reinstall/status capture. Do not tag or publish 0.9.2 from the partial
+evidence above.

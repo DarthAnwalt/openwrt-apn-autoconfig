@@ -278,7 +278,7 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 
 ```sh
 apk add --allow-untrusted \
-  ./apn-autoconfig-providers-2026.07.18-r1.apk \
+  ./apn-autoconfig-providers-2026.08.10-r1.apk \
   ./apn-autoconfig-0.9.2-r1.apk \
   ./luci-app-apn-autoconfig-0.6.0-r1.apk
 ```

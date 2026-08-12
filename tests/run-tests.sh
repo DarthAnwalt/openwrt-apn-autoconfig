@@ -195,6 +195,12 @@ cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
 suffix=""
 [ -z "${UBUS_L3_DEVICE:-}" ] || suffix=", \"l3_device\": \"$UBUS_L3_DEVICE\""
+case "${2:-}" in
+	network.interface.*_4)
+		[ "${QMI_DATA_UNAVAILABLE:-0}" = 1 ] || suffix="${suffix}, \"ipv4-address\": [{ \"address\": \"192.0.2.2\" }]"
+		[ "${QMI_TRACE_RESET_ORDER:-0}" != 1 ] || printf '%s\n' data >>"$TEST_STATE/qmi-reset-order"
+	;;
+esac
 if [ "${QMI_DUALSTACK_REJECT:-0}" = 1 ] && [ "$(cat "$TEST_STATE/qmi-pdptype" 2>/dev/null || :)" = ipv4v6 ]; then
 	printf '{ "up": false%s }\n' "$suffix"
 elif [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
@@ -1226,8 +1232,19 @@ grep -F -q 'down cellqmi' "$STATE/events" || fail 'QMI modem reset did not stop 
 grep -F -q 'up cellqmi' "$STATE/events" || fail 'QMI modem reset did not restore its selected target'
 [ "$(sed -n '1p' "$STATE/qmi-reset-order")" = identity ] || fail 'QMI modem reset did not first wait for SIM identity'
 [ "$(sed -n '2p' "$STATE/qmi-reset-order")" = up ] || fail 'QMI modem reset queried identity again before handing control to netifd'
+[ "$(sed -n '3p' "$STATE/qmi-reset-order")" = data ] || fail 'QMI modem reset did not wait for its data interface before reconciling'
 unset QMI_TRACE_RESET_ORDER
 TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+
+printf '%s\n' 'TEST QMI modem reset does not query identity before its data interface is ready'
+: >"$STATE/events"
+rm -f "$STATE/ifup-seen"
+if QMI_DATA_UNAVAILABLE=1 TEST_INTERFACE=cellqmi sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+	fail 'QMI modem reset continued without a ready data interface'
+else
+	[ "$?" -eq 3 ] || fail 'missing QMI data interface did not return retryable status'
+fi
+[ "$(grep -c '^up cellqmi$' "$STATE/events")" -ge 1 ] || fail 'failed QMI data readiness did not attempt interface recovery'
 
 printf '%s\n' 'TEST modem reset is unavailable without a board integration package'
 : >"$STATE/events"

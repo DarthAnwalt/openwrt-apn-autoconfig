@@ -1699,6 +1699,26 @@ wait_for_interface() {
 	return 1
 }
 
+qmi_data_interface_is_ready() {
+	command_exists ubus || return 1
+	for data_interface in "$INTERFACE" "${INTERFACE}_4" "${INTERFACE}_6"; do
+		status="$(ubus call "network.interface.${data_interface}" status 2>/dev/null || :)"
+		printf '%s\n' "$status" | grep -q '"up"[[:space:]]*:[[:space:]]*true' || continue
+		printf '%s\n' "$status" | grep -q '"address"[[:space:]]*:[[:space:]]*"' && return 0
+	done
+	return 1
+}
+
+wait_for_qmi_data_interface() {
+	remaining="$WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		qmi_data_interface_is_ready && return 0
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 1
+}
+
 mwan3_available() {
 	command_exists mwan3 || return 1
 	case "$USE_MWAN3" in
@@ -2144,13 +2164,14 @@ modem_reset_cmd() {
 		# client close before handing the control device back to netifd, then
 		# wait for qmi.sh to own initialization before reconcile queries status.
 		settle_after_ifdown
-		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface; then
+		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_qmi_data_interface; then
 			INTERFACE_RESTORE_ARMED=0
-			log notice "QMI interface $INTERFACE is ready after modem power return"
+			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else
-			log warning "QMI interface $INTERFACE did not become ready before APN reconciliation"
+			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
 			ifdown "$INTERFACE" >/dev/null 2>&1 || :
 			settle_after_ifdown
+			return 3
 		fi
 	fi
 	log notice "modem and SIM are available again; reconciling APN"

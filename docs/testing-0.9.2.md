@@ -73,8 +73,23 @@ synthetic suite or SDK build alone is not sufficient to publish 0.9.2.
   The production ModemManager configuration was restored byte-for-byte, both
   Travelmate and LTE returned online, HTTP succeeded through both paths and
   UCI was clean after a final router reboot.
+- A clean repeat with target baseline/cache on persistent storage and the
+  normal 30-second boot delay passed on 2026-08-12: the boot worker exited 0,
+  reported the SIM as already reconciled without changing the profile, QMI
+  and Travelmate both returned HTTP 204, UCI was clean and the physical 3GPP
+  profile before/after reboot had the same SHA-256.
+- The first BTN_0 hotplug repeat exposed a hardware-only readiness race. The
+  parent QMI interface became `up` while `qmi.sh` was still establishing the
+  dynamic data bearer; an immediate identity query then competed with netifd
+  and the worker ended retryable. The corrected candidate waits for an
+  addressed `${interface}_4` or `${interface}_6` data interface. Repeating the
+  same installed hotplug handler with the original five-second GPIO power-off
+  completed in 76 seconds, recorded action state `success`, kept the physical
+  profile byte-identical, returned QMI and Travelmate HTTP 204 and left UCI
+  clean. The event was injected into the installed hotplug handler with
+  `BUTTON=BTN_0 ACTION=released`; the board GPIO, worker and recovery path were
+  real, but the mechanical switch itself was not pressed in this repeat.
 
-The reference-router gate therefore remains open for a clean reboot with
-persistent isolated state, BTN_0 recovery, `reset-all`/package removal and the
-final reinstall/status capture. Do not tag or publish 0.9.2 from the partial
-evidence above.
+The reference-router gate therefore remains open only for the corrected
+official-SDK artifact, `reset-all`/package removal and the final
+reinstall/status capture. Do not tag or publish 0.9.2 before those steps pass.

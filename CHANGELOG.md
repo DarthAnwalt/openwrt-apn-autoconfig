@@ -20,6 +20,10 @@
 - Consolidated the shared ModemManager/QMI profile capture, mutation and
   rollback plumbing while retaining backend-owned authentication and IP-family
   option mappings.
+- Wait for the real QMI IPv4/IPv6 data interface after a board modem reset,
+  instead of treating the parent netifd interface as ready while `qmi.sh` is
+  still establishing its bearer. This prevents the post-reset identity query
+  from racing netifd on the RM520N-GL.
 - Clarified that QMI roaming state is observable but QMI roaming-policy control
   remains unavailable until a portable netifd mapping is hardware-validated.
 

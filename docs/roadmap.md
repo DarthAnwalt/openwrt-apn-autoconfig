@@ -74,12 +74,21 @@ reinstall and ModemManager regression gates passed on the reference
 Huasifei WH3000 Pro + RM520N-GL. This is hardware evidence for that tested
 combination, not a claim that every QMI modem behaves identically.
 
-## 0.9.2 — native MBIM adapter
+## 0.9.2 — rollback and backend hardening
+
+Stabilization release before adding another backend. It makes boot/action
+termination reach the active engine, leaves a bounded procd window for QMI
+rollback, validates signal recovery and root-only state modes, canonicalizes
+QMI devpaths, binds legacy baselines to their selected target and consolidates
+the shared ModemManager/QMI profile plumbing. It adds no new hardware-support
+claim; the release gate is recorded in `testing-0.9.2.md`.
+
+## 0.9.3 — native MBIM adapter
 
 Planned for a separate task. Add MBIM SIM identity collection, profile mapping
 and correct handling of dynamically created IPv4/IPv6 child interfaces.
 
-## 0.9.3 — extend generic AT identity
+## 0.9.4 — extend generic AT identity
 
 Planned for a separate task. Extend the fixed read-only AT identity transport
 introduced for QMI to AT-managed backends and normalized registration identity

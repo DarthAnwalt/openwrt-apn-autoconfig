@@ -1,7 +1,7 @@
 # apn-autoconfig — OpenWrt source packages
 
 `apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
-0.9.1 discovers configured cellular netifd interfaces and publishes both
+0.9.2 discovers configured cellular netifd interfaces and publishes both
 their runtime capabilities and validation level through a GUI-independent API.
 Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
 uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
@@ -10,8 +10,10 @@ selected AT-managed protocols remain inventory-only. The engine resolves the act
 candidates in a worldwide local TSV database, restarts only the selected mobile
 interface, verifies real Internet access through netifd's current layer-3 device, caches
 the successful profile by ICCID, and restores the previous profile when all candidates
-fail. It distinguishes the SIM's home operator from the serving network,
-honors OpenWrt's canonical data-roaming policy before changing any APN, and
+fail. It distinguishes the SIM's home operator from the serving network.
+ModemManager honors OpenWrt's canonical data-roaming policy before changing
+any APN; QMI reports observed roaming but exposes policy control as unsupported
+because no portable netifd mapping has been hardware-validated. The engine
 reports registration failures separately from profile failures. It includes an idempotent `reconcile` command for SIM transitions and an
 opt-in delayed boot service. A separately installed Huasifei board integration
 can power-cycle the modem through its verified exported GPIO and reconcile the
@@ -276,8 +278,8 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 
 ```sh
 apk add --allow-untrusted \
-  ./apn-autoconfig-providers-2026.07.18-r1.apk \
-  ./apn-autoconfig-0.9.1-r1.apk \
+  ./apn-autoconfig-providers-2026.08.10-r1.apk \
+  ./apn-autoconfig-0.9.2-r1.apk \
   ./luci-app-apn-autoconfig-0.6.0-r1.apk
 ```
 
@@ -779,6 +781,10 @@ submission has been implemented and tested.
   and regeneration of the database.
 - ModemManager cannot report tariff cost, roaming quotas or whether roaming is
   free. The policy controls technical permission only.
+- QMI reports observed home/roaming registration but does not apply
+  `network.<interface>.allow_roaming`. A policy previously configured for a
+  ModemManager target must not be assumed to remain effective after migrating
+  that interface to QMI.
 - A generic bearer rejection cannot always distinguish a wrong APN from a
   subscription or roaming-agreement restriction; messages avoid claiming an
   APN-specific cause without evidence.
@@ -794,5 +800,5 @@ project boundary, package map, binding safety invariants, public integration
 surface, backend-extension checklist and required release workflow. Detailed
 QMI/API semantics, evidence gates and future adapter direction remain in
 [`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
-[`docs/testing-0.9.1.md`](docs/testing-0.9.1.md) and
+[`docs/testing-0.9.2.md`](docs/testing-0.9.2.md) and
 [`docs/roadmap.md`](docs/roadmap.md).

@@ -2,7 +2,7 @@
 
 This document is the shortest safe entry point for a new maintainer or coding
 assistant. Read it together with [`backend-contract-v1.md`](backend-contract-v1.md),
-[`testing-0.9.1.md`](testing-0.9.1.md) and [`roadmap.md`](roadmap.md) before
+[`testing-0.9.2.md`](testing-0.9.2.md) and [`roadmap.md`](roadmap.md) before
 changing runtime behavior. The README is the user-facing reference; the
 changelog records shipped differences rather than future intentions.
 
@@ -134,9 +134,10 @@ the source tree or build artifacts.
 
 ## Current development direction
 
-The 0.9.1 line establishes stable ModemManager and native QMI adapters plus the
-multi-target package/API foundation. The next adapters are separate tasks:
-MBIM, broader AT-managed backends, and then the multi-backend 1.0 objective,
+The 0.9.2 stabilization line hardens termination rollback, state/path
+validation and the shared ModemManager/QMI profile plumbing without adding a
+backend. The next adapters are separate tasks: MBIM in 0.9.3, broader
+AT-managed backends in 0.9.4, and then the multi-backend 1.0 objective,
 including a practical control path for Fibocom FM350-GL. Exact sequencing can
 change after hardware findings; the safety invariants above cannot.
 

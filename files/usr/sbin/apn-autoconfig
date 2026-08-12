@@ -79,6 +79,7 @@ LOCK_HELD=0
 MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
+SETTLE_SLEEP_PID=""
 
 MODEM_STATE="unknown"
 REGISTRATION_STATE="unknown"
@@ -125,7 +126,9 @@ cleanup_files() {
 state_value_is_safe() {
 	value="$1"
 	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
 	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
 	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
 }
 
@@ -140,7 +143,9 @@ set_or_delete_option() {
 	fi
 }
 
-modemmanager_capture_old_profile() {
+capture_owned_profile() {
+	auth_option="$1"
+	ip_option="$2"
 	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
 		OLD_APN_SET=1
 		OLD_APN="$(uci -q get "network.${INTERFACE}.apn")"
@@ -153,67 +158,32 @@ modemmanager_capture_old_profile() {
 		OLD_PASSWORD_SET=1
 		OLD_PASSWORD="$(uci -q get "network.${INTERFACE}.password")"
 	fi
-	if uci -q get "network.${INTERFACE}.allowedauth" >/dev/null 2>&1; then
+	if uci -q get "network.${INTERFACE}.${auth_option}" >/dev/null 2>&1; then
 		OLD_ALLOWEDAUTH_SET=1
-		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.allowedauth")"
+		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.${auth_option}")"
 	fi
-	if uci -q get "network.${INTERFACE}.iptype" >/dev/null 2>&1; then
+	if uci -q get "network.${INTERFACE}.${ip_option}" >/dev/null 2>&1; then
 		OLD_IPTYPE_SET=1
-		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.iptype")"
-	fi
-}
-
-qmi_capture_old_profile() {
-	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
-		OLD_APN_SET=1
-		OLD_APN="$(uci -q get "network.${INTERFACE}.apn")"
-	fi
-	if uci -q get "network.${INTERFACE}.username" >/dev/null 2>&1; then
-		OLD_USERNAME_SET=1
-		OLD_USERNAME="$(uci -q get "network.${INTERFACE}.username")"
-	fi
-	if uci -q get "network.${INTERFACE}.password" >/dev/null 2>&1; then
-		OLD_PASSWORD_SET=1
-		OLD_PASSWORD="$(uci -q get "network.${INTERFACE}.password")"
-	fi
-	if uci -q get "network.${INTERFACE}.auth" >/dev/null 2>&1; then
-		OLD_ALLOWEDAUTH_SET=1
-		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.auth")"
-	fi
-	if uci -q get "network.${INTERFACE}.pdptype" >/dev/null 2>&1; then
-		OLD_IPTYPE_SET=1
-		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.pdptype")"
+		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.${ip_option}")"
 	fi
 }
 
 capture_old_profile() {
 	case "$TARGET_BACKEND" in
-		modemmanager) modemmanager_capture_old_profile ;;
-		qmi) qmi_capture_old_profile ;;
+		modemmanager) capture_owned_profile allowedauth iptype ;;
+		qmi) capture_owned_profile auth pdptype ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read APN profiles" ;;
 	esac
 }
 
-modemmanager_restore_old_profile() {
-	log warning "restoring previous mobile profile for interface $INTERFACE"
+restore_owned_profile() {
+	auth_option="$1"
+	ip_option="$2"
 	set_or_delete_option apn "$OLD_APN_SET" "$OLD_APN" || return 1
 	set_or_delete_option username "$OLD_USERNAME_SET" "$OLD_USERNAME" || return 1
 	set_or_delete_option password "$OLD_PASSWORD_SET" "$OLD_PASSWORD" || return 1
-	set_or_delete_option allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
-	set_or_delete_option iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
-	uci commit network >/dev/null 2>&1 || return 1
-	ifdown "$INTERFACE" >/dev/null 2>&1 || :
-	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
-	ifup "$INTERFACE" >/dev/null 2>&1 || :
-}
-
-qmi_restore_old_profile() {
-	log warning "restoring previous QMI profile for interface $INTERFACE"
-	set_or_delete_option apn "$OLD_APN_SET" "$OLD_APN" || return 1
-	set_or_delete_option username "$OLD_USERNAME_SET" "$OLD_USERNAME" || return 1
-	set_or_delete_option password "$OLD_PASSWORD_SET" "$OLD_PASSWORD" || return 1
-	set_or_delete_option auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
-	set_or_delete_option pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
+	set_or_delete_option "$auth_option" "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
+	set_or_delete_option "$ip_option" "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
 	uci commit network >/dev/null 2>&1 || return 1
 	ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
@@ -223,10 +193,55 @@ qmi_restore_old_profile() {
 
 restore_old_profile() {
 	case "$TARGET_BACKEND" in
-		modemmanager) modemmanager_restore_old_profile ;;
-		qmi) qmi_restore_old_profile ;;
+		modemmanager)
+			log warning "restoring previous mobile profile for interface $INTERFACE"
+			restore_owned_profile allowedauth iptype
+		;;
+		qmi)
+			log warning "restoring previous QMI profile for interface $INTERFACE"
+			restore_owned_profile auth pdptype
+		;;
 		*) return 1 ;;
 	esac
+}
+
+set_owned_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth_option="$4"
+	auth_value="$5"
+	ip_option="$6"
+	ip_value="$7"
+
+	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
+	state_value_is_safe "$auth_value" || return 1
+	state_value_is_safe "$ip_value" || return 1
+
+	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
+	if [ "$username" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$password" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$auth_value" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.${auth_option}" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.${auth_option}=$auth_value" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$ip_value" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.${ip_option}" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.${ip_option}=$ip_value" >/dev/null 2>&1 || return 1
+	fi
+	uci commit network >/dev/null 2>&1
 }
 
 modemmanager_set_profile() {
@@ -236,34 +251,10 @@ modemmanager_set_profile() {
 	auth="$4"
 	ip_type="$5"
 
-	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
-	state_value_is_safe "$username" || return 1
-	state_value_is_safe "$password" || return 1
 	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
 	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
-
-	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
-	if [ "$username" = "-" ]; then
-		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
-	else
-		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
-	fi
-	if [ "$password" = "-" ]; then
-		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
-	else
-		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
-	fi
-	case "$auth" in
-		-) uci -q delete "network.${INTERFACE}.allowedauth" >/dev/null 2>&1 || : ;;
-		pap-or-chap) uci set "network.${INTERFACE}.allowedauth=pap chap" >/dev/null 2>&1 || return 1 ;;
-		*) uci set "network.${INTERFACE}.allowedauth=$auth" >/dev/null 2>&1 || return 1 ;;
-	esac
-	if [ "$ip_type" = "-" ]; then
-		uci -q delete "network.${INTERFACE}.iptype" >/dev/null 2>&1 || :
-	else
-		uci set "network.${INTERFACE}.iptype=$ip_type" >/dev/null 2>&1 || return 1
-	fi
-	uci commit network >/dev/null 2>&1
+	[ "$auth" != pap-or-chap ] || auth="pap chap"
+	set_owned_profile "$apn" "$username" "$password" allowedauth "$auth" iptype "$ip_type"
 }
 
 qmi_set_profile() {
@@ -273,34 +264,11 @@ qmi_set_profile() {
 	auth="$4"
 	ip_type="$5"
 
-	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
-	state_value_is_safe "$username" || return 1
-	state_value_is_safe "$password" || return 1
 	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
 	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
-
-	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
-	if [ "$username" = "-" ]; then
-		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
-	else
-		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
-	fi
-	if [ "$password" = "-" ]; then
-		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
-	else
-		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
-	fi
-	case "$auth" in
-		-) uci -q delete "network.${INTERFACE}.auth" >/dev/null 2>&1 || : ;;
-		pap-or-chap) uci set "network.${INTERFACE}.auth=both" >/dev/null 2>&1 || return 1 ;;
-		*) uci set "network.${INTERFACE}.auth=$auth" >/dev/null 2>&1 || return 1 ;;
-	esac
-	case "$ip_type" in
-		-) uci -q delete "network.${INTERFACE}.pdptype" >/dev/null 2>&1 || : ;;
-		ipv4) uci set "network.${INTERFACE}.pdptype=ip" >/dev/null 2>&1 || return 1 ;;
-		*) uci set "network.${INTERFACE}.pdptype=$ip_type" >/dev/null 2>&1 || return 1 ;;
-	esac
-	uci commit network >/dev/null 2>&1
+	[ "$auth" != pap-or-chap ] || auth=both
+	[ "$ip_type" != ipv4 ] || ip_type=ip
+	set_owned_profile "$apn" "$username" "$password" auth "$auth" pdptype "$ip_type"
 }
 
 set_profile() {
@@ -312,8 +280,13 @@ set_profile() {
 }
 
 on_exit() {
-	status=$?
+	on_exit_status=$?
 	trap - 0 HUP INT TERM
+	if [ -n "$SETTLE_SLEEP_PID" ]; then
+		kill -TERM "$SETTLE_SLEEP_PID" 2>/dev/null || :
+		wait "$SETTLE_SLEEP_PID" 2>/dev/null || :
+		SETTLE_SLEEP_PID=""
+	fi
 	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
 		printf '%s\n' "$MODEM_POWER_ON_VALUE" >"$MODEM_POWER_PATH" 2>/dev/null || \
 			log err "failed to restore modem power after interruption"
@@ -326,10 +299,15 @@ on_exit() {
 			log err "failed to restart interface $INTERFACE after modem reset failure"
 	fi
 	cleanup_files
-	exit "$status"
+	exit "$on_exit_status"
 }
 
-trap on_exit 0 HUP INT TERM
+on_signal() {
+	exit 143
+}
+
+trap on_exit 0
+trap on_signal HUP INT TERM
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
@@ -816,11 +794,10 @@ qmi_resolve_control_device() {
 		qmi_control_device_is_safe "$NETWORK_DEVICE"
 		return $?
 	fi
-	case "$NETWORK_DEVPATH" in
-		"$SYSFS_ROOT"/devices/?*) : ;;
-		*) return 1 ;;
-	esac
-	case "$NETWORK_DEVPATH" in *'/../'*|*'/..') return 1 ;; esac
+	resolved_sysfs="$(readlink -f "$SYSFS_ROOT" 2>/dev/null)" || return 1
+	resolved_devpath="$(readlink -f "$NETWORK_DEVPATH" 2>/dev/null)" || return 1
+	case "$resolved_devpath" in "$resolved_sysfs"/devices/*) : ;; *) return 1 ;; esac
+	NETWORK_DEVPATH="$resolved_devpath"
 
 	resolved=""
 	count=0
@@ -893,6 +870,12 @@ read_sim() {
 		qmi) qmi_read_sim ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read SIM identity" ;;
 	esac
+	for value in "$SIM_INDEX" "$MODEM_INDEX" "$ICCID" "$IMSI" "$EID" \
+		"$OPERATOR_ID" "$OPERATOR_NAME" "$GID1" "$GID2" "$MODEM_STATE" \
+		"$REGISTRATION_STATE" "$SERVING_OPERATOR_ID" "$SERVING_OPERATOR_NAME" \
+		"$ACCESS_TECHNOLOGIES" "$SIGNAL_QUALITY" "$CONFIGURED_PLMN"; do
+		state_value_is_safe "$value" || die "unsafe multiline value returned by identity backend"
+	done
 }
 
 cache_file() {
@@ -1095,6 +1078,8 @@ reset_cmd() {
 	baseline_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
 	baseline_backend=""
 	case "$baseline_interface" in ''|*[!A-Za-z0-9_]*) die "invalid interface in baseline" ;; esac
+	[ "$baseline_interface" = "$INTERFACE" ] || \
+		die "baseline belongs to interface $baseline_interface, not selected interface $INTERFACE"
 	case "$baseline_version" in
 		v1|v2) [ "$TARGET_BACKEND" = modemmanager ] || die "legacy baseline is only valid for a ModemManager target" ;;
 	esac
@@ -1695,13 +1680,39 @@ settle_after_ifdown() {
 	# netifd's QMI handler releases client IDs asynchronously. RM520N hardware
 	# needs this bounded quiet period; a two-second delay can race SIM queries
 	# and make qmi.sh power-cycle an otherwise healthy SIM.
-	[ "$TARGET_BACKEND" != qmi ] || sleep 6
+	[ "$TARGET_BACKEND" != qmi ] && return 0
+	sleep 6 &
+	SETTLE_SLEEP_PID=$!
+	settle_status=0
+	wait "$SETTLE_SLEEP_PID" || settle_status=$?
+	SETTLE_SLEEP_PID=""
+	return "$settle_status"
 }
 
 wait_for_interface() {
 	remaining="$WAIT_SECONDS"
 	while [ "$remaining" -gt 0 ]; do
 		interface_is_up && return 0
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 1
+}
+
+qmi_data_interface_is_ready() {
+	command_exists ubus || return 1
+	for data_interface in "$INTERFACE" "${INTERFACE}_4" "${INTERFACE}_6"; do
+		status="$(ubus call "network.interface.${data_interface}" status 2>/dev/null || :)"
+		printf '%s\n' "$status" | grep -q '"up"[[:space:]]*:[[:space:]]*true' || continue
+		printf '%s\n' "$status" | grep -q '"address"[[:space:]]*:[[:space:]]*"' && return 0
+	done
+	return 1
+}
+
+wait_for_qmi_data_interface() {
+	remaining="$WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		qmi_data_interface_is_ready && return 0
 		sleep 1
 		remaining=$((remaining - 1))
 	done
@@ -2153,13 +2164,14 @@ modem_reset_cmd() {
 		# client close before handing the control device back to netifd, then
 		# wait for qmi.sh to own initialization before reconcile queries status.
 		settle_after_ifdown
-		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface; then
+		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_qmi_data_interface; then
 			INTERFACE_RESTORE_ARMED=0
-			log notice "QMI interface $INTERFACE is ready after modem power return"
+			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else
-			log warning "QMI interface $INTERFACE did not become ready before APN reconciliation"
+			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
 			ifdown "$INTERFACE" >/dev/null 2>&1 || :
 			settle_after_ifdown
+			return 3
 		fi
 	fi
 	log notice "modem and SIM are available again; reconciling APN"

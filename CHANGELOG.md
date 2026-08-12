@@ -1,5 +1,28 @@
 # Changelog
 
+## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0 (unreleased)
+
+- Made service shutdown safe during QMI reconciliation: boot and background
+  workers now forward termination to the active engine, the QMI teardown pause
+  is interruptible, and procd allows enough time for the bounded request plus
+  exact profile rollback and interface recovery.
+- Added real `SIGTERM` regression coverage that interrupts a QMI apply during
+  its teardown quiet period and verifies restoration of every owned UCI field
+  plus the final interface `ifup`.
+- Added worker-level signal-forwarding tests and enforce root-only `0600`
+  action, baseline, active-profile and credential-cache state.
+- Rejected carriage returns as well as tabs and newlines in backend/state
+  values, preventing terminal output from being visually forged by modem data.
+- Canonicalized QMI sysfs devpaths before enumeration and reject symlinks that
+  resolve outside the configured sysfs devices tree.
+- Bound legacy v1/v2 baselines to the selected interface before any restore
+  write, matching the existing v3 target check.
+- Consolidated the shared ModemManager/QMI profile capture, mutation and
+  rollback plumbing while retaining backend-owned authentication and IP-family
+  option mappings.
+- Clarified that QMI roaming state is observable but QMI roaming-policy control
+  remains unavailable until a portable netifd mapping is hardware-validated.
+
 ## apn-autoconfig 0.9.1 / apn-autoconfig-providers 2026.07.18 / luci-app-apn-autoconfig 0.6.0 (2026-07-22)
 
 - Added a native QMI backend: identity through `uqmi`/same-device AT fallback,

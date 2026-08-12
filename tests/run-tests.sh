@@ -246,6 +246,11 @@ EOF
 
 cat >"$MOCKBIN/sleep" <<'EOF'
 #!/bin/sh
+[ "${BLOCK_QMI_SETTLE:-0}" != 1 ] || [ "${1:-}" != 6 ] || [ -e "$TEST_STATE/qmi-settle-seen" ] || {
+	: >"$TEST_STATE/qmi-settle-seen"
+	printf '%s\n' "$$" >"$TEST_STATE/qmi-settle-pid"
+	exec /bin/sleep 30
+}
 exit 0
 EOF
 
@@ -405,6 +410,10 @@ assert_contains() {
 	printf '%s\n' "$haystack" | grep -F -q "$needle" || fail "missing: $needle"
 }
 
+file_mode() {
+	stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
+
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and all(t["network:cellqmi"]["capabilities"].values()); assert t["network:cellqmi"]["implementation_state"] == "stable" and t["network:cellqmi"]["validation_state"] == "hardware" and t["network:cellqmi"]["hardware_validated"] is True; assert t["network:cellqmi"]["unavailable_reason"] == ""; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
@@ -520,6 +529,14 @@ mkdir -p "$qmi_devpath/1-2:1.4/usbmisc"
 TEST_QMI_USE_DEVPATH=1 TEST_QMI_DEVPATH="$qmi_devpath" TEST_INTERFACE=cellqmi \
 	sh "$SCRIPT" detect-json >/dev/null
 grep -F -q -- '-d /dev/cdc-wdm7 ' "$STATE/uqmi-calls" || fail 'QMI devpath resolved the wrong control device'
+outside_devpath="$TESTROOT/outside-qmi-devpath"
+mkdir -p "$outside_devpath/usbmisc"
+: >"$outside_devpath/usbmisc/cdc-wdm9"
+ln -s "$outside_devpath" "$TESTROOT/sys/devices/qmi-devpath-escape"
+if TEST_QMI_USE_DEVPATH=1 TEST_QMI_DEVPATH="$TESTROOT/sys/devices/qmi-devpath-escape" \
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1; then
+	fail 'QMI devpath symlink escaping sysfs was accepted'
+fi
 : >"$qmi_devpath/1-2:1.4/usbmisc/cdc-wdm8"
 if TEST_QMI_USE_DEVPATH=1 TEST_QMI_DEVPATH="$qmi_devpath" TEST_INTERFACE=cellqmi \
 	sh "$SCRIPT" detect-json >/dev/null 2>&1; then
@@ -684,6 +701,34 @@ TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
 CURL_SUCCESS_APN=internet.telekom
 export CURL_SUCCESS_APN
 
+printf '%s\n' 'TEST SIGTERM during QMI apply restores the exact profile and interface'
+rm -rf "$PERSIST/targets/network_cellqmi" "$CACHE"
+mkdir -p "$CACHE"
+printf 'v2\tinternet.telekom\tQMI signal fixture\t2026-01-01T00:00:00Z\tfixture-user\tfixture-pass\tpap-or-chap\tipv4v6\n' \
+	>"$CACHE/89490200002186275443.tsv"
+rm -f "$STATE/qmi-settle-seen" "$STATE/qmi-settle-pid" "$STATE/ifup-seen"
+: >"$STATE/events"
+BLOCK_QMI_SETTLE=1 TEST_INTERFACE=cellqmi sh "$SCRIPT" apply >/dev/null 2>&1 &
+signal_engine_pid=$!
+signal_wait=50
+while [ ! -e "$STATE/qmi-settle-seen" ] && [ "$signal_wait" -gt 0 ]; do
+	/bin/sleep 0.1
+	signal_wait=$((signal_wait - 1))
+done
+[ -e "$STATE/qmi-settle-seen" ] || fail 'QMI signal test did not reach the teardown quiet period'
+kill -TERM "$signal_engine_pid"
+if wait "$signal_engine_pid"; then
+	fail 'interrupted QMI apply returned success'
+fi
+kill -TERM "$(cat "$STATE/qmi-settle-pid")" 2>/dev/null || :
+[ "$(cat "$STATE/qmi-apn")" = qmi.old ] || fail 'SIGTERM did not restore QMI APN'
+[ "$(cat "$STATE/qmi-username")" = qmi-user ] || fail 'SIGTERM did not restore QMI username'
+[ "$(cat "$STATE/qmi-password")" = qmi-pass ] || fail 'SIGTERM did not restore QMI password'
+[ "$(cat "$STATE/qmi-auth")" = chap ] || fail 'SIGTERM did not restore QMI auth'
+[ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'SIGTERM did not restore QMI PDP type'
+[ "$(tail -n 1 "$STATE/events")" = 'up cellqmi' ] || fail 'SIGTERM rollback left the QMI interface down'
+TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+
 printf '%s\n' 'TEST connectivity URL rejects non-HTTP schemes'
 if invalid_url_output="$(TEST_CONFIG_URL=file:///etc/passwd sh "$SCRIPT" status 2>&1)"; then
 	fail 'file URL was accepted as a connectivity test endpoint'
@@ -700,6 +745,14 @@ assert_contains "$first_candidate" 'Kaufland Mobil'
 [ "$(printf '%s\n' "$detect_output" | grep -F -c 'internet.telekom')" -eq 2 ] || \
 	fail 'detect collapsed distinct authentication profiles or emitted an unexpected duplicate'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'detect changed APN'
+
+printf '%s\n' 'TEST identity values containing carriage returns fail closed'
+MM_SERVING_OPERATOR_NAME="$(printf 'forged\routput')"
+export MM_SERVING_OPERATOR_NAME
+if sh "$SCRIPT" status >/dev/null 2>&1; then
+	fail 'carriage return in modem identity output was accepted'
+fi
+unset MM_SERVING_OPERATOR_NAME
 
 printf '%s\n' 'TEST detect supports AOSP-style IMSI digit masks'
 SIM_IMSI=214035212345678
@@ -729,6 +782,10 @@ grep -F -q 'internet.telekom' "$CACHE/89490200002186275443.tsv" || fail 'cache A
 grep -F -q 'fixture-user' "$CACHE/89490200002186275443.tsv" || fail 'cache profile missing'
 [ -s "$TARGET_PERSIST/baseline.tsv" ] || fail 'target-scoped pre-apply APN baseline missing'
 [ -s "$TARGET_PERSIST/active.tsv" ] || fail 'target-scoped reconciled SIM state missing'
+[ "$(file_mode "$TARGET_PERSIST")" = 700 ] || fail 'target state directory is not mode 0700'
+[ "$(file_mode "$TARGET_PERSIST/baseline.tsv")" = 600 ] || fail 'baseline is not mode 0600'
+[ "$(file_mode "$TARGET_PERSIST/active.tsv")" = 600 ] || fail 'active state is not mode 0600'
+[ "$(file_mode "$CACHE/89490200002186275443.tsv")" = 600 ] || fail 'credential cache is not mode 0600'
 
 printf '%s\n' 'TEST a matching cached profile refreshes its provider label from the database'
 printf 'v2\tinternet.telekom\tLegacy provider label\t2026-01-01T00:00:00Z\t-\t-\t-\t-\n' \
@@ -988,6 +1045,39 @@ while [ "$action_wait" -gt 0 ]; do
 	action_wait=$((action_wait - 1))
 done
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"] == "success" and d["busy"] is False' "$action_json" || fail 'background action did not reach success'
+[ "$(file_mode "$TEST_ACTION_STATE")" = 700 ] || fail 'action state directory is not mode 0700'
+[ "$(file_mode "$TEST_ACTION_STATE/state.tsv")" = 600 ] || fail 'action state file is not mode 0600'
+
+printf '%s\n' 'TEST action worker forwards SIGTERM and protects its state file'
+cat >"$MOCKBIN/apn-autoconfig-signal-command" <<'EOF'
+#!/bin/sh
+trap ': >"$TEST_STATE/worker-child-terminated"; exit 143' TERM
+: >"$TEST_STATE/worker-child-ready"
+while :; do /bin/sleep 1; done
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-signal-command"
+rm -rf "$TEST_ACTION_STATE"
+mkdir -p "$TEST_ACTION_STATE"
+rm -f "$STATE/worker-child-ready" "$STATE/worker-child-terminated"
+(
+	umask 022
+	export APN_AUTOCONFIG_ACTION_COMMAND="$MOCKBIN/apn-autoconfig-signal-command"
+	exec sh "$BASE/files/usr/libexec/apn-autoconfig-action" reconcile \
+		"$TEST_ACTION_STATE" 2026-08-11T00:00:00Z network:wwan
+) >/dev/null 2>&1 &
+action_worker_pid=$!
+signal_wait=50
+while [ ! -e "$STATE/worker-child-ready" ] && [ "$signal_wait" -gt 0 ]; do
+	/bin/sleep 0.1
+	signal_wait=$((signal_wait - 1))
+done
+[ -e "$STATE/worker-child-ready" ] || fail 'action worker signal child did not start'
+kill -TERM "$action_worker_pid"
+if wait "$action_worker_pid"; then fail 'interrupted action worker returned success'; fi
+[ -e "$STATE/worker-child-terminated" ] || fail 'action worker did not forward SIGTERM to its child'
+[ "$(file_mode "$TEST_ACTION_STATE/state.tsv")" = 600 ] || fail 'action state file is not mode 0600'
+grep -F -q "$(printf 'v2\tfailed\treconcile')" "$TEST_ACTION_STATE/state.tsv" || \
+	fail 'interrupted action worker did not publish terminal state'
 
 printf '%s\n' 'TEST a roaming policy block reaches a terminal blocked action state'
 rm -rf "$TEST_ACTION_STATE"
@@ -1095,6 +1185,23 @@ sh "$BOOT_SCRIPT" >/dev/null 2>&1 || fail 'boot worker treated policy block as a
 [ ! -e "$STATE/boot-calls" ] || fail 'blocked boot reconciliation was retried'
 unset ACTION_EXIT
 
+printf '%s\n' 'TEST boot worker forwards SIGTERM to reconcile'
+grep -F -q 'procd_set_param term_timeout 30' "$BASE/files/etc/init.d/apn-autoconfig" || \
+	fail 'procd termination window no longer covers bounded request and QMI rollback'
+rm -f "$STATE/worker-child-ready" "$STATE/worker-child-terminated"
+TEST_AUTOSTART=1 APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-signal-command" \
+	sh "$BOOT_SCRIPT" >/dev/null 2>&1 &
+boot_worker_pid=$!
+signal_wait=50
+while [ ! -e "$STATE/worker-child-ready" ] && [ "$signal_wait" -gt 0 ]; do
+	/bin/sleep 0.1
+	signal_wait=$((signal_wait - 1))
+done
+[ -e "$STATE/worker-child-ready" ] || fail 'boot worker signal child did not start'
+kill -TERM "$boot_worker_pid"
+if wait "$boot_worker_pid"; then fail 'interrupted boot worker returned success'; fi
+[ -e "$STATE/worker-child-terminated" ] || fail 'boot worker did not forward SIGTERM to reconcile'
+
 printf '%s\n' 'TEST hardware modem reset restores power and reconciles APN'
 printf '%s\n' 'wrong.apn' >"$STATE/apn"
 SIM_ICCID=89490200002186275443
@@ -1167,6 +1274,22 @@ grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
 	fail 'button release did not queue modem-reset through the job API'
 
 printf '%s\n' 'TEST reset-all restores every target baseline before package removal'
+rm -rf "$PERSIST/targets"
+mkdir -p "$PERSIST/targets/network_wwan"
+printf '%s\n' qmi-before-legacy-mismatch >"$STATE/qmi-apn"
+printf 'v1\tcellqmi\t1\twrong-interface\n' >"$PERSIST/targets/network_wwan/baseline.tsv"
+if sh "$SCRIPT" reset --target network:wwan >/dev/null 2>&1; then
+	fail 'legacy baseline for another interface was accepted'
+fi
+[ "$(cat "$STATE/qmi-apn")" = qmi-before-legacy-mismatch ] || \
+	fail 'mismatched legacy baseline changed another interface'
+printf 'v2\tcellqmi\noption\tapn\t1\twrong-interface\n' \
+	>"$PERSIST/targets/network_wwan/baseline.tsv"
+if sh "$SCRIPT" reset --target network:wwan >/dev/null 2>&1; then
+	fail 'v2 baseline for another interface was accepted'
+fi
+[ "$(cat "$STATE/qmi-apn")" = qmi-before-legacy-mismatch ] || \
+	fail 'mismatched v2 baseline changed another interface'
 rm -rf "$PERSIST/targets"
 mkdir -p "$PERSIST/targets/network_wwan"
 printf '%s\n' must-not-change >"$STATE/apn"

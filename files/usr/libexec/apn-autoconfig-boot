@@ -2,6 +2,18 @@
 
 PROG="apn-autoconfig-boot"
 AUTOCONFIG_BIN="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
+CHILD_PID=""
+
+on_signal() {
+	trap - HUP INT TERM
+	if [ -n "$CHILD_PID" ]; then
+		kill -TERM "$CHILD_PID" 2>/dev/null || :
+		wait "$CHILD_PID" 2>/dev/null || :
+	fi
+	exit 143
+}
+
+trap on_signal HUP INT TERM
 
 log() {
 	level="$1"
@@ -63,11 +75,14 @@ log notice "waiting ${delay}s before boot reconciliation"
 attempt=1
 while [ "$attempt" -le "$attempts" ]; do
 	log notice "boot reconciliation attempt $attempt of $attempts"
-	if "$AUTOCONFIG_BIN" reconcile; then
+	"$AUTOCONFIG_BIN" reconcile &
+	CHILD_PID=$!
+	status=0
+	wait "$CHILD_PID" || status=$?
+	CHILD_PID=""
+	if [ "$status" -eq 0 ]; then
 		log notice "boot reconciliation completed successfully"
 		exit 0
-	else
-		status=$?
 	fi
 	if [ "$status" -eq 2 ]; then
 		log notice "boot reconciliation stopped because mobile data roaming is blocked by policy"

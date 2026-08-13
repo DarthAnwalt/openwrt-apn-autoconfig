@@ -580,6 +580,10 @@ netifd_interface_for_record() {
 		case "$section_device" in
 			"$data_device"|"$control_device"|"/dev/$control_name"|"$control_name") matched=1 ;;
 		esac
+		if [ "$matched" -eq 0 ] && [ -n "$section_device" ] && [ -n "$usb_path" ]; then
+			candidate_usb="$(physical_usb_device_path "$section_device" 2>/dev/null || :)"
+			[ "$candidate_usb" = "$usb_path" ] && matched=1
+		fi
 		if [ "$matched" -eq 0 ] && [ -n "$section_devpath" ] && [ -n "$usb_path" ]; then
 			candidate_usb="$(physical_usb_device_path "$section_devpath" 2>/dev/null || :)"
 			[ "$candidate_usb" = "$usb_path" ] && matched=1

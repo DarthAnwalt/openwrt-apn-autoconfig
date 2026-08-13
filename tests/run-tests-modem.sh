@@ -259,7 +259,9 @@ TEST_HOTPLUG_COALESCE_SECONDS=2
 export TEST_HOTPLUG_COALESCE_SECONDS
 ACTION=add APN_AUTOCONFIG_MODEM_BIN="$SCRIPT" sh "$HOTPLUG_SCRIPT"
 ACTION=add APN_AUTOCONFIG_MODEM_BIN="$SCRIPT" sh "$HOTPLUG_SCRIPT"
-/bin/sleep 3
+# Leave enough margin for the two-second debounce plus a full inventory scan on
+# a loaded CI runner. The production debounce value itself is unchanged.
+/bin/sleep 5
 mv "$MOCKBIN/sleep.mock" "$MOCKBIN/sleep"
 TEST_HOTPLUG_COALESCE_SECONDS=0
 export TEST_HOTPLUG_COALESCE_SECONDS
@@ -486,7 +488,7 @@ reset_network_config
 add_qmi_modem 2-1.4 2c7c 0801 '' 0 wwan0
 printf "network.wwan=interface\nnetwork.wwan.proto='modemmanager'\n" >>"$TEST_NETWORK_SECTIONS"
 printf '%s\tproto\t%s\n' wwan modemmanager >>"$TEST_NETWORK_OPTIONS"
-printf '%s\tdevpath\t%s\n' wwan "$TESTROOT/sys/devices/platform/mock-usb/2-1.4" >>"$TEST_NETWORK_OPTIONS"
+printf '%s\tdevice\t%s\n' wwan "$TESTROOT/sys/devices/platform/mock-usb/2-1.4" >>"$TEST_NETWORK_OPTIONS"
 : >"$TEST_UQMI_CALLS"
 out="$(MM_MODEM_INDEX=0 \
 	MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" \
@@ -503,7 +505,7 @@ assert m["control_device"] == "/dev/cdc-wdm0", m
 assert m["data_device"] == "wwan0", m
 assert m["netifd_interface"] == "wwan", m
 assert m["owner_state"] == "modemmanager", m
-' "$out" || fail 'physical USB device-root paths did not merge into one bound modem record'
+' "$out" || fail 'physical USB device-root in netifd device did not merge into one bound modem record'
 [ ! -s "$TEST_UQMI_CALLS" ] || fail 'physical-root ModemManager ownership allowed a direct uqmi identity probe'
 [ "$(MM_MODEM_INDEX=0 MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" \
 	MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" MM_IMEI=490154203237999 \

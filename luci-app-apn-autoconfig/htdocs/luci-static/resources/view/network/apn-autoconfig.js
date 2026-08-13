@@ -9,6 +9,7 @@
 
 var queryCommand = '/usr/libexec/apn-autoconfig-query';
 var controlCommand = '/usr/libexec/apn-autoconfig-control';
+var modemQueryCommand = '/usr/libexec/apn-autoconfig-modem-query';
 
 function call(command, args) {
 	return fs.exec(command, args).then(function(result) {
@@ -184,7 +185,8 @@ return view.extend({
 			call(queryCommand, [ 'status' ]).catch(function(error) { return { error: error.message }; }),
 			call(queryCommand, [ 'action-status' ]).catch(function(error) { return { error: error.message }; }),
 			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; }),
-			call(queryCommand, [ 'targets' ]).catch(function(error) { return { error: error.message }; })
+			call(queryCommand, [ 'targets' ]).catch(function(error) { return { error: error.message }; }),
+			call(modemQueryCommand, [ 'inventory' ]).catch(function(error) { return { error: error.message }; })
 		]);
 	},
 
@@ -533,12 +535,48 @@ return view.extend({
 		]);
 	},
 
+	modemOwnerStateLabel: function(state) {
+		switch (state) {
+		case 'none': return _('No active control session');
+		case 'netifd-direct': return _('Controlled directly by netifd');
+		case 'modemmanager': return _('Controlled by ModemManager');
+		case 'transitioning': return _('Reset in progress');
+		case 'conflicting': return _('Conflicting owners — no operation will start');
+		default: return text(state);
+		}
+	},
+
+	modemInventoryNodes: function(inventory) {
+		if (!inventory || inventory.error)
+			return [ E('p', { 'class': 'apn-modem-unavailable' }, [
+				_('The optional apn-autoconfig-modem package is not installed, so modem inventory is not shown here. It is not required for the APN functions above.')
+			]) ];
+
+		var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
+		if (!modems.length)
+			return [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
+
+		return modems.map(function(modem) {
+			var rows = [
+				row(_('Modem identity'), sensitiveIdentifier(modem.modem_id, _('modem identity'))),
+				row(_('Evidence'), modem.evidence_tier),
+				row(_('Protocol'), modem.protocol),
+				row(_('Control owner'), this.modemOwnerStateLabel(modem.owner_state)),
+				row(_('Bound netifd interface'), modem.netifd_interface || _('none'))
+			];
+			if (modem.ambiguous)
+				rows.push(row(_('Ambiguous'), modem.ambiguity_reason || _('yes')));
+			return E('div', { 'class': 'apn-modem-entry' }, [ table(rows) ]);
+		}, this);
+	},
+
 	render: function(data) {
 		var self = this;
 		var status = data[1];
 		var action = data[2];
 		var database = data[3];
 		var targets = data[4];
+		var modemInventory = data[5];
 		var m = new form.Map('apn-autoconfig', _('Settings'),
 			_('Automatic APN selection through the target-aware cellular engine.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
@@ -550,6 +588,7 @@ return view.extend({
 		self.currentStatus = status;
 		self.targetInventory = targets;
 		self.hardwareIntegration = status && status.hardware_integration || '';
+		self.modemInventory = modemInventory;
 
 		s.tab('general', _('General'));
 		s.tab('advanced', _('Advanced'));
@@ -683,6 +722,7 @@ return view.extend({
 		self.connectionBox = E('div', {}, self.connectionNodes(status));
 		self.apnBox = E('div', {}, self.apnNodes(status));
 		self.databaseBox = E('div', {}, self.databaseNodes(database, status));
+		self.modemBox = E('div', {}, self.modemInventoryNodes(modemInventory));
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
@@ -723,6 +763,11 @@ return view.extend({
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Current APN') ]),
 						self.apnBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card' }, [
+						E('h3', {}, [ _('Modem inventory') ]),
+						E('p', {}, [ _('Read-only, from the optional apn-autoconfig-modem package. Modem control and reset are not yet exposed here.') ]),
+						self.modemBox
 					]),
 					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
 						E('h3', {}, [ _('Provider database') ]),

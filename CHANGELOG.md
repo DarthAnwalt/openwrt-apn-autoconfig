@@ -24,6 +24,11 @@
   the internal modem controlled by the WH3000 GPIO. Signal/error cleanup always
   restores power and the selected interface, and APN/modem operations share the
   documented global-to-per-modem lock order.
+- Reset completion now requires the same stable modem identity to return under
+  its original control owner before netifd is restarted. The compatibility
+  path then waits boundedly for ModemManager's primary SIM and interface before
+  APN reconciliation, preventing a raw USB re-enumeration from being mistaken
+  for an operational modem.
 - Background modem actions now use atomic launch serialization, versioned v2
   state with operation IDs and terminal blocked/retryable results. Live package
   installation enables the service and performs a delayed full scan, while

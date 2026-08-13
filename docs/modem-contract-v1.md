@@ -137,7 +137,8 @@ lock (`acquire_lock` in `apn-autoconfig`) using one mandatory order:
 1. acquire or prove ownership of the global APN operation lock;
 2. acquire the selected per-`modem_id` lock;
 3. revalidate presence, ownership and reset capability after both locks;
-4. perform the guarded power-cycle and re-enumeration wait;
+4. perform the guarded power-cycle and wait for the same stable identity to
+   return under the pre-reset control owner without ambiguity;
 5. release the modem lock, finish targeted APN reconciliation while retaining
    the global lock, then release the global lock.
 
@@ -156,8 +157,11 @@ busy/external detection) so LuCI can reuse the same polling pattern for both.
 released behavior and exit codes. When `apn-autoconfig-modem` is installed,
 the engine resolves the modem bound to its selected target
 (`apn-autoconfig-modem resolve --interface <section>`) and delegates the
-power-cycle-and-reidentify phase to `apn-autoconfig-modem reset --modem <id>`
-before running its own unchanged `reconcile` step under the same global lock.
+power-cycle-and-reidentify phase to `apn-autoconfig-modem reset --modem <id>`.
+The modem package restarts netifd only after the original control owner has
+returned; for a ModemManager target, the APN engine then waits boundedly for a
+readable primary SIM and the selected interface before running `reconcile`
+under the same global lock.
 When `apn-autoconfig-modem` is not installed, the engine's original inline
 power-cycle path runs exactly as released. When it is installed but cannot
 prove one reset-capable binding, the operation fails closed; it never silently

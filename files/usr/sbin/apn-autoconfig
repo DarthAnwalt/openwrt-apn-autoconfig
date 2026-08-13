@@ -2221,7 +2221,17 @@ modem_reset_via_coordinator_cmd() {
 			*) die_code "$coordinator_status" "apn-autoconfig-modem reset failed (exit $coordinator_status)" ;;
 		esac
 	fi
-	if [ "$TARGET_BACKEND" = qmi ]; then
+	if [ "$TARGET_BACKEND" = modemmanager ]; then
+		log notice "control owner returned; waiting up to ${MODEM_WAIT_SECONDS}s for the primary SIM"
+		if ! wait_for_modem; then
+			log warning "primary SIM did not become readable after modem power return"
+			return 3
+		fi
+		if ! wait_for_interface; then
+			log warning "mobile interface $INTERFACE did not become ready after modem power return"
+			return 3
+		fi
+	elif [ "$TARGET_BACKEND" = qmi ]; then
 		if wait_for_interface && wait_for_qmi_data_interface; then
 			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else

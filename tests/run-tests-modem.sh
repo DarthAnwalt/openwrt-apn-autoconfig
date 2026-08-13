@@ -79,6 +79,15 @@ cat >"$MOCKBIN/mmcli" <<'EOF'
 [ "${MM_UNAVAILABLE:-0}" = 1 ] && exit 1
 case "${1:-}" in
 -L)
+	if [ "${MM_DELAY_AFTER_IFDOWN:-0}" = 1 ] && [ -e "$TEST_STATE/ifdown-seen" ]; then
+		count="$(cat "$TEST_STATE/mm-owner-scan-count" 2>/dev/null || printf '%s' 0)"
+		count=$((count + 1))
+		printf '%s\n' "$count" >"$TEST_STATE/mm-owner-scan-count"
+		if [ "$count" -lt 3 ]; then
+			exit 0
+		fi
+		: >"$TEST_STATE/mm-owner-ready"
+	fi
 	[ -z "${MM_MODEM_INDEX:-}" ] || printf '%s\n' "    /org/freedesktop/ModemManager1/Modem/${MM_MODEM_INDEX}"
 	exit 0
 ;;
@@ -110,11 +119,14 @@ EOF
 cat >"$MOCKBIN/ifdown" <<'EOF'
 #!/bin/sh
 printf 'down %s\n' "$1" >>"$TEST_EVENTS"
+[ "${MM_DELAY_AFTER_IFDOWN:-0}" != 1 ] || : >"$TEST_STATE/ifdown-seen"
 EOF
 
 cat >"$MOCKBIN/ifup" <<'EOF'
 #!/bin/sh
 printf 'up %s\n' "$1" >>"$TEST_EVENTS"
+[ "${MM_DELAY_AFTER_IFDOWN:-0}" != 1 ] || [ -e "$TEST_STATE/mm-owner-ready" ] || \
+	: >"$TEST_STATE/up-before-owner"
 EOF
 
 cat >"$MOCKBIN/logger" <<'EOF'
@@ -578,7 +590,22 @@ grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'reset did not restore the bou
 [ ! -d "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] \
 	|| fail 'per-modem lock was not released after reset'
 
+printf '%s\n' 'TEST reset waits for the original ModemManager owner before restoring netifd'
+: >"$TEST_EVENTS"
+rm -f "$STATE/ifdown-seen" "$STATE/mm-owner-scan-count" "$STATE/mm-owner-ready" "$STATE/up-before-owner"
+reset_network_config
+add_network_section wwan modemmanager "$TESTROOT/sys/devices/platform/mock-usb/1-1.2"
+MM_DELAY_AFTER_IFDOWN=1 MM_MODEM_INDEX=0 MM_DEVICE=cdc-wdm0 \
+	MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/1-1.2" MM_IMEI=490154203237999 \
+	sh "$SCRIPT" reset --modem "$TEST_RESET_MODEM_ID" || \
+	fail 'reset did not wait for ModemManager to reclaim the modem'
+[ "$(cat "$STATE/mm-owner-scan-count")" -eq 3 ] || fail 'reset did not poll until ModemManager returned'
+[ ! -e "$STATE/up-before-owner" ] || fail 'reset restored netifd before ModemManager reclaimed the modem'
+grep -F -x -q 'up wwan' "$TEST_EVENTS" || fail 'reset did not restore ModemManager netifd after owner readiness'
+
 printf '%s\n' 'TEST interruption while GPIO is off restores power, interface and lock state'
+reset_network_config
+add_network_section cellqmi qmi /dev/cdc-wdm0
 mv "$MOCKBIN/sleep" "$MOCKBIN/sleep.mock"
 TEST_MODEM_POWER_OFF_SECONDS=5
 export TEST_MODEM_POWER_OFF_SECONDS

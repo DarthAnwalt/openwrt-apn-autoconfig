@@ -1,7 +1,8 @@
 # 0.10.0 modem-control foundation test and release plan
 
-Status: runtime hardening and synthetic gate complete; official SDK, package
-lifecycle and hardware evidence pending.
+Status: runtime hardening and synthetic gate complete; official SDK builds and
+live 0.9.2-to-0.10.0 upgrade complete; the remaining package lifecycle and
+hardware gates are in progress.
 
 ## Implementation status
 
@@ -20,6 +21,8 @@ and `tests/run-tests-modem.sh` are implemented and pass
   optional AT-port suppression on proven QMI; all owner states including the live
   `transitioning` overlay; service-start scanning; hotplug debounce; strong
   board-reset binding; GPIO/interface/lock restoration under real `SIGTERM`;
+  delayed original-owner return before netifd restoration; delayed primary-SIM
+  readiness after coordinator return;
   atomic parallel action launch; v2 operation state; stale worker recovery;
   narrow RPC wrappers; and behavioral compatibility-shim success and failure
   propagation. All released 0.9.2 regressions remain green.
@@ -133,7 +136,8 @@ On the tested Huasifei WH3000 Pro setup, prove both manual and physical paths:
 4. confirm the guarded GPIO returns to its powered-on value after success and
    after interruption;
 5. wait boundedly for the same modem to re-enumerate under changed volatile
-   device/object indices;
+   device/object indices, for its original control owner to reclaim it and for
+   the primary SIM to become readable;
 6. reconcile a changed or unchanged SIM/APN as appropriate;
 7. verify real Internet connectivity and online mwan3 state where installed;
 8. confirm `BTN_0` press is ignored and one enabled release queues exactly one

@@ -847,6 +847,14 @@ find_record() {
 	printf '%s\n' "$line"
 }
 
+find_inventory_record() {
+	wanted="$1"
+	scan_inventory
+	line="$(awk -F '\t' -v id="$wanted" '$1 == id { print; exit }' "$INVENTORY_FILE")"
+	[ -n "$line" ] || return 1
+	printf '%s\n' "$line"
+}
+
 status_json_cmd() {
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "status-json requires --modem"
 	line="$(find_record "$REQUESTED_MODEM")" || {
@@ -944,12 +952,15 @@ write_modem_power() {
 	printf '%s\n' "$1" >"$MODEM_POWER_PATH" 2>/dev/null
 }
 
-wait_for_control_device() {
+wait_for_control_owner() {
 	modem_id="$1"
+	expected_owner="$2"
 	remaining="$MODEM_WAIT_SECONDS"
 	while [ "$remaining" -gt 0 ]; do
 		scan_inventory
-		if awk -F '\t' -v id="$modem_id" '$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' "$INVENTORY_FILE" 2>/dev/null; then
+		if awk -F '\t' -v id="$modem_id" -v owner="$expected_owner" \
+			'$1 == id && $8 == owner && $12 == 0 { found=1; exit } END { exit(found ? 0 : 1) }' \
+			"$INVENTORY_FILE" 2>/dev/null; then
 			return 0
 		fi
 		rm -f "$INVENTORY_FILE"
@@ -965,13 +976,17 @@ reset_cmd() {
 	hardware_integration_name >/dev/null 2>&1 || die_code 4 "reset requires an installed, supported board integration"
 	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
 
-	line="$(find_record "$modem_id")" || die_code 4 "modem $modem_id is not currently present"
+	# Reset decisions use the discovered owner, not the public
+	# action-status overlay that deliberately reports this worker as
+	# "transitioning" while a background reset is active.
+	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id is not currently present"
 	capable_reset="$(printf '%s' "$line" | awk -F '\t' '{ print $14 }')"
 	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is not the strongly identified modem bound to the board reset GPIO"
 	owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
 	case "$owner_state" in
 		conflicting) die_code 4 "modem $modem_id has a conflicting control-owner state; refusing to reset" ;;
 	esac
+	expected_owner_state="$owner_state"
 	netifd_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
 
 	# Every composite operation uses one global order: APN lock, then the
@@ -979,11 +994,13 @@ reset_cmd() {
 	# APN lock only after proving the owner PID above.
 	acquire_apn_lock
 	acquire_modem_lock "$modem_id"
-	line="$(find_record "$modem_id")" || die_code 4 "modem $modem_id disappeared before reset could start"
+	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id disappeared before reset could start"
 	capable_reset="$(field "$line" 14)"
-	owner_state="$(field "$line" 8)"
+	current_owner_state="$(field "$line" 8)"
 	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is no longer safely reset-capable"
-	[ "$owner_state" != conflicting ] || die_code 4 "modem $modem_id acquired a conflicting owner before reset"
+	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $modem_id acquired a conflicting owner before reset"
+	[ "$current_owner_state" = "$expected_owner_state" ] || \
+		die_code 4 "modem $modem_id changed control owner before reset"
 	netifd_interface="$(field "$line" 9)"
 
 	restore_armed=0
@@ -1004,9 +1021,9 @@ reset_cmd() {
 	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
 	MODEM_POWER_OFF_ARMED=0
 
-	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for re-enumeration"
-	if ! wait_for_control_device "$modem_id"; then
-		die_code 3 "modem $modem_id did not re-enumerate within ${MODEM_WAIT_SECONDS}s"
+	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
+	if ! wait_for_control_owner "$modem_id" "$expected_owner_state"; then
+		die_code 3 "modem $modem_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
 	fi
 
 	if [ "$restore_armed" -eq 1 ]; then
@@ -1014,7 +1031,7 @@ reset_cmd() {
 		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
 	release_modem_lock
-	log notice "modem $modem_id reset completed; control device is available again"
+	log notice "modem $modem_id reset completed; stable identity and control owner are available again"
 }
 
 action_state_dir_for() {

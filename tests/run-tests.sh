@@ -157,6 +157,15 @@ case "${1:-}" in
 	exit 0
 	;;
 -m)
+	if [ "${MM_DELAY_AFTER_COORDINATOR:-0}" = 1 ] && [ -e "$TEST_STATE/coordinator-reset-complete" ]; then
+		count="$(cat "$TEST_STATE/coordinator-mm-count" 2>/dev/null || printf '%s' 0)"
+		count=$((count + 1))
+		printf '%s\n' "$count" >"$TEST_STATE/coordinator-mm-count"
+		if [ "$count" -lt 3 ]; then
+			exit 1
+		fi
+		: >"$TEST_STATE/coordinator-sim-ready"
+	fi
 	registration_state="${MM_REGISTRATION_STATE:-home}"
 	if [ -n "${MM_REGISTRATION_AFTER_IFUP:-}" ] && [ -e "$TEST_STATE/ifup-seen" ]; then
 		registration_state="$MM_REGISTRATION_AFTER_IFUP"
@@ -1271,7 +1280,11 @@ printf '%s\n' "$*" >>"$TEST_STATE/coordinator-calls"
 case "${1:-}" in
 	resolve) printf '%s\n' 'imei:490154203237518' ;;
 	status-json) printf '%s\n' '{"version":"v1","capabilities":{"reset":true}}' ;;
-	reset) exit "${TEST_COORDINATOR_RESET_EXIT:-0}" ;;
+	reset)
+		status="${TEST_COORDINATOR_RESET_EXIT:-0}"
+		[ "$status" -ne 0 ] || : >"$TEST_STATE/coordinator-reset-complete"
+		exit "$status"
+	;;
 	*) exit 2 ;;
 esac
 EOF
@@ -1283,8 +1296,11 @@ else
 	[ "$?" -eq 7 ] || fail 'coordinator reset failure did not preserve exit code 7'
 fi
 printf '%s\n' 'wrong.apn' >"$STATE/apn"
-TEST_COORDINATOR_RESET_EXIT=0 sh "$SCRIPT" modem-reset >/dev/null 2>&1 || \
+rm -f "$STATE/coordinator-reset-complete" "$STATE/coordinator-mm-count" "$STATE/coordinator-sim-ready"
+MM_DELAY_AFTER_COORDINATOR=1 TEST_COORDINATOR_RESET_EXIT=0 sh "$SCRIPT" modem-reset >/dev/null 2>&1 || \
 	fail 'successful coordinator reset did not continue to APN reconcile'
+[ "$(cat "$STATE/coordinator-mm-count")" -ge 3 ] || fail 'core did not poll until the primary SIM became readable'
+[ -e "$STATE/coordinator-sim-ready" ] || fail 'core reconciled before the primary SIM became readable'
 [ "$(cat "$STATE/apn")" = internet.telekom ] || fail 'successful coordinator reset did not reconcile APN'
 grep -F -x -q 'resolve --interface wwan' "$STATE/coordinator-calls" || fail 'compatibility shim did not resolve the selected interface'
 grep -F -x -q 'reset --modem imei:490154203237518' "$STATE/coordinator-calls" || fail 'compatibility shim did not invoke coordinator reset'

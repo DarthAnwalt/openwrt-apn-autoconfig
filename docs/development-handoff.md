@@ -6,20 +6,26 @@ assistant. Read it together with [`backend-contract-v1.md`](backend-contract-v1.
 changing runtime behavior. The README is the user-facing reference; the
 changelog records shipped differences rather than future intentions.
 
-## Project boundary
+## Current core boundary and project direction
 
-APN Auto-Config identifies the SIM and registration context, ranks normalized
-APN profiles, applies only the profile fields owned by the selected connection
-backend, verifies Internet connectivity, and rolls back on failure. It is not a
-general modem manager. Radio mode, bands, PIN entry, SIM power, eSIM lifecycle,
-SMS, USSD, firmware and normal bearer ownership remain with netifd and the
-installed modem-management packages.
+The released `apn-autoconfig` core identifies the SIM and registration context,
+ranks normalized APN profiles, applies only the profile fields owned by the
+selected connection backend, verifies Internet connectivity, and rolls back on
+failure. That package remains a narrow APN engine rather than becoming a
+general modem manager.
 
 The engine supports an already configured cellular target. It does not create
 the user's `network` section, install every possible protocol stack, or guess
 between multiple equally capable targets. Runtime discovery and implementation
 evidence are separate: recognizing `mbim` or `fibocom` must never imply that a
 writable adapter exists.
+
+The broader first-party project is planned to grow toward 1.0 with sibling
+packages for modem inventory/provisioning, connection control, selected netifd
+protocol support and eSIM lifecycle. These packages must consume one another's
+narrow machine APIs instead of duplicating APN matching, writing each other's
+UCI fields or bypassing netifd bearer ownership. The public sequence is in
+`roadmap.md`; unimplemented milestones are not current capabilities.
 
 ## Package and file map
 
@@ -61,7 +67,9 @@ writable adapter exists.
    Root-owned baseline/cache state uses process-wide `umask 077`; LuCI masks
    ICCID, IMSI and EID until an explicit reveal action.
 7. Preserve the operation lock across CLI, LuCI, boot and physical-button
-   entry points. Long LuCI actions use the bounded background action API.
+   entry points. Future modem-provisioning and eSIM-switch triggers must join a
+   documented serialization model without bypassing or deadlocking this lock.
+   Long LuCI actions use bounded background action APIs.
 8. Capability, implementation and validation evidence are independent. Never
    mark a backend `stable`/`hardware` from fixture or parser tests alone.
 9. Roaming policy is backend-specific. ModemManager may edit its canonical
@@ -134,13 +142,15 @@ the source tree or build artifacts.
 
 ## Current development direction
 
-The 0.9.2 stabilization line hardens termination rollback, state/path
-validation and the shared ModemManager/QMI profile plumbing without adding a
-backend. The next adapters are separate tasks: MBIM in 0.9.3, broader
-AT-managed backends in 0.9.4, and then the multi-backend 1.0 objective,
-including a practical control path for Fibocom FM350-GL. Exact sequencing can
-change after hardware findings; the safety invariants above cannot.
+Version 0.9.2 is released. The next implementation task is the bounded native
+MBIM APN adapter in 0.9.3; automatic modem provisioning, the connection-control
+UI and eSIM lifecycle are explicitly later milestones. The core keeps its
+current APN boundary while the repository grows into a signed first-party
+package suite. Exact sequencing can change after hardware findings; the safety
+invariants above cannot.
 
-Before starting the next release, update this document's final paragraph,
-`roadmap.md`, the support matrix in the README, and the latest test evidence so
-another tool receives one consistent project state.
+At the start of 0.9.3, branch from current `main`, confirm that the README
+support matrix still describes shipped behavior, and create a version-specific
+MBIM test plan before the first hardware mutation. Preserve the completed
+0.9.2 evidence as a historical release record rather than rewriting it for the
+new release.

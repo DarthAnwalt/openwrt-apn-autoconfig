@@ -1,110 +1,90 @@
 # Architecture roadmap
 
-This roadmap records the current direction rather than a promise that every
-minor release will contain exactly the listed work. Hardware findings and
-adapter constraints may change the sequence. The safety invariants remain
-binding: never mutate an ambiguous target, never claim a capability that is
-not implemented, verify connectivity before keeping a profile, and restore the
-previous profile after failure.
+This roadmap records public release milestones. It describes intended outcomes,
+not implementation proposals or evaluations of other projects. Hardware findings
+may change the sequence, but the safety invariants remain binding: never mutate
+an ambiguous target, never claim an unavailable capability, verify connectivity
+before keeping a profile, and restore the previous profile after failure.
 
-All protocol adapters ship inside one `apn-autoconfig` engine package so a
-travel-router user can replace a USB modem without first choosing another
-AutoAPN package. The adapters remain separate internal modules and activate
-from the selected netifd target plus available runtime commands. Modem-specific
-managers, protocol tools and kernel drivers are supplied by the user's OpenWrt
-modem configuration; the small `sms-tool` transport is a common core dependency
-because the read-only AT fallback is shared across protocol families. LuCI and
-board-specific physical controls remain separate optional packages.
+The `apn-autoconfig` package keeps its narrow responsibility: identify the SIM
+and registration context for a configured cellular target, select and apply an
+APN profile, verify connectivity, and roll back safely. The project will grow
+toward 1.0 through additional first-party packages for modem provisioning,
+connection control and eSIM lifecycle rather than folding those responsibilities
+into the APN engine. All project packages must be built from source where
+applicable and distributed through the signed repository; the LuCI frontend
+remains an optional consumer of versioned machine APIs.
 
 ## 0.9.0 — adapter foundation
 
-0.9.0 separates the APN selection engine from modem discovery, SIM identity
-collection and netifd profile application. It must preserve the complete
-working ModemManager behavior of 0.8.x while publishing a versioned,
-target-aware API that other applications can consume without the LuCI package.
-
-Scope:
-
-- discover configured cellular network sections and expose each as a stable
-  target with its netifd protocol and declared capabilities;
-- recognize `modemmanager`, `qmi`, `mbim`, `fibocom`, `atc`, `xmm`, `ncm`,
-  `wwan` and `3g` targets, without treating recognition as write support;
-- provide a complete ModemManager identity and profile adapter;
-- report non-ModemManager targets as read-only inventory entries with
-  `identity=false` and `profile_apply=false` until their adapters exist;
-- reject unsupported and ambiguous mutating operations before changing UCI,
-  restarting an interface or touching persistent state;
-- resolve the effective layer-3 device from netifd/ubus instead of requiring a
-  fixed `wwan0` name for connectivity tests;
-- version the JSON target and operation contracts and retain the existing
-  narrow read-only and mutating rpcd entry points;
-- namespace persistent active/baseline state by target while retaining the
-  ICCID profile cache as SIM-owned state;
-- migrate the 0.8.x single-target state without losing the exact rollback
-  baseline;
-- keep the LuCI package optional and make it a consumer of the same public core
-  API available to external applications;
-- cover discovery, capabilities, ambiguity, migration, rollback, input
-  validation and adapter isolation with synthetic and security tests;
-- validate installation, reconciliation, connectivity verification, rollback,
-  reboot behavior and removal recovery on the reference router before release.
-
-Out of scope:
-
-- QMI, MBIM, AT, Fibocom or other non-ModemManager profile mutation;
-- eSIM profile management, `lpac`, SMS, USSD, band control or modem UI work;
-- a dependency on `luci-app-5gmodem` or any other external modem UI;
-- automatic selection between multiple equally eligible cellular targets.
-
-The distinction between recognition and support is part of the public API. A
-recognized target must declare its capabilities explicitly. An unsupported
-backend is a normal inventory result, not a partially functional fallback.
+Released. Introduced stable target discovery, explicit capabilities, the
+versioned GUI-independent API, per-target state, fail-closed mutation and the
+complete ModemManager backend.
 
 ## 0.9.1 — native QMI adapter
 
-Released as stable 0.9.1. It adds a native `uqmi` identity adapter
-with a same-device `sms-tool` fallback, a
-backend contract, runtime/evidence states and synthetic home, roaming,
-malformed-output and injection coverage.
-It also removes the core package's hard dependency on a particular modem
-manager. QMI profile capture/write/apply, exact rollback and a bounded
-dual-stack-to-IPv4 fallback are implemented through the configured netifd
-target. The packaged live apply/failure, reboot, cold LuCI, button, removal,
-reinstall and ModemManager regression gates passed on the reference
-Huasifei WH3000 Pro + RM520N-GL. This is hardware evidence for that tested
-combination, not a claim that every QMI modem behaves identically.
+Released. Added native QMI identity and profile handling for configured netifd
+targets, exact rollback, dual-stack fallback and hardware evidence for the
+Huasifei WH3000 Pro with Quectel RM520N-GL.
 
 ## 0.9.2 — rollback and backend hardening
 
-Stabilization release before adding another backend. It makes boot/action
-termination reach the active engine, leaves a bounded procd window for QMI
-rollback, validates signal recovery and root-only state modes, canonicalizes
-QMI devpaths, binds legacy baselines to their selected target and consolidates
-the shared ModemManager/QMI profile plumbing. It adds no new hardware-support
-claim; the release gate is recorded in `testing-0.9.2.md`.
+Released. Hardened signal handling, QMI rollback, root-only state validation,
+canonical device paths, baseline ownership, shared profile plumbing and QMI
+data-interface readiness after a physical modem reset.
 
-## 0.9.3 — native MBIM adapter
+## 0.9.3 — native MBIM APN adapter
 
-Planned for a separate task. Add MBIM SIM identity collection, profile mapping
-and correct handling of dynamically created IPv4/IPv6 child interfaces.
+Planned next. Add MBIM SIM and registration identity, backend-owned profile
+capture/write/restore, and correct readiness handling for dynamically created
+IPv4/IPv6 data interfaces. The release requires the normal fixture, official
+SDK, package lifecycle and real-hardware evidence gates. Automatic modem
+provisioning and eSIM management remain out of scope for this release.
 
-## 0.9.4 — extend generic AT identity
+## 0.9.4 — generic AT identity and manual profile input
 
-Planned for a separate task. Extend the fixed read-only AT identity transport
-introduced for QMI to AT-managed backends and normalized registration identity
-without coupling the APN matcher to vendor commands.
+Extend bounded, read-only AT identity collection to selected configured
+AT-managed targets, including stable port resolution and normalized ICCID,
+IMSI, home/serving PLMN and registration state. Add a supported manual APN
+profile path that uses the same write, connectivity-verification and rollback
+discipline as database-selected profiles.
 
-## 1.0 — stable multi-backend engine
+## 0.10.0 — modem inventory and automatic provisioning
 
-The 1.0 objective is a hardware-independent APN engine usable with configured
-ModemManager, QMI, MBIM and selected AT-managed usbnet modems. Fibocom FM350-GL
-support is a target for this milestone, either through a separately installed
-compatible netifd handler or an optional independently implemented handler.
-RNDIS/ECM alone is not an APN control protocol, so support is defined by the
-control adapter used with the usbnet data device rather than by the network
-driver name.
+Add a first-party modem inventory and provisioning service. It will identify
+an unconfigured attached modem by stable hardware identity, classify an
+implemented control path, create or update only its owned netifd section, and
+hand APN selection to `apn-autoconfig` before enabling automatic connection.
+Stock QMI/MBIM netifd protocols remain preferred where available; selected
+AT-managed devices may use separately packaged protocol support.
 
-The core remains independent of every GUI. `luci-app-apn-autoconfig` is the
-project's optional frontend; applications such as `luci-app-5gmodem` may use
-the versioned query/control API without either project owning the other's
-modem-management responsibilities.
+## 0.11.0 — connection control and LuCI connection tab
+
+Publish a narrow connection-control API and add a dedicated LuCI tab for modem
+and bearer status, signal quality, connect/disconnect/reconnect and supported
+reset operations. Existing signal and modem-reset presentation moves out of
+the APN tab. Board-specific physical controls remain optional and capability
+gated.
+
+## 0.12.0 — eSIM lifecycle and live APN reconciliation
+
+Add source-built eSIM support around `lpac`, distributed through the signed
+project repository. Provide bounded profile inventory and lifecycle actions,
+plus a serialized workflow that re-reads the active SIM and invokes targeted
+APN reconciliation after a successful profile switch so data connectivity can
+return without a router reboot. Add a dedicated LuCI eSIM tab.
+
+## 1.0 — stable standalone mobile-connectivity suite
+
+Stabilize the package boundaries and machine APIs for the APN engine, provider
+database, modem provisioning/control, eSIM lifecycle and the unified optional
+LuCI frontend. The frontend presents separate APN, connection and eSIM tabs;
+provider-database updates remain on the APN tab. The 1.0 compatibility target
+includes configured ModemManager, QMI and MBIM paths, selected AT-managed
+devices, and a practical Fibocom FM350-GL control path, each advertised only at
+its demonstrated implementation and hardware-validation level.
+
+The 1.0 gate includes upgrade and removal safety, multi-entry-point locking,
+SIM/eSIM transition recovery, modem hotplug and re-enumeration, coexistence of
+multiple control stacks, signed installation without untrusted packages, and
+documented hardware evidence for every stable support claim.

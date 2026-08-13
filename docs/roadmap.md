@@ -49,7 +49,7 @@ IMSI, home/serving PLMN and registration state. Add a supported manual APN
 profile path that uses the same write, connectivity-verification and rollback
 discipline as database-selected profiles.
 
-## 0.10.0 — modem inventory and automatic provisioning
+## 0.9.5 — modem inventory and automatic provisioning
 
 Add a first-party modem inventory and provisioning service. It will identify
 an unconfigured attached modem by stable hardware identity, classify an
@@ -58,7 +58,7 @@ hand APN selection to `apn-autoconfig` before enabling automatic connection.
 Stock QMI/MBIM netifd protocols remain preferred where available; selected
 AT-managed devices may use separately packaged protocol support.
 
-## 0.11.0 — connection control and LuCI connection tab
+## 0.9.6 — connection control and LuCI connection tab
 
 Publish a narrow connection-control API and add a dedicated LuCI tab for modem
 and bearer status, signal quality, connect/disconnect/reconnect and supported
@@ -66,7 +66,7 @@ reset operations. Existing signal and modem-reset presentation moves out of
 the APN tab. Board-specific physical controls remain optional and capability
 gated.
 
-## 0.12.0 — eSIM lifecycle and live APN reconciliation
+## 0.9.7 — eSIM lifecycle and live APN reconciliation
 
 Add source-built eSIM support around `lpac`, distributed through the signed
 project repository. Provide bounded profile inventory and lifecycle actions,

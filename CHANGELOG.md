@@ -29,6 +29,10 @@
   path then waits boundedly for ModemManager's primary SIM and interface before
   APN reconciliation, preventing a raw USB re-enumeration from being mistaken
   for an operational modem.
+- All core ModemManager reads now have an eight-second per-call bound with a
+  portable watchdog fallback when `timeout` is unavailable. Signal cleanup
+  also terminates both the bounded child and its watchdog, so the documented
+  reset readiness window cannot silently turn into an unbounded D-Bus wait.
 - Background modem actions now use atomic launch serialization, versioned v2
   state with operation IDs and terminal blocked/retryable results. Live package
   installation enables the service and performs a delayed full scan, while

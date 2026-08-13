@@ -151,6 +151,10 @@ EOF
 cat >"$MOCKBIN/mmcli" <<'EOF'
 #!/bin/sh
 [ "${MMCLI_UNAVAILABLE:-0}" = "1" ] && exit 1
+[ "${MMCLI_HANG:-0}" != 1 ] || {
+	printf '%s\n' "$$" >"$TEST_STATE/mmcli-hang-pid"
+	exec /bin/sleep 30
+}
 case "${1:-}" in
 -L)
 	printf '%s\n' "    /org/freedesktop/ModemManager1/Modem/${MM_MODEM_INDEX:-7} [Quectel] RM520N-GL"
@@ -1014,6 +1018,24 @@ printf '%s\n' 'TEST temporary ModemManager or SIM unavailability remains retryab
 if MMCLI_UNAVAILABLE=1 sh "$SCRIPT" reconcile >/dev/null 2>&1; then fail 'unavailable modem unexpectedly reconciled'; else unavailable_status=$?; fi
 [ "$unavailable_status" -eq 3 ] || fail 'temporary modem unavailability was not classified as retryable'
 
+printf '%s\n' 'TEST ModemManager calls remain bounded without an external timeout command'
+rm -f "$STATE/mmcli-hang-pid"
+bounded_started="$(date +%s)"
+if MMCLI_UNAVAILABLE=0 MMCLI_HANG=1 TEST_INTERFACE=wwan \
+	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
+	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=1 sh "$SCRIPT" status >/dev/null 2>&1; then
+	fail 'a hanging mmcli call unexpectedly produced status output'
+else
+	[ "$?" -eq 3 ] || fail 'a hanging mmcli call did not remain retryable'
+fi
+bounded_elapsed=$(($(date +%s) - bounded_started))
+[ "$bounded_elapsed" -le 5 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
+mmcli_hang_pid="$(cat "$STATE/mmcli-hang-pid" 2>/dev/null || :)"
+[ -n "$mmcli_hang_pid" ] || fail 'hanging mmcli fixture did not start'
+if kill -0 "$mmcli_hang_pid" 2>/dev/null; then
+	fail 'fallback mmcli timeout left its child process running'
+fi
+
 MM_REGISTRATION_STATE=home
 SIM_OPERATOR_ID=26201
 SIM_OPERATOR_NAME='Kaufland Mobil'
@@ -1164,6 +1186,7 @@ if sh "$SCRIPT" reconcile >/dev/null 2>&1; then
 else
 	lock_status=$?
 fi
+
 [ "$lock_status" -eq 3 ] || fail 'live operation lock contention was not classified as retryable'
 rm -rf "$TEST_LOCK"
 

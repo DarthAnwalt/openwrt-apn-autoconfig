@@ -47,6 +47,7 @@ MODEM_POWER_OFF_ARMED=0
 RESET_INTERFACE=""
 RESET_INTERFACE_RESTORE_ARMED=0
 BOUNDED_CHILD_PID=""
+BOUNDED_WATCHDOG_PID=""
 
 log() {
 	level="$1"
@@ -74,6 +75,11 @@ command_exists() {
 }
 
 cleanup_files() {
+	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
+		kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		BOUNDED_WATCHDOG_PID=""
+	fi
 	if [ -n "$BOUNDED_CHILD_PID" ]; then
 		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
 		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
@@ -453,12 +459,13 @@ run_bounded_to_file() {
 		sleep 1
 		kill -9 "$BOUNDED_CHILD_PID" 2>/dev/null || :
 	) >/dev/null 2>&1 &
-	watchdog_pid=$!
+	BOUNDED_WATCHDOG_PID=$!
 	bounded_status=0
 	wait "$BOUNDED_CHILD_PID" || bounded_status=$?
 	BOUNDED_CHILD_PID=""
-	kill "$watchdog_pid" 2>/dev/null || :
-	wait "$watchdog_pid" 2>/dev/null || :
+	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	BOUNDED_WATCHDOG_PID=""
 	return "$bounded_status"
 }
 

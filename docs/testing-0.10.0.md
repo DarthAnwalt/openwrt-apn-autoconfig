@@ -2,7 +2,8 @@
 
 Status: runtime hardening and synthetic gate complete; official SDK builds and
 live 0.9.2-to-0.10.0 upgrade complete; the remaining package lifecycle and
-hardware gates are in progress.
+hardware gates are in progress. The manual reset-plus-reconcile and interrupted
+power-cycle recovery paths passed on WH3000; see `router-test-0.10.0.md`.
 
 ## Implementation status
 
@@ -22,7 +23,8 @@ and `tests/run-tests-modem.sh` are implemented and pass
   `transitioning` overlay; service-start scanning; hotplug debounce; strong
   board-reset binding; GPIO/interface/lock restoration under real `SIGTERM`;
   delayed original-owner return before netifd restoration; delayed primary-SIM
-  readiness after coordinator return;
+  readiness after coordinator return; bounded ModemManager calls with and
+  without an external `timeout`, including orphan-free watchdog cleanup;
   atomic parallel action launch; v2 operation state; stale worker recovery;
   narrow RPC wrappers; and behavioral compatibility-shim success and failure
   propagation. All released 0.9.2 regressions remain green.

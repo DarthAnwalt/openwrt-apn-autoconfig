@@ -12,6 +12,13 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-qmi"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/sbin/apn-autoconfig-modem"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-boot"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-action"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-query"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-control"
+sh -n "$ROOT/apn-autoconfig-modem/files/etc/init.d/apn-autoconfig-modem"
+sh -n "$ROOT/apn-autoconfig-modem/files/etc/hotplug.d/usb/50-apn-autoconfig-modem"
 sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
@@ -111,6 +118,17 @@ case "$core_depends" in
 esac
 if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
 	printf '%s\n' 'The core package still owns the provider database.' >&2
+	exit 1
+fi
+modem_depends="$(sed -n 's/^[[:space:]]*DEPENDS:=//p' "$ROOT/apn-autoconfig-modem/Makefile" | sed -n '1p')"
+case "$modem_depends" in
+	*modemmanager*|*uqmi*|*umbim*|*kmod-button-hotplug*)
+		printf '%s\n' 'apn-autoconfig-modem has a backend- or board-specific hard dependency.' >&2
+		exit 1
+	;;
+esac
+if grep -F -q 'DEPENDS:=+apn-autoconfig-modem' "$ROOT/Makefile"; then
+	printf '%s\n' 'apn-autoconfig must not hard-depend on apn-autoconfig-modem in 0.10.0; coupling is soft this release.' >&2
 	exit 1
 fi
 if command -v node >/dev/null 2>&1; then

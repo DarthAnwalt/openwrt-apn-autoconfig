@@ -1,0 +1,17 @@
+#!/bin/sh
+
+# Narrow mutating entry point for rpcd/LuCI ACLs.
+
+COMMAND="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
+MODEM_ID="${2:-}"
+[ "$#" -le 2 ] || exit 2
+
+case "$MODEM_ID" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+
+case "${1:-}" in
+	reset)
+		[ -n "$MODEM_ID" ] || exit 2
+		exec "$COMMAND" action-start reset --modem "$MODEM_ID"
+	;;
+	*) exit 2 ;;
+esac

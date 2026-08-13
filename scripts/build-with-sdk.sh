@@ -45,6 +45,8 @@ cp "$ROOT/data/licenses/Apache-2.0.txt" "$ROOT/data/licenses/MBPI-CC-PDDC.txt" \
 	"$SDK_DIR/package/apn-autoconfig-providers/licenses/"
 rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
 cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
+rm -rf "$SDK_DIR/package/apn-autoconfig-modem"
+cp -R "$ROOT/apn-autoconfig-modem" "$SDK_DIR/package/apn-autoconfig-modem"
 
 (
 	cd "$SDK_DIR"
@@ -52,6 +54,7 @@ cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-integration-huasifei-wh3000=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-providers=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
+	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-modem=m' >>.config
 	make defconfig
 	make package/apn-autoconfig-providers/clean
 	make package/apn-autoconfig-providers/compile V=s
@@ -59,21 +62,26 @@ cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 	make package/apn-autoconfig/compile V=s
 	make package/luci-app-apn-autoconfig/clean
 	make package/luci-app-apn-autoconfig/compile V=s
+	make package/apn-autoconfig-modem/clean
+	make package/apn-autoconfig-modem/compile V=s
 )
 
 rm -f "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
 	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
-	"$OUTPUT"/luci-app-apn-autoconfig-*.apk
+	"$OUTPUT"/luci-app-apn-autoconfig-*.apk \
+	"$OUTPUT"/apn-autoconfig-modem-*.apk
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-[0-9]*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-integration-huasifei-wh3000-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-providers-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
+find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-modem-*.apk' -exec cp {} "$OUTPUT/" \;
 set -- "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
 	"$OUTPUT"/luci-app-apn-autoconfig-*.apk \
-	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk
-[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] && [ -f "$4" ] || {
+	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk \
+	"$OUTPUT"/apn-autoconfig-modem-*.apk
+[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] && [ -f "$4" ] && [ -f "$5" ] || {
 	printf '%s\n' 'One or more APKs were not produced' >&2
 	exit 1
 }
@@ -190,10 +198,47 @@ inspect_package "$4" apn-autoconfig-integration-huasifei-wh3000 4 \
 	exit 1
 }
 
+inspect_package "$5" apn-autoconfig-modem 12 \
+	usr/sbin/apn-autoconfig-modem \
+	usr/libexec/apn-autoconfig-modem-boot \
+	usr/libexec/apn-autoconfig-modem-action \
+	usr/libexec/apn-autoconfig-modem-query \
+	usr/libexec/apn-autoconfig-modem-control \
+	etc/config/apn-autoconfig-modem \
+	etc/init.d/apn-autoconfig-modem \
+	etc/hotplug.d/usb/50-apn-autoconfig-modem \
+	usr/share/licenses/apn-autoconfig-modem/LICENSE \
+	lib/apk/packages/apn-autoconfig-modem.list \
+	lib/apk/packages/apn-autoconfig-modem.conffiles \
+	lib/apk/packages/apn-autoconfig-modem.conffiles_static
+
+for forbidden_dependency in modemmanager uqmi umbim kmod-button-hotplug; do
+	if grep -F -q '"'"$forbidden_dependency"'"' "$BUILD_ROOT/apn-autoconfig-modem-adbdump.json"; then
+		printf 'apn-autoconfig-modem unexpectedly depends on %s.\n' "$forbidden_dependency" >&2
+		exit 1
+	fi
+done
+
+for executable in \
+	usr/sbin/apn-autoconfig-modem \
+	usr/libexec/apn-autoconfig-modem-boot \
+	usr/libexec/apn-autoconfig-modem-action \
+	usr/libexec/apn-autoconfig-modem-query \
+	usr/libexec/apn-autoconfig-modem-control \
+	etc/init.d/apn-autoconfig-modem \
+	etc/hotplug.d/usb/50-apn-autoconfig-modem
+do
+	[ -x "$BUILD_ROOT/inspect-apn-autoconfig-modem/$executable" ] || {
+		printf 'Package file is not executable: /%s\n' "$executable" >&2
+		exit 1
+	}
+done
+
 (cd "$OUTPUT" && sha256sum \
 	apn-autoconfig-[0-9]*.apk \
 	apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	apn-autoconfig-providers-*.apk \
-	luci-app-apn-autoconfig-*.apk >SHA256SUMS)
+	luci-app-apn-autoconfig-*.apk \
+	apn-autoconfig-modem-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print

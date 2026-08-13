@@ -240,7 +240,12 @@ qmi_probe_imei() {
 	fi
 	imei="$(printf '%s\n' "$output" | tr -d '"[:space:]')"
 	case "$imei" in
-		[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+		# IMEI is 14 digits without its check digit, 15 with it (the common
+		# case), or 16 for an IMEISV.
+		''|*[!0-9]*) return 1 ;;
+	esac
+	case ${#imei} in
+		14|15|16)
 			printf '%s\n' "$imei"
 			return 0
 		;;
@@ -693,7 +698,7 @@ wait_for_control_device() {
 	remaining="$MODEM_WAIT_SECONDS"
 	while [ "$remaining" -gt 0 ]; do
 		scan_inventory
-		if awk -F '\t' -v id="$modem_id" '$1 == id { exit 0 } END { exit 1 }' "$INVENTORY_FILE" 2>/dev/null; then
+		if awk -F '\t' -v id="$modem_id" '$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' "$INVENTORY_FILE" 2>/dev/null; then
 			return 0
 		fi
 		rm -f "$INVENTORY_FILE"
@@ -881,6 +886,11 @@ main() {
 		esac
 	done
 	load_config
+	# Normalize once so every sysfs prefix comparison below (usb_device_path,
+	# resolve_class_device_usb_path) compares against the same canonical form
+	# a resolved /dev symlink chain will already be in, matching the same
+	# normalization apn-autoconfig-qmi applies before its own prefix checks.
+	SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
 	case "$COMMAND_NAME" in
 		inventory-json) inventory_json_cmd ;;
 		status-json) status_json_cmd ;;

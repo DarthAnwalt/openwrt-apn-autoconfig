@@ -464,6 +464,36 @@ assert m["modem_id"] == "imei:490154203237999", m
 ' "$out" || fail 'ModemManager-only ownership was not detected correctly'
 [ ! -s "$TEST_UQMI_CALLS" ] || fail 'inventory issued a direct uqmi transaction against a ModemManager-owned modem'
 
+printf '%s\n' 'TEST physical-root ModemManager and netifd paths correlate like the WH3000 runtime'
+reset_sysfs
+reset_network_config
+add_qmi_modem 2-1.4 2c7c 0801 '' 0 wwan0
+printf "network.wwan=interface\nnetwork.wwan.proto='modemmanager'\n" >>"$TEST_NETWORK_SECTIONS"
+printf '%s\tproto\t%s\n' wwan modemmanager >>"$TEST_NETWORK_OPTIONS"
+printf '%s\tdevpath\t%s\n' wwan "$TESTROOT/sys/devices/platform/mock-usb/2-1.4" >>"$TEST_NETWORK_OPTIONS"
+: >"$TEST_UQMI_CALLS"
+out="$(MM_MODEM_INDEX=0 \
+	MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" \
+	MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" \
+	MM_IMEI=490154203237999 sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["modems"]) == 1, d
+m = d["modems"][0]
+assert m["modem_id"] == "imei:490154203237999", m
+assert m["protocol"] == "qmi", m
+assert m["control_device"] == "/dev/cdc-wdm0", m
+assert m["data_device"] == "wwan0", m
+assert m["netifd_interface"] == "wwan", m
+assert m["owner_state"] == "modemmanager", m
+' "$out" || fail 'physical USB device-root paths did not merge into one bound modem record'
+[ ! -s "$TEST_UQMI_CALLS" ] || fail 'physical-root ModemManager ownership allowed a direct uqmi identity probe'
+[ "$(MM_MODEM_INDEX=0 MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" \
+	MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/2-1.4" MM_IMEI=490154203237999 \
+	sh "$SCRIPT" resolve --interface wwan)" = imei:490154203237999 ] || \
+	fail 'physical-root netifd devpath did not resolve the ModemManager-owned modem'
+
 printf '%s\n' 'TEST ModemManager and a direct netifd protocol both claiming a modem is conflicting'
 reset_network_config
 add_network_section celldirect qmi /dev/cdc-wdm3

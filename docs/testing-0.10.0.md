@@ -13,6 +13,7 @@ and `tests/run-tests-modem.sh` are implemented and pass
 - Covered: modem-record schema and 0/1/N candidates; USB-serial/IMEI/weak
   evidence; inventory-only QMI/MBIM/AT classification; ModemManager-first
   ownership without direct QMI probing, including failed ownership discovery;
+  physical USB device-root correlation matching the WH3000 runtime;
   QMI identity bounding without an external `timeout`; duplicate weak identity
   and duplicate netifd-binding ambiguity; all owner states including the live
   `transitioning` overlay; service-start scanning; hotplug debounce; strong

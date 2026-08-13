@@ -13,6 +13,9 @@
   identity remains locally bounded without an external `timeout`; duplicate
   weak identities, control devices and netifd bindings fail closed instead of
   selecting the first item.
+- Normalize the physical USB device-root paths emitted by ModemManager and
+  netifd on WH3000 so their observations merge with the correlated QMI control
+  and data devices instead of producing separate incomplete records.
 - Reset capability now requires an explicit strong `reset_modem_id` binding to
   the internal modem controlled by the WH3000 GPIO. Signal/error cleanup always
   restores power and the selected interface, and APN/modem operations share the

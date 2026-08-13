@@ -101,7 +101,9 @@ probe. A USB device already claimed by ModemManager keeps ModemManager as its
 only control reader during the scan; the inventory must not issue `uqmi`
 against it. If ModemManager discovery fails or returns an unparseable non-empty
 inventory, ownership is uncertain and no direct QMI identity probe runs during
-that scan. Direct QMI inventory shares the APN adapter's per-control-device
+that scan. Both USB interface paths and physical USB device-root paths reported
+by ModemManager or netifd normalize to the same physical record. Direct QMI
+inventory shares the APN adapter's per-control-device
 identity lock and degrades to weak evidence when that bounded lock cannot be
 obtained. Every external backend query is bounded, including when the platform
 has no external `timeout` command. More than one correlated control channel,

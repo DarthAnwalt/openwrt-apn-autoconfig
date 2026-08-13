@@ -248,6 +248,19 @@ usb_device_path() {
 	return 1
 }
 
+physical_usb_device_path() {
+	# ModemManager and netifd may report either a USB interface path
+	# (.../2-1.4:1.4) or the physical device root itself (.../2-1.4).
+	# Normalize both forms to the latter before correlating candidates.
+	path="$(readlink -f "$1" 2>/dev/null)" || return 1
+	case "$path" in "$SYSFS_ROOT"/devices/*) : ;; *) return 1 ;; esac
+	if [ -r "$path/idVendor" ] && [ -r "$path/idProduct" ]; then
+		printf '%s\n' "$path"
+		return 0
+	fi
+	usb_device_path "$path"
+}
+
 usb_attr() {
 	usb_path="$1"
 	attr="$2"
@@ -484,8 +497,8 @@ discover_modemmanager_candidates() {
 
 		usb_path=""
 		case "$physdev_field" in
-			/*) usb_path="$(usb_device_path "$(readlink -f "$physdev_field" 2>/dev/null || printf '%s' "$physdev_field")" 2>/dev/null || :)" ;;
-			*[!\ ]*) usb_path="$SYSFS_ROOT/bus/usb/devices/$physdev_field" ; [ -d "$usb_path" ] || usb_path="" ;;
+			/*) usb_path="$(physical_usb_device_path "$physdev_field" 2>/dev/null || :)" ;;
+			*[!\ ]*) usb_path="$(physical_usb_device_path "$SYSFS_ROOT/bus/usb/devices/$physdev_field" 2>/dev/null || :)" ;;
 		esac
 		[ -n "$usb_path" ] || [ -z "$control_device" ] || \
 			usb_path="$(resolve_class_device_usb_path "$SYSFS_ROOT/class/usbmisc/${control_device#/dev/}/device" 2>/dev/null || :)"
@@ -568,8 +581,7 @@ netifd_interface_for_record() {
 			"$data_device"|"$control_device"|"/dev/$control_name"|"$control_name") matched=1 ;;
 		esac
 		if [ "$matched" -eq 0 ] && [ -n "$section_devpath" ] && [ -n "$usb_path" ]; then
-			resolved_devpath="$(readlink -f "$section_devpath" 2>/dev/null || :)"
-			candidate_usb="$(usb_device_path "$resolved_devpath" 2>/dev/null || :)"
+			candidate_usb="$(physical_usb_device_path "$section_devpath" 2>/dev/null || :)"
 			[ "$candidate_usb" = "$usb_path" ] && matched=1
 		fi
 		[ "$matched" -eq 1 ] || continue

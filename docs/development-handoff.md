@@ -1,87 +1,106 @@
 # Development handoff
 
-This document is the shortest safe entry point for a new maintainer or coding
-assistant. Read it together with [`backend-contract-v1.md`](backend-contract-v1.md),
-[`testing-0.9.2.md`](testing-0.9.2.md) and [`roadmap.md`](roadmap.md) before
-changing runtime behavior. The README is the user-facing reference; the
-changelog records shipped differences rather than future intentions.
+This is the shortest safe entry point for the next implementation task. Read it
+with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-contract-v1.md),
+[`testing-0.9.2.md`](testing-0.9.2.md), [`testing-0.10.0.md`](testing-0.10.0.md)
+and [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
+describes released behavior; the changelog records shipped differences rather
+than future intentions.
 
-## Current core boundary and project direction
+## Current state and next release
 
-The released `apn-autoconfig` core identifies the SIM and registration context,
-ranks normalized APN profiles, applies only the profile fields owned by the
-selected connection backend, verifies Internet connectivity, and rolls back on
-failure. That package remains a narrow APN engine rather than becoming a
-general modem manager.
+Version 0.9.2 is released. It is a target-aware APN engine for already
+configured ModemManager and QMI netifd sections. It does not yet provision an
+unconfigured modem, own a general connection-control service, mutate MBIM
+profiles or manage eSIM.
 
-The engine supports an already configured cellular target. It does not create
-the user's `network` section, install every possible protocol stack, or guess
-between multiple equally capable targets. Runtime discovery and implementation
-evidence are separate: recognizing `mbim` or `fibocom` must never imply that a
-writable adapter exists.
+The next implementation release is **0.10.0**, not the former 0.9.3 MBIM
+milestone. Its job is to establish the modem-control boundary needed by every
+later protocol and lifecycle feature. MBIM moves to 0.12.0, after safe
+first-run provisioning in 0.11.0. Do not implement MBIM profile mutation in the
+old APN monolith as an isolated shortcut.
 
-The broader first-party project is planned to grow toward 1.0 with sibling
-packages for modem inventory/provisioning, connection control, selected netifd
-protocol support and eSIM lifecycle. These packages must consume one another's
-narrow machine APIs instead of duplicating APN matching, writing each other's
-UCI fields or bypassing netifd bearer ownership. The public sequence is in
-`roadmap.md`; unimplemented milestones are not current capabilities.
+The agreed product and ownership rules are normative in `architecture.md`. In
+particular, the final suite must work both when the modem is attached after the
+software and when an internal or USB modem was already present before package
+installation. Hotplug is never the only discovery mechanism.
 
-## Package and file map
+## Released package and file map
 
-- `apn-autoconfig`: GUI-independent POSIX-shell engine, narrow rpcd workers,
-  boot worker and internal protocol adapters. ModemManager and QMI adapters
-  live in this one package so a travel-router user can replace a configured USB
-  modem without selecting another AutoAPN package.
+- `apn-autoconfig`: GUI-independent POSIX-shell APN engine, narrow rpcd
+  workers, boot worker and current internal ModemManager/QMI adapters.
 - `apn-autoconfig-providers`: independently versioned generated TSV database.
-- `luci-app-apn-autoconfig`: optional consumer of the public machine API. It
-  must not reimplement discovery, matching, mutation or rollback.
+- `luci-app-apn-autoconfig`: optional consumer of the public machine API.
 - `apn-autoconfig-integration-huasifei-wh3000`: optional tested BTN_0/GPIO
   integration and its kernel dependency. It is not a generic button package.
 - `files/usr/sbin/apn-autoconfig`: target discovery, backend dispatch, matching,
   state, connectivity verification, rollback and public CLI/JSON API.
-- `files/usr/libexec/apn-autoconfig-qmi`: bounded, read-only QMI/SIM identity
-  transport. Netifd still owns the QMI bearer.
+- `files/usr/libexec/apn-autoconfig-qmi`: bounded read-only QMI/SIM transport.
 - `files/usr/libexec/apn-autoconfig-query` and `-control`: narrow LuCI/rpcd
   allowlists. Do not grant LuCI the general-purpose CLI.
-- `tests/run-tests.sh`: backend, state, failure, rollback, injection and
-  compatibility regression suite.
+- `tests/run-tests.sh`: backend, state, failure, rollback, injection, reset and
+  compatibility regressions.
 - `scripts/verify.sh`: required local and CI gate.
 
-## Binding safety invariants
+## Target package map
 
-1. Resolve one stable `network:<section>` target before mutation. Zero,
-   unavailable or ambiguous targets fail closed with no UCI, interface or
-   persistent-state change.
-2. Treat `detect`, `detect-json`, `status`, `status-json` and `targets-json` as
-   read-only. Every modem transaction reachable from them must be bounded.
-3. Capture and atomically persist the complete backend-owned profile baseline
-   before the first write. Validate every baseline record before the first
-   restore write.
-4. Change only backend-owned UCI options and restart only the selected netifd
-   interface. Never take ownership of the bearer inside an adapter.
-5. Keep a candidate only after real connectivity succeeds through netifd's
-   effective L3 device. Restore the exact pre-change profile after every
-   candidate failure, interruption or explicit reset.
-6. Keep credentials and identifiers out of logs and normal LuCI display.
-   Root-owned baseline/cache state uses process-wide `umask 077`; LuCI masks
-   ICCID, IMSI and EID until an explicit reveal action.
-7. Preserve the operation lock across CLI, LuCI, boot and physical-button
-   entry points. Future modem-provisioning and eSIM-switch triggers must join a
-   documented serialization model without bypassing or deadlocking this lock.
-   Long LuCI actions use bounded background action APIs.
-8. Capability, implementation and validation evidence are independent. Never
-   mark a backend `stable`/`hardware` from fixture or parser tests alone.
-9. Roaming policy is backend-specific. ModemManager may edit its canonical
-   netifd option; QMI exposes the observed state but leaves policy control
-   disabled because no portable mapping has been validated.
-10. Package removal runs `reset-all` and aborts if restoration fails. New state
-    formats must remain safely removable and must not corrupt older baselines.
+The accepted names are `apn-autoconfig-modem`, `apn-autoconfig`,
+`apn-autoconfig-providers`, `apn-autoconfig-proto-fibocom`,
+`apn-autoconfig-esim`, optional `apn-autoconfig-lpac`, the existing
+`luci-app-apn-autoconfig` and the existing Huasifei integration package.
+Logical component names such as “modem control” must not become generic global
+package, UCI, executable or ubus names.
 
-## Public integration surface
+`apn-autoconfig-modem` becomes the lower-level dependency. It owns read-only
+inventory, stable identity, runtime capabilities, control-owner arbitration,
+project-created netifd sections, connection/reset operations and the shared
+operation coordinator. `apn-autoconfig` remains the APN policy consumer and
+owns only declared APN/profile fields and rollback state. Netifd remains the
+sole bearer owner.
 
-External GUIs should use the machine commands, preferably through an
-equivalently narrow privileged wrapper:
+## Binding and lifecycle invariants
+
+1. Resolve exactly one stable modem and target before mutation. Zero,
+   unavailable or ambiguous candidates fail closed.
+2. Scan actual state at service start as well as hotplug. A modem attached
+   before package installation must appear without physical reconnection.
+3. Treat volatile `/dev` and netdev names as attributes. Rebind them only to a
+   modem identity proven by physical topology and stronger identity evidence.
+4. Keep discovery read-only. Provisioning is a later explicit transition that
+   creates only a disabled, marked, project-owned staging section.
+5. Keep netifd as bearer owner and one explicit control owner per modem. Never
+   let direct protocol operations race ModemManager.
+6. Capture and atomically persist complete owned baselines before the first
+   write. Restore exact state after candidate, operation or removal failure.
+7. Verify connectivity through the selected target's effective L3 route before
+   keeping a changed profile or promoting autoconnect.
+8. Keep credentials and identifiers out of logs and normal LuCI display.
+   Root-owned baseline/cache state uses process-wide `umask 077`.
+9. CLI, LuCI, boot, hotplug, provisioning, eSIM and physical buttons join one
+   serialized operation model.
+10. Capability, implementation state and validation evidence remain separate.
+11. Removal restores or deletes only project-owned state and aborts safely when
+    restoration cannot complete.
+
+## Huasifei compatibility gate
+
+The currently proven physical-button behavior must survive the architecture
+migration. An enabled `BTN_0` release queues one bounded operation that
+power-cycles the selected modem, waits for re-enumeration, refreshes its stable
+binding, performs targeted APN `reconcile`, verifies connectivity and exposes
+the result to LuCI. Press events remain ignored and repeated releases cannot
+overlap.
+
+Introduce the modem-control reset API first. Preserve
+`apn-autoconfig modem-reset` and `action-start modem-reset` as compatibility
+shims for at least one release. Do not move or remove the Huasifei package's
+handler until manual reset, physical button, interruption, upgrade and package
+removal tests pass against the new coordinator.
+
+## Released public APN integration surface
+
+Until a versioned replacement is implemented and documented, consumers use the
+released commands through equivalently narrow privileged wrappers:
 
 ```text
 apn-autoconfig targets-json
@@ -91,66 +110,54 @@ apn-autoconfig action-start reconcile [--target network:<section>]
 apn-autoconfig action-status
 ```
 
-`targets-json` v2 is authoritative for target selection and exact runtime
-capabilities. Status/detect v2 include `engine_api: v1`, stable target identity,
+`targets-json` v2 remains authoritative for released target selection and
+runtime capability. Status/detect v2 include `engine_api: v1`, target identity,
 backend, effective data device and separate implementation/validation evidence.
-Consumers must not infer write support from protocol names or silently switch
-to a different target. The full schema and QMI adapter contract are documented
-in `backend-contract-v1.md`.
+New 0.10.0 APIs need an explicit schema and compatibility decision; do not
+silently change these responses in place.
 
-## Adding a backend
+## 0.10.0 implementation entry point
 
-Keep the common matcher and rollback algorithm backend-neutral. A new backend
-normally requires:
+Before the first runtime edit:
 
-1. discovery normalization and truthful per-operation capabilities;
-2. bounded, validated identity collection that separates the SIM home identity
-   from the serving network;
-3. exact capture/restore of only that backend's owned netifd options;
-4. normalized profile mapping for APN, credentials, authentication and IP
-   family without shell evaluation;
-5. netifd-owned reconnect and common L3 connectivity verification;
-6. fixture tests for home, roaming, malformed output, missing dependencies,
-   ambiguity, injection, apply, idempotency, failure rollback and reset;
-7. official-SDK packaging tests followed by a documented physical hardware
-   gate before changing the evidence state.
+1. create the `apn-autoconfig-modem` package skeleton and define its machine
+   API, stable modem-record schema and error/result classes;
+2. document the discovery evidence hierarchy and ambiguity behavior for
+   ModemManager, QMI and inventory-only MBIM/AT devices;
+3. define control-owner states and safe coexistence transitions;
+4. design a coordinator that can compose reset and APN reconcile without
+   nested-lock deadlock;
+5. define service-start scanning, hotplug coalescing and readiness retries so
+   event order cannot change the final inventory;
+6. decide the compatibility adapter by which the released APN engine consumes
+   modem identity/status while retaining its public CLI;
+7. make the common LuCI shell display inventory and current APN behavior only
+   through narrow RPC methods; and
+8. implement tests in `testing-0.10.0.md` before migrating the Huasifei reset
+   owner.
 
-Do not copy vendor-specific commands into the matcher. Extend or add a narrow
-internal adapter and make unsupported operations explicit. RNDIS/ECM describes
-a data link, not an APN-control protocol; support depends on the accompanying
-control path.
+The 0.10.0 scope is architecture foundation and read-only inventory. It does
+not automatically create network sections, add native MBIM profile writes,
+ship the Fibocom protocol or expose eSIM actions. Record discoveries for later
+milestones without folding those features into this release.
 
-## Required workflow
+## Required workflow and release evidence
 
-Before editing, inspect the worktree and preserve unrelated user changes. After
-runtime, packaging, LuCI or documentation changes run:
+Inspect the worktree and preserve unrelated changes. After runtime, packaging,
+LuCI or documentation edits run:
 
 ```sh
 sh scripts/verify.sh
 ```
 
 The release gate additionally requires the official OpenWrt 25.12 SDK build,
-APK install/upgrade/removal simulation, real hardware tests recorded in the
-version-specific testing document, rollback artifacts, and a final installed
-package smoke test. A green fixture suite is necessary but not sufficient for
-a hardware-support claim.
+APK install/upgrade/removal simulation, the order-independent discovery matrix,
+real hardware tests recorded in `testing-0.10.0.md`, rollback/recovery
+artifacts, signed-feed installation and a final installed-package smoke test.
+A green fixture suite is necessary but insufficient for a hardware claim.
 
-Release tags are `v<core-version>`. The GitHub workflow rejects a tag that does
-not match `PKG_VERSION`, publishes checksummed APK assets, and updates the
-signed package repository. Never store the private repository signing key in
-the source tree or build artifacts.
-
-## Current development direction
-
-Version 0.9.2 is released. The next implementation task is the bounded native
-MBIM APN adapter in 0.9.3; automatic modem provisioning, the connection-control
-UI and eSIM lifecycle are explicitly later milestones. The core keeps its
-current APN boundary while the repository grows into a signed first-party
-package suite. Exact sequencing can change after hardware findings; the safety
-invariants above cannot.
-
-At the start of 0.9.3, branch from current `main`, confirm that the README
-support matrix still describes shipped behavior, and create a version-specific
-MBIM test plan before the first hardware mutation. Preserve the completed
-0.9.2 evidence as a historical release record rather than rewriting it for the
-new release.
+Release tags are `v<suite-version>`. From 0.10.0, first-party code packages
+participating in a suite release use the suite version; provider data remains
+date-versioned and upstream-derived dependencies retain their upstream source
+version. `PKG_RELEASE` denotes a packaging rebuild. The GitHub workflow must
+reject inconsistent first-party versions and exact package-name collisions.

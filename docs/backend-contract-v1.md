@@ -1,5 +1,11 @@
 # Backend contract v1
 
+This is the released APN-backend contract through 0.9.2. The accepted target
+architecture adds a lower-level modem-control boundary without weakening this
+profile safety contract; see [`architecture.md`](architecture.md). Any 0.10.0
+compatibility mapping or successor API must be documented explicitly rather
+than silently changing the v1 meanings below.
+
 This document defines the boundary between the APN decision engine and a modem
 backend. The contract is intentionally smaller than a modem-management API.
 Backends identify a configured target and map a normalized mobile profile to

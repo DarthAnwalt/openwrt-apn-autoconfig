@@ -1,6 +1,6 @@
 # apn-autoconfig — OpenWrt source packages
 
-`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
+`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. Version
 0.9.2 discovers configured cellular netifd interfaces and publishes both
 their runtime capabilities and validation level through a GUI-independent API.
 Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
@@ -28,6 +28,25 @@ packages with the official OpenWrt 25.12 SDK:
 - `luci-app-apn-autoconfig`, the optional web interface;
 - `apn-autoconfig-integration-huasifei-wh3000`, the optional, board-specific
   BTN_0/GPIO integration tested on the Huasifei WH3000 Pro.
+
+## Direction to 1.0
+
+The released packages intentionally retain the configured-target requirement
+described above. The accepted architecture now grows them into a signed,
+self-contained mobile-connectivity suite. A supported modem may be present
+before package installation, attached later or installed internally at boot;
+service-start scanning and hotplug must converge to the same inventory without
+requiring a physical reconnect. Later milestones add safe project-owned netifd
+provisioning, MBIM, bounded AT/Fibocom support and eSIM lifecycle behind one
+capability-driven LuCI package.
+
+The next implementation release is 0.10.0, which establishes modem inventory,
+identity, ownership and operation coordination before new writable protocols.
+It must preserve the tested Huasifei BTN_0 behavior: guarded modem power-cycle,
+re-enumeration, targeted APN reconcile and verified connectivity as one
+serialized operation. See [`docs/architecture.md`](docs/architecture.md) and
+[`docs/roadmap.md`](docs/roadmap.md). These future milestones are not current
+0.9.2 capability claims.
 
 The generated provider database combines GNOME mobile-broadband-provider-info,
 the AOSP sample APN database and locally verified overrides. Large upstream XML
@@ -797,8 +816,9 @@ builds or runtime behavior depend on upstream availability.
 New maintainers and coding assistants should start with
 [`docs/development-handoff.md`](docs/development-handoff.md). It records the
 project boundary, package map, binding safety invariants, public integration
-surface, backend-extension checklist and required release workflow. Detailed
-QMI/API semantics, evidence gates and future adapter direction remain in
-[`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
-[`docs/testing-0.9.2.md`](docs/testing-0.9.2.md) and
-[`docs/roadmap.md`](docs/roadmap.md).
+surface and required release workflow. The accepted target architecture and
+release sequence are in [`docs/architecture.md`](docs/architecture.md) and
+[`docs/roadmap.md`](docs/roadmap.md). Released QMI/API semantics and evidence
+remain in [`docs/backend-contract-v1.md`](docs/backend-contract-v1.md) and
+[`docs/testing-0.9.2.md`](docs/testing-0.9.2.md); the next release gate is
+[`docs/testing-0.10.0.md`](docs/testing-0.10.0.md).

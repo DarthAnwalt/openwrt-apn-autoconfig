@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (unreleased)
+## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (2026-08-13)
 
 - Made service shutdown safe during QMI reconciliation: boot and background
   workers now forward termination to the active engine, the QMI teardown pause

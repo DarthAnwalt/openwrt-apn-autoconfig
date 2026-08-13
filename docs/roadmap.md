@@ -2,18 +2,15 @@
 
 This roadmap records public release milestones. It describes intended outcomes,
 not implementation proposals or evaluations of other projects. Hardware findings
-may change the sequence, but the safety invariants remain binding: never mutate
-an ambiguous target, never claim an unavailable capability, verify connectivity
-before keeping a profile, and restore the previous profile after failure.
+may change the sequence, but the safety invariants in
+[`architecture.md`](architecture.md) remain binding. Future milestones are not
+claims about the released 0.9.2 packages.
 
-The `apn-autoconfig` package keeps its narrow responsibility: identify the SIM
-and registration context for a configured cellular target, select and apply an
-APN profile, verify connectivity, and roll back safely. The project will grow
-toward 1.0 through additional first-party packages for modem provisioning,
-connection control and eSIM lifecycle rather than folding those responsibilities
-into the APN engine. All project packages must be built from source where
-applicable and distributed through the signed repository; the LuCI frontend
-remains an optional consumer of versioned machine APIs.
+The `apn-autoconfig` package keeps its narrow APN responsibility. The project
+grows toward 1.0 through namespaced first-party packages for modem control,
+provisioning, selected netifd protocols and eSIM lifecycle. The common LuCI
+package consumes their versioned machine APIs. All packages are distributed
+through the signed repository and built from source where applicable.
 
 ## 0.9.0 — adapter foundation
 
@@ -33,58 +30,74 @@ Released. Hardened signal handling, QMI rollback, root-only state validation,
 canonical device paths, baseline ownership, shared profile plumbing and QMI
 data-interface readiness after a physical modem reset.
 
-## 0.9.3 — native MBIM APN adapter
+## 0.10.0 — modem-control architecture foundation
 
-Planned next. Add MBIM SIM and registration identity, backend-owned profile
-capture/write/restore, and correct readiness handling for dynamically created
-IPv4/IPv6 data interfaces. The release requires the normal fixture, official
-SDK, package lifecycle and real-hardware evidence gates. Automatic modem
-provisioning and eSIM management remain out of scope for this release.
+Introduce `apn-autoconfig-modem` with read-only inventory at service start and
+hotplug, stable modem identity, truthful capability evidence, explicit
+ModemManager/direct-control ownership and a shared serialized operation model.
+Move low-level status and reset responsibilities behind its narrow API while
+preserving the released APN commands as compatibility shims. Begin the common
+LuCI shell with modem inventory and the existing APN experience.
 
-## 0.9.4 — generic AT identity and manual profile input
+This release must discover a modem that was attached before package
+installation; hotplug event history is never required. It must preserve the
+tested Huasifei BTN_0 operation as one serialized modem power-cycle followed by
+re-enumeration, targeted APN reconciliation and connectivity verification.
+Automatic creation of network sections and MBIM profile mutation remain out of
+scope until this foundation is proven.
 
-Extend bounded, read-only AT identity collection to selected configured
-AT-managed targets, including stable port resolution and normalized ICCID,
-IMSI, home/serving PLMN and registration state. Add a supported manual APN
-profile path that uses the same write, connectivity-verification and rollback
-discipline as database-selected profiles.
+## 0.11.0 — safe first-run provisioning
 
-## 0.9.5 — modem inventory and automatic provisioning
+Add a capability-driven first-run workflow for an unconfigured ModemManager or
+QMI modem. Create only a disabled, project-owned staging netifd section, provide
+automatic and manual APN paths, connect through netifd, verify Internet access
+and then promote the requested autoconnect state. Add basic
+connect/disconnect/reconnect actions, explicit adoption rules and exact
+provisioning rollback/removal tests.
 
-Add a first-party modem inventory and provisioning service. It will identify
-an unconfigured attached modem by stable hardware identity, classify an
-implemented control path, create or update only its owned netifd section, and
-hand APN selection to `apn-autoconfig` before enabling automatic connection.
-Stock QMI/MBIM netifd protocols remain preferred where available; selected
-AT-managed devices may use separately packaged protocol support.
+## 0.12.0 — complete native MBIM vertical slice
 
-## 0.9.6 — connection control and LuCI connection tab
+Add MBIM inventory and ownership, safe network-section provisioning, SIM and
+registration identity, backend-owned profile capture/write/restore, dynamic
+IPv4/IPv6 readiness, connection control, roaming policy where proven and the
+complete common-GUI workflow. Hardware evidence covers discovery through
+post-connect verification and rollback, not an isolated parser.
 
-Publish a narrow connection-control API and add a dedicated LuCI tab for modem
-and bearer status, signal quality, connect/disconnect/reconnect and supported
-reset operations. Existing signal and modem-reset presentation moves out of
-the APN tab. Board-specific physical controls remain optional and capability
-gated.
+## 0.13.0 — bounded generic AT framework
 
-## 0.9.7 — eSIM lifecycle and live APN reconciliation
+Add stable same-device AT-port resolution, bounded probing, normalized
+identity and a capability/quirk extension contract. No public control accepts
+free-form AT commands. Manual APN remains an APN-engine operation using the
+same baseline, verification and rollback discipline as database profiles.
 
-Add source-built eSIM support around `lpac`, distributed through the signed
-project repository. Provide bounded profile inventory and lifecycle actions,
-plus a serialized workflow that re-reads the active SIM and invokes targeted
-APN reconciliation after a successful profile switch so data connectivity can
-return without a router reboot. Add a dedicated LuCI eSIM tab.
+## 0.14.0 — Fibocom FM350 connection path
 
-## 1.0 — stable standalone mobile-connectivity suite
+Add separately packaged netifd protocol support and capability modules needed
+for the practical FM350 connection lifecycle. Validate provisioning,
+connection, interruption, recovery and coexistence on hardware without moving
+bearer ownership outside netifd.
 
-Stabilize the package boundaries and machine APIs for the APN engine, provider
-database, modem provisioning/control, eSIM lifecycle and the unified optional
-LuCI frontend. The frontend presents separate APN, connection and eSIM tabs;
-provider-database updates remain on the APN tab. The 1.0 compatibility target
-includes configured ModemManager, QMI and MBIM paths, selected AT-managed
-devices, and a practical Fibocom FM350-GL control path, each advertised only at
-its demonstrated implementation and hardware-validation level.
+## 0.15.0 — eSIM lifecycle and live APN recovery
 
-The 1.0 gate includes upgrade and removal safety, multi-entry-point locking,
-SIM/eSIM transition recovery, modem hotplug and re-enumeration, coexistence of
-multiple control stacks, signed installation without untrusted packages, and
-documented hardware evidence for every stable support claim.
+Add `apn-autoconfig-esim` and, if still required, the private upstream-tracking
+`apn-autoconfig-lpac` build. Provide protected activation-code handling,
+bounded profile and notification operations, and the serialized workflow:
+profile switch, optional capability-gated modem reset, refreshed SIM identity,
+targeted APN reconcile and verified connectivity. Add the eSIM area to the
+common LuCI package.
+
+## 0.16.0 — 1.0 release-candidate hardening
+
+Complete multi-modem, hotplug/re-enumeration, ownership coexistence, fresh
+install, upgrade, removal and failure-recovery matrices. Freeze package names,
+machine APIs and migration rules only after all old CLI/LuCI/button entry
+points have safe compatibility paths.
+
+## 1.0.0 — stable standalone mobile-connectivity suite
+
+Stabilize the signed first-party suite for modem discovery and provisioning,
+connection control, APN policy, selected QMI/MBIM/AT-managed paths, practical
+Fibocom FM350 support, eSIM lifecycle and the unified optional LuCI frontend.
+The same supported modem state converges safely whether the modem was attached
+before installation, after installation or present internally at boot. Every
+stable support claim has documented runtime, lifecycle and hardware evidence.

@@ -80,6 +80,7 @@ MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
 SETTLE_SLEEP_PID=""
+MODEM_COORDINATOR_ID=""
 
 MODEM_STATE="unknown"
 REGISTRATION_STATE="unknown"
@@ -2140,7 +2141,7 @@ wait_for_modem() {
 	return 1
 }
 
-modem_reset_cmd() {
+modem_reset_inline_cmd() {
 	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
 	acquire_lock
 	migrate_target_state
@@ -2185,6 +2186,53 @@ modem_reset_cmd() {
 	fi
 	INTERFACE_RESTORE_ARMED=0
 	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
+# Compatibility mapping to apn-autoconfig-modem, per docs/modem-contract-v1.md:
+# when the new package is installed and can unambiguously resolve the modem
+# bound to this target, it owns the power-cycle and re-enumeration wait;
+# apn-autoconfig keeps its own SIM/QMI-readiness wait and reconcile step
+# unchanged either way. Soft coupling for 0.10.0: no hard package dependency,
+# and any failure to resolve falls back to the released inline path so a
+# missing or not-yet-scanned apn-autoconfig-modem never blocks modem-reset.
+modem_reset_coordinator_modem_id() {
+	command_exists apn-autoconfig-modem || return 1
+	MODEM_COORDINATOR_ID="$(apn-autoconfig-modem resolve --interface "$INTERFACE" 2>/dev/null)" || return 1
+	[ -n "$MODEM_COORDINATOR_ID" ] || return 1
+}
+
+modem_reset_via_coordinator_cmd() {
+	acquire_lock
+	migrate_target_state
+	log notice "hardware modem reset requested; delegating power-cycle to apn-autoconfig-modem for $MODEM_COORDINATOR_ID"
+	if ! apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID"; then
+		coordinator_status=$?
+		case "$coordinator_status" in
+			3) die_code 3 "modem $MODEM_COORDINATOR_ID did not become ready again in time" ;;
+			*) die_code "$coordinator_status" "apn-autoconfig-modem reset failed (exit $coordinator_status)" ;;
+		esac
+	fi
+	if [ "$TARGET_BACKEND" = qmi ]; then
+		if wait_for_interface && wait_for_qmi_data_interface; then
+			log notice "QMI data interface $INTERFACE is ready after modem power return"
+		else
+			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
+			return 3
+		fi
+	fi
+	log notice "modem and SIM are available again; reconciling APN"
+	reconcile_cmd
+	status=$?
+	[ "$status" -eq 0 ] || return "$status"
+	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
+modem_reset_cmd() {
+	if modem_reset_coordinator_modem_id; then
+		modem_reset_via_coordinator_cmd
+		return $?
+	fi
+	modem_reset_inline_cmd
 }
 
 usage() {

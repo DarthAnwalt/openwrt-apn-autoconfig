@@ -1,6 +1,33 @@
 # 0.10.0 modem-control foundation test and release plan
 
-Status: accepted release charter; implementation and evidence pending.
+Status: accepted release charter; codebase prepared, hardware and release
+evidence pending.
+
+## Implementation status
+
+`apn-autoconfig-modem` (read-only inventory, coordinator, bounded `reset`),
+the `apn-autoconfig` compatibility shim, the LuCI read-only inventory card
+and `tests/run-tests-modem.sh` are implemented and pass
+`sh scripts/verify.sh`. Coverage against the contract-test list below:
+
+- Covered: modem-record schema and 0/1/N candidates (1, 2); all three
+  evidence tiers; owner states `none`/`netifd-direct`/`modemmanager`/
+  `conflicting` including simultaneous ModemManager+netifd-direct claims
+  (5, partial); `resolve`'s fail-closed behavior on an unbound or ambiguous
+  interface; the reset operation's board-integration gate, GPIO power-cycle
+  and per-modem lock release; `action-start`/`action-status` busy detection,
+  including a stale dead-PID marker not blocking a new operation; the narrow
+  query/control rpcd wrappers; and the compatibility-shim's fallback to the
+  released inline path when the new package is absent.
+- Not yet covered by a synthetic test, still open work: absent/late/
+  malformed backend dependencies (3); the `weak-vidpid` modem_id-collision
+  ambiguity path specifically, as opposed to the conflicting-owner path (6);
+  hotplug coalescing/debounce (7); the `transitioning` display overlay
+  during a live operation; and a full behavioral (not source-hook) test of
+  the compatibility shim actually delegating into a real coordinator
+  instance end-to-end.
+- Not applicable to a synthetic suite: everything in the Huasifei hardware
+  gate and packaging/release gate below, which need the physical router.
 
 Version 0.10.0 establishes the control plane required by provisioning, MBIM,
 generic AT, Fibocom and eSIM milestones. Passing this plan proves the

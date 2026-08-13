@@ -1,5 +1,27 @@
 # Changelog
 
+## apn-autoconfig 0.10.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (unreleased)
+
+- Added the `apn-autoconfig-modem` package: read-only modem inventory with
+  stable identity independent of volatile `/dev` names (USB serial > IMEI >
+  weak VID:PID evidence), explicit
+  none/netifd-direct/modemmanager/conflicting control-owner states and a
+  per-modem operation coordinator. See `docs/modem-contract-v1.md`.
+- `apn-autoconfig modem-reset` (and `action-start modem-reset`) delegate the
+  guarded power-cycle and re-enumeration wait to `apn-autoconfig-modem` when
+  it is installed and can unambiguously resolve the target's modem; the
+  released inline path is unchanged and used automatically otherwise.
+  Coupling is soft this release: no new package dependency.
+- Added a read-only "Modem inventory" card to the LuCI view, fed by the new
+  package's narrow rpcd query method; it shows an informational message
+  instead of a broken control when the optional package is not installed.
+- This is an architecture-foundation release: it does not add automatic
+  network provisioning, native MBIM profile mutation or eSIM support. See
+  `docs/architecture.md`, `docs/roadmap.md` and `docs/testing-0.10.0.md`.
+- Hardware validation (Huasifei WH3000 reset-plus-reconcile gate) and the
+  packaging/release gate are pending; do not call this release stable until
+  `docs/testing-0.10.0.md`'s exit criteria are met on real hardware.
+
 ## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (2026-08-13)
 
 - Made service shutdown safe during QMI reconciliation: boot and background

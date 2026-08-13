@@ -298,9 +298,14 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.9.2-r1.apk \
-  ./luci-app-apn-autoconfig-0.6.0-r1.apk
+  ./apn-autoconfig-0.10.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.10.0-r1.apk
 ```
+
+`apn-autoconfig-modem-0.10.0-r1.apk` is optional and not part of this
+transaction: `apn-autoconfig` does not depend on it in 0.10.0, and it only
+adds read-only modem inventory and a coordinator-based `modem-reset` path
+alongside the existing one. Install it separately if you want to try it.
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
 `/usr/share/apn-autoconfig/providers.tsv` from the old core package to the new

@@ -1,7 +1,7 @@
 # 0.10.0 modem-control foundation test and release plan
 
-Status: accepted release charter; codebase prepared, hardware and release
-evidence pending.
+Status: runtime hardening and synthetic gate complete; official SDK, package
+lifecycle and hardware evidence pending.
 
 ## Implementation status
 
@@ -10,22 +10,20 @@ the `apn-autoconfig` compatibility shim, the LuCI read-only inventory card
 and `tests/run-tests-modem.sh` are implemented and pass
 `sh scripts/verify.sh`. Coverage against the contract-test list below:
 
-- Covered: modem-record schema and 0/1/N candidates (1, 2); all three
-  evidence tiers; owner states `none`/`netifd-direct`/`modemmanager`/
-  `conflicting` including simultaneous ModemManager+netifd-direct claims
-  (5, partial); `resolve`'s fail-closed behavior on an unbound or ambiguous
-  interface; the reset operation's board-integration gate, GPIO power-cycle
-  and per-modem lock release; `action-start`/`action-status` busy detection,
-  including a stale dead-PID marker not blocking a new operation; the narrow
-  query/control rpcd wrappers; and the compatibility-shim's fallback to the
-  released inline path when the new package is absent.
-- Not yet covered by a synthetic test, still open work: absent/late/
-  malformed backend dependencies (3); the `weak-vidpid` modem_id-collision
-  ambiguity path specifically, as opposed to the conflicting-owner path (6);
-  hotplug coalescing/debounce (7); the `transitioning` display overlay
-  during a live operation; and a full behavioral (not source-hook) test of
-  the compatibility shim actually delegating into a real coordinator
-  instance end-to-end.
+- Covered: modem-record schema and 0/1/N candidates; USB-serial/IMEI/weak
+  evidence; inventory-only QMI/MBIM/AT classification; ModemManager-first
+  ownership without direct QMI probing, including failed ownership discovery;
+  QMI identity bounding without an external `timeout`; duplicate weak identity
+  and duplicate netifd-binding ambiguity; all owner states including the live
+  `transitioning` overlay; service-start scanning; hotplug debounce; strong
+  board-reset binding; GPIO/interface/lock restoration under real `SIGTERM`;
+  atomic parallel action launch; v2 operation state; stale worker recovery;
+  narrow RPC wrappers; and behavioral compatibility-shim success and failure
+  propagation. All released 0.9.2 regressions remain green.
+- Remaining synthetic work is limited to additional malformed-output and
+  no-external-timeout backend permutations if platform findings expose a new
+  case. They are defense-in-depth, not substitutes for the pending lifecycle
+  and hardware gates below.
 - Not applicable to a synthetic suite: everything in the Huasifei hardware
   gate and packaging/release gate below, which need the physical router.
 
@@ -160,6 +158,8 @@ interface/modem.
 - Build all first-party 0.10.0 code packages with the official supported SDK.
 - Simulate and execute clean install, 0.9.2 upgrade and removal transactions.
 - Verify service behavior in live install and offline image-root contexts.
+- Verify removal preserves live operation locks and cleans only stale runtime
+  state; it must not use a wildcard that can erase an in-flight lock.
 - Check package names against supported OpenWrt indexes and known public
   package trees immediately before the release candidate.
 - Install exclusively through the signed project feed without

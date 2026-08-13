@@ -1264,6 +1264,32 @@ fi
 [ "$(cat "$TEST_GPIO")" = '0' ] || fail 'failed modem reset left modem power off'
 grep -F -q 'up wwan' "$STATE/events" || fail 'failed modem reset did not attempt WWAN recovery'
 
+printf '%s\n' 'TEST coordinator delegation preserves failure status and runs reconcile only after success'
+cat >"$MOCKBIN/apn-autoconfig-modem" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/coordinator-calls"
+case "${1:-}" in
+	resolve) printf '%s\n' 'imei:490154203237518' ;;
+	status-json) printf '%s\n' '{"version":"v1","capabilities":{"reset":true}}' ;;
+	reset) exit "${TEST_COORDINATOR_RESET_EXIT:-0}" ;;
+	*) exit 2 ;;
+esac
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-modem"
+: >"$STATE/coordinator-calls"
+if TEST_COORDINATOR_RESET_EXIT=7 sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+	fail 'coordinator reset failure was converted into success'
+else
+	[ "$?" -eq 7 ] || fail 'coordinator reset failure did not preserve exit code 7'
+fi
+printf '%s\n' 'wrong.apn' >"$STATE/apn"
+TEST_COORDINATOR_RESET_EXIT=0 sh "$SCRIPT" modem-reset >/dev/null 2>&1 || \
+	fail 'successful coordinator reset did not continue to APN reconcile'
+[ "$(cat "$STATE/apn")" = internet.telekom ] || fail 'successful coordinator reset did not reconcile APN'
+grep -F -x -q 'resolve --interface wwan' "$STATE/coordinator-calls" || fail 'compatibility shim did not resolve the selected interface'
+grep -F -x -q 'reset --modem imei:490154203237518' "$STATE/coordinator-calls" || fail 'compatibility shim did not invoke coordinator reset'
+rm -f "$MOCKBIN/apn-autoconfig-modem"
+
 printf '%s\n' 'TEST button ignores press and queues modem reset only on release'
 cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
 #!/bin/sh

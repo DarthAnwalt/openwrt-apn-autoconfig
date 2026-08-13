@@ -81,10 +81,18 @@ core_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile")"
 core_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile")"
 luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
 luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
+modem_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
+modem_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
 [ -n "$core_version" ]
 [ -n "$core_release" ]
 [ -n "$luci_version" ]
 [ -n "$luci_release" ]
+[ -n "$modem_version" ]
+[ -n "$modem_release" ]
+[ "$modem_version" = "$core_version" ] || {
+	printf 'Modem package version %s does not match suite version %s.\n' "$modem_version" "$core_version" >&2
+	exit 1
+}
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
 	grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
 		"$ROOT/CHANGELOG.md"
@@ -94,6 +102,7 @@ else
 fi
 grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
 grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
+grep -F -q "apn-autoconfig-modem-$modem_version-r$modem_release.apk" "$ROOT/README.md"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
 	printf 'Release tag %s does not match core package version %s.\n' \
 		"$EXPECTED_RELEASE_TAG" "$core_version" >&2
@@ -132,6 +141,9 @@ if grep -F -q 'DEPENDS:=+apn-autoconfig-modem' "$ROOT/Makefile"; then
 	printf '%s\n' 'apn-autoconfig must not hard-depend on apn-autoconfig-modem in 0.10.0; coupling is soft this release.' >&2
 	exit 1
 fi
+grep -F -q "option autostart '1'" "$ROOT/apn-autoconfig-modem/files/etc/config/apn-autoconfig-modem"
+grep -F -q '[ -n "$${IPKG_INSTROOT}" ] && exit 0' "$ROOT/apn-autoconfig-modem/Makefile"
+grep -F -q '/etc/init.d/apn-autoconfig-modem restart' "$ROOT/apn-autoconfig-modem/Makefile"
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 	node "$ROOT/tests/test-luci-roaming-policy.js"

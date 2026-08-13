@@ -2192,21 +2192,30 @@ modem_reset_inline_cmd() {
 # when the new package is installed and can unambiguously resolve the modem
 # bound to this target, it owns the power-cycle and re-enumeration wait;
 # apn-autoconfig keeps its own SIM/QMI-readiness wait and reconcile step
-# unchanged either way. Soft coupling for 0.10.0: no hard package dependency,
-# and any failure to resolve falls back to the released inline path so a
-# missing or not-yet-scanned apn-autoconfig-modem never blocks modem-reset.
+# unchanged either way. Soft coupling for 0.10.0 means no hard package
+# dependency: only an absent coordinator falls back to the released inline
+# path. Once installed, unresolved identity or unsafe capability fails closed.
 modem_reset_coordinator_modem_id() {
 	command_exists apn-autoconfig-modem || return 1
-	MODEM_COORDINATOR_ID="$(apn-autoconfig-modem resolve --interface "$INTERFACE" 2>/dev/null)" || return 1
-	[ -n "$MODEM_COORDINATOR_ID" ] || return 1
+	MODEM_COORDINATOR_ID="$(apn-autoconfig-modem resolve --interface "$INTERFACE" 2>/dev/null)" || \
+		die_code 4 "apn-autoconfig-modem could not resolve one safe modem for interface $INTERFACE"
+	[ -n "$MODEM_COORDINATOR_ID" ] || \
+		die_code 4 "apn-autoconfig-modem returned an empty modem identity for interface $INTERFACE"
+	coordinator_status_json="$(apn-autoconfig-modem status-json --modem "$MODEM_COORDINATOR_ID" 2>/dev/null)" || \
+		die_code 4 "apn-autoconfig-modem could not validate modem $MODEM_COORDINATOR_ID"
+	coordinator_reset_capability="$(jsonfilter -s "$coordinator_status_json" -e '@.capabilities.reset' 2>/dev/null || :)"
+	[ "$coordinator_reset_capability" = true ] || \
+		die_code 4 "modem $MODEM_COORDINATOR_ID is not explicitly bound to the supported board reset integration"
 }
 
 modem_reset_via_coordinator_cmd() {
 	acquire_lock
 	migrate_target_state
 	log notice "hardware modem reset requested; delegating power-cycle to apn-autoconfig-modem for $MODEM_COORDINATOR_ID"
-	if ! apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID"; then
-		coordinator_status=$?
+	coordinator_status=0
+	APN_AUTOCONFIG_COORDINATOR_PARENT_PID="$$" \
+		apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID" || coordinator_status=$?
+	if [ "$coordinator_status" -ne 0 ]; then
 		case "$coordinator_status" in
 			3) die_code 3 "modem $MODEM_COORDINATOR_ID did not become ready again in time" ;;
 			*) die_code "$coordinator_status" "apn-autoconfig-modem reset failed (exit $coordinator_status)" ;;

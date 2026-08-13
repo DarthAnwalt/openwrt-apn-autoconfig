@@ -54,6 +54,18 @@ define Package/apn-autoconfig-modem/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-control $(1)/usr/libexec/apn-autoconfig-modem-control
 endef
 
+# A live installation must discover hardware that was already present before
+# the package existed. Offline image construction remains inert.
+define Package/apn-autoconfig-modem/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+if [ -x /etc/init.d/apn-autoconfig-modem ]; then
+	/etc/init.d/apn-autoconfig-modem enable >/dev/null 2>&1 || exit 1
+	/etc/init.d/apn-autoconfig-modem restart >/dev/null 2>&1 || exit 1
+fi
+exit 0
+endef
+
 # Removal restores administrative state only; discovery is read-only, so
 # there is no netifd or profile baseline for this package to roll back.
 define Package/apn-autoconfig-modem/prerm
@@ -69,7 +81,23 @@ endef
 define Package/apn-autoconfig-modem/postrm
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
-rm -rf /var/run/apn-autoconfig-modem /var/lock/apn-autoconfig-modem*
+# Runtime state is ephemeral, but never remove a live operation lock during an
+# uninstall. Clean regular registry files and provably stale locks only.
+for state_file in /var/run/apn-autoconfig-modem/modems/*.tsv; do
+	[ -f "$${state_file}" ] && rm -f "$${state_file}"
+done
+rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
+rmdir /var/run/apn-autoconfig-modem 2>/dev/null || :
+for lock_dir in /var/lock/apn-autoconfig-modem.*; do
+	[ -d "$${lock_dir}" ] || continue
+	lock_pid="$$(cat "$${lock_dir}/pid" 2>/dev/null || :)"
+	case "$${lock_pid}" in
+		''|*[!0-9]*) : ;;
+		*) kill -0 "$${lock_pid}" 2>/dev/null && continue ;;
+	esac
+	rm -f "$${lock_dir}/pid"
+	rmdir "$${lock_dir}" 2>/dev/null || :
+done
 rm -f /etc/config/apn-autoconfig-modem \
 	/etc/config/apn-autoconfig-modem.apk-new \
 	/etc/config/apn-autoconfig-modem.apk-old

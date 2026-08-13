@@ -307,6 +307,21 @@ transaction: `apn-autoconfig` does not depend on it in 0.10.0, and it only
 adds read-only modem inventory and a coordinator-based `modem-reset` path
 alongside the existing one. Install it separately if you want to try it.
 
+The inventory service starts automatically on a live installation so a modem
+that was already attached is discovered without reconnecting it. GPIO reset is
+still disabled until the internal modem is pinned with its strong identity:
+
+```sh
+apn-autoconfig-modem inventory-json
+uci set 'apn-autoconfig-modem.main.reset_modem_id=usb-serial:<exact-id-from-inventory>'
+uci commit apn-autoconfig-modem
+/etc/init.d/apn-autoconfig-modem restart
+```
+
+Do not copy the example placeholder. Use only the exact `usb-serial:` or
+`imei:` value for the modem physically controlled by the tested WH3000 GPIO.
+If that binding is absent, weak or ambiguous, reset capability remains false.
+
 Use the same single transaction when upgrading from 0.7.0. It transfers
 `/usr/share/apn-autoconfig/providers.tsv` from the old core package to the new
 provider package while preserving the UCI configuration, baseline and ICCID

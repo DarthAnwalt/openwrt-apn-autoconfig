@@ -30,6 +30,9 @@ contract explicitly rather than silently widening it.
       "data_device": "wwan0",
       "at_device": "/dev/ttyUSB2",
       "protocol": "qmi|mbim|at|modemmanager|unknown",
+      "implementation_state": "experimental",
+      "validation_state": "synthetic",
+      "hardware_validated": false,
       "owner_state": "none|netifd-direct|modemmanager|transitioning|conflicting",
       "netifd_interface": "wwan",
       "capabilities": { "inventory": true, "reset": false },
@@ -51,8 +54,11 @@ across scans to decide whether two records describe the same physical modem.
 Only `modem_id`, derived per the evidence hierarchy below, is stable.
 
 `capabilities.reset` is true only when a supported board integration package
-(the Huasifei GPIO integration, currently) is installed and the record's
-`protocol` is one this release can safely power-cycle and re-identify.
+(the Huasifei GPIO integration, currently) is installed, the record's
+`protocol` is one this release can safely power-cycle and re-identify, and the
+administrator has pinned that record's strong `usb-serial:` or `imei:` identity
+as `apn-autoconfig-modem.main.reset_modem_id`. A board-wide GPIO is never
+inferred to control every QMI modem merely because several are present.
 Capability, implementation maturity and hardware-validation evidence stay
 separate exactly as in the APN backend contract; an installed classifier is
 not hardware support.
@@ -90,6 +96,18 @@ may target either `modem_id` until the ambiguity resolves (fewer candidates,
 or one gains stronger evidence). This mirrors the fail-closed rule already
 proven for APN target selection.
 
+ModemManager inventory is collected before any optional direct QMI identity
+probe. A USB device already claimed by ModemManager keeps ModemManager as its
+only control reader during the scan; the inventory must not issue `uqmi`
+against it. If ModemManager discovery fails or returns an unparseable non-empty
+inventory, ownership is uncertain and no direct QMI identity probe runs during
+that scan. Direct QMI inventory shares the APN adapter's per-control-device
+identity lock and degrades to weak evidence when that bounded lock cannot be
+obtained. Every external backend query is bounded, including when the platform
+has no external `timeout` command. More than one correlated control channel,
+AT port, data device or netifd section is ambiguity, not an enumeration-order
+choice.
+
 ## Control-owner states
 
 | State | Meaning |
@@ -107,20 +125,21 @@ second operation while one is `transitioning`.
 
 ## Coordinator and lock ordering
 
-`apn-autoconfig-modem` composes with the existing APN engine's own lock
-(`acquire_lock` in `apn-autoconfig`) without nesting them. The rule is
-**sequencing, not nesting**:
+`apn-autoconfig-modem` composes with the existing APN engine's global operation
+lock (`acquire_lock` in `apn-autoconfig`) using one mandatory order:
 
-1. A reset operation acquires apn-autoconfig-modem's own per-`modem_id` lock,
-   performs the guarded power-cycle and waits for re-enumeration, then
-   **releases that lock** before returning.
-2. Only after the modem-control lock is released does the caller (either
-   `apn-autoconfig`'s compatibility shim or a direct `action-start reset`
-   caller) invoke APN `reconcile`, which acquires the APN engine's own lock
-   independently.
+1. acquire or prove ownership of the global APN operation lock;
+2. acquire the selected per-`modem_id` lock;
+3. revalidate presence, ownership and reset capability after both locks;
+4. perform the guarded power-cycle and re-enumeration wait;
+5. release the modem lock, finish targeted APN reconciliation while retaining
+   the global lock, then release the global lock.
 
-Neither lock is ever held while blockingly waiting to acquire the other, so
-the composition cannot deadlock. `action-start`/`action-status` on
+A direct modem reset acquires both locks itself. The compatibility shim passes
+its PID and the modem package accepts borrowed ownership only when that exact
+live PID is recorded in the APN lock. Future provisioning and eSIM operations
+must use the same global-to-specific order; reverse acquisition is forbidden.
+`action-start`/`action-status` on
 `apn-autoconfig-modem` mirror the existing `apn-autoconfig` background-action
 contract (`state.tsv` v2 record, `running/success/blocked/retryable/failed`,
 busy/external detection) so LuCI can reuse the same polling pattern for both.
@@ -132,9 +151,11 @@ released behavior and exit codes. When `apn-autoconfig-modem` is installed,
 the engine resolves the modem bound to its selected target
 (`apn-autoconfig-modem resolve --interface <section>`) and delegates the
 power-cycle-and-reidentify phase to `apn-autoconfig-modem reset --modem <id>`
-before running its own unchanged `reconcile` step. When
-`apn-autoconfig-modem` is not installed, the engine's original inline
-power-cycle path runs exactly as released. Callers cannot observe which path
-ran; only log lines differ. This keeps the coupling soft for 0.10.0 per
+before running its own unchanged `reconcile` step under the same global lock.
+When `apn-autoconfig-modem` is not installed, the engine's original inline
+power-cycle path runs exactly as released. When it is installed but cannot
+prove one reset-capable binding, the operation fails closed; it never silently
+falls back after the new ownership boundary was selected. This keeps the
+package dependency soft for 0.10.0 per
 `architecture.md`/`development-handoff.md` — a later release may retire the
 inline path once the new coordinator has hardware evidence.

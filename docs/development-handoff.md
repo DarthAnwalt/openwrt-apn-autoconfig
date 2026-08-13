@@ -7,6 +7,11 @@ and [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
 
+Coding assistants must also follow the root [`CLAUDE.md`](../CLAUDE.md). Its
+0.10.0 review lessons record concrete failure patterns found during the first
+modem-control implementation and are mandatory acceptance criteria for later
+architectural releases.
+
 ## Current state and next release
 
 Version 0.9.2 is released. It is a target-aware APN engine for already
@@ -116,25 +121,21 @@ backend, effective data device and separate implementation/validation evidence.
 New 0.10.0 APIs need an explicit schema and compatibility decision; do not
 silently change these responses in place.
 
-## 0.10.0 implementation entry point
+## 0.10.0 current state and next gate
 
-Before the first runtime edit:
+The package skeleton, v1 inventory schema, QMI/MBIM/AT-only discovery,
+ModemManager-first ownership, fail-closed ambiguity, common APN-to-modem lock
+order, bounded GPIO reset, compatibility shim, service-start/hotplug scans,
+LuCI inventory and synthetic tests are implemented. Reset remains disabled
+until the maintainer pins the strong identity of the internal modem as
+`apn-autoconfig-modem.main.reset_modem_id`; never infer a board-wide GPIO
+binding from QMI protocol or USB VID:PID alone.
 
-1. create the `apn-autoconfig-modem` package skeleton and define its machine
-   API, stable modem-record schema and error/result classes;
-2. document the discovery evidence hierarchy and ambiguity behavior for
-   ModemManager, QMI and inventory-only MBIM/AT devices;
-3. define control-owner states and safe coexistence transitions;
-4. design a coordinator that can compose reset and APN reconcile without
-   nested-lock deadlock;
-5. define service-start scanning, hotplug coalescing and readiness retries so
-   event order cannot change the final inventory;
-6. decide the compatibility adapter by which the released APN engine consumes
-   modem identity/status while retaining its public CLI;
-7. make the common LuCI shell display inventory and current APN behavior only
-   through narrow RPC methods; and
-8. implement tests in `testing-0.10.0.md` before migrating the Huasifei reset
-   owner.
+The next work is evidence collection, not new feature scope: official SDK
+build and APK inspection, clean/live/offline install behavior, 0.9.2 upgrade
+and removal simulation, then the complete WH3000 manual/BTN_0 interruption and
+reset-plus-reconcile hardware matrix in `testing-0.10.0.md`. Any defect found
+there must receive a fixture regression before the release candidate advances.
 
 The 0.10.0 scope is architecture foundation and read-only inventory. It does
 not automatically create network sections, add native MBIM profile writes,

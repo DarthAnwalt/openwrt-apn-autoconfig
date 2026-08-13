@@ -7,10 +7,28 @@
   weak VID:PID evidence), explicit
   none/netifd-direct/modemmanager/conflicting control-owner states and a
   per-modem operation coordinator. See `docs/modem-contract-v1.md`.
+- Hardened the foundation before hardware validation: inventory now classifies
+  QMI, MBIM and AT-only devices without issuing direct QMI identity requests
+  against ModemManager-owned or ownership-uncertain hardware; direct QMI
+  identity remains locally bounded without an external `timeout`; duplicate
+  weak identities, control devices and netifd bindings fail closed instead of
+  selecting the first item.
+- Reset capability now requires an explicit strong `reset_modem_id` binding to
+  the internal modem controlled by the WH3000 GPIO. Signal/error cleanup always
+  restores power and the selected interface, and APN/modem operations share the
+  documented global-to-per-modem lock order.
+- Background modem actions now use atomic launch serialization, versioned v2
+  state with operation IDs and terminal blocked/retryable results. Live package
+  installation enables the service and performs a delayed full scan, while
+  offline image installation remains inert.
+- Package removal preserves locks owned by live operations and no longer uses
+  a broad wildcard to delete modem-control runtime paths.
 - `apn-autoconfig modem-reset` (and `action-start modem-reset`) delegate the
   guarded power-cycle and re-enumeration wait to `apn-autoconfig-modem` when
-  it is installed and can unambiguously resolve the target's modem; the
-  released inline path is unchanged and used automatically otherwise.
+  it is installed and can unambiguously resolve the target's explicitly
+  reset-capable modem; the released inline path is used only when the new
+  package is absent. An installed coordinator that cannot prove a safe binding
+  fails closed instead of silently bypassing the new ownership boundary.
   Coupling is soft this release: no new package dependency.
 - Added a read-only "Modem inventory" card to the LuCI view, fed by the new
   package's narrow rpcd query method; it shows an informational message

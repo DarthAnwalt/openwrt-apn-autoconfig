@@ -549,7 +549,7 @@ return view.extend({
 	modemInventoryNodes: function(inventory) {
 		if (!inventory || inventory.error)
 			return [ E('p', { 'class': 'apn-modem-unavailable' }, [
-				_('The optional apn-autoconfig-modem package is not installed, so modem inventory is not shown here. It is not required for the APN functions above.')
+				_('Modem inventory is unavailable. The optional apn-autoconfig-modem package may be absent, disabled or unable to complete its bounded scan. The APN functions above remain independent.')
 			]) ];
 
 		var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
@@ -561,6 +561,8 @@ return view.extend({
 				row(_('Modem identity'), sensitiveIdentifier(modem.modem_id, _('modem identity'))),
 				row(_('Evidence'), modem.evidence_tier),
 				row(_('Protocol'), modem.protocol),
+				row(_('Implementation'), modem.implementation_state),
+				row(_('Validation'), modem.hardware_validated ? _('hardware') : modem.validation_state),
 				row(_('Control owner'), this.modemOwnerStateLabel(modem.owner_state)),
 				row(_('Bound netifd interface'), modem.netifd_interface || _('none'))
 			];

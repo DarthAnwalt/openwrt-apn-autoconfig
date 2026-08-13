@@ -364,7 +364,7 @@ assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
 
-printf '%s\n' 'TEST multiple correlated AT ports are reported as ambiguity, not first-port selection'
+printf '%s\n' 'TEST a QMI modem with multiple optional AT ports keeps its proven control binding'
 reset_sysfs
 add_qmi_modem 3-1.3 2c7c 0801 MULTIPORT 5
 add_at_modem 3-1.3 2c7c 0801 MULTIPORT 1
@@ -373,10 +373,26 @@ out="$(sh "$SCRIPT" inventory-json)"
 python3 -c '
 import json, sys
 m = json.loads(sys.argv[1])["modems"][0]
+assert m["protocol"] == "qmi", m
+assert m["control_device"] == "/dev/cdc-wdm5", m
+assert m["ambiguous"] is False, m
+assert m["owner_state"] == "none", m
+assert not m["at_device"], m
+' "$out" || fail 'optional AT ports incorrectly blocked a proven QMI control path'
+
+printf '%s\n' 'TEST an AT-only modem with multiple ports remains ambiguous without role evidence'
+reset_sysfs
+add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 1
+add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 2
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["protocol"] == "at", m
 assert m["ambiguous"] is True, m
 assert m["owner_state"] == "conflicting", m
 assert not m["at_device"], m
-' "$out" || fail 'multiple same-modem AT ports were selected by enumeration order'
+' "$out" || fail 'AT-only multi-port modem selected a port without role evidence'
 
 printf '%s\n' 'TEST two distinct physically present modems are both reported, not merged'
 reset_sysfs

@@ -15,7 +15,8 @@ and `tests/run-tests-modem.sh` are implemented and pass
   ownership without direct QMI probing, including failed ownership discovery;
   physical USB device-root correlation matching the WH3000 runtime;
   QMI identity bounding without an external `timeout`; duplicate weak identity
-  and duplicate netifd-binding ambiguity; all owner states including the live
+  and duplicate netifd-binding ambiguity; multi-port AT-only failure versus
+  optional AT-port suppression on proven QMI; all owner states including the live
   `transitioning` overlay; service-start scanning; hotplug debounce; strong
   board-reset binding; GPIO/interface/lock restoration under real `SIGTERM`;
   atomic parallel action launch; v2 operation state; stale worker recovery;

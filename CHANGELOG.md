@@ -16,6 +16,9 @@
 - Normalize the physical USB device-root paths emitted by ModemManager and
   netifd on WH3000 so their observations merge with the correlated QMI control
   and data devices instead of producing separate incomplete records.
+- Treat multiple AT ports on a proven QMI/MBIM modem as an unavailable optional
+  AT attribute rather than a conflict for the whole modem; AT-only devices
+  still fail closed until a port can be identified by role.
 - Reset capability now requires an explicit strong `reset_modem_id` binding to
   the internal modem controlled by the WH3000 GPIO. Signal/error cleanup always
   restores power and the selected interface, and APN/modem operations share the

@@ -107,8 +107,11 @@ inventory shares the APN adapter's per-control-device
 identity lock and degrades to weak evidence when that bounded lock cannot be
 obtained. Every external backend query is bounded, including when the platform
 has no external `timeout` command. More than one correlated control channel,
-AT port, data device or netifd section is ambiguity, not an enumeration-order
-choice.
+data device or netifd section is ambiguity, not an enumeration-order choice.
+Multiple AT ports are terminal ambiguity for an AT-only modem. On a modem with
+a separately proven QMI/MBIM control channel they suppress only the optional
+`at_device` attribute; they do not invalidate that control binding, and no AT
+operation is allowed until a future backend identifies a port by role.
 
 ## Control-owner states
 

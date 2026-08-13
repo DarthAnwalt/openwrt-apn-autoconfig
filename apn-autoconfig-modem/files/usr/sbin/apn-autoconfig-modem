@@ -688,8 +688,15 @@ scan_inventory() {
 		fi
 		if [ "$at_device" = '!ambiguous' ]; then
 			at_device=""
-			ambiguous=1
-			ambiguity_reason="multiple AT ports claim the same physical modem"
+			# Composite USB modems normally expose several ttyUSB ports. That is
+			# terminal ambiguity only when AT is the sole control transport. A
+			# proven QMI/MBIM control path may remain inventory/reset-capable, but
+			# it advertises no AT device until a future AT backend identifies one
+			# by role instead of enumeration order.
+			if [ -z "$control_device" ] || [ "$protocol" = at ]; then
+				ambiguous=1
+				ambiguity_reason="multiple AT ports claim the same physical modem"
+			fi
 		fi
 		if [ "$ambiguous" -eq 0 ] && grep -F -x -q "$modem_id" "$INVENTORY_FILE.dupes" 2>/dev/null; then
 			ambiguous=1

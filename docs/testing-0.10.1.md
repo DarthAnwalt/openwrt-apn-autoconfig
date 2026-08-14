@@ -99,10 +99,19 @@ window, the `BTN_0` duplicate-release invariant (three releases, one power-cycle
 one terminal result), the re-measured wall-clock bound and the removal
 simulation.
 
-## Open gates before release
+## Completed release gates
 
-1. Publication of the release tag and the signed feed.
-2. The live feed install/removal/reinstall smoke without `--allow-untrusted`.
+`v0.10.1` published through workflow run `31834532897`. The live signed feed was
+accepted on the router through the pinned key without `--allow-untrusted`, the
+packages were reinstalled by name so `world` holds plain package names, and the
+shipped `post-deinstall` lock loop was exercised in place against both lock
+representations. See [`router-test-0.10.1.md`](router-test-0.10.1.md).
+
+## Not performed
+
+A full destructive removal-and-reinstall cycle. Its remaining unique coverage is
+`reset-all` baseline restoration, which this patch does not change and which the
+0.10.0 record validated. Run it if the removal path itself is ever modified.
 
 ## Upgrade constraint
 

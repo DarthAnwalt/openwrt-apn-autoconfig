@@ -92,10 +92,39 @@ subtracted. The measured figures remain consistent with the 0.10.0 record
 ## Package lifecycle
 
 Removal simulation selected exactly the five project packages and nothing else.
-Actual removal and reinstall are deferred to the post-publication smoke so that
-they exercise the signed feed rather than local artifacts.
+
+The shipped `post-deinstall` script was extracted from the router's own package
+database — not read from the source tree — and its lock loop was exercised in
+place against four fixtures without uninstalling anything: a lock file owned by
+a live process, a lock file naming a dead one, and the same two cases in the
+0.10.0 directory representation. The live file and the live legacy directory
+survived; both stale locks were removed. This is the behaviour the patch
+changed, so it is proven directly rather than inferred from the removal
+simulation.
+
+## Post-publication signed-feed smoke
+
+Release `v0.10.1` published through workflow run `31834532897`; all three jobs
+(`test-and-build`, `publish-release`, `publish-repository`) succeeded.
+
+`apk update` on the router accepted the project index through the pinned public
+key with no `--allow-untrusted`, and the live feed exposed 0.10.1 for the three
+changed packages. The packages were then reinstalled **by name** from that feed.
+This replaced the checksum-bound `world` entries that the pre-publication local
+installation had left behind — the same artefact noted in the 0.10.0 record —
+so every project entry in `world` is now a plain package name.
+
+Configuration survived: the pinned `reset_modem_id`, the enabled `BTN_0`
+setting and the selected interface are unchanged. After the reinstall the modem
+inventory reports `owner_state: modemmanager` with reset capability, both locks
+are clear, `wwan` is up on `wwan0` and a real HTTPS request over the modem
+interface succeeds.
 
 ## Open
 
-- publication of the release tag and the signed feed; and
-- the live feed install/removal/reinstall smoke without `--allow-untrusted`.
+A full destructive removal-and-reinstall cycle was not performed. Its remaining
+unique coverage is `reset-all` baseline restoration, which this patch does not
+touch and which the 0.10.0 record already validated; the parts 0.10.1 does
+change — package selection and the `postrm` lock loop — are covered above.
+Running it would delete the live APN configuration and depend on restoring it
+from the captured recovery point.

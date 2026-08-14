@@ -15,7 +15,7 @@ define Package/apn-autoconfig-modem
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Modem inventory, identity and control-owner arbitration
-  DEPENDS:=+ubus +uci
+  DEPENDS:=+ubus +uci +jsonfilter
   PKGARCH:=all
 endef
 

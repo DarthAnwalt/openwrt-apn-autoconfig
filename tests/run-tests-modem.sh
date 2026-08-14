@@ -60,6 +60,7 @@ get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
 get:apn-autoconfig-modem.main.modem_power_off_seconds) printf '%s\n' "${TEST_MODEM_POWER_OFF_SECONDS:-1}" ;;
 get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' 3 ;;
 get:apn-autoconfig-modem.main.modem_poll_seconds) printf '%s\n' 1 ;;
+get:apn-autoconfig-modem.main.connect_wait_seconds) printf '%s\n' "${TEST_CONNECT_WAIT_SECONDS:-2}" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
@@ -194,6 +195,40 @@ EOF
 cat >"$MOCKBIN/logger" <<'EOF'
 #!/bin/sh
 exit 0
+EOF
+
+# netifd state as seen through ubus. TEST_IFACE_UP names the section netifd
+# reports as up, so a connect can be made to succeed or to time out.
+cat >"$MOCKBIN/ubus" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+call)
+	section="${2#network.interface.}"
+	if [ "$section" = "${TEST_IFACE_UP:-}" ]; then
+		printf '{"up":true,"l3_device":"wwan0"}\n'
+	else
+		printf '{"up":false}\n'
+	fi
+	exit 0
+;;
+esac
+exit 1
+EOF
+
+cat >"$MOCKBIN/jsonfilter" <<'EOF'
+#!/bin/sh
+expression=""
+document=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-e) expression="$2"; shift 2 ;;
+		-s) document="$2"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ -n "$document" ] || document="$(cat)"
+key="${expression#@.}"
+printf '%s' "$document" | sed -n "s/.*\"${key}\":\([^,}]*\).*/\1/p" | tr -d '"'
 EOF
 
 cat >"$MOCKBIN/sleep" <<'EOF'
@@ -1332,6 +1367,60 @@ name_out="$(sh "$SCRIPT" provision --modem "$PROV_MODEM")" || fail 'provision fa
 [ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["section"])' "$name_out")" = apnmodem3 ] || \
 	fail 'provision did not skip the occupied section names'
 sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+
+# ---- connection control on a project-owned section ----
+
+printf '%s\n' 'TEST connect brings up the project-owned section and reports netifd state'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed'
+: >"$TEST_EVENTS"
+TEST_IFACE_UP=apnmodem1
+export TEST_IFACE_UP
+conn_out="$(sh "$SCRIPT" connect --modem "$PROV_MODEM")" || fail 'connect failed on an up interface'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["section"] == "apnmodem1", d
+assert d["action"] == "connect", d
+assert d["state"] == "up", d
+' "$conn_out" || fail 'connect did not report the interface as up'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the interface'
+
+printf '%s\n' 'TEST disconnect stops the section and reconnect cycles it'
+: >"$TEST_EVENTS"
+disc_out="$(sh "$SCRIPT" disconnect --modem "$PROV_MODEM")" || fail 'disconnect failed'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="down" and d["action"]=="disconnect", d' \
+	"$disc_out" || fail 'disconnect did not report the interface as down'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'disconnect did not ask netifd to stop the interface'
+: >"$TEST_EVENTS"
+sh "$SCRIPT" reconnect --modem "$PROV_MODEM" >/dev/null || fail 'reconnect failed'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'reconnect did not stop the interface first'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'reconnect did not start the interface again'
+
+printf '%s\n' 'TEST connect is retryable rather than successful when netifd never comes up'
+TEST_IFACE_UP=
+export TEST_IFACE_UP
+timeout_status=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || timeout_status=$?
+[ "$timeout_status" -eq 3 ] || \
+	fail "a section that never came up exited $timeout_status instead of the retryable class 3"
+
+printf '%s\n' 'TEST connection control refuses a modem with no project-owned section'
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+unowned_conn=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || unowned_conn=$?
+[ "$unowned_conn" -eq 4 ] || fail "connect without a project-owned section exited $unowned_conn instead of 4"
+
+printf '%s\n' 'TEST connection control never drives a user-created interface'
+provision_fixture
+add_network_section usermade qmi /dev/cdc-wdm0
+: >"$TEST_EVENTS"
+usercontrol=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || usercontrol=$?
+[ "$usercontrol" -eq 4 ] || fail "connect adopted a user-created interface (exit $usercontrol)"
+[ ! -s "$TEST_EVENTS" ] || fail 'connect touched netifd for an interface it does not own'
+TEST_IFACE_UP=
+export TEST_IFACE_UP
 
 printf '%s\n' 'TEST the narrow query wrapper rejects unlisted verbs and out-of-range arguments'
 if "$QUERY_SCRIPT" inventory extra-arg >/dev/null 2>&1; then

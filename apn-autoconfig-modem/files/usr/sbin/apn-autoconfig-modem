@@ -25,6 +25,7 @@ MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
 MODEM_POLL_SECONDS="2"
+CONNECT_WAIT_SECONDS="60"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
 RESET_MODEM_ID=""
 
@@ -150,6 +151,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
 }
@@ -177,9 +179,11 @@ validate_config() {
 	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
 	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
 	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	case "$CONNECT_WAIT_SECONDS" in ''|*[!0-9]*) die "connect_wait_seconds must be numeric" ;; esac
 	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
+	[ "$CONNECT_WAIT_SECONDS" -gt 0 ] || die "connect_wait_seconds must be greater than zero"
 	if [ -n "$RESET_MODEM_ID" ]; then
 		safe_token "$RESET_MODEM_ID" || die "reset_modem_id contains unsafe characters"
 		case "$RESET_MODEM_ID" in usb-serial:*|imei:*) : ;; *) die "reset_modem_id must use strong usb-serial or imei evidence" ;; esac
@@ -1272,6 +1276,76 @@ provision_cmd() {
 	printf '}\n'
 }
 
+# netifd stays the bearer owner. These verbs only ask it to act on a section
+# this package created, and report what netifd then reports.
+interface_is_up() {
+	command_exists ubus || return 1
+	command_exists jsonfilter || return 1
+	conn_state="$(ubus call "network.interface.$1" status 2>/dev/null | \
+		jsonfilter -e '@.up' 2>/dev/null || :)"
+	[ "$conn_state" = true ]
+}
+
+wait_for_interface_up() {
+	conn_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		interface_is_up "$1" && return 0
+		conn_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		conn_elapsed=$((conn_now - conn_started))
+		[ "$conn_elapsed" -ge 0 ] || conn_elapsed="$CONNECT_WAIT_SECONDS"
+		[ "$conn_elapsed" -lt "$CONNECT_WAIT_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
+connection_cmd() {
+	conn_action="$1"
+	conn_modem="$REQUESTED_MODEM"
+	[ -n "$conn_modem" ] || die_code 2 "$conn_action requires --modem"
+	command_exists uci || die "uci is required"
+
+	# v1 acts only on sections this package owns. A user-created interface is
+	# never driven from here; see docs/provisioning-contract-v1.md.
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "no section owned by this package is bound to modem $conn_modem"
+	case "$conn_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	acquire_apn_lock
+	acquire_modem_lock "$conn_modem"
+
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "modem $conn_modem no longer owns a project-created section"
+
+	conn_result=up
+	case "$conn_action" in
+		disconnect)
+			ifdown "$conn_section" >/dev/null 2>&1 || die "failed to stop $conn_section"
+			conn_result=down
+		;;
+		connect|reconnect)
+			if [ "$conn_action" = reconnect ]; then
+				ifdown "$conn_section" >/dev/null 2>&1 || :
+			fi
+			ifup "$conn_section" >/dev/null 2>&1 || die "failed to start $conn_section"
+			if ! wait_for_interface_up "$conn_section"; then
+				die_code 3 "$conn_section did not come up within ${CONNECT_WAIT_SECONDS}s"
+			fi
+		;;
+		*) die_code 2 "unsupported connection action: $conn_action" ;;
+	esac
+
+	release_modem_lock
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$conn_modem"; printf ','
+	json_key_string section "$conn_section"; printf ','
+	json_key_string action "$conn_action"; printf ','
+	json_key_string state "$conn_result"
+	printf '}\n'
+}
+
 deprovision_cmd() {
 	deprov_modem="$REQUESTED_MODEM"
 	[ -n "$deprov_modem" ] || die_code 2 "deprovision requires --modem"
@@ -1651,6 +1725,9 @@ Commands:
   provision         Create a project-owned section for --modem, reconcile its
                     APN through apn-autoconfig and promote autoconnect
   deprovision       Remove the project-owned section created for --modem
+  connect           Bring the project-owned section for --modem up
+  disconnect        Bring the project-owned section for --modem down
+  reconnect         Cycle the project-owned section for --modem
   action-start reset  Start a bounded power-cycle in background; requires --modem
   action-status     Show background/external reset operation state; requires --modem
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
@@ -1704,6 +1781,7 @@ main() {
 		provision-plan) provision_plan_cmd ;;
 		provision) provision_cmd ;;
 		deprovision) deprovision_cmd ;;
+		connect|disconnect|reconnect) connection_cmd "$COMMAND_NAME" ;;
 		action-start) action_start_cmd "$command_argument" ;;
 		action-status) action_status_cmd ;;
 		reset) reset_cmd ;;

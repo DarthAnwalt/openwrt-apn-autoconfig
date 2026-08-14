@@ -1,6 +1,8 @@
 # 0.10.1 lock-protocol patch test and release plan
 
-Status: synthetic gate complete; SDK, lifecycle and hardware gates open.
+Status: synthetic, SDK, APK-inspection, upgrade and hardware gates complete.
+Publication and the live signed-feed smoke remain open. Hardware evidence is in
+[`router-test-0.10.1.md`](router-test-0.10.1.md).
 
 0.10.1 changes no feature and no public API. It replaces the protocol that
 publishes an operation lock, which the hardware-validated 0.10.0 reset path
@@ -79,26 +81,19 @@ Inspect the installed package on the router with the real `apk` instead, which
 is stronger evidence than desktop unpacking because it covers what is actually
 installed.
 
+## Completed hardware and lifecycle gates
+
+Recorded in [`router-test-0.10.1.md`](router-test-0.10.1.md): APK inspection with
+the real apk v3 tool on the router, the live 0.10.0-to-0.10.1 upgrade with
+conffiles preserved, the compatibility reset, a `TERM` inside the destructive
+window, the `BTN_0` duplicate-release invariant (three releases, one power-cycle,
+one terminal result), the re-measured wall-clock bound and the removal
+simulation.
+
 ## Open gates before release
 
-1. Inspection of the produced APKs with a real apk v3 tool on the router:
-   file list, modes, control scripts and the `postrm` lock handling.
-2. Clean install, 0.10.0 upgrade and removal simulation, including the
-   `postrm` path that now understands both lock representations.
-3. Live 0.10.0-to-0.10.1 upgrade on the WH3000 with the modem attached.
-4. Hardware re-validation of the reset path, because its lock protocol changed:
-   - compatibility `apn-autoconfig modem-reset` completes, GPIO returns to its
-     powered-on value, both locks are clear and connectivity is verified;
-   - a real `TERM` during the destructive window still restores power, the
-     selected interface and both locks;
-   - one `BTN_0` release starts exactly one operation, and a second release
-     during that operation is logged as an ignored duplicate — this is the
-     window the handoff defect corrupted, so it must be exercised deliberately
-     rather than assumed;
-   - `modem_wait_seconds` is now a wall-clock bound; record the observed
-     power-restored-to-owner-returned duration again and confirm it is bounded
-     by the configured value.
-5. Signed-feed publication and the install/removal/reinstall smoke test.
+1. Publication of the release tag and the signed feed.
+2. The live feed install/removal/reinstall smoke without `--allow-untrusted`.
 
 ## Upgrade constraint
 

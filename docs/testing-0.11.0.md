@@ -3,13 +3,20 @@
 Status: contract accepted, implementation in progress. No hardware gate has
 been attempted.
 
-Implemented and covered so far: `provision-plan` (read-only planning with its
-stable refusal reasons), the `auto`-selection protection for disabled
-project-owned sections, and the borrowed operation lock's refusal paths. Still
-to implement: `provision`, `deprovision`, `connect`/`disconnect`/`reconnect`,
-promotion, the provisioning baseline and rollback, the LuCI first-run view and
-the lifecycle tests. The borrowed lock's success path is exercised once
-`provision` exists; only its refusal paths are asserted today.
+Implemented and covered so far: `provision-plan` with its stable refusal
+reasons; the `auto`-selection protection for disabled project-owned sections;
+the borrowed operation lock in both directions; and `provision` /
+`deprovision` including the staging section, ownership markers, promotion,
+the provisioning baseline, exact rollback and interruption.
+
+Still to implement: `connect`/`disconnect`/`reconnect`, the manual APN path,
+the LuCI first-run view, and the install/upgrade/removal lifecycle tests. No
+part of this has run on hardware.
+
+The test harness's `uci` mock now supports `set`, `delete`, `commit` and
+`revert`, and journals every write. Assertions therefore check which keys were
+written, not just the resulting state — which is what makes "touched only the
+section it created" a real assertion rather than an inspection.
 
 0.11.0 builds directly on the locks repaired in 0.10.1 and adds new callers to
 them. Land and validate 0.10.1 first; do not develop provisioning against the

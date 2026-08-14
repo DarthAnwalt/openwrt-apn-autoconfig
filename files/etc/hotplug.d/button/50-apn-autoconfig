@@ -8,9 +8,6 @@ configured_button="$(uci -q get apn-autoconfig.main.button_name)"
 [ "${BUTTON:-}" = "$configured_button" ] || exit 0
 [ "${ACTION:-}" = "released" ] || exit 0
 
-logger -t apn-autoconfig-button -p user.notice -- \
-	"button $configured_button released; starting modem reset and APN reconciliation" 2>/dev/null || :
-
 autoconfig_bin="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 [ -x "$autoconfig_bin" ] || {
 	logger -t apn-autoconfig-button -p user.err -- \
@@ -18,10 +15,33 @@ autoconfig_bin="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 	exit 1
 }
 
-if ! "$autoconfig_bin" action-start modem-reset </dev/null >/dev/null 2>&1; then
+launch_result="$("$autoconfig_bin" action-start modem-reset </dev/null 2>/dev/null)" || {
 	logger -t apn-autoconfig-button -p user.err -- \
 		"failed to enqueue modem reset and APN reconciliation" 2>/dev/null || :
 	exit 1
-fi
+}
+
+accepted="$(jsonfilter -s "$launch_result" -e '@.accepted' 2>/dev/null || :)"
+busy="$(jsonfilter -s "$launch_result" -e '@.busy' 2>/dev/null || :)"
+case "$accepted:$busy" in
+	true:true|true:false)
+		logger -t apn-autoconfig-button -p user.notice -- \
+			"button $configured_button released; modem reset and APN reconciliation accepted" 2>/dev/null || :
+	;;
+	false:true)
+		logger -t apn-autoconfig-button -p user.notice -- \
+			"button $configured_button released while an operation is already running; duplicate ignored" 2>/dev/null || :
+	;;
+	false:false)
+		logger -t apn-autoconfig-button -p user.err -- \
+			"button $configured_button released, but modem reset was rejected" 2>/dev/null || :
+		exit 1
+	;;
+	*)
+		logger -t apn-autoconfig-button -p user.err -- \
+			"button $configured_button received an invalid action-start response" 2>/dev/null || :
+		exit 1
+	;;
+esac
 
 exit 0

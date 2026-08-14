@@ -151,12 +151,25 @@ EOF
 cat >"$MOCKBIN/mmcli" <<'EOF'
 #!/bin/sh
 [ "${MMCLI_UNAVAILABLE:-0}" = "1" ] && exit 1
+[ "${MMCLI_HANG:-0}" != 1 ] || {
+	printf '%s\n' "$$" >"$TEST_STATE/mmcli-hang-pid"
+	exec /bin/sleep 30
+}
 case "${1:-}" in
 -L)
 	printf '%s\n' "    /org/freedesktop/ModemManager1/Modem/${MM_MODEM_INDEX:-7} [Quectel] RM520N-GL"
 	exit 0
 	;;
 -m)
+	if [ "${MM_DELAY_AFTER_COORDINATOR:-0}" = 1 ] && [ -e "$TEST_STATE/coordinator-reset-complete" ]; then
+		count="$(cat "$TEST_STATE/coordinator-mm-count" 2>/dev/null || printf '%s' 0)"
+		count=$((count + 1))
+		printf '%s\n' "$count" >"$TEST_STATE/coordinator-mm-count"
+		if [ "$count" -lt 3 ]; then
+			exit 1
+		fi
+		: >"$TEST_STATE/coordinator-sim-ready"
+	fi
 	registration_state="${MM_REGISTRATION_STATE:-home}"
 	if [ -n "${MM_REGISTRATION_AFTER_IFUP:-}" ] && [ -e "$TEST_STATE/ifup-seen" ]; then
 		registration_state="$MM_REGISTRATION_AFTER_IFUP"
@@ -247,6 +260,7 @@ EOF
 
 cat >"$MOCKBIN/logger" <<'EOF'
 #!/bin/sh
+[ -z "${TEST_LOGGER_CALLS:-}" ] || printf '%s\n' "$*" >>"$TEST_LOGGER_CALLS"
 exit 0
 EOF
 
@@ -1005,6 +1019,24 @@ printf '%s\n' 'TEST temporary ModemManager or SIM unavailability remains retryab
 if MMCLI_UNAVAILABLE=1 sh "$SCRIPT" reconcile >/dev/null 2>&1; then fail 'unavailable modem unexpectedly reconciled'; else unavailable_status=$?; fi
 [ "$unavailable_status" -eq 3 ] || fail 'temporary modem unavailability was not classified as retryable'
 
+printf '%s\n' 'TEST ModemManager calls remain bounded without an external timeout command'
+rm -f "$STATE/mmcli-hang-pid"
+bounded_started="$(date +%s)"
+if MMCLI_UNAVAILABLE=0 MMCLI_HANG=1 TEST_INTERFACE=wwan \
+	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
+	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=1 sh "$SCRIPT" status >/dev/null 2>&1; then
+	fail 'a hanging mmcli call unexpectedly produced status output'
+else
+	[ "$?" -eq 3 ] || fail 'a hanging mmcli call did not remain retryable'
+fi
+bounded_elapsed=$(($(date +%s) - bounded_started))
+[ "$bounded_elapsed" -le 5 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
+mmcli_hang_pid="$(cat "$STATE/mmcli-hang-pid" 2>/dev/null || :)"
+[ -n "$mmcli_hang_pid" ] || fail 'hanging mmcli fixture did not start'
+if kill -0 "$mmcli_hang_pid" 2>/dev/null; then
+	fail 'fallback mmcli timeout left its child process running'
+fi
+
 MM_REGISTRATION_STATE=home
 SIM_OPERATOR_ID=26201
 SIM_OPERATOR_NAME='Kaufland Mobil'
@@ -1155,6 +1187,7 @@ if sh "$SCRIPT" reconcile >/dev/null 2>&1; then
 else
 	lock_status=$?
 fi
+
 [ "$lock_status" -eq 3 ] || fail 'live operation lock contention was not classified as retryable'
 rm -rf "$TEST_LOCK"
 
@@ -1264,13 +1297,53 @@ fi
 [ "$(cat "$TEST_GPIO")" = '0' ] || fail 'failed modem reset left modem power off'
 grep -F -q 'up wwan' "$STATE/events" || fail 'failed modem reset did not attempt WWAN recovery'
 
+printf '%s\n' 'TEST coordinator delegation preserves failure status and runs reconcile only after success'
+cat >"$MOCKBIN/apn-autoconfig-modem" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/coordinator-calls"
+case "${1:-}" in
+	resolve) printf '%s\n' 'imei:490154203237518' ;;
+	status-json) printf '%s\n' '{"version":"v1","capabilities":{"reset":true}}' ;;
+	reset)
+		status="${TEST_COORDINATOR_RESET_EXIT:-0}"
+		[ "$status" -ne 0 ] || : >"$TEST_STATE/coordinator-reset-complete"
+		exit "$status"
+	;;
+	*) exit 2 ;;
+esac
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-modem"
+: >"$STATE/coordinator-calls"
+if TEST_COORDINATOR_RESET_EXIT=7 sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+	fail 'coordinator reset failure was converted into success'
+else
+	[ "$?" -eq 7 ] || fail 'coordinator reset failure did not preserve exit code 7'
+fi
+printf '%s\n' 'wrong.apn' >"$STATE/apn"
+rm -f "$STATE/coordinator-reset-complete" "$STATE/coordinator-mm-count" "$STATE/coordinator-sim-ready"
+MM_DELAY_AFTER_COORDINATOR=1 TEST_COORDINATOR_RESET_EXIT=0 sh "$SCRIPT" modem-reset >/dev/null 2>&1 || \
+	fail 'successful coordinator reset did not continue to APN reconcile'
+[ "$(cat "$STATE/coordinator-mm-count")" -ge 3 ] || fail 'core did not poll until the primary SIM became readable'
+[ -e "$STATE/coordinator-sim-ready" ] || fail 'core reconciled before the primary SIM became readable'
+[ "$(cat "$STATE/apn")" = internet.telekom ] || fail 'successful coordinator reset did not reconcile APN'
+grep -F -x -q 'resolve --interface wwan' "$STATE/coordinator-calls" || fail 'compatibility shim did not resolve the selected interface'
+grep -F -x -q 'reset --modem imei:490154203237518' "$STATE/coordinator-calls" || fail 'compatibility shim did not invoke coordinator reset'
+rm -f "$MOCKBIN/apn-autoconfig-modem"
+
 printf '%s\n' 'TEST button ignores press and queues modem reset only on release'
 cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_STATE/button-calls"
+case "${TEST_BUTTON_LAUNCH_RESULT:-accepted}" in
+	accepted) printf '%s\n' '{"version":"v2","accepted":true,"busy":true,"state":"running"}' ;;
+	busy) printf '%s\n' '{"version":"v2","accepted":false,"busy":true,"state":"running"}' ;;
+	rejected) printf '%s\n' '{"version":"v2","accepted":false,"busy":false,"state":"failed"}' ;;
+	malformed) printf '%s\n' 'not-json' ;;
+	failure) exit 7 ;;
+esac
 EOF
 chmod 0755 "$MOCKBIN/apn-autoconfig-button-command"
-rm -f "$STATE/button-calls"
+rm -f "$STATE/button-calls" "$STATE/button-logger-calls"
 TEST_BUTTON_ENABLED=0 BUTTON=BTN_0 ACTION=released \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
@@ -1280,6 +1353,7 @@ TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=pressed \
 	sh "$BUTTON_SCRIPT"
 [ ! -e "$STATE/button-calls" ] || fail 'button press triggered the action before release'
 TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=released \
+	TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
 button_wait=10
@@ -1289,6 +1363,30 @@ while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
 done
 grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
 	fail 'button release did not queue modem-reset through the job API'
+grep -F -q 'modem reset and APN reconciliation accepted' "$STATE/button-logger-calls" || \
+	fail 'accepted button release did not log its real launch result'
+
+printf '%s\n' 'TEST repeated button release reports busy coalescing instead of a second launch'
+: >"$STATE/button-calls"
+: >"$STATE/button-logger-calls"
+TEST_BUTTON_ENABLED=1 TEST_BUTTON_LAUNCH_RESULT=busy BUTTON=BTN_0 ACTION=released \
+	TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
+	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+	sh "$BUTTON_SCRIPT"
+[ "$(grep -F -x -c 'action-start modem-reset' "$STATE/button-calls")" -eq 1 ] || \
+	fail 'busy button release invoked more than one launch request'
+grep -F -q 'operation is already running; duplicate ignored' "$STATE/button-logger-calls" || \
+	fail 'busy button release was logged as a newly started reset'
+
+printf '%s\n' 'TEST rejected or malformed button launch is an explicit hotplug failure'
+for result in rejected malformed failure; do
+	if TEST_BUTTON_ENABLED=1 TEST_BUTTON_LAUNCH_RESULT="$result" BUTTON=BTN_0 ACTION=released \
+		TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
+		APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+		sh "$BUTTON_SCRIPT"; then
+		fail "button launch result '$result' was converted into success"
+	fi
+done
 
 printf '%s\n' 'TEST reset-all restores every target baseline before package removal'
 rm -rf "$PERSIST/targets"

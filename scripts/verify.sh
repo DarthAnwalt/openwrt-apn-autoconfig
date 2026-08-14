@@ -12,7 +12,15 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-qmi"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/sbin/apn-autoconfig-modem"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-boot"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-action"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-query"
+sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-control"
+sh -n "$ROOT/apn-autoconfig-modem/files/etc/init.d/apn-autoconfig-modem"
+sh -n "$ROOT/apn-autoconfig-modem/files/etc/hotplug.d/usb/50-apn-autoconfig-modem"
 sh -n "$ROOT/tests/run-tests.sh"
+sh -n "$ROOT/tests/run-tests-modem.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/build-repository.sh"
@@ -73,19 +81,28 @@ core_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/Makefile")"
 core_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/Makefile")"
 luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
 luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
+modem_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
+modem_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
 [ -n "$core_version" ]
 [ -n "$core_release" ]
 [ -n "$luci_version" ]
 [ -n "$luci_release" ]
+[ -n "$modem_version" ]
+[ -n "$modem_release" ]
+[ "$modem_version" = "$core_version" ] || {
+	printf 'Modem package version %s does not match suite version %s.\n' "$modem_version" "$core_version" >&2
+	exit 1
+}
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
-	grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
+	grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-modem $modem_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
 		"$ROOT/CHANGELOG.md"
 else
-	grep -F "## apn-autoconfig $core_version / apn-autoconfig-providers " "$ROOT/CHANGELOG.md" |
+	grep -F "## apn-autoconfig $core_version / apn-autoconfig-modem $modem_version / apn-autoconfig-providers " "$ROOT/CHANGELOG.md" |
 		grep -F -q " / luci-app-apn-autoconfig $luci_version"
 fi
 grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
 grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
+grep -F -q "apn-autoconfig-modem-$modem_version-r$modem_release.apk" "$ROOT/README.md"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ] && [ "$EXPECTED_RELEASE_TAG" != "v$core_version" ]; then
 	printf 'Release tag %s does not match core package version %s.\n' \
 		"$EXPECTED_RELEASE_TAG" "$core_version" >&2
@@ -113,6 +130,20 @@ if grep -F -q 'providers.tsv' "$ROOT/Makefile"; then
 	printf '%s\n' 'The core package still owns the provider database.' >&2
 	exit 1
 fi
+modem_depends="$(sed -n 's/^[[:space:]]*DEPENDS:=//p' "$ROOT/apn-autoconfig-modem/Makefile" | sed -n '1p')"
+case "$modem_depends" in
+	*modemmanager*|*uqmi*|*umbim*|*kmod-button-hotplug*)
+		printf '%s\n' 'apn-autoconfig-modem has a backend- or board-specific hard dependency.' >&2
+		exit 1
+	;;
+esac
+if grep -F -q 'DEPENDS:=+apn-autoconfig-modem' "$ROOT/Makefile"; then
+	printf '%s\n' 'apn-autoconfig must not hard-depend on apn-autoconfig-modem in 0.10.0; coupling is soft this release.' >&2
+	exit 1
+fi
+grep -F -q "option autostart '1'" "$ROOT/apn-autoconfig-modem/files/etc/config/apn-autoconfig-modem"
+grep -F -q '[ -n "$${IPKG_INSTROOT}" ] && exit 0' "$ROOT/apn-autoconfig-modem/Makefile"
+grep -F -q '/etc/init.d/apn-autoconfig-modem restart' "$ROOT/apn-autoconfig-modem/Makefile"
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 	node "$ROOT/tests/test-luci-roaming-policy.js"
@@ -151,4 +182,5 @@ sh "$ROOT/tests/test-provider-generator.sh"
 sh "$ROOT/tests/test-database-update.sh"
 sh "$ROOT/tests/test-installer.sh"
 sh "$ROOT/tests/run-tests.sh"
+sh "$ROOT/tests/run-tests-modem.sh"
 printf '%s\n' 'Static and behavioral verification passed.'

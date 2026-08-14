@@ -1,9 +1,12 @@
 # apn-autoconfig — OpenWrt source packages
 
-`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. The
-0.9.2 discovers configured cellular netifd interfaces and publishes both
+`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. Version
+0.10.0 preserves the released ModemManager and native OpenWrt QMI profile
+backends and adds an optional modem-control package with read-only inventory,
+stable identity, control-owner arbitration and serialized reset coordination.
+The APN engine discovers configured cellular netifd interfaces and publishes
 their runtime capabilities and validation level through a GUI-independent API.
-Its operational backends are ModemManager and native OpenWrt QMI. QMI identity
+QMI identity
 uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
 application is delegated to the configured netifd `qmi.sh` target. MBIM, Fibocom and
 selected AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
@@ -20,14 +23,35 @@ can power-cycle the modem through its verified exported GPIO and reconcile the
 APN after the modem returns. Boot automation is disabled by default; physical
 controls are not treated as a generic router capability.
 
-This repository contains four OpenWrt packages. It builds normal `.apk`
+This repository contains five OpenWrt packages. It builds normal `.apk`
 packages with the official OpenWrt 25.12 SDK:
 
 - `apn-autoconfig`, the POSIX-shell core;
 - `apn-autoconfig-providers`, the independently versioned provider database;
 - `luci-app-apn-autoconfig`, the optional web interface;
 - `apn-autoconfig-integration-huasifei-wh3000`, the optional, board-specific
-  BTN_0/GPIO integration tested on the Huasifei WH3000 Pro.
+  BTN_0/GPIO integration tested on the Huasifei WH3000 Pro; and
+- `apn-autoconfig-modem`, the optional read-only modem inventory and operation
+  coordinator introduced in 0.10.0.
+
+## Direction to 1.0
+
+The released packages intentionally retain the configured-target requirement
+described above. The accepted architecture now grows them into a signed,
+self-contained mobile-connectivity suite. A supported modem may be present
+before package installation, attached later or installed internally at boot;
+service-start scanning and hotplug must converge to the same inventory without
+requiring a physical reconnect. Later milestones add safe project-owned netifd
+provisioning, MBIM, bounded AT/Fibocom support and eSIM lifecycle behind one
+capability-driven LuCI package.
+
+Version 0.10.0 establishes modem inventory, identity, ownership and operation
+coordination before new writable protocols. It preserves the tested Huasifei
+BTN_0 behavior: guarded modem power-cycle,
+re-enumeration, targeted APN reconcile and verified connectivity as one
+serialized operation. See [`docs/architecture.md`](docs/architecture.md) and
+[`docs/roadmap.md`](docs/roadmap.md). Later milestones remain future capability
+claims and are not implied by the 0.10.0 foundation.
 
 The generated provider database combines GNOME mobile-broadband-provider-info,
 the AOSP sample APN database and locally verified overrides. Large upstream XML
@@ -124,8 +148,8 @@ profile without reapplying it.
 
 ## Signed package repository
 
-OpenWrt 25.12 routers can install and upgrade the core, database, LuCI and
-optional Huasifei integration packages from the
+OpenWrt 25.12 routers can install and upgrade the core, database, LuCI,
+optional modem-control and Huasifei integration packages from the
 project's signed APK repository.
 
 ### Quick installer
@@ -215,6 +239,12 @@ For a command-line-only installation, use this final command instead:
 apk add apn-autoconfig
 ```
 
+Install the optional read-only modem inventory and operation coordinator with:
+
+```sh
+apk add apn-autoconfig-modem
+```
+
 Only on the tested Huasifei WH3000 Pro, install the separate board adapter if
 the BTN_0/GPIO modem-reset flow is desired:
 
@@ -279,9 +309,29 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.9.2-r1.apk \
-  ./luci-app-apn-autoconfig-0.6.0-r1.apk
+  ./apn-autoconfig-0.10.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.10.0-r1.apk
 ```
+
+`apn-autoconfig-modem-0.10.0-r1.apk` is optional and not part of this
+transaction: `apn-autoconfig` does not depend on it in 0.10.0. It adds
+read-only modem inventory and a coordinator-based `modem-reset` path alongside
+the compatibility path. Install it when those functions are required.
+
+The inventory service starts automatically on a live installation so a modem
+that was already attached is discovered without reconnecting it. GPIO reset is
+still disabled until the internal modem is pinned with its strong identity:
+
+```sh
+apn-autoconfig-modem inventory-json
+uci set 'apn-autoconfig-modem.main.reset_modem_id=usb-serial:<exact-id-from-inventory>'
+uci commit apn-autoconfig-modem
+/etc/init.d/apn-autoconfig-modem restart
+```
+
+Do not copy the example placeholder. Use only the exact `usb-serial:` or
+`imei:` value for the modem physically controlled by the tested WH3000 GPIO.
+If that binding is absent, weak or ambiguous, reset capability remains false.
 
 Use the same single transaction when upgrading from 0.7.0. It transfers
 `/usr/share/apn-autoconfig/providers.tsv` from the old core package to the new
@@ -721,10 +771,15 @@ To undo testing but keep the package installed:
 apn-autoconfig reset
 ```
 
-To restore the baseline and remove the package:
+To restore the baseline and remove the installed code packages while retaining
+the independently managed provider database:
 
 ```sh
-apk del apn-autoconfig
+apk del \
+  luci-app-apn-autoconfig \
+  apn-autoconfig-integration-huasifei-wh3000 \
+  apn-autoconfig-modem \
+  apn-autoconfig
 ```
 
 The package pre-deinstall script stops and disables the boot service, then
@@ -750,13 +805,17 @@ Removing the core does not remove or rewrite files owned by the optional board
 integration. Removing `apn-autoconfig-integration-huasifei-wh3000` removes its
 button handler and marker; APK also prevents leaving it installed without its
 core dependency. Neither package enables button handling in UCI by default.
+Removing `apn-autoconfig-modem` stops its read-only inventory service and
+cleans its own configuration and stale runtime state without changing netifd or
+the APN profile.
 
 ## Attended sysupgrade
 
-This package is not yet in an official OpenWrt feed. A local `.apk` is therefore
-not guaranteed to be included by the public Attended Sysupgrade server. Do not
-assume seamless ASU preservation until a custom signed feed or an official feed
-submission has been implemented and tested.
+This package is not yet in an official OpenWrt feed. The project provides its
+own signed feed, but the public Attended Sysupgrade server does not
+automatically include packages from it. Do not assume seamless ASU preservation
+until the project feed is explicitly integrated into that upgrade path or the
+packages enter an official feed.
 
 ## Known limitations
 
@@ -797,8 +856,9 @@ builds or runtime behavior depend on upstream availability.
 New maintainers and coding assistants should start with
 [`docs/development-handoff.md`](docs/development-handoff.md). It records the
 project boundary, package map, binding safety invariants, public integration
-surface, backend-extension checklist and required release workflow. Detailed
-QMI/API semantics, evidence gates and future adapter direction remain in
-[`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
+surface and required release workflow. The accepted target architecture and
+release sequence are in [`docs/architecture.md`](docs/architecture.md) and
+[`docs/roadmap.md`](docs/roadmap.md). Released QMI/API semantics and evidence
+remain in [`docs/backend-contract-v1.md`](docs/backend-contract-v1.md),
 [`docs/testing-0.9.2.md`](docs/testing-0.9.2.md) and
-[`docs/roadmap.md`](docs/roadmap.md).
+[`docs/testing-0.10.0.md`](docs/testing-0.10.0.md).

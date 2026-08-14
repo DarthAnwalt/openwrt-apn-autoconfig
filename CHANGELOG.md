@@ -1,6 +1,67 @@
 # Changelog
 
-## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (unreleased)
+## apn-autoconfig 0.10.0 / apn-autoconfig-modem 0.10.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (2026-08-14)
+
+- Added the `apn-autoconfig-modem` package: read-only modem inventory with
+  stable identity independent of volatile `/dev` names (USB serial > IMEI >
+  weak VID:PID evidence), explicit
+  none/netifd-direct/modemmanager/conflicting control-owner states and a
+  per-modem operation coordinator. See `docs/modem-contract-v1.md`.
+- Hardened the foundation before hardware validation: inventory now classifies
+  QMI, MBIM and AT-only devices without issuing direct QMI identity requests
+  against ModemManager-owned or ownership-uncertain hardware; direct QMI
+  identity remains locally bounded without an external `timeout`; duplicate
+  weak identities, control devices and netifd bindings fail closed instead of
+  selecting the first item.
+- Normalize the physical USB device-root paths emitted by ModemManager and
+  stored in netifd `device`/`devpath` on WH3000 so their observations merge with
+  the correlated QMI control and data devices instead of producing separate
+  incomplete records.
+- Treat multiple AT ports on a proven QMI/MBIM modem as an unavailable optional
+  AT attribute rather than a conflict for the whole modem; AT-only devices
+  still fail closed until a port can be identified by role.
+- Reset capability now requires an explicit strong `reset_modem_id` binding to
+  the internal modem controlled by the WH3000 GPIO. Signal/error cleanup always
+  restores power and the selected interface, and APN/modem operations share the
+  documented global-to-per-modem lock order.
+- Reset completion now requires the same stable modem identity to return under
+  its original control owner before netifd is restarted. The compatibility
+  path then waits boundedly for ModemManager's primary SIM and interface before
+  APN reconciliation, preventing a raw USB re-enumeration from being mistaken
+  for an operational modem.
+- All core ModemManager reads now have an eight-second per-call bound with a
+  portable watchdog fallback when `timeout` is unavailable. Signal cleanup
+  also terminates both the bounded child and its watchdog, so the documented
+  reset readiness window cannot silently turn into an unbounded D-Bus wait.
+- Background modem actions now use atomic launch serialization, versioned v2
+  state with operation IDs and terminal blocked/retryable results. Live package
+  installation enables the service and performs a delayed full scan, while
+  offline image installation remains inert.
+- The verified WH3000 `BTN_0` release handler now parses the job launch result:
+  accepted work, a safely coalesced busy duplicate and a real rejection receive
+  distinct truthful logs. Press events remain inert and repeated releases still
+  cannot overlap modem resets.
+- Package removal preserves locks owned by live operations and no longer uses
+  a broad wildcard to delete modem-control runtime paths.
+- `apn-autoconfig modem-reset` (and `action-start modem-reset`) delegate the
+  guarded power-cycle and re-enumeration wait to `apn-autoconfig-modem` when
+  it is installed and can unambiguously resolve the target's explicitly
+  reset-capable modem; the released inline path is used only when the new
+  package is absent. An installed coordinator that cannot prove a safe binding
+  fails closed instead of silently bypassing the new ownership boundary.
+  Coupling is soft this release: no new package dependency.
+- Added a read-only "Modem inventory" card to the LuCI view, fed by the new
+  package's narrow rpcd query method; it shows an informational message
+  instead of a broken control when the optional package is not installed.
+- This is an architecture-foundation release: it does not add automatic
+  network provisioning, native MBIM profile mutation or eSIM support. See
+  `docs/architecture.md`, `docs/roadmap.md` and `docs/testing-0.10.0.md`.
+- Passed the Huasifei WH3000 hardware gate: manual and physical-button
+  reset-plus-reconcile, interruption recovery, repeated-release coalescing and
+  LuCI observation all restored the same ModemManager-owned modem, `wwan` and
+  verified connectivity without overlapping power cycles.
+
+## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (2026-08-13)
 
 - Made service shutdown safe during QMI reconciliation: boot and background
   workers now forward termination to the active engine, the QMI teardown pause

@@ -49,8 +49,10 @@ MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
 MODEM_POLL_SECONDS="2"
+MMCLI_TIMEOUT_SECONDS="${APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS:-8}"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 QMI_ADAPTER="${APN_AUTOCONFIG_QMI_ADAPTER:-/usr/libexec/apn-autoconfig-qmi}"
+TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
 HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn-autoconfig/integrations/huasifei-wh3000}"
 
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
@@ -80,6 +82,9 @@ MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
 SETTLE_SLEEP_PID=""
+BOUNDED_CHILD_PID=""
+BOUNDED_WATCHDOG_PID=""
+MODEM_COORDINATOR_ID=""
 
 MODEM_STATE="unknown"
 REGISTRATION_STATE="unknown"
@@ -114,6 +119,16 @@ die_code() {
 }
 
 cleanup_files() {
+	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
+		kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		BOUNDED_WATCHDOG_PID=""
+	fi
+	if [ -n "$BOUNDED_CHILD_PID" ]; then
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		BOUNDED_CHILD_PID=""
+	fi
 	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
 		"$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS" "$TARGETS_DATA"
 	if [ "$LOCK_HELD" -eq 1 ]; then
@@ -311,6 +326,32 @@ trap on_signal HUP INT TERM
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
+}
+
+run_bounded_to_file() {
+	seconds="$1"
+	output_file="$2"
+	shift 2
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null
+		return
+	fi
+	"$@" >"$output_file" 2>/dev/null &
+	BOUNDED_CHILD_PID=$!
+	(
+		sleep "$seconds"
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
+		sleep 1
+		kill -9 "$BOUNDED_CHILD_PID" 2>/dev/null || :
+	) >/dev/null 2>&1 &
+	BOUNDED_WATCHDOG_PID=$!
+	bounded_status=0
+	wait "$BOUNDED_CHILD_PID" || bounded_status=$?
+	BOUNDED_CHILD_PID=""
+	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	BOUNDED_WATCHDOG_PID=""
+	return "$bounded_status"
 }
 
 load_config() {
@@ -533,9 +574,11 @@ validate_config() {
 	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
 	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
 	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	case "$MMCLI_TIMEOUT_SECONDS" in ''|*[!0-9]*) die "mmcli timeout must be numeric" ;; esac
 	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
+	[ "$MMCLI_TIMEOUT_SECONDS" -gt 0 ] || die "mmcli timeout must be greater than zero"
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
 	case "$CACHE_DIR" in /|*/../*|*/..) die "unsafe cache_dir" ;; /*) : ;; *) die "cache_dir must be absolute" ;; esac
 	case "$CACHE_DIR" in "$STATE_DIR"/?*) : ;; *) die "cache_dir must be inside state_dir" ;; esac
@@ -615,8 +658,9 @@ kv_value() {
 
 resolve_sim_index() {
 	: >"$MODEM_LIST"
-	mmcli -L 2>/dev/null | \
-		sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' >"$MODEM_LIST" || :
+	if run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$MODEM_DATA" mmcli -L; then
+		sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' "$MODEM_DATA" >"$MODEM_LIST"
+	fi
 
 	selected_sim=""
 	selected_modem=""
@@ -625,7 +669,8 @@ resolve_sim_index() {
 	modem_count=0
 	while IFS= read -r modem_index; do
 		case "$modem_index" in ''|*[!0-9]*) continue ;; esac
-		mmcli -m "$modem_index" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || continue
+		run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$MODEM_DATA" \
+			mmcli -m "$modem_index" --output-keyvalue || continue
 		modem_count=$((modem_count + 1))
 		modem_device="$(kv_value_from "$MODEM_DATA" 'modem.generic.device')"
 		modem_physdev="$(kv_value_from "$MODEM_DATA" 'modem.generic.physdev')"
@@ -719,7 +764,8 @@ modemmanager_refresh_modem_status() {
 	read_roaming_policy
 
 	[ -n "$MODEM_INDEX" ] || return 1
-	mmcli -m "$MODEM_INDEX" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || return 1
+	run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$MODEM_DATA" \
+		mmcli -m "$MODEM_INDEX" --output-keyvalue || return 1
 	MODEM_STATE="$(kv_value_from "$MODEM_DATA" 'modem.generic.state')"
 	REGISTRATION_STATE="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.registration-state')"
 	SERVING_OPERATOR_ID="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.operator-code')"
@@ -745,7 +791,8 @@ refresh_modem_status() {
 
 modemmanager_read_sim() {
 	resolve_sim_index || die_code 3 "cannot yet resolve the primary SIM for interface $INTERFACE"
-	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
+	run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
+		mmcli -i "$SIM_INDEX" --output-keyvalue || \
 		die_code 3 "cannot yet read SIM $SIM_INDEX with mmcli"
 	IMSI="$(kv_value 'sim.properties.imsi')"
 	ICCID="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
@@ -2074,7 +2121,8 @@ roaming_policy_set_cmd() {
 	sim_available=0
 	SIM_INDEX=""
 	MODEM_INDEX=""
-	if resolve_sim_index && mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+	if resolve_sim_index && run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
+		mmcli -i "$SIM_INDEX" --output-keyvalue; then
 		sim_available=1
 		refresh_modem_status || :
 		was_roaming="$ROAMING_STATUS"
@@ -2121,7 +2169,8 @@ wait_for_modem() {
 			modemmanager)
 				SIM_INDEX=""
 				if resolve_sim_index && \
-				   mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+				   run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
+					mmcli -i "$SIM_INDEX" --output-keyvalue; then
 					ready_iccid="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
 					case "$ready_iccid" in ''|*[!0-9]*) : ;; *) return 0 ;; esac
 				fi
@@ -2140,7 +2189,7 @@ wait_for_modem() {
 	return 1
 }
 
-modem_reset_cmd() {
+modem_reset_inline_cmd() {
 	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
 	acquire_lock
 	migrate_target_state
@@ -2185,6 +2234,72 @@ modem_reset_cmd() {
 	fi
 	INTERFACE_RESTORE_ARMED=0
 	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
+# Compatibility mapping to apn-autoconfig-modem, per docs/modem-contract-v1.md:
+# when the new package is installed and can unambiguously resolve the modem
+# bound to this target, it owns the power-cycle and re-enumeration wait;
+# apn-autoconfig keeps its own SIM/QMI-readiness wait and reconcile step
+# unchanged either way. Soft coupling for 0.10.0 means no hard package
+# dependency: only an absent coordinator falls back to the released inline
+# path. Once installed, unresolved identity or unsafe capability fails closed.
+modem_reset_coordinator_modem_id() {
+	command_exists apn-autoconfig-modem || return 1
+	MODEM_COORDINATOR_ID="$(apn-autoconfig-modem resolve --interface "$INTERFACE" 2>/dev/null)" || \
+		die_code 4 "apn-autoconfig-modem could not resolve one safe modem for interface $INTERFACE"
+	[ -n "$MODEM_COORDINATOR_ID" ] || \
+		die_code 4 "apn-autoconfig-modem returned an empty modem identity for interface $INTERFACE"
+	coordinator_status_json="$(apn-autoconfig-modem status-json --modem "$MODEM_COORDINATOR_ID" 2>/dev/null)" || \
+		die_code 4 "apn-autoconfig-modem could not validate modem $MODEM_COORDINATOR_ID"
+	coordinator_reset_capability="$(jsonfilter -s "$coordinator_status_json" -e '@.capabilities.reset' 2>/dev/null || :)"
+	[ "$coordinator_reset_capability" = true ] || \
+		die_code 4 "modem $MODEM_COORDINATOR_ID is not explicitly bound to the supported board reset integration"
+}
+
+modem_reset_via_coordinator_cmd() {
+	acquire_lock
+	migrate_target_state
+	log notice "hardware modem reset requested; delegating power-cycle to apn-autoconfig-modem for $MODEM_COORDINATOR_ID"
+	coordinator_status=0
+	APN_AUTOCONFIG_COORDINATOR_PARENT_PID="$$" \
+		apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID" || coordinator_status=$?
+	if [ "$coordinator_status" -ne 0 ]; then
+		case "$coordinator_status" in
+			3) die_code 3 "modem $MODEM_COORDINATOR_ID did not become ready again in time" ;;
+			*) die_code "$coordinator_status" "apn-autoconfig-modem reset failed (exit $coordinator_status)" ;;
+		esac
+	fi
+	if [ "$TARGET_BACKEND" = modemmanager ]; then
+		log notice "control owner returned; waiting up to ${MODEM_WAIT_SECONDS}s for the primary SIM"
+		if ! wait_for_modem; then
+			log warning "primary SIM did not become readable after modem power return"
+			return 3
+		fi
+		if ! wait_for_interface; then
+			log warning "mobile interface $INTERFACE did not become ready after modem power return"
+			return 3
+		fi
+	elif [ "$TARGET_BACKEND" = qmi ]; then
+		if wait_for_interface && wait_for_qmi_data_interface; then
+			log notice "QMI data interface $INTERFACE is ready after modem power return"
+		else
+			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
+			return 3
+		fi
+	fi
+	log notice "modem and SIM are available again; reconciling APN"
+	reconcile_cmd
+	status=$?
+	[ "$status" -eq 0 ] || return "$status"
+	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
+modem_reset_cmd() {
+	if modem_reset_coordinator_modem_id; then
+		modem_reset_via_coordinator_cmd
+		return $?
+	fi
+	modem_reset_inline_cmd
 }
 
 usage() {

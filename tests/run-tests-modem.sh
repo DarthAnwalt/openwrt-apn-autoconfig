@@ -1174,6 +1174,14 @@ printf '%s\towner_pid=%s\tsection_disabled=%s\tsection_apn=%s\n' \
 # Publishes its own PID and then holds the operation open, so a signal can be
 # delivered while the staging section exists and the locks are held. Checking
 # that PID afterwards detects an engine left running as an orphan.
+case "${1:-}" in
+forget-target)
+	# Mirrors the engine: drop only this target's state directory.
+	section="${3#network:}"
+	rm -rf "$TEST_ENGINE_STATE/targets/network_${section}"
+	exit "${FORGET_EXIT:-0}"
+;;
+esac
 printf '%s\n' "$$" >"$TEST_RECONCILE_PID"
 [ "${RECONCILE_HANG:-0}" = 1 ] && /bin/sleep 30
 exit "${RECONCILE_EXIT:-0}"
@@ -1182,6 +1190,7 @@ MOCKEOF
 }
 export TEST_RECONCILE_CALLS="$STATE/reconcile-calls"
 export TEST_RECONCILE_PID="$STATE/reconcile-pid"
+export TEST_ENGINE_STATE="$STATE/engine-state"
 setup_apn_engine_mock
 
 provision_fixture() {
@@ -1251,10 +1260,27 @@ sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || second_status=$?
 [ "$second_status" -eq 4 ] || fail "a repeated provision exited $second_status instead of the blocked class 4"
 [ "$(network_section_count apnmodem)" -eq 1 ] || fail 'a repeated provision created a second section'
 
+printf '%s\n' 'TEST deprovision asks the engine to forget the deleted target'
+mkdir -p "$TEST_ENGINE_STATE/targets/network_apnmodem1"
+printf 'v3\tapnmodem1\tnetwork:apnmodem1\tmodemmanager\tmodemmanager\n' \
+	>"$TEST_ENGINE_STATE/targets/network_apnmodem1/baseline.tsv"
+mkdir -p "$TEST_ENGINE_STATE/targets/network_other"
+printf 'v3\tother\tnetwork:other\tqmi\tqmi\n' \
+	>"$TEST_ENGINE_STATE/targets/network_other/baseline.tsv"
+
 printf '%s\n' 'TEST deprovision removes exactly the project-owned section and its state'
 deprov_out="$(sh "$SCRIPT" deprovision --modem "$PROV_MODEM")" || fail 'deprovision failed'
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="removed" and d["section"]=="apnmodem1", d' \
-	"$deprov_out" || fail 'deprovision did not report the removed section'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["state"] == "removed", d
+assert d["section"] == "apnmodem1", d
+assert d["engine_state"] == "dropped", d
+' "$deprov_out" || fail 'deprovision did not report the removed section and dropped engine state'
+[ ! -e "$TEST_ENGINE_STATE/targets/network_apnmodem1" ] || \
+	fail 'deprovision left the engine state for the deleted target behind'
+[ -f "$TEST_ENGINE_STATE/targets/network_other/baseline.tsv" ] || \
+	fail 'deprovision dropped engine state belonging to an unrelated target'
 [ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'deprovision left the section behind'
 grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'deprovision did not stop the interface first'
 [ ! -e "$TEST_MODEM_STATE_DIR/provisioning/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01.tsv" ] || \

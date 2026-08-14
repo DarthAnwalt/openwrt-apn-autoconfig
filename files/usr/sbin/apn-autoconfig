@@ -1302,6 +1302,41 @@ reset_cmd() {
 	log notice "restored original mobile profile; cache and baseline removed"
 }
 
+# Drops this engine's state for one target and nothing else. It exists because
+# there was no safe way to clean up after a section was deleted: `reset` is the
+# wrong tool, since its no-baseline path clears CACHE_DIR, which is shared by
+# every target. Provisioning teardown needs to forget one target without
+# touching another target's fast path.
+forget_target_cmd() {
+	[ -n "$REQUESTED_TARGET" ] || die_code 2 "forget-target requires --target"
+	case "$REQUESTED_TARGET" in
+		network:*) forget_section="${REQUESTED_TARGET#network:}" ;;
+		*) die_code 4 "invalid target ID" ;;
+	esac
+	case "$forget_section" in ''|*[!A-Za-z0-9_]*) die_code 4 "invalid target interface" ;; esac
+	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+
+	# A baseline is the only record of the profile this engine replaced. While
+	# the section still exists, dropping it would strand a live target with no
+	# way back, so this refuses rather than accepting the caller's word.
+	if uci -q show network 2>/dev/null | grep -q "^network\.${forget_section}="; then
+		die_code 4 "network section $forget_section still exists; forget-target only drops state for a section that is already gone"
+	fi
+
+	acquire_lock
+
+	forget_dir="$STATE_DIR/targets/network_${forget_section}"
+	if [ ! -d "$forget_dir" ]; then
+		log notice "no engine state to forget for network:$forget_section"
+		return 0
+	fi
+	# Named files only: never a recursive or wildcard delete under the state root.
+	rm -f "$forget_dir/baseline.tsv" "$forget_dir/active.tsv"
+	rmdir "$forget_dir" 2>/dev/null || \
+		log warning "engine state directory for network:$forget_section is not empty; left in place"
+	log notice "dropped engine state for network:$forget_section"
+}
+
 reset_all_cmd() {
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
 	self="$0"
@@ -2448,6 +2483,8 @@ Commands:
   roaming-policy-set <default|allow|block>  Change OpenWrt's canonical policy
   reset    Restore the APN state saved before the first apply; clear cache
   reset-all  Restore every target baseline; intended for safe package removal
+  forget-target  Drop this engine's state for --target, whose section must
+             already be gone; leaves the shared cache and other targets alone
 EOF
 }
 
@@ -2490,6 +2527,14 @@ main() {
 		INTERFACE="wwan"
 		validate_config
 		reset_all_cmd
+		return $?
+	fi
+	if [ "$COMMAND_NAME" = forget-target ]; then
+		# Deliberately before select_target: the whole point is a target whose
+		# section no longer exists, which target selection cannot resolve.
+		INTERFACE="wwan"
+		validate_config
+		forget_target_cmd
 		return $?
 	fi
 	if [ "$COMMAND_NAME" = action-start ]; then

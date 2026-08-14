@@ -1250,6 +1250,48 @@ else
 fi
 rm -f "$TEST_LOCK"
 
+printf '%s\n' 'TEST forget-target drops one target and leaves the shared cache alone'
+rm -rf "$TEST_LOCK"
+mkdir -p "$PERSIST/targets/network_apnmodem1" "$PERSIST/targets/network_cellqmi" "$CACHE"
+printf 'v3\tapnmodem1\tnetwork:apnmodem1\tmodemmanager\tmodemmanager\n' \
+	>"$PERSIST/targets/network_apnmodem1/baseline.tsv"
+printf 'v3\t8949\tweb.example\t-\t-\t-\t-\tnetwork:apnmodem1\tmodemmanager\n' \
+	>"$PERSIST/targets/network_apnmodem1/active.tsv"
+printf 'v3\tcellqmi\tnetwork:cellqmi\tqmi\tqmi\n' \
+	>"$PERSIST/targets/network_cellqmi/baseline.tsv"
+printf 'keep-me\n' >"$CACHE/shared-cache-entry.tsv"
+sh "$SCRIPT" forget-target --target network:apnmodem1 >/dev/null 2>&1 || \
+	fail 'forget-target failed for a section that no longer exists'
+[ ! -e "$PERSIST/targets/network_apnmodem1" ] || \
+	fail 'forget-target left the target state behind'
+[ -f "$PERSIST/targets/network_cellqmi/baseline.tsv" ] || \
+	fail 'forget-target removed an unrelated target state'
+[ -f "$CACHE/shared-cache-entry.tsv" ] || \
+	fail 'forget-target cleared the cache shared by every target'
+
+printf '%s\n' 'TEST forget-target refuses while the network section still exists'
+mkdir -p "$PERSIST/targets/network_wwan"
+printf 'v3\twwan\tnetwork:wwan\tmodemmanager\tmodemmanager\n' \
+	>"$PERSIST/targets/network_wwan/baseline.tsv"
+forget_status=0
+sh "$SCRIPT" forget-target --target network:wwan >/dev/null 2>&1 || forget_status=$?
+[ "$forget_status" -eq 4 ] || \
+	fail "forget-target on a live section exited $forget_status instead of the blocked class 4"
+[ -f "$PERSIST/targets/network_wwan/baseline.tsv" ] || \
+	fail 'forget-target stranded a live target by dropping the baseline that restores it'
+
+printf '%s\n' 'TEST forget-target requires an explicit target and rejects an unsafe one'
+if sh "$SCRIPT" forget-target >/dev/null 2>&1; then
+	fail 'forget-target ran without --target'
+fi
+if sh "$SCRIPT" forget-target --target 'network:../../tmp/x' >/dev/null 2>&1; then
+	fail 'forget-target accepted an unsafe target ID'
+fi
+
+printf '%s\n' 'TEST forget-target is a no-op when there is no state for the target'
+sh "$SCRIPT" forget-target --target network:neverexisted >/dev/null 2>&1 || \
+	fail 'forget-target failed when there was nothing to forget'
+
 printf '%s\n' 'TEST a disabled project-owned staging section never joins automatic target selection'
 TEST_SINGLE_TARGET=1
 export TEST_SINGLE_TARGET

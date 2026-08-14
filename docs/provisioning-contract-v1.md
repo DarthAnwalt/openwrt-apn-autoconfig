@@ -205,6 +205,35 @@ profile operation. Provisioning never writes `apn`, `username`, `password`,
 `auth` or `pdptype` itself; those remain APN-engine-owned fields applied through
 the same baseline, verification and rollback discipline as a database profile.
 
+## Forgetting a deprovisioned target
+
+Deleting the section is not the whole teardown. The APN engine keeps its own
+per-target `baseline.tsv` and `active.tsv`, and those survive the section that
+owned them. Left behind they accumulate across provision/deprovision cycles,
+and a later provisioning that reuses the section name meets state recorded for
+a different SIM.
+
+`deprovision` therefore asks the engine to forget the target, rather than
+reaching into the engine's state itself:
+
+```text
+apn-autoconfig forget-target --target network:<section>
+```
+
+`forget-target` drops exactly one target's state. It refuses while a network
+section of that name still exists, because that baseline is the only record of
+the profile the engine replaced and dropping it would strand a live target with
+no way back. It never touches the cache, which is shared by every target, and
+never touches another target's state.
+
+`reset --target` is **not** a substitute: when a target has no baseline its
+no-baseline path clears the whole shared cache, so using it as a per-target
+cleanup would discard every other target's cached profile.
+
+The result reports `engine_state` as `dropped` or `retained`. A failure to
+forget does not fail the deprovision — the section is already gone — but it is
+logged and reported.
+
 ## Removal
 
 Package removal must not silently delete a user's working connection. `postrm`

@@ -90,8 +90,9 @@ artefact remains.
 1. **Fixed before the run:** provisioning started the staging section before the
    engine had chosen a profile. See above.
 
-2. **Open — orphaned engine state.** `deprovision` removes the section and the
-   provisioning baseline, but the APN engine's per-target state survives:
+2. **Fixed after the run, re-verified on hardware — orphaned engine state.**
+   As first run, `deprovision` removed the section and the
+   provisioning baseline, but the APN engine's per-target state survived:
    `/etc/apn-autoconfig/targets/network_apnmodem1/{baseline,active}.tsv`
    remained, recording the original profile and the applied APN with its ICCID.
    It accumulates across provision/deprovision cycles, and a later provisioning
@@ -99,13 +100,21 @@ artefact remains.
    It was removed by hand here.
 
    The obvious fix — having `deprovision` call
-   `apn-autoconfig reset --target network:<section>` — is **not safe as it
-   stands**: when a target has no baseline, `reset_cmd` executes
-   `rm -rf "$CACHE_DIR"`, and that cache is shared across targets. A per-target
-   reset would therefore wipe the SIM cache for every target. Resolving this
-   needs a narrow engine-owned "forget this target" operation rather than a
-   reach into the engine's state from the modem package, and that is a core API
-   decision, not a quick fix.
+   `apn-autoconfig reset --target network:<section>` — is **not safe**: when a
+   target has no baseline, `reset_cmd` executes `rm -rf "$CACHE_DIR"`, and that
+   cache is shared across targets, so a per-target reset would wipe the SIM
+   cache for every target.
+
+   The engine instead gained `forget-target`, which drops exactly one target's
+   state, refuses while a section of that name still exists, and leaves the
+   shared cache and other targets untouched. `deprovision` now calls it and
+   reports `engine_state`.
+
+   Re-verified on this router afterwards: a full provision/deprovision cycle
+   returned `engine_state: dropped`, `/etc/apn-autoconfig/targets/` was left
+   holding only `network_wwan`, and the shared cache kept all three entries.
+   `wwan` was restored with verified connectivity, and no test artefact,
+   watchdog or modified package file remained.
 
 ## Not covered
 

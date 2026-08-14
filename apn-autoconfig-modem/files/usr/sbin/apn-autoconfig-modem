@@ -1375,13 +1375,28 @@ deprovision_cmd() {
 	uci delete "network.${deprov_section}" || die "cannot remove section $deprov_section"
 	uci commit network || die "cannot commit removal of $deprov_section"
 	rm -f "$(provisioning_baseline_file "$deprov_modem")"
+
+	# The APN engine keeps its own per-target baseline and active state. Ask it
+	# to forget this now-deleted section rather than reaching into its files:
+	# left behind, that state accumulates and a later provisioning reusing the
+	# section name would meet state belonging to a different SIM.
+	deprov_engine_state=retained
+	if command_exists apn-autoconfig; then
+		if APN_AUTOCONFIG_LOCK_OWNER_PID="$$" \
+			apn-autoconfig forget-target --target "network:${deprov_section}" >/dev/null 2>&1; then
+			deprov_engine_state=dropped
+		else
+			log warning "apn-autoconfig kept its state for network:${deprov_section}"
+		fi
+	fi
 	release_modem_lock
 
 	printf '{'
 	json_key_string version v1; printf ','
 	json_key_string modem_id "$deprov_modem"; printf ','
 	json_key_string section "$deprov_section"; printf ','
-	json_key_string state removed
+	json_key_string state removed; printf ','
+	json_key_string engine_state "$deprov_engine_state"
 	printf '}\n'
 }
 

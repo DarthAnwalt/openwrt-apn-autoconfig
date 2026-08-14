@@ -9,9 +9,8 @@ the borrowed operation lock in both directions; and `provision` /
 `deprovision` including the staging section, ownership markers, promotion,
 the provisioning baseline, exact rollback and interruption.
 
-Still to implement: the manual APN path, the LuCI first-run view, the
-install/upgrade/removal lifecycle tests, and a narrow engine-owned way to
-forget a deprovisioned target's state (see below).
+Still to implement: the manual APN path, the LuCI first-run view and the
+install/upgrade/removal lifecycle tests.
 
 The provisioning path has had one exploratory hardware run, recorded in
 [`router-test-0.11.0.md`](router-test-0.11.0.md): refusal paths, provisioning,
@@ -20,11 +19,13 @@ on the WH3000. It was run from `/tmp` against the installed 0.10.1 packages,
 so it validates the code, not a 0.11.0 package. `connect`/`disconnect`/
 `reconnect`, interruption and concurrency remain fixture-only.
 
-**Known gap from that run:** `deprovision` leaves the APN engine's per-target
-state behind. `apn-autoconfig reset --target` cannot be used to clear it as
-things stand, because its no-baseline path runs `rm -rf "$CACHE_DIR"` against
-a cache shared by every target. This needs a narrow engine operation, not a
-reach into the engine's state from the modem package.
+**The gap found in that run is now closed.** `deprovision` leaves no engine
+state behind: it calls `apn-autoconfig forget-target`, a narrow engine-owned
+operation that drops exactly one target and refuses while its section still
+exists. `reset --target` remains unusable for this, because its no-baseline
+path runs `rm -rf "$CACHE_DIR"` against a cache shared by every target. The
+fix was re-verified on hardware through a full provision/deprovision cycle:
+`engine_state: dropped`, no orphaned target directory, shared cache intact.
 
 The test harness's `uci` mock now supports `set`, `delete`, `commit` and
 `revert`, and journals every write. Assertions therefore check which keys were

@@ -50,10 +50,39 @@ The two defects appeared roughly once per four to eight runs of the modem suite
 on a loaded host. Re-run the suite under sustained CPU load, not once on an idle
 machine — a single green run proves nothing about either defect.
 
+## Completed SDK gate
+
+GitHub Actions run `31824195430` on PR 29 (`fix/0.10.1-lock-protocol`) passed
+`scripts/verify.sh` and the official OpenWrt 25.12.5 SDK build, and produced all
+five packages. Downloaded checksums verified against the run's `SHA256SUMS`:
+
+| Package | SHA-256 |
+|---|---|
+| `apn-autoconfig-0.10.1-r1.apk` | `a8c2e814117f11ded412978d2ad12046e1dcfb790fead8173c62827d0125596a` |
+| `apn-autoconfig-modem-0.10.1-r1.apk` | `e0d055fc83489fdea299b319f79c6d1b9bc413b6ce1d6d4c3281e89238ddff8c` |
+| `apn-autoconfig-integration-huasifei-wh3000-0.10.1-r1.apk` | `0d4210e2fce0f012e1e0979c84fa9b6bd82ad42af00f98f6840c0cd84e671236` |
+| `apn-autoconfig-providers-2026.08.10-r1.apk` | `8910b2f83fe0fa972828f2160ada06d3950d039bc25c7520b6b3b6123fbe38c7` |
+| `luci-app-apn-autoconfig-0.10.0-r1.apk` | `fb678176bdc7846964f761061e59bdc6032603dced27f386a71340100feb01a3` |
+
+`luci-app-apn-autoconfig` stays at 0.10.0 because this patch does not change it.
+The Huasifei integration is versioned by the root Makefile and therefore moves
+to 0.10.1 with the core.
+
+Package-name collisions were re-checked immediately before this candidate: the
+official OpenWrt packages feed contains no `apn*` package, and no third-party
+`apn-autoconfig` package is visible. 0.10.1 introduces no new package name, so
+the namespace decision from 0.10.0 is unchanged.
+
+APK contents were **not** inspected from the desktop: OpenWrt 25.12 produces apk
+v3 ADB containers, and no apk v3 tool exists on the maintainer's macOS host.
+Inspect the installed package on the router with the real `apk` instead, which
+is stronger evidence than desktop unpacking because it covers what is actually
+installed.
+
 ## Open gates before release
 
-1. Official OpenWrt 25.12 SDK build of `apn-autoconfig` and
-   `apn-autoconfig-modem`, and inspection of the produced APKs.
+1. Inspection of the produced APKs with a real apk v3 tool on the router:
+   file list, modes, control scripts and the `postrm` lock handling.
 2. Clean install, 0.10.0 upgrade and removal simulation, including the
    `postrm` path that now understands both lock representations.
 3. Live 0.10.0-to-0.10.1 upgrade on the WH3000 with the modem attached.

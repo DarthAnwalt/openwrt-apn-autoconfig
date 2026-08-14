@@ -1,15 +1,15 @@
 # 0.10.0 WH3000 hardware validation record
 
-Date: 2026-08-13  
-Status: partial hardware gate passed; next session prepared, release gate open
+Date: 2026-08-14
+Status: modem and button hardware paths passed; package lifecycle gate open
 
 ## Test system
 
 - Huasifei WH3000 Pro running OpenWrt 25.12.5;
 - internal Quectel RM520N connected through ModemManager and netifd target
   `wwan`;
-- draft PR 27, official SDK artifact for commit `ae08a92` from GitHub Actions
-  run `31716017201`;
+- draft PR 27, official SDK artifacts through commit `2cd8708` from GitHub
+  Actions run `31798760086`;
 - recovery snapshot stored on the router before installation;
 - modem and SIM identifiers intentionally omitted from this record.
 
@@ -45,6 +45,11 @@ Status: partial hardware gate passed; next session prepared, release gate open
   rpcd `file.exec` call used by LuCI returned code 0 with `state=success`,
   `busy=false`, exit code 0 and the expected terminal message. No modem or SIM
   identifier was needed in either status path.
+- The official `2cd8708` WH3000 integration APK passed its published checksum
+  and was reinstalled without invoking a reset. The enabled `BTN_0`
+  configuration was preserved, both operation locks remained clear, `wwan`
+  stayed up on `wwan0`, and the installed handler hash matched the reviewed
+  source (`8903bf03fd48c995ce9c60d3531f8daf53c1972b1e932689c51d04aba0ae9d41`).
 
 ## Router-clock timing of the successful reset
 
@@ -76,11 +81,9 @@ is not a valid oracle.
 
 ## Required next hardware session
 
-1. Install the next official SDK artifact containing the truthful button launch
-   logging; verify checksums and preserved configuration. The change does not
-   alter the already validated `BTN_0` event or reset transaction.
-2. Complete signed-feed install and removal/reinstall lifecycle tests before a
+1. Complete signed-feed install and removal/reinstall lifecycle tests before a
    release candidate is called ready.
 
 No further GPIO or modem mutations should be run merely to reproduce desktop
-timing. The next session starts from the bounded build and the steps above.
+timing. The next session starts from the verified `2cd8708` build and the
+package-lifecycle step above.

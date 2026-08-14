@@ -1,7 +1,10 @@
 # Provisioning contract v1 (0.11.0)
 
-Status: accepted design for 0.11.0, ahead of implementation. This document is
-normative for `apn-autoconfig-modem`'s provisioning API. It extends
+Status: accepted design for 0.11.0. `provision-plan`, `provision`,
+`deprovision`, `connect`, `disconnect` and `reconnect` are implemented and
+covered by fixtures; the manual APN path and the LuCI first-run view are not,
+and nothing here has run on hardware. This document is normative for
+`apn-autoconfig-modem`'s provisioning API. It extends
 [`modem-contract-v1.md`](modem-contract-v1.md) and inherits every rule in it,
 including the lock representation and lock ordering. The safety invariants in
 [`architecture.md`](architecture.md) remain binding.

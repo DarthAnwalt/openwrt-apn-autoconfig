@@ -55,17 +55,37 @@ cat >"$MOCKBIN/uci" <<'EOF'
 [ "${1:-}" = "-q" ] && shift
 case "$1:$2" in
 show:network)
-	printf '%s\n' \
-		"network.wwan=interface" \
-		"network.wwan.proto='modemmanager'" \
-		"network.wwan.device='/sys/devices/mock-modem'" \
-		"network.cellqmi=interface" \
-		"network.cellqmi.proto='qmi'" \
-		"network.cellmbim=interface" \
-		"network.cellmbim.proto='mbim'"
+	if [ "${TEST_SINGLE_TARGET:-0}" = 1 ]; then
+		printf '%s\n' \
+			"network.wwan=interface" \
+			"network.wwan.proto='modemmanager'" \
+			"network.wwan.device='/sys/devices/mock-modem'"
+	else
+		printf '%s\n' \
+			"network.wwan=interface" \
+			"network.wwan.proto='modemmanager'" \
+			"network.wwan.device='/sys/devices/mock-modem'" \
+			"network.cellqmi=interface" \
+			"network.cellqmi.proto='qmi'" \
+			"network.cellmbim=interface" \
+			"network.cellmbim.proto='mbim'"
+	fi
+	if [ "${TEST_STAGING_SECTION:-0}" = 1 ]; then
+		printf '%s\n' "network.apnmodem1=interface" "network.apnmodem1.proto='qmi'"
+	fi
 	if [ "${TEST_SECOND_MM:-0}" = 1 ]; then
 		printf '%s\n' "network.wwan2=interface" "network.wwan2.proto='modemmanager'"
 	fi
+;;
+get:network.apnmodem1.proto) [ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' qmi ;;
+get:network.apnmodem1.device)
+	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' "${TEST_QMI_DEVICE:-/dev/cdc-wdm0}"
+;;
+get:network.apnmodem1.apn_autoconfig_owner)
+	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' apn-autoconfig-modem
+;;
+get:network.apnmodem1.disabled)
+	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && [ "${TEST_STAGING_PROMOTED:-0}" = 0 ] && printf '%s\n' 1
 ;;
 get:apn-autoconfig.main.interface) printf '%s\n' "${TEST_INTERFACE:-wwan}" ;;
 get:apn-autoconfig.main.sim_index) printf '%s\n' 0 ;;
@@ -1190,6 +1210,75 @@ fi
 
 [ "$lock_status" -eq 3 ] || fail 'live operation lock contention was not classified as retryable'
 rm -rf "$TEST_LOCK"
+
+# ---- 0.11.0 provisioning support ----
+#
+# See docs/provisioning-contract-v1.md. Provisioning inverts the existing
+# borrow direction: apn-autoconfig-modem owns the global lock and this engine
+# borrows it. The variable alone must never grant the lock.
+
+printf '%s\n' 'TEST the operation lock is borrowed only by proving live ownership'
+rm -rf "$TEST_ACTION_STATE" "$TEST_LOCK"
+mkdir -p "$(dirname "$TEST_LOCK")"
+printf '%s\n' "$$" >"$TEST_LOCK"
+borrow_status=0
+APN_AUTOCONFIG_LOCK_OWNER_PID=999999 sh "$SCRIPT" reconcile >/dev/null 2>"$STATE/borrow-mismatch.err" || \
+	borrow_status=$?
+[ "$borrow_status" -eq 3 ] || fail "a borrow PID that does not own the lock exited $borrow_status instead of 3"
+grep -q 'did not prove ownership' "$STATE/borrow-mismatch.err" || \
+	fail 'a borrow PID that does not own the lock was not refused as unproven ownership'
+
+rm -f "$TEST_LOCK"
+borrow_status=0
+APN_AUTOCONFIG_LOCK_OWNER_PID="$$" sh "$SCRIPT" reconcile >/dev/null 2>"$STATE/borrow-nolock.err" || \
+	borrow_status=$?
+[ "$borrow_status" -eq 3 ] || fail "a borrow claim with no lock at all exited $borrow_status instead of 3"
+grep -q 'did not prove ownership' "$STATE/borrow-nolock.err" || \
+	fail 'an environment variable alone was treated as lock ownership'
+
+if kill -0 999999 2>/dev/null; then
+	printf 'SKIP: PID 999999 is unexpectedly alive on this host\n'
+else
+	printf '%s\n' 999999 >"$TEST_LOCK"
+	borrow_status=0
+	APN_AUTOCONFIG_LOCK_OWNER_PID=999999 sh "$SCRIPT" reconcile >/dev/null 2>"$STATE/borrow-dead.err" || \
+		borrow_status=$?
+	[ "$borrow_status" -eq 3 ] || \
+		fail "a borrow claim naming a dead owner exited $borrow_status instead of 3"
+	grep -q 'did not prove ownership' "$STATE/borrow-dead.err" || \
+		fail 'a dead owner recorded in the lock was accepted as a live borrow'
+fi
+rm -f "$TEST_LOCK"
+
+printf '%s\n' 'TEST a disabled project-owned staging section never joins automatic target selection'
+TEST_SINGLE_TARGET=1
+export TEST_SINGLE_TARGET
+auto_out="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:wwan", json.loads(sys.argv[1])' \
+	"$auto_out" || fail 'the single writable target was not selected automatically'
+TEST_STAGING_SECTION=1
+export TEST_STAGING_SECTION
+auto_out="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:wwan", json.loads(sys.argv[1])' \
+	"$auto_out" || fail 'a disabled staging section made automatic target selection ambiguous'
+
+printf '%s\n' 'TEST an explicit target still selects a disabled staging section'
+staged_out="$(sh "$SCRIPT" status-json --target network:apnmodem1)"
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:apnmodem1", json.loads(sys.argv[1])' \
+	"$staged_out" || fail 'an explicit --target did not select the staging section'
+
+printf '%s\n' 'TEST a promoted project-owned section participates in automatic selection again'
+TEST_STAGING_PROMOTED=1
+export TEST_STAGING_PROMOTED
+if TEST_INTERFACE=auto sh "$SCRIPT" status-json >/dev/null 2>&1; then
+	fail 'a promoted second writable target did not make automatic selection ambiguous'
+else
+	[ "$?" -eq 4 ] || fail 'ambiguous automatic selection after promotion used the wrong exit code'
+fi
+TEST_STAGING_PROMOTED=0
+TEST_STAGING_SECTION=0
+TEST_SINGLE_TARGET=0
+export TEST_STAGING_PROMOTED TEST_STAGING_SECTION TEST_SINGLE_TARGET
 
 printf '%s\n' 'TEST boot worker is inert while autostart is disabled'
 rm -f "$STATE/boot-calls"

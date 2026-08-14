@@ -2,7 +2,8 @@
 
 This is the shortest safe entry point for the next implementation task. Read it
 with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-contract-v1.md),
-[`testing-0.9.2.md`](testing-0.9.2.md), [`testing-0.10.0.md`](testing-0.10.0.md)
+[`testing-0.9.2.md`](testing-0.9.2.md), [`testing-0.10.0.md`](testing-0.10.0.md),
+[`testing-0.10.1.md`](testing-0.10.1.md)
 and [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
@@ -19,10 +20,28 @@ already configured ModemManager and QMI netifd sections and adds the optional
 read-only modem inventory and operation coordinator. It does not yet provision
 an unconfigured modem, mutate MBIM profiles or manage eSIM.
 
-The next implementation release is **0.11.0**, which adds safe first-run
-provisioning on top of the 0.10.0 modem-control boundary. MBIM remains scheduled
-for 0.12.0. Do not implement MBIM profile mutation in the old APN monolith as
-an isolated shortcut.
+**0.10.1 is prepared but not released.** It is a defect-only patch: the
+operation-lock protocol published a lock in two steps, so a competitor could
+observe a lock with no recorded owner, treat it as crashed and delete it while
+it was live. See [`testing-0.10.1.md`](testing-0.10.1.md) for what is proven and
+what is still open. The synthetic gate passes; the SDK, lifecycle and hardware
+gates are open, and the 0.10.0 hardware evidence does not carry over because the
+reset path's lock protocol changed underneath it.
+
+The next feature release is **0.11.0**, which adds safe first-run provisioning
+on top of the 0.10.0 modem-control boundary. MBIM remains scheduled for 0.12.0.
+Do not implement MBIM profile mutation in the old APN monolith as an isolated
+shortcut. Provisioning adds new callers to exactly the locks 0.10.1 repairs, so
+build it on the patched foundation rather than in parallel with it.
+
+Its accepted design is [`provisioning-contract-v1.md`](provisioning-contract-v1.md)
+and its plan is [`testing-0.11.0.md`](testing-0.11.0.md). Three points there are
+easy to miss and expensive to get wrong: there is **no adoption** of
+user-created sections in v1; a staging section is created without an `apn`
+option so netifd cannot dial a vendor default before reconciliation chooses one;
+and a disabled project-owned section must be excluded from the APN engine's
+`auto` target selection, or provisioning a second modem silently breaks APN
+operations on a working one.
 
 The agreed product and ownership rules are normative in `architecture.md`. In
 particular, the final suite must work both when the modem is attached after the

@@ -78,6 +78,7 @@ OLD_ALLOWEDAUTH=""
 OLD_IPTYPE_SET=0
 OLD_IPTYPE=""
 LOCK_HELD=0
+LOCK_BORROWED=0
 MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
@@ -132,10 +133,111 @@ cleanup_files() {
 	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
 		"$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS" "$TARGETS_DATA"
 	if [ "$LOCK_HELD" -eq 1 ]; then
-		rm -f "$LOCK_DIR/pid"
-		rmdir "$LOCK_DIR" 2>/dev/null || :
+		lock_release "$LOCK_DIR"
 		LOCK_HELD=0
 	fi
+}
+
+# ---- lock primitives ----
+#
+# A lock is a regular file whose first line is the owner PID, published
+# atomically by `ln` so no competitor can ever see a created-but-unowned lock
+# and mistake it for a crashed owner. apn-autoconfig-modem and
+# apn-autoconfig-qmi implement the identical protocol, which is what keeps the
+# shared APN operation lock and the per-device QMI identity lock mutually
+# exclusive across packages.
+
+# 0.10.0 and earlier used a directory containing "pid"; honor a live owner
+# from that representation instead of deadlocking against it after an upgrade.
+lock_owner_pid() {
+	if [ -d "$1" ]; then
+		lock_owner_value="$(sed -n '1p' "$1/pid" 2>/dev/null || :)"
+	else
+		lock_owner_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	fi
+	case "$lock_owner_value" in ''|*[!0-9]*|0) return 1 ;; esac
+	printf '%s\n' "$lock_owner_value"
+}
+
+# 0 acquired, 1 unusable path, 2 already present
+lock_try_acquire() {
+	acquire_path="$1"
+	# `ln source directory` links *into* the directory instead of failing, so a
+	# lock left behind as a 0.10.0-style directory has to be rejected here and
+	# handled by the reclaim path rather than silently "acquired".
+	[ -d "$acquire_path" ] && return 2
+	acquire_tmp="${acquire_path}.tmp.$$"
+	printf '%s\n' "$$" >"$acquire_tmp" 2>/dev/null || return 1
+	if ln "$acquire_tmp" "$acquire_path" 2>/dev/null; then
+		if [ -f "$acquire_path" ] && [ "$(sed -n '1p' "$acquire_path" 2>/dev/null)" = "$$" ]; then
+			rm -f "$acquire_tmp"
+			return 0
+		fi
+		# A directory appeared underneath us and took the link inside itself.
+		rm -f "$acquire_path/${acquire_tmp##*/}" 2>/dev/null || :
+		rm -f "$acquire_tmp"
+		return 2
+	fi
+	rm -f "$acquire_tmp"
+	return 2
+}
+
+lock_release() {
+	[ -n "$1" ] || return 0
+	rm -f "$1" 2>/dev/null || :
+}
+
+lock_set_owner() {
+	set_owner_path="$1"
+	set_owner_tmp="${set_owner_path}.own.$$"
+	printf '%s\n' "$2" >"$set_owner_tmp" 2>/dev/null || return 1
+	mv "$set_owner_tmp" "$set_owner_path" 2>/dev/null || {
+		rm -f "$set_owner_tmp"
+		return 1
+	}
+}
+
+lock_reclaim_if_stale() {
+	# Every name here is prefixed because POSIX shell has no local scope and
+	# this function calls lock_try_acquire, which assigns its own variables.
+	reclaim_path="$1"
+	reclaim_guard="${reclaim_path}.reclaim"
+	reclaim_guard_owner="$(lock_owner_pid "$reclaim_guard" 2>/dev/null || :)"
+	if [ -n "$reclaim_guard_owner" ] && ! process_is_alive "$reclaim_guard_owner"; then
+		rm -f "$reclaim_guard" 2>/dev/null || :
+	fi
+	lock_try_acquire "$reclaim_guard" || return 1
+	reclaim_result=1
+	reclaim_owner="$(lock_owner_pid "$reclaim_path" 2>/dev/null || :)"
+	if [ -n "$reclaim_owner" ] && process_is_alive "$reclaim_owner"; then
+		reclaim_result=1
+	elif [ -d "$reclaim_path" ]; then
+		rm -f "$reclaim_path/pid" 2>/dev/null || :
+		rmdir "$reclaim_path" 2>/dev/null && reclaim_result=0
+	else
+		rm -f "$reclaim_path" 2>/dev/null && reclaim_result=0
+	fi
+	rm -f "$reclaim_guard" 2>/dev/null || :
+	return "$reclaim_result"
+}
+
+# 0 acquired, 1 unusable path, 3 held by a live owner
+lock_try_acquire_or_reclaim() {
+	attempt_path="$1"
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	attempt_owner="$(lock_owner_pid "$attempt_path" 2>/dev/null || :)"
+	if [ -n "$attempt_owner" ] && process_is_alive "$attempt_owner"; then
+		return 3
+	fi
+	lock_reclaim_if_stale "$attempt_path" || return 3
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	return 3
 }
 
 state_value_is_safe() {
@@ -452,6 +554,18 @@ discover_targets() {
 	done >"$TARGETS_DATA"
 }
 
+# A section is project-owned staging only when apn-autoconfig-modem marked it
+# and it is still administratively disabled. A section that merely looks like
+# one is never treated as ours; see docs/provisioning-contract-v1.md.
+is_disabled_staging_section() {
+	staging_section="$1"
+	staging_owner="$(uci -q get "network.${staging_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+	[ "$staging_owner" = apn-autoconfig-modem ] || return 1
+	staging_disabled="$(uci -q get "network.${staging_section}.disabled" 2>/dev/null || :)"
+	case "$staging_disabled" in 1|on|true|yes|enabled) return 0 ;; esac
+	return 1
+}
+
 select_target() {
 	configured="$CONFIGURED_INTERFACE"
 	if [ -n "$REQUESTED_TARGET" ]; then
@@ -465,6 +579,13 @@ select_target() {
 			while IFS="$(printf '\t')" read -r section proto; do
 				target_protocol_capabilities "$proto"
 				[ "$TARGET_PROFILE_APPLY" = true ] || continue
+				# A disabled section created by apn-autoconfig-modem is staged,
+				# not yet a working target. Counting it here would make "auto"
+				# ambiguous the moment a second modem is provisioned and would
+				# break APN operations on a modem that already works. An
+				# explicit --target still selects it, and a promoted section
+				# participates normally.
+				is_disabled_staging_section "$section" && continue
 				selected="$section"
 				count=$((count + 1))
 			done <"$TARGETS_DATA"
@@ -1473,7 +1594,7 @@ process_is_alive() {
 }
 
 operation_lock_pid() {
-	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+	pid="$(lock_owner_pid "$LOCK_DIR" 2>/dev/null || :)"
 	process_is_alive "$pid" || return 1
 	printf '%s\n' "$pid"
 }
@@ -1507,7 +1628,15 @@ action_status_values() {
 		ACTION_TARGET="$(action_state_field 9)"
 		case "$ACTION_STATUS" in
 			starting|queued|running)
+				# Launcher exited but the accepted worker still owns the start
+				# lock and has not written its first record yet. Our own start
+				# lock does not count: a launcher holding it is deciding whether
+				# to start, not observing someone else's handoff.
+				handoff_pid="$(lock_owner_pid "${ACTION_STATE_DIR}.start-lock" 2>/dev/null || :)"
+				[ "$handoff_pid" = "$$" ] && handoff_pid=""
 				if process_is_alive "$ACTION_PID"; then
+					ACTION_BUSY=true
+				elif process_is_alive "$handoff_pid"; then
 					ACTION_BUSY=true
 				else
 					ACTION_STATUS="failed"
@@ -1565,70 +1694,68 @@ action_start_cmd() {
 
 	start_lock="${ACTION_STATE_DIR}.start-lock"
 	mkdir -p "$(dirname "$ACTION_STATE_DIR")" || die "cannot create action state parent"
-	if ! mkdir "$start_lock" 2>/dev/null; then
-		start_pid="$(cat "$start_lock/pid" 2>/dev/null || :)"
-		if process_is_alive "$start_pid"; then
-			print_action_json false
-			return 0
-		fi
-		rm -f "$start_lock/pid"
-		rmdir "$start_lock" 2>/dev/null || {
-			print_action_json false
-			return 0
-		}
-		mkdir "$start_lock" 2>/dev/null || {
-			print_action_json false
-			return 0
-		}
-	fi
-	printf '%s\n' "$$" >"$start_lock/pid" || {
-		rmdir "$start_lock" 2>/dev/null || :
-		die "cannot record action launch lock"
-	}
+	lock_try_acquire_or_reclaim "$start_lock"
+	start_lock_status=$?
+	case "$start_lock_status" in
+		0) : ;;
+		3) print_action_json false; return 0 ;;
+		*) die "cannot record action launch lock" ;;
+	esac
 
 	action_status_values
 	if [ "$ACTION_BUSY" = true ]; then
-		rm -f "$start_lock/pid"
-		rmdir "$start_lock" 2>/dev/null || :
+		lock_release "$start_lock"
 		print_action_json false
 		return 0
 	fi
 
 	mkdir -p "$ACTION_STATE_DIR" || {
-		rm -f "$start_lock/pid"
-		rmdir "$start_lock" 2>/dev/null || :
+		lock_release "$start_lock"
 		die "cannot create action state directory"
 	}
 	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
 	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\t%s\n' \
 		"$action" "$$" "$started" "$TARGET_ID" >"$ACTION_STATE_DIR/state.tsv"
-	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" "$TARGET_ID" \
+	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" "$TARGET_ID" "$start_lock" \
 		</dev/null >/dev/null 2>&1 &
-	rm -f "$start_lock/pid"
-	rmdir "$start_lock" 2>/dev/null || :
+	# Hand the start lock to the worker instead of dropping it here. It is the
+	# only live token between this launcher's exit and the worker's first
+	# "running" record, and without it action-status reported an accepted
+	# operation as a dead worker - which the WH3000 button handler in turn
+	# reads as a rejected launch rather than a coalesced duplicate release.
+	lock_set_owner "$start_lock" "$!" || :
 	print_action_json true
 }
 
 acquire_lock() {
 	[ "$LOCK_HELD" -eq 1 ] && return 0
-	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
-	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-		old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
-		case "$old_pid" in
-			''|*[!0-9]*) die "lock exists without a valid PID: $LOCK_DIR" ;;
-		esac
-		if kill -0 "$old_pid" 2>/dev/null; then
-			die_code 3 "another operation is already running (PID $old_pid); retry later"
-		fi
-		log warning "removing stale lock left by PID $old_pid"
-		rm -f "$LOCK_DIR/pid"
-		rmdir "$LOCK_DIR" 2>/dev/null || die "cannot remove stale lock: $LOCK_DIR"
-		mkdir "$LOCK_DIR" 2>/dev/null || die "cannot acquire lock: $LOCK_DIR"
+	[ "$LOCK_BORROWED" -eq 1 ] && return 0
+	# Symmetric counterpart to APN_AUTOCONFIG_COORDINATOR_PARENT_PID: during
+	# provisioning apn-autoconfig-modem owns the global lock and calls this
+	# engine, the reverse of the reset direction. One global order therefore
+	# still holds and neither component waits on a lock the other has. The
+	# variable alone is not ownership: the lock must record exactly this PID
+	# and that process must still be alive.
+	borrow_pid="${APN_AUTOCONFIG_LOCK_OWNER_PID:-}"
+	case "$borrow_pid" in ''|*[!0-9]*) borrow_pid="" ;; esac
+	if [ -n "$borrow_pid" ]; then
+		recorded_pid="$(lock_owner_pid "$LOCK_DIR" 2>/dev/null || :)"
+		[ "$recorded_pid" = "$borrow_pid" ] && process_is_alive "$borrow_pid" || \
+			die_code 3 "caller did not prove ownership of the operation lock"
+		LOCK_BORROWED=1
+		return 0
 	fi
-	printf '%s\n' "$$" >"$LOCK_DIR/pid" || {
-		rmdir "$LOCK_DIR" 2>/dev/null || :
-		die "cannot write lock PID"
-	}
+	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
+	lock_try_acquire_or_reclaim "$LOCK_DIR"
+	operation_lock_status=$?
+	case "$operation_lock_status" in
+		0) : ;;
+		3)
+			old_pid="$(lock_owner_pid "$LOCK_DIR" 2>/dev/null || :)"
+			die_code 3 "another operation is already running (PID ${old_pid:-unknown}); retry later"
+		;;
+		*) die "cannot acquire lock: $LOCK_DIR" ;;
+	esac
 	LOCK_HELD=1
 }
 

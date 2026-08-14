@@ -30,9 +30,11 @@ sanitize() {
 	printf '%s' "$*" | tr '\t\r\n' '   '
 }
 
+# The launcher hands this worker the start lock (a regular file holding the
+# owner PID) so action-status can still see a live owner between the
+# launcher's exit and the first "running" record written below.
 cleanup_start_lock() {
-	rm -f "$START_LOCK/pid" 2>/dev/null || :
-	rmdir "$START_LOCK" 2>/dev/null || :
+	rm -f "$START_LOCK" 2>/dev/null || :
 }
 
 trap cleanup_start_lock 0

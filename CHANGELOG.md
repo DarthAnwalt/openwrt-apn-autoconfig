@@ -1,6 +1,11 @@
 # Changelog
 
-## apn-autoconfig 0.10.1 / apn-autoconfig-modem 0.10.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (unreleased)
+## apn-autoconfig 0.10.1 / apn-autoconfig-modem 0.10.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (2026-08-14)
+
+Mainly a defect-fix release for the operation-lock protocol. It also carries two
+additive changes that are the first runtime step of the 0.11.0 provisioning
+work; they are listed separately below because this release is otherwise
+behaviour-preserving.
 
 - Fixed the operation-lock protocol. A lock was created in two steps — `mkdir`,
   then write the owner PID — and any process arriving between them read an
@@ -37,6 +42,22 @@
   rather than `failed`.
 - Package removal understands both lock representations and still refuses to
   delete a lock owned by a live operation.
+
+Additive changes from the 0.11.0 provisioning work, included here because they
+were built and hardware-validated as part of this release:
+
+- Added `apn-autoconfig-modem provision-plan --modem <id>`, a strictly read-only
+  query that reports whether a modem could be provisioned and, when it cannot,
+  a stable machine-readable reason. It writes no configuration, creates no state
+  and opens no control channel. Nothing else in the provisioning workflow is
+  implemented yet; see `docs/provisioning-contract-v1.md`.
+- `apn-autoconfig` now excludes **disabled sections marked as owned by
+  `apn-autoconfig-modem`** from automatic target selection. This is a behaviour
+  change to `auto`, and it exists so that a future staging section cannot make
+  `auto` ambiguous and break APN operations on a modem that already works. An
+  explicit `--target` still selects such a section, and sections that are not
+  marked project-owned are entirely unaffected — as is every existing
+  configuration, since no released version creates these markers.
 
 Upgrade note: 0.10.0 still uses the old two-step protocol, so upgrade the suite
 packages together rather than mixing 0.10.0 and 0.10.1 binaries against a

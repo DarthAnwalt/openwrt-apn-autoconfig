@@ -4,11 +4,20 @@ Status: synthetic, SDK, APK-inspection, upgrade and hardware gates complete.
 Publication and the live signed-feed smoke remain open. Hardware evidence is in
 [`router-test-0.10.1.md`](router-test-0.10.1.md).
 
-0.10.1 changes no feature and no public API. It replaces the protocol that
-publishes an operation lock, which the hardware-validated 0.10.0 reset path
-depends on. The 0.10.0 hardware evidence therefore does **not** carry over: the
-reset and `BTN_0` paths must be re-proven on the router before this patch is
-called stable.
+0.10.1 is primarily a defect fix. It replaces the protocol that publishes an
+operation lock, which the hardware-validated 0.10.0 reset path depends on. The
+0.10.0 hardware evidence therefore does **not** carry over: the reset and
+`BTN_0` paths must be re-proven on the router before this patch is called
+stable.
+
+It is not purely behaviour-preserving. The release also carries the first
+runtime step of 0.11.0 — the read-only `provision-plan` query and the exclusion
+of disabled project-owned sections from the APN engine's `auto` selection — 
+because those were built into the binaries that passed the hardware gate.
+Splitting them out afterwards would have invalidated that evidence. Both are
+listed explicitly in the changelog; the `auto` change is the only one that
+alters existing behaviour, and it cannot affect any released configuration
+because no released version creates the ownership markers it keys on.
 
 ## What changed
 

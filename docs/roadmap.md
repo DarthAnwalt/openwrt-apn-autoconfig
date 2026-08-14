@@ -46,6 +46,15 @@ targeted APN reconciliation and connectivity verification.
 Automatic creation of network sections and MBIM profile mutation remain out of
 scope until this foundation is proven.
 
+## 0.10.1 — operation-lock correctness
+
+Prepared, not released. A defect-only patch with no feature or API change. It
+makes lock publication atomic, so a lock can no longer be observed without a
+recorded owner and deleted while it is live. That window allowed two background
+workers to be accepted for one modem and made an accepted operation report
+itself as a dead worker, which in turn made a duplicate physical button release
+look like a rejected launch.
+
 ## 0.11.0 — safe first-run provisioning
 
 Add a capability-driven first-run workflow for an unconfigured ModemManager or

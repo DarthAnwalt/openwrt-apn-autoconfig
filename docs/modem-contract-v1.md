@@ -146,6 +146,34 @@ A direct modem reset acquires both locks itself. The compatibility shim passes
 its PID and the modem package accepts borrowed ownership only when that exact
 live PID is recorded in the APN lock. Future provisioning and eSIM operations
 must use the same global-to-specific order; reverse acquisition is forbidden.
+
+### Lock representation
+
+Since 0.10.1 a lock is a **regular file whose first line is the owner PID**,
+created with `ln` from a temporary file that already contains the PID. The
+name and its owner therefore become visible in one atomic step. `mkdir`
+followed by a separate PID write is forbidden: it leaves a window in which the
+lock exists with no recorded owner, and every waiter that treats a missing
+owner as proof of a crash will delete a live lock and proceed. That window was
+the cause of two intermittent 0.10.0 defects — a duplicated background worker
+and an accepted operation reported as a dead one.
+
+A lock whose owner is not alive may be reclaimed only while holding an
+`ln`-guarded `<lock>.reclaim` mutex, and the owner must be re-read inside that
+guarded section so a racing reclaimer cannot delete a lock another process has
+just legitimately taken.
+
+`apn-autoconfig`, `apn-autoconfig-qmi` and `apn-autoconfig-modem` implement the
+identical protocol. This is a cross-package requirement, not a style choice:
+the global APN operation lock and the per-device QMI identity lock are shared
+namespaces, and two different representations at one path would not exclude
+each other reliably.
+
+0.10.0 represented a lock as a directory containing a `pid` file. All three
+implementations still honor a live owner in that shape and reclaim a dead one,
+so an upgrade cannot deadlock against a leftover. Because a 0.10.0 process
+still uses the old two-step protocol, upgrade every suite package together
+rather than mixing 0.10.0 and 0.10.1 binaries against a shared lock.
 `action-start`/`action-status` on
 `apn-autoconfig-modem` mirror the existing `apn-autoconfig` background-action
 contract (`state.tsv` v2 record, `running/success/blocked/retryable/failed`,

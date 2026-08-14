@@ -1,5 +1,48 @@
 # Changelog
 
+## apn-autoconfig 0.10.1 / apn-autoconfig-modem 0.10.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (unreleased)
+
+- Fixed the operation-lock protocol. A lock was created in two steps — `mkdir`,
+  then write the owner PID — and any process arriving between them read an
+  empty PID, concluded the owner had crashed, deleted the live lock and
+  continued. A lock is now a regular file whose first line is the owner PID,
+  published atomically with `ln`, so the name and its owner appear together and
+  that window cannot exist. A dead owner's lock is reclaimed only under an
+  `ln`-guarded reclaim mutex that re-reads the owner inside the guarded
+  section. `apn-autoconfig`, `apn-autoconfig-qmi` and `apn-autoconfig-modem`
+  share one implementation because the global APN lock and the per-device QMI
+  identity lock are cross-package namespaces.
+- Two concurrent `action-start` calls could therefore both be accepted, which
+  contradicted the 0.10.0 note about atomic launch serialization. Exactly one
+  worker is now accepted, and the repeated-launch invariant is asserted over
+  several rounds instead of a single attempt.
+- `action-status` no longer reports an accepted operation as a dead worker
+  during the launcher-to-worker handoff. The launcher hands its start lock to
+  the worker, and the status path treats another process's live start lock as
+  proof that the handoff is in flight. On the WH3000 this window made a
+  duplicate `BTN_0` release look like a rejected launch — a hotplug failure —
+  instead of a coalesced duplicate.
+- Inventory can no longer take over the QMI identity lock from the APN engine's
+  in-flight transaction on the same control device. The identity adapter also
+  no longer spins forever on a lock path that is not a directory.
+- `modem_wait_seconds` is a wall-clock bound again. The re-enumeration wait
+  counted poll intervals and ignored the time each inventory scan spent in its
+  own bounded ModemManager calls, so the configured and LuCI-labelled maximum
+  could be exceeded several times over with the interface still down.
+- A hotplug debounce window whose worker was killed no longer disables every
+  later USB rescan for the rest of the uptime; the marker records an owner and
+  is reclaimed like any other lock.
+- Contention on the shared APN lock is reported as the retryable exit class
+  instead of a generic failure, so a background worker records `retryable`
+  rather than `failed`.
+- Package removal understands both lock representations and still refuses to
+  delete a lock owned by a live operation.
+
+Upgrade note: 0.10.0 still uses the old two-step protocol, so upgrade the suite
+packages together rather than mixing 0.10.0 and 0.10.1 binaries against a
+shared lock. Locks left behind by 0.10.0 are honored while their owner lives
+and reclaimed once it exits.
+
 ## apn-autoconfig 0.10.0 / apn-autoconfig-modem 0.10.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (2026-08-14)
 
 - Added the `apn-autoconfig-modem` package: read-only modem inventory with

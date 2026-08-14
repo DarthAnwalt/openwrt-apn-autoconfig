@@ -14,16 +14,15 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.9.2 is released. It is a target-aware APN engine for already
-configured ModemManager and QMI netifd sections. It does not yet provision an
-unconfigured modem, own a general connection-control service, mutate MBIM
-profiles or manage eSIM.
+Version 0.10.0 is released. It preserves the target-aware APN engine for
+already configured ModemManager and QMI netifd sections and adds the optional
+read-only modem inventory and operation coordinator. It does not yet provision
+an unconfigured modem, mutate MBIM profiles or manage eSIM.
 
-The next implementation release is **0.10.0**, not the former 0.9.3 MBIM
-milestone. Its job is to establish the modem-control boundary needed by every
-later protocol and lifecycle feature. MBIM moves to 0.12.0, after safe
-first-run provisioning in 0.11.0. Do not implement MBIM profile mutation in the
-old APN monolith as an isolated shortcut.
+The next implementation release is **0.11.0**, which adds safe first-run
+provisioning on top of the 0.10.0 modem-control boundary. MBIM remains scheduled
+for 0.12.0. Do not implement MBIM profile mutation in the old APN monolith as
+an isolated shortcut.
 
 The agreed product and ownership rules are normative in `architecture.md`. In
 particular, the final suite must work both when the modem is attached after the
@@ -121,7 +120,7 @@ backend, effective data device and separate implementation/validation evidence.
 New 0.10.0 APIs need an explicit schema and compatibility decision; do not
 silently change these responses in place.
 
-## 0.10.0 current state and next gate
+## 0.10.0 release state
 
 The package skeleton, v1 inventory schema, QMI/MBIM/AT-only discovery,
 ModemManager-first ownership, fail-closed ambiguity, common APN-to-modem lock
@@ -131,11 +130,12 @@ until the maintainer pins the strong identity of the internal modem as
 `apn-autoconfig-modem.main.reset_modem_id`; never infer a board-wide GPIO
 binding from QMI protocol or USB VID:PID alone.
 
-The next work is evidence collection, not new feature scope: official SDK
-build and APK inspection, clean/live/offline install behavior, 0.9.2 upgrade
-and removal simulation, then the complete WH3000 manual/BTN_0 interruption and
-reset-plus-reconcile hardware matrix in `testing-0.10.0.md`. Any defect found
-there must receive a fixture regression before the release candidate advances.
+Official SDK build and APK inspection, clean/live/offline install behavior,
+0.9.2 upgrade, removal simulation and the WH3000 manual/BTN_0 interruption and
+reset-plus-reconcile hardware matrix are complete. The remaining release action
+is publication followed by the live signed-feed install/removal/reinstall smoke
+test recorded in `testing-0.10.0.md`. Any defect found there requires a fixture
+regression and a follow-up patch release rather than rewriting the release tag.
 
 The 0.10.0 scope is architecture foundation and read-only inventory. It does
 not automatically create network sections, add native MBIM profile writes,

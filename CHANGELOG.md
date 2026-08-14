@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.10.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (unreleased)
+## apn-autoconfig 0.10.0 / apn-autoconfig-modem 0.10.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (2026-08-14)
 
 - Added the `apn-autoconfig-modem` package: read-only modem inventory with
   stable identity independent of volatile `/dev` names (USB serial > IMEI >
@@ -56,9 +56,10 @@
 - This is an architecture-foundation release: it does not add automatic
   network provisioning, native MBIM profile mutation or eSIM support. See
   `docs/architecture.md`, `docs/roadmap.md` and `docs/testing-0.10.0.md`.
-- Hardware validation (Huasifei WH3000 reset-plus-reconcile gate) and the
-  packaging/release gate are pending; do not call this release stable until
-  `docs/testing-0.10.0.md`'s exit criteria are met on real hardware.
+- Passed the Huasifei WH3000 hardware gate: manual and physical-button
+  reset-plus-reconcile, interruption recovery, repeated-release coalescing and
+  LuCI observation all restored the same ModemManager-owned modem, `wwan` and
+  verified connectivity without overlapping power cycles.
 
 ## apn-autoconfig 0.9.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.6.0 (2026-08-13)
 

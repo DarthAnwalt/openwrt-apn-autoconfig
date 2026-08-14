@@ -4,7 +4,7 @@ This roadmap records public release milestones. It describes intended outcomes,
 not implementation proposals or evaluations of other projects. Hardware findings
 may change the sequence, but the safety invariants in
 [`architecture.md`](architecture.md) remain binding. Future milestones are not
-claims about the released 0.9.2 packages.
+claims about the released 0.10.0 packages.
 
 The `apn-autoconfig` package keeps its narrow APN responsibility. The project
 grows toward 1.0 through namespaced first-party packages for modem control,
@@ -32,17 +32,17 @@ data-interface readiness after a physical modem reset.
 
 ## 0.10.0 — modem-control architecture foundation
 
-Introduce `apn-autoconfig-modem` with read-only inventory at service start and
-hotplug, stable modem identity, truthful capability evidence, explicit
+Released. Introduced `apn-autoconfig-modem` with read-only inventory at service
+start and hotplug, stable modem identity, truthful capability evidence, explicit
 ModemManager/direct-control ownership and a shared serialized operation model.
-Move low-level status and reset responsibilities behind its narrow API while
-preserving the released APN commands as compatibility shims. Begin the common
+Moved low-level status and reset responsibilities behind its narrow API while
+preserving the released APN commands as compatibility shims. Began the common
 LuCI shell with modem inventory and the existing APN experience.
 
-This release must discover a modem that was attached before package
-installation; hotplug event history is never required. It must preserve the
-tested Huasifei BTN_0 operation as one serialized modem power-cycle followed by
-re-enumeration, targeted APN reconciliation and connectivity verification.
+The release discovers a modem that was attached before package installation;
+hotplug event history is not required. It preserves the tested Huasifei BTN_0
+operation as one serialized modem power-cycle followed by re-enumeration,
+targeted APN reconciliation and connectivity verification.
 Automatic creation of network sections and MBIM profile mutation remain out of
 scope until this foundation is proven.
 

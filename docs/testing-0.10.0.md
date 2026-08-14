@@ -1,10 +1,9 @@
 # 0.10.0 modem-control foundation test and release plan
 
-Status: runtime hardening and synthetic gate complete; official SDK builds and
-live 0.9.2-to-0.10.0 upgrade complete; the remaining package lifecycle and
-hardware gates are in progress. The manual reset-plus-reconcile, interrupted
-power-cycle recovery and physical BTN_0 overlap paths passed on WH3000; see
-`router-test-0.10.0.md`.
+Status: runtime hardening, synthetic tests, official SDK builds, live
+0.9.2-to-0.10.0 upgrade and the WH3000 hardware gate are complete. Tag
+publication and the final install/removal/reinstall smoke test through the live
+signed feed remain. See `router-test-0.10.0.md`.
 
 ## Implementation status
 
@@ -29,12 +28,11 @@ and `tests/run-tests-modem.sh` are implemented and pass
   atomic parallel action launch; v2 operation state; stale worker recovery;
   narrow RPC wrappers; and behavioral compatibility-shim success and failure
   propagation. All released 0.9.2 regressions remain green.
-- Remaining synthetic work is limited to additional malformed-output and
-  no-external-timeout backend permutations if platform findings expose a new
-  case. They are defense-in-depth, not substitutes for the pending lifecycle
-  and hardware gates below.
-- Not applicable to a synthetic suite: everything in the Huasifei hardware
-  gate and packaging/release gate below, which need the physical router.
+- Additional malformed-output and no-external-timeout backend permutations may
+  be added if platform findings expose a new case; they are defense-in-depth,
+  not open release blockers.
+- Hardware-only evidence is recorded in `router-test-0.10.0.md`; it is not
+  inferred from the synthetic suite.
 
 Version 0.10.0 establishes the control plane required by provisioning, MBIM,
 generic AT, Fibocom and eSIM milestones. Passing this plan proves the
@@ -172,11 +170,9 @@ interface/modem.
   state; it must not use a wildcard that can erase an in-flight lock.
 - Check package names against supported OpenWrt indexes and known public
   package trees immediately before the release candidate.
-- Install exclusively through the signed project feed without
-  `--allow-untrusted`.
-- Build a signed repository artifact from the candidate branch without
-  deploying it over the stable GitHub Pages feed; use an isolated repository
-  configuration for the candidate lifecycle test.
+- After the release tag publishes the signed project feed, install exclusively
+  through that live feed without `--allow-untrusted` and complete the final
+  removal/reinstall smoke test.
 - Run `sh scripts/verify.sh` and preserve CI checksums, package inventory,
   hardware logs with private identifiers redacted and recovery artifacts.
 

@@ -1,7 +1,7 @@
 # 0.10.0 WH3000 hardware validation record
 
 Date: 2026-08-14
-Status: modem and button hardware paths passed; package lifecycle gate open
+Status: modem and button hardware paths passed; live signed-feed smoke pending
 
 ## Test system
 
@@ -79,11 +79,14 @@ of the selected control device (or an equivalent kernel event), then verify the
 post-condition GPIO value; polling the value file for the transient off state
 is not a valid oracle.
 
-## Required next hardware session
+## Post-publication live repository smoke
 
-1. Complete signed-feed install and removal/reinstall lifecycle tests before a
-   release candidate is called ready.
+1. Publish the verified commit as `v0.10.0`, allowing the release workflow to
+   update the signed project feed.
+2. Install from that live feed without `--allow-untrusted`, remove the LuCI,
+   board integration, modem-control and core packages, then reinstall all five
+   first-party packages while verifying restored configuration and connectivity.
 
 No further GPIO or modem mutations should be run merely to reproduce desktop
-timing. The next session starts from the verified `2cd8708` build and the
-package-lifecycle step above.
+timing. The next session starts from the published `v0.10.0` feed and the
+package-lifecycle smoke test above.

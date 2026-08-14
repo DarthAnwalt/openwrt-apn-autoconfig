@@ -986,6 +986,146 @@ status_json_cmd() {
 	printf '\n'
 }
 
+# ---- provisioning (read-only planning; see docs/provisioning-contract-v1.md) ----
+
+PROVISION_SECTION_PREFIX="apnmodem"
+PROVISION_OWNER="apn-autoconfig-modem"
+
+network_section_names() {
+	uci -q show network 2>/dev/null | awk -F. '
+		/^network\.[A-Za-z0-9_]+=/ { split($2, parts, "="); print parts[1] }
+	'
+}
+
+# The protocol provisioning would configure, which is not the same as the
+# protocol inventory observed: a modem ModemManager owns is provisioned as a
+# modemmanager section even though its kernel transport is QMI.
+provision_protocol_for_record() {
+	provision_owner_state="$1"
+	provision_observed_protocol="$2"
+	case "$provision_owner_state" in
+		modemmanager) printf '%s\n' modemmanager; return 0 ;;
+	esac
+	case "$provision_observed_protocol" in
+		qmi) printf '%s\n' qmi; return 0 ;;
+	esac
+	return 1
+}
+
+provision_device_for_record() {
+	case "$1" in
+		modemmanager) printf '%s\n' "$3" ;;
+		qmi) printf '%s\n' "$2" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Returns the project-owned section already provisioned for this modem, if any.
+provision_existing_section() {
+	wanted_modem="$1"
+	for candidate_section in $(network_section_names); do
+		candidate_owner="$(uci -q get "network.${candidate_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+		[ "$candidate_owner" = "$PROVISION_OWNER" ] || continue
+		candidate_modem="$(uci -q get "network.${candidate_section}.apn_autoconfig_modem_id" 2>/dev/null || :)"
+		[ "$candidate_modem" = "$wanted_modem" ] || continue
+		printf '%s\n' "$candidate_section"
+		return 0
+	done
+	return 1
+}
+
+provision_free_section_name() {
+	existing_names="$(network_section_names)"
+	index=1
+	while [ "$index" -le 64 ]; do
+		candidate="${PROVISION_SECTION_PREFIX}${index}"
+		printf '%s\n' "$existing_names" | grep -F -x -q "$candidate" || {
+			printf '%s\n' "$candidate"
+			return 0
+		}
+		index=$((index + 1))
+	done
+	return 1
+}
+
+# Evaluates provisioning preconditions against one inventory record without
+# writing anything. Sets PROVISION_* and returns the exit class.
+provision_evaluate() {
+	PROVISION_REASON=""
+	PROVISION_SECTION=""
+	PROVISION_EXISTING=""
+	PROVISION_PROTOCOL=""
+	PROVISION_DEVICE=""
+
+	provision_line="$(find_inventory_record "$1" 2>/dev/null || :)"
+	if [ -z "$provision_line" ]; then
+		PROVISION_REASON="not_present"
+		return 3
+	fi
+	provision_ambiguous="$(field "$provision_line" 12)"
+	provision_owner_state="$(field "$provision_line" 8)"
+	provision_interface="$(field "$provision_line" 9)"
+	provision_observed_protocol="$(field "$provision_line" 7)"
+	provision_control_device="$(field "$provision_line" 4)"
+	provision_usb_path="$(field "$provision_line" 3)"
+
+	PROVISION_EXISTING="$(provision_existing_section "$1" 2>/dev/null || :)"
+
+	if [ "$provision_ambiguous" = 1 ]; then
+		PROVISION_REASON="ambiguous"
+		return 4
+	fi
+	if [ "$provision_owner_state" = conflicting ]; then
+		PROVISION_REASON="conflicting_owner"
+		return 4
+	fi
+	if [ -n "$PROVISION_EXISTING" ]; then
+		# Already provisioned by this package for this exact modem: report it
+		# instead of creating a second section.
+		PROVISION_SECTION="$PROVISION_EXISTING"
+		PROVISION_REASON="already_provisioned"
+		return 0
+	fi
+	if [ -n "$provision_interface" ]; then
+		PROVISION_REASON="already_configured"
+		return 4
+	fi
+	PROVISION_PROTOCOL="$(provision_protocol_for_record "$provision_owner_state" "$provision_observed_protocol" 2>/dev/null || :)"
+	if [ -z "$PROVISION_PROTOCOL" ]; then
+		PROVISION_REASON="unsupported_protocol"
+		return 4
+	fi
+	PROVISION_DEVICE="$(provision_device_for_record "$PROVISION_PROTOCOL" "$provision_control_device" "$provision_usb_path" 2>/dev/null || :)"
+	if [ -z "$PROVISION_DEVICE" ]; then
+		PROVISION_REASON="unsupported_protocol"
+		return 4
+	fi
+	PROVISION_SECTION="$(provision_free_section_name 2>/dev/null || :)"
+	if [ -z "$PROVISION_SECTION" ]; then
+		PROVISION_REASON="name_unavailable"
+		return 3
+	fi
+	PROVISION_REASON="ok"
+	return 0
+}
+
+provision_plan_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "provision-plan requires --modem"
+	plan_status=0
+	provision_evaluate "$REQUESTED_MODEM" || plan_status=$?
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$REQUESTED_MODEM"; printf ','
+	printf '"can_provision":%s,' "$([ "$plan_status" -eq 0 ] && [ "$PROVISION_REASON" = ok ] && printf true || printf false)"
+	json_key_string reason "$PROVISION_REASON"; printf ','
+	json_key_string section "$PROVISION_SECTION"; printf ','
+	json_key_string existing_section "$PROVISION_EXISTING"; printf ','
+	json_key_string protocol "$PROVISION_PROTOCOL"; printf ','
+	json_key_string device "$PROVISION_DEVICE"
+	printf '}\n'
+	return "$plan_status"
+}
+
 resolve_cmd() {
 	[ -n "$REQUESTED_INTERFACE" ] || die_code 2 "resolve requires --interface"
 	case "$REQUESTED_INTERFACE" in ''|*[!A-Za-z0-9_]*) die_code 2 "invalid interface name" ;; esac
@@ -1309,6 +1449,7 @@ Commands:
   inventory-json    Read-only scan of currently present modems (JSON)
   status-json       Single modem record; requires --modem
   resolve           Print the modem_id bound to --interface, or fail closed
+  provision-plan    Read-only check of whether --modem can be provisioned
   action-start reset  Start a bounded power-cycle in background; requires --modem
   action-status     Show background/external reset operation state; requires --modem
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
@@ -1354,6 +1495,7 @@ main() {
 		inventory-json) inventory_json_cmd ;;
 		status-json) status_json_cmd ;;
 		resolve) resolve_cmd ;;
+		provision-plan) provision_plan_cmd ;;
 		action-start) action_start_cmd "$command_argument" ;;
 		action-status) action_status_cmd ;;
 		reset) reset_cmd ;;

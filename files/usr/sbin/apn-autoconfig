@@ -78,6 +78,7 @@ OLD_ALLOWEDAUTH=""
 OLD_IPTYPE_SET=0
 OLD_IPTYPE=""
 LOCK_HELD=0
+LOCK_BORROWED=0
 MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
@@ -553,6 +554,18 @@ discover_targets() {
 	done >"$TARGETS_DATA"
 }
 
+# A section is project-owned staging only when apn-autoconfig-modem marked it
+# and it is still administratively disabled. A section that merely looks like
+# one is never treated as ours; see docs/provisioning-contract-v1.md.
+is_disabled_staging_section() {
+	staging_section="$1"
+	staging_owner="$(uci -q get "network.${staging_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+	[ "$staging_owner" = apn-autoconfig-modem ] || return 1
+	staging_disabled="$(uci -q get "network.${staging_section}.disabled" 2>/dev/null || :)"
+	case "$staging_disabled" in 1|on|true|yes|enabled) return 0 ;; esac
+	return 1
+}
+
 select_target() {
 	configured="$CONFIGURED_INTERFACE"
 	if [ -n "$REQUESTED_TARGET" ]; then
@@ -566,6 +579,13 @@ select_target() {
 			while IFS="$(printf '\t')" read -r section proto; do
 				target_protocol_capabilities "$proto"
 				[ "$TARGET_PROFILE_APPLY" = true ] || continue
+				# A disabled section created by apn-autoconfig-modem is staged,
+				# not yet a working target. Counting it here would make "auto"
+				# ambiguous the moment a second modem is provisioned and would
+				# break APN operations on a modem that already works. An
+				# explicit --target still selects it, and a promoted section
+				# participates normally.
+				is_disabled_staging_section "$section" && continue
 				selected="$section"
 				count=$((count + 1))
 			done <"$TARGETS_DATA"
@@ -1709,6 +1729,22 @@ action_start_cmd() {
 
 acquire_lock() {
 	[ "$LOCK_HELD" -eq 1 ] && return 0
+	[ "$LOCK_BORROWED" -eq 1 ] && return 0
+	# Symmetric counterpart to APN_AUTOCONFIG_COORDINATOR_PARENT_PID: during
+	# provisioning apn-autoconfig-modem owns the global lock and calls this
+	# engine, the reverse of the reset direction. One global order therefore
+	# still holds and neither component waits on a lock the other has. The
+	# variable alone is not ownership: the lock must record exactly this PID
+	# and that process must still be alive.
+	borrow_pid="${APN_AUTOCONFIG_LOCK_OWNER_PID:-}"
+	case "$borrow_pid" in ''|*[!0-9]*) borrow_pid="" ;; esac
+	if [ -n "$borrow_pid" ]; then
+		recorded_pid="$(lock_owner_pid "$LOCK_DIR" 2>/dev/null || :)"
+		[ "$recorded_pid" = "$borrow_pid" ] && process_is_alive "$borrow_pid" || \
+			die_code 3 "caller did not prove ownership of the operation lock"
+		LOCK_BORROWED=1
+		return 0
+	fi
 	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
 	lock_try_acquire_or_reclaim "$LOCK_DIR"
 	operation_lock_status=$?

@@ -187,6 +187,16 @@ add_network_section() {
 	[ -z "$device" ] || printf '%s\tdevice\t%s\n' "$name" "$device" >>"$TEST_NETWORK_OPTIONS"
 }
 
+add_section_option() {
+	# section option value
+	printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$TEST_NETWORK_OPTIONS"
+}
+
+add_plain_section() {
+	# A section with no proto, so it occupies a name without being a target.
+	printf 'network.%s=interface\n' "$1" >>"$TEST_NETWORK_SECTIONS"
+}
+
 reset_sysfs() {
 	rm -rf "$TESTROOT/sys"
 	mkdir -p "$TESTROOT/sys/class/gpio/modem_power" "$TESTROOT/sys/class/usbmisc" \
@@ -900,6 +910,123 @@ sh "$SCRIPT" reset --modem "$TEST_RESET_MODEM_ID" >/dev/null 2>&1 || contended_s
 kill "$apn_owner_pid" 2>/dev/null || :
 wait "$apn_owner_pid" 2>/dev/null || :
 rm -f "$TEST_APN_LOCK_DIR"
+
+# ---- provisioning planning (0.11.0, read-only) ----
+#
+# See docs/provisioning-contract-v1.md. provision-plan must never write UCI,
+# never create state and never open a control channel; every refusal is a
+# stable machine-readable reason.
+
+plan_json() {
+	plan_out="$1"
+	plan_key="$2"
+	python3 -c 'import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])' "$plan_out" "$plan_key"
+}
+
+printf '%s\n' 'TEST provision-plan accepts one unambiguous unconfigured QMI modem'
+reset_sysfs
+reset_network_config
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0
+plan_modem='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")" || plan_status=$?
+[ "$plan_status" -eq 0 ] || fail "provision-plan on a provisionable modem exited $plan_status"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["version"] == "v1", d
+assert d["can_provision"] is True, d
+assert d["reason"] == "ok", d
+assert d["section"] == "apnmodem1", d
+assert d["protocol"] == "qmi", d
+assert d["device"] == "/dev/cdc-wdm0", d
+' "$plan_out" || fail 'provision-plan did not accept an unconfigured QMI modem'
+
+printf '%s\n' 'TEST provision-plan is read-only'
+plan_sections_before="$(cat "$TEST_NETWORK_SECTIONS")"
+plan_options_before="$(cat "$TEST_NETWORK_OPTIONS")"
+: >"$TEST_UQMI_CALLS"
+sh "$SCRIPT" provision-plan --modem "$plan_modem" >/dev/null
+[ "$plan_sections_before" = "$(cat "$TEST_NETWORK_SECTIONS")" ] || \
+	fail 'provision-plan modified network sections'
+[ "$plan_options_before" = "$(cat "$TEST_NETWORK_OPTIONS")" ] || \
+	fail 'provision-plan modified network options'
+[ ! -s "$TEST_UQMI_CALLS" ] || fail 'provision-plan opened a QMI control channel'
+
+printf '%s\n' 'TEST provision-plan refuses a modem that is already bound to an interface'
+add_network_section wwanexisting qmi /dev/cdc-wdm0
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")" || plan_status=$?
+[ "$plan_status" -eq 4 ] || fail "an already configured modem exited $plan_status instead of the blocked class 4"
+[ "$(plan_json "$plan_out" reason)" = already_configured ] || \
+	fail 'an already configured modem did not report already_configured'
+[ "$(plan_json "$plan_out" can_provision)" = False ] || \
+	fail 'an already configured modem was reported provisionable'
+
+printf '%s\n' 'TEST provision-plan picks the lowest free section name'
+reset_network_config
+add_plain_section apnmodem1
+add_plain_section apnmodem2
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")"
+[ "$(plan_json "$plan_out" section)" = apnmodem3 ] || \
+	fail 'provision-plan did not choose the lowest free section name'
+
+printf '%s\n' 'TEST provision-plan reports an existing project-owned section instead of a second one'
+reset_network_config
+add_network_section apnmodem1 qmi /dev/cdc-wdm0
+add_section_option apnmodem1 apn_autoconfig_owner apn-autoconfig-modem
+add_section_option apnmodem1 apn_autoconfig_modem_id "$plan_modem"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")"
+[ "$(plan_json "$plan_out" reason)" = already_provisioned ] || \
+	fail 'an existing project-owned section was not recognised'
+[ "$(plan_json "$plan_out" existing_section)" = apnmodem1 ] || \
+	fail 'the existing project-owned section was not reported'
+
+printf '%s\n' 'TEST a section that only looks project-owned is never claimed'
+reset_network_config
+add_network_section apnmodem1 qmi /dev/cdc-wdm0
+add_section_option apnmodem1 apn_autoconfig_modem_id "$plan_modem"
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")" || plan_status=$?
+[ "$(plan_json "$plan_out" existing_section)" = '' ] || \
+	fail 'a section without the ownership marker was treated as project-owned'
+[ "$(plan_json "$plan_out" reason)" = already_configured ] || \
+	fail 'an unowned section bound to the modem must block provisioning, not be adopted'
+
+printf '%s\n' 'TEST provision-plan refuses an ambiguous modem without inspecting it further'
+reset_sysfs
+reset_network_config
+add_qmi_modem 4-1.1 1bc7 1900 '' 6
+add_qmi_modem 4-1.2 1bc7 1900 '' 7
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem weak-vidpid:4-1.1:1bc7:1900)" || plan_status=$?
+[ "$plan_status" -eq 4 ] || fail "an ambiguous modem exited $plan_status instead of the blocked class 4"
+[ "$(plan_json "$plan_out" reason)" = ambiguous ] || \
+	fail 'an ambiguous modem did not report the ambiguous reason'
+
+printf '%s\n' 'TEST provision-plan refuses an AT-only modem as an unsupported protocol'
+reset_sysfs
+reset_network_config
+add_at_modem 5-1.1 1bc7 1901 ATONLYSERIAL 4
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem usb-serial:5-1.1:1bc7:1901:ATONLYSERIAL)" || plan_status=$?
+[ "$plan_status" -eq 4 ] || fail "an AT-only modem exited $plan_status instead of the blocked class 4"
+[ "$(plan_json "$plan_out" reason)" = unsupported_protocol ] || \
+	fail 'an AT-only modem was not refused as an unsupported provisioning protocol'
+
+printf '%s\n' 'TEST provision-plan reports an absent modem as retryable, not blocked'
+reset_sysfs
+reset_network_config
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem usb-serial:9-9.9:0000:0000:ABSENT)" || plan_status=$?
+[ "$plan_status" -eq 3 ] || fail "an absent modem exited $plan_status instead of the retryable class 3"
+[ "$(plan_json "$plan_out" reason)" = not_present ] || \
+	fail 'an absent modem did not report not_present'
+
+printf '%s\n' 'TEST provision-plan requires an explicit modem identity'
+if sh "$SCRIPT" provision-plan >/dev/null 2>&1; then
+	fail 'provision-plan ran without --modem'
+fi
 
 printf '%s\n' 'TEST the narrow query wrapper rejects unlisted verbs and out-of-range arguments'
 if "$QUERY_SCRIPT" inventory extra-arg >/dev/null 2>&1; then

@@ -3,6 +3,14 @@
 Status: contract accepted, implementation in progress. No hardware gate has
 been attempted.
 
+Implemented and covered so far: `provision-plan` (read-only planning with its
+stable refusal reasons), the `auto`-selection protection for disabled
+project-owned sections, and the borrowed operation lock's refusal paths. Still
+to implement: `provision`, `deprovision`, `connect`/`disconnect`/`reconnect`,
+promotion, the provisioning baseline and rollback, the LuCI first-run view and
+the lifecycle tests. The borrowed lock's success path is exercised once
+`provision` exists; only its refusal paths are asserted today.
+
 0.11.0 builds directly on the locks repaired in 0.10.1 and adds new callers to
 them. Land and validate 0.10.1 first; do not develop provisioning against the
 0.10.0 lock protocol.

@@ -34,6 +34,15 @@ Do not implement MBIM profile mutation in the old APN monolith as an isolated
 shortcut. Provisioning adds new callers to exactly the locks 0.10.1 repairs, so
 build it on the patched foundation rather than in parallel with it.
 
+Its accepted design is [`provisioning-contract-v1.md`](provisioning-contract-v1.md)
+and its plan is [`testing-0.11.0.md`](testing-0.11.0.md). Three points there are
+easy to miss and expensive to get wrong: there is **no adoption** of
+user-created sections in v1; a staging section is created without an `apn`
+option so netifd cannot dial a vendor default before reconciliation chooses one;
+and a disabled project-owned section must be excluded from the APN engine's
+`auto` target selection, or provisioning a second modem silently breaks APN
+operations on a working one.
+
 The agreed product and ownership rules are normative in `architecture.md`. In
 particular, the final suite must work both when the modem is attached after the
 software and when an internal or USB modem was already present before package

@@ -24,10 +24,98 @@ command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
+# ---- lock primitives ----
+#
+# Identical protocol to apn-autoconfig and apn-autoconfig-modem: the lock is a
+# regular file whose first line is the owner PID, published atomically by
+# `ln`. The previous mkdir-then-write protocol let a waiter observe a
+# created-but-unowned lock, conclude the owner had crashed and take over an
+# active identity transaction on the same control device.
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+lock_owner_pid() {
+	if [ -d "$1" ]; then
+		lock_owner_value="$(sed -n '1p' "$1/pid" 2>/dev/null || :)"
+	else
+		lock_owner_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	fi
+	case "$lock_owner_value" in ''|*[!0-9]*|0) return 1 ;; esac
+	printf '%s\n' "$lock_owner_value"
+}
+
+# 0 acquired, 1 unusable path, 2 already present
+lock_try_acquire() {
+	acquire_path="$1"
+	# `ln source directory` links *into* the directory instead of failing, so a
+	# lock left behind as a 0.10.0-style directory has to be rejected here and
+	# handled by the reclaim path rather than silently "acquired".
+	[ -d "$acquire_path" ] && return 2
+	acquire_tmp="${acquire_path}.tmp.$$"
+	printf '%s\n' "$$" >"$acquire_tmp" 2>/dev/null || return 1
+	if ln "$acquire_tmp" "$acquire_path" 2>/dev/null; then
+		if [ -f "$acquire_path" ] && [ "$(sed -n '1p' "$acquire_path" 2>/dev/null)" = "$$" ]; then
+			rm -f "$acquire_tmp"
+			return 0
+		fi
+		# A directory appeared underneath us and took the link inside itself.
+		rm -f "$acquire_path/${acquire_tmp##*/}" 2>/dev/null || :
+		rm -f "$acquire_tmp"
+		return 2
+	fi
+	rm -f "$acquire_tmp"
+	return 2
+}
+
+lock_reclaim_if_stale() {
+	# Every name here is prefixed because POSIX shell has no local scope and
+	# this function calls lock_try_acquire, which assigns its own variables.
+	reclaim_path="$1"
+	reclaim_guard="${reclaim_path}.reclaim"
+	reclaim_guard_owner="$(lock_owner_pid "$reclaim_guard" 2>/dev/null || :)"
+	if [ -n "$reclaim_guard_owner" ] && ! process_is_alive "$reclaim_guard_owner"; then
+		rm -f "$reclaim_guard" 2>/dev/null || :
+	fi
+	lock_try_acquire "$reclaim_guard" || return 1
+	reclaim_result=1
+	reclaim_owner="$(lock_owner_pid "$reclaim_path" 2>/dev/null || :)"
+	if [ -n "$reclaim_owner" ] && process_is_alive "$reclaim_owner"; then
+		reclaim_result=1
+	elif [ -d "$reclaim_path" ]; then
+		rm -f "$reclaim_path/pid" 2>/dev/null || :
+		rmdir "$reclaim_path" 2>/dev/null && reclaim_result=0
+	else
+		rm -f "$reclaim_path" 2>/dev/null && reclaim_result=0
+	fi
+	rm -f "$reclaim_guard" 2>/dev/null || :
+	return "$reclaim_result"
+}
+
+# 0 acquired, 1 unusable path, 3 held by a live owner
+lock_try_acquire_or_reclaim() {
+	attempt_path="$1"
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	attempt_owner="$(lock_owner_pid "$attempt_path" 2>/dev/null || :)"
+	if [ -n "$attempt_owner" ] && process_is_alive "$attempt_owner"; then
+		return 3
+	fi
+	lock_reclaim_if_stale "$attempt_path" || return 3
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	return 3
+}
+
 release_identity_lock() {
 	[ -n "$IDENTITY_LOCK_DIR" ] || return 0
-	rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
-	rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+	rm -f "$IDENTITY_LOCK_DIR" 2>/dev/null || :
 	IDENTITY_LOCK_DIR=
 }
 
@@ -40,33 +128,19 @@ acquire_identity_lock() {
 	device_name="${1#/dev/}"
 	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
 	IDENTITY_LOCK_DIR="$IDENTITY_LOCK_ROOT.$device_name"
+	mkdir -p "$(dirname "$IDENTITY_LOCK_ROOT")" 2>/dev/null || :
 	waited=0
-	while ! mkdir "$IDENTITY_LOCK_DIR" 2>/dev/null; do
-		owner="$(sed -n '1p' "$IDENTITY_LOCK_DIR/pid" 2>/dev/null)"
-		case "$owner" in
-			''|*[!0-9]*) owner= ;;
-		esac
-		if [ -z "$owner" ] && [ "$waited" -eq 0 ]; then
-			"$SLEEP" 1
-			waited=1
-			continue
-		fi
-		if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
-			rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
-			rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
-			continue
-		fi
-		[ "$waited" -lt 15 ] || {
+	while :; do
+		lock_try_acquire_or_reclaim "$IDENTITY_LOCK_DIR"
+		identity_lock_status=$?
+		[ "$identity_lock_status" -eq 0 ] && break
+		if [ "$identity_lock_status" -eq 1 ] || [ "$waited" -ge 15 ]; then
 			IDENTITY_LOCK_DIR=
 			return 1
-		}
+		fi
 		"$SLEEP" 1
 		waited=$((waited + 1))
 	done
-	printf '%s\n' "$$" >"$IDENTITY_LOCK_DIR/pid" || {
-		release_identity_lock
-		return 1
-	}
 	trap identity_signal HUP INT TERM
 }
 

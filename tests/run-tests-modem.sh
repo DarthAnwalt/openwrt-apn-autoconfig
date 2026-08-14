@@ -630,7 +630,7 @@ export TEST_MODEM_POWER_OFF_SECONDS
 [ "$reset_status" -eq 143 ] || fail "interrupted reset exited $reset_status instead of 143"
 [ "$(cat "$GPIO")" = 0 ] || fail 'interrupted reset left modem power off'
 grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'interrupted reset did not restart the selected interface'
-[ ! -d "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 	fail 'interrupted reset left the per-modem lock behind'
 
 printf '%s\n' 'TEST reset refuses to run against a conflicting-ownership modem'
@@ -724,6 +724,182 @@ printf 'v2\trunning\treset\t%s\t2026-01-01T00:00:00Z\t\t\toperation is running\t
 busy_out="$(sh "$SCRIPT" action-start reset --modem "$action_modem_id")"
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is False, d' "$busy_out" \
 	|| fail 'a modem with a live-PID running action must refuse a second concurrent action-start'
+
+# ---- lock-protocol regressions (0.10.1) ----
+#
+# 0.10.0 published a lock in two steps (mkdir, then write the PID). A
+# competitor arriving between them read an empty PID, concluded the owner had
+# crashed, deleted the live lock and proceeded. These cases pin the atomic
+# replacement and the upgrade path from the old representation.
+
+printf '%s\n' 'TEST a start lock owned by a live process is never stolen by a second launcher'
+reset_sysfs
+reset_network_config
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+rm -rf "$TEST_MODEM_ACTION_DIR"
+lock_state_dir="$TEST_MODEM_ACTION_DIR/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01"
+foreign_start_lock="${lock_state_dir}.start-lock"
+mkdir -p "$TEST_MODEM_ACTION_DIR"
+/bin/sleep 30 &
+foreign_pid=$!
+printf '%s\n' "$foreign_pid" >"$foreign_start_lock"
+steal_out="$(sh "$SCRIPT" action-start reset --modem "$TEST_RESET_MODEM_ID")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is False, d' "$steal_out" \
+	|| fail 'action-start stole a start lock held by a live owner'
+[ "$(sed -n '1p' "$foreign_start_lock" 2>/dev/null)" = "$foreign_pid" ] || \
+	fail 'the live owner of a start lock was overwritten by a competing launcher'
+kill "$foreign_pid" 2>/dev/null || :
+wait "$foreign_pid" 2>/dev/null || :
+rm -f "$foreign_start_lock"
+
+printf '%s\n' 'TEST repeated parallel launches accept exactly one worker every time'
+mv "$MOCKBIN/sleep" "$MOCKBIN/sleep.mock"
+TEST_MODEM_POWER_OFF_SECONDS=3
+export TEST_MODEM_POWER_OFF_SECONDS
+parallel_round=0
+while [ "$parallel_round" -lt 8 ]; do
+	parallel_round=$((parallel_round + 1))
+	rm -rf "$TEST_MODEM_ACTION_DIR"
+	sh "$SCRIPT" action-start reset --modem "$TEST_RESET_MODEM_ID" >"$STATE/race-a.json" 2>/dev/null &
+	race_a=$!
+	sh "$SCRIPT" action-start reset --modem "$TEST_RESET_MODEM_ID" >"$STATE/race-b.json" 2>/dev/null &
+	race_b=$!
+	wait "$race_a" || :
+	wait "$race_b" || :
+	race_accepted="$(python3 -c '
+import json, sys
+count = 0
+for path in sys.argv[1:]:
+    try:
+        count += 1 if json.load(open(path))["accepted"] else 0
+    except Exception:
+        pass
+print(count)
+' "$STATE/race-a.json" "$STATE/race-b.json")"
+	[ "$race_accepted" -eq 1 ] || \
+		fail "parallel launch round $parallel_round accepted $race_accepted workers instead of exactly one"
+	race_wait=0
+	while [ "$race_wait" -lt 15 ]; do
+		race_state="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["state"])' \
+			"$(sh "$SCRIPT" action-status --modem "$TEST_RESET_MODEM_ID")")"
+		case "$race_state" in success|blocked|retryable|failed) break ;; esac
+		race_wait=$((race_wait + 1))
+		/bin/sleep 1
+	done
+done
+mv "$MOCKBIN/sleep.mock" "$MOCKBIN/sleep"
+TEST_MODEM_POWER_OFF_SECONDS=1
+export TEST_MODEM_POWER_OFF_SECONDS
+
+if kill -0 999999 2>/dev/null; then
+	printf 'SKIP: PID 999999 is unexpectedly alive on this host\n'
+else
+	printf '%s\n' 'TEST the launcher-to-worker handoff is reported busy rather than as a dead worker'
+	rm -rf "$TEST_MODEM_ACTION_DIR"
+	mkdir -p "$lock_state_dir"
+	/bin/sleep 30 &
+	handoff_pid=$!
+	printf '%s\n' "$handoff_pid" >"${lock_state_dir}.start-lock"
+	printf 'v2\tstarting\treset\t999999\t2026-01-01T00:00:00Z\t\t\tstarting background worker\t%s\thandoff-op\n' \
+		"$TEST_RESET_MODEM_ID" >"$lock_state_dir/state.tsv"
+	handoff_out="$(sh "$SCRIPT" action-status --modem "$TEST_RESET_MODEM_ID")"
+	python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["state"] == "starting", d
+assert d["busy"] is True, d
+' "$handoff_out" || fail 'an accepted worker that has not written its first record was reported as failed'
+
+	printf '%s\n' 'TEST a worker that really died without a start lock still reaches a terminal failure'
+	rm -f "${lock_state_dir}.start-lock"
+	dead_out="$(sh "$SCRIPT" action-status --modem "$TEST_RESET_MODEM_ID")"
+	python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["state"] == "failed", d
+assert d["busy"] is False, d
+' "$dead_out" || fail 'a genuinely dead worker must still terminate the operation'
+	kill "$handoff_pid" 2>/dev/null || :
+	wait "$handoff_pid" 2>/dev/null || :
+	rm -rf "$TEST_MODEM_ACTION_DIR"
+fi
+
+printf '%s\n' 'TEST a 0.10.0 directory-style identity lock is honored while its owner is alive'
+reset_sysfs
+add_qmi_modem 1-1.3 2c7c 0801 '' 1
+legacy_lock="${TEST_QMI_IDENTITY_LOCK_ROOT}.cdc-wdm1"
+mkdir -p "$(dirname "$TEST_QMI_IDENTITY_LOCK_ROOT")"
+rm -rf "$legacy_lock"
+mkdir "$legacy_lock"
+printf '%s\n' "$$" >"$legacy_lock/pid"
+: >"$TEST_UQMI_CALLS"
+legacy_out="$(UQMI_IMEI=490154203237518 sh "$SCRIPT" inventory-json)"
+[ ! -s "$TEST_UQMI_CALLS" ] || \
+	fail 'inventory opened QMI while a live owner held the pre-upgrade lock directory'
+[ -d "$legacy_lock" ] || fail 'a lock directory owned by a live process was removed'
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["modems"][0]["evidence_tier"] == "weak-vidpid"' \
+	"$legacy_out" || fail 'a held pre-upgrade lock did not degrade to weak read-only inventory'
+
+if kill -0 999999 2>/dev/null; then
+	printf 'SKIP: PID 999999 is unexpectedly alive on this host\n'
+else
+	printf '%s\n' 'TEST a 0.10.0 lock directory left by a dead owner is reclaimed instead of deadlocking'
+	printf '%s\n' 999999 >"$legacy_lock/pid"
+	: >"$TEST_UQMI_CALLS"
+	reclaimed_out="$(UQMI_IMEI=490154203237518 sh "$SCRIPT" inventory-json)"
+	[ -s "$TEST_UQMI_CALLS" ] || \
+		fail 'a pre-upgrade lock directory left by a dead owner blocked identity for good'
+	python3 -c 'import json,sys; assert json.loads(sys.argv[1])["modems"][0]["evidence_tier"] == "imei"' \
+		"$reclaimed_out" || fail 'identity did not recover after reclaiming a stale pre-upgrade lock'
+	if [ -e "$legacy_lock" ]; then
+		fail 'the reclaimed pre-upgrade lock was left behind'
+	fi
+fi
+rm -rf "$legacy_lock"
+
+if kill -0 999999 2>/dev/null; then
+	printf 'SKIP: PID 999999 is unexpectedly alive on this host\n'
+else
+	printf '%s\n' 'TEST a hotplug debounce marker left by a dead worker does not disable later rescans'
+	debounce_lock="${TEST_MODEM_LOCK_ROOT}.hotplug-debounce"
+	rm -rf "$debounce_lock"
+	printf '%s\n' 999999 >"$debounce_lock"
+	reset_sysfs
+	add_qmi_modem 1-1.1 2c7c 0801 '' 9
+	: >"$TEST_UQMI_CALLS"
+	ACTION=add APN_AUTOCONFIG_MODEM_BIN="$SCRIPT" sh "$HOTPLUG_SCRIPT"
+	/bin/sleep 2
+	[ -s "$TEST_UQMI_CALLS" ] || \
+		fail 'a stale debounce marker silently swallowed every later hotplug rescan'
+	rm -f "$debounce_lock"
+fi
+
+printf '%s\n' 'TEST the coordinator reports shared APN lock contention as retryable, not failed'
+reset_sysfs
+reset_network_config
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0
+add_network_section cellqmi qmi /dev/cdc-wdm0
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+/bin/sleep 30 &
+apn_owner_pid=$!
+mkdir -p "$(dirname "$TEST_APN_LOCK_DIR")"
+rm -rf "$TEST_APN_LOCK_DIR"
+printf '%s\n' "$apn_owner_pid" >"$TEST_APN_LOCK_DIR"
+: >"$TEST_EVENTS"
+contended_status=0
+sh "$SCRIPT" reset --modem "$TEST_RESET_MODEM_ID" >/dev/null 2>&1 || contended_status=$?
+[ "$contended_status" -eq 3 ] || \
+	fail "contention on the shared APN lock exited $contended_status instead of the retryable class 3"
+[ ! -s "$TEST_EVENTS" ] || fail 'a blocked reset still touched the selected interface'
+[ "$(cat "$GPIO")" = 0 ] || fail 'a blocked reset still moved the modem power GPIO'
+[ "$(sed -n '1p' "$TEST_APN_LOCK_DIR" 2>/dev/null)" = "$apn_owner_pid" ] || \
+	fail 'a blocked reset stole the shared APN lock from its live owner'
+kill "$apn_owner_pid" 2>/dev/null || :
+wait "$apn_owner_pid" 2>/dev/null || :
+rm -f "$TEST_APN_LOCK_DIR"
 
 printf '%s\n' 'TEST the narrow query wrapper rejects unlisted verbs and out-of-range arguments'
 if "$QUERY_SCRIPT" inventory extra-arg >/dev/null 2>&1; then

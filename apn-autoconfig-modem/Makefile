@@ -88,15 +88,23 @@ for state_file in /var/run/apn-autoconfig-modem/modems/*.tsv; do
 done
 rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem 2>/dev/null || :
-for lock_dir in /var/lock/apn-autoconfig-modem.*; do
-	[ -d "$${lock_dir}" ] || continue
-	lock_pid="$$(cat "$${lock_dir}/pid" 2>/dev/null || :)"
+for lock_path in /var/lock/apn-autoconfig-modem.*; do
+	[ -e "$${lock_path}" ] || continue
+	if [ -d "$${lock_path}" ]; then
+		lock_pid="$$(cat "$${lock_path}/pid" 2>/dev/null || :)"
+	else
+		lock_pid="$$(sed -n '1p' "$${lock_path}" 2>/dev/null || :)"
+	fi
 	case "$${lock_pid}" in
 		''|*[!0-9]*) : ;;
 		*) kill -0 "$${lock_pid}" 2>/dev/null && continue ;;
 	esac
-	rm -f "$${lock_dir}/pid"
-	rmdir "$${lock_dir}" 2>/dev/null || :
+	if [ -d "$${lock_path}" ]; then
+		rm -f "$${lock_path}/pid"
+		rmdir "$${lock_path}" 2>/dev/null || :
+	else
+		rm -f "$${lock_path}"
+	fi
 done
 rm -f /etc/config/apn-autoconfig-modem \
 	/etc/config/apn-autoconfig-modem.apk-new \

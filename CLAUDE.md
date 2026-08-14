@@ -125,6 +125,10 @@ not optional style preferences.
   package trees immediately before an RC, and inspect the actual APK produced
   by the official supported SDK rather than inferring package contents from the
   source tree.
+- Never overwrite the stable GitHub Pages feed merely to test an unreleased
+  branch. A manually dispatched feature-branch workflow may build and upload a
+  signed Pages artifact, but deployment is restricted to `main` and release
+  tags. Test the branch artifact through an isolated repository configuration.
 
 ### Tests required for architectural work
 

@@ -158,6 +158,8 @@ grep -F -q 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v
 grep -F -q 'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8' "$ROOT/.github/workflows/build.yml"
 grep -F -q 'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5' "$ROOT/.github/workflows/build.yml"
 grep -F -q 'actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5' "$ROOT/.github/workflows/build.yml"
+grep -F -q "if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'" \
+	"$ROOT/.github/workflows/build.yml"
 grep -F -q 'actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7' "$ROOT/.github/workflows/update-provider-database.yml"
 grep -F -q 'ref: ${{ inputs.release_tag || github.ref }}' "$ROOT/.github/workflows/build.yml"
 grep -F -q 'gh release create "$RELEASE_TAG"' "$ROOT/.github/workflows/build.yml"

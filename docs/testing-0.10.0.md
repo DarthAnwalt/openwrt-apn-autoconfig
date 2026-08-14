@@ -174,6 +174,9 @@ interface/modem.
   package trees immediately before the release candidate.
 - Install exclusively through the signed project feed without
   `--allow-untrusted`.
+- Build a signed repository artifact from the candidate branch without
+  deploying it over the stable GitHub Pages feed; use an isolated repository
+  configuration for the candidate lifecycle test.
 - Run `sh scripts/verify.sh` and preserve CI checksums, package inventory,
   hardware logs with private identifiers redacted and recovery artifacts.
 

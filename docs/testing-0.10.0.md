@@ -2,8 +2,9 @@
 
 Status: runtime hardening and synthetic gate complete; official SDK builds and
 live 0.9.2-to-0.10.0 upgrade complete; the remaining package lifecycle and
-hardware gates are in progress. The manual reset-plus-reconcile and interrupted
-power-cycle recovery paths passed on WH3000; see `router-test-0.10.0.md`.
+hardware gates are in progress. The manual reset-plus-reconcile, interrupted
+power-cycle recovery and physical BTN_0 overlap paths passed on WH3000; see
+`router-test-0.10.0.md`.
 
 ## Implementation status
 

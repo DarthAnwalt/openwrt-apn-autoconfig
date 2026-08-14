@@ -83,6 +83,26 @@ not optional style preferences.
   operation locks. Pre-lock validation alone has a time-of-check/time-of-use
   race.
 
+### Verified WH3000 button compatibility
+
+- Preserve the hardware-validated hotplug contract exactly: the WH3000
+  integration accepts only `BUTTON=BTN_0` with `ACTION=released`, remains
+  disabled by default for new installs and ignores press events. Do not infer a
+  replacement event name from device-tree labels when the real hotplug event
+  has already been validated on this board.
+- A release must call `action-start modem-reset` and return promptly. Never
+  fork a direct synchronous reset from hotplug and never bypass the common
+  operation lock or coordinator.
+- Parse the versioned launch response. `accepted:true` means a worker was
+  accepted; `accepted:false,busy:true` means a repeated release was safely
+  coalesced and must be logged as an ignored duplicate, not as a newly started
+  reset. A non-busy rejection, malformed response or nonzero command status is
+  a hotplug failure.
+- Regression coverage must include disabled mode, ignored press, accepted
+  release, busy duplicate, malformed/rejected launch and the hardware invariant
+  that two releases during one running operation produce two release events but
+  only one power-cycle and one terminal result.
+
 ### Compatibility and package lifecycle
 
 - A compatibility fallback is permitted only when the new optional package is

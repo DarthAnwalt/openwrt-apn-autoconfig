@@ -32,6 +32,19 @@ Status: partial hardware gate passed; next session prepared, release gate open
   device disappeared from sysfs. It exited 143 and restored the powered-on GPIO
   value, the netifd interface and both locks. The temporary 30-second power-off
   test setting was restored to the configured five seconds.
+- With commit `3223d75` installed, one physical `BTN_0` release started the
+  background `modem-reset`; a second release 28 seconds later arrived while the
+  first operation was still running. Router evidence showed two release events,
+  one GPIO power-cycle, one successful terminal result, clear locks and `wwan`
+  restored after 60 seconds. The inherited handler's pre-launch log described
+  both releases as starts even though the second was safely rejected as busy;
+  the follow-up handler fix parses `accepted`/`busy` and reports that duplicate
+  truthfully without changing the verified hardware event contract.
+- During that physical operation the core action API reported
+  `running`, `busy=true`, `action=modem-reset`. After completion, the deployed
+  rpcd `file.exec` call used by LuCI returned code 0 with `state=success`,
+  `busy=false`, exit code 0 and the expected terminal message. No modem or SIM
+  identifier was needed in either status path.
 
 ## Router-clock timing of the successful reset
 
@@ -63,16 +76,10 @@ is not a valid oracle.
 
 ## Required next hardware session
 
-1. Install the next official SDK artifact containing the bounded core `mmcli`
-   calls; verify checksums and preserved configuration.
-2. Repeat one public compatibility reset while recording router-clock stage
-   timings and confirm the same modem, owner, SIM, target and connectivity.
-3. Exercise the actual physical `BTN_0`: press must be inert; one enabled
-   release must queue exactly one composite operation; repeated releases must
-   not overlap.
-4. Confirm LuCI observes an externally started operation through its real busy
-   and terminal states without exposing private modem/SIM identifiers.
-5. Complete signed-feed install and removal/reinstall lifecycle tests before a
+1. Install the next official SDK artifact containing the truthful button launch
+   logging; verify checksums and preserved configuration. The change does not
+   alter the already validated `BTN_0` event or reset transaction.
+2. Complete signed-feed install and removal/reinstall lifecycle tests before a
    release candidate is called ready.
 
 No further GPIO or modem mutations should be run merely to reproduce desktop

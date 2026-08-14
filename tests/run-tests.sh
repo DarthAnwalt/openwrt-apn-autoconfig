@@ -260,6 +260,7 @@ EOF
 
 cat >"$MOCKBIN/logger" <<'EOF'
 #!/bin/sh
+[ -z "${TEST_LOGGER_CALLS:-}" ] || printf '%s\n' "$*" >>"$TEST_LOGGER_CALLS"
 exit 0
 EOF
 
@@ -1333,9 +1334,16 @@ printf '%s\n' 'TEST button ignores press and queues modem reset only on release'
 cat >"$MOCKBIN/apn-autoconfig-button-command" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$TEST_STATE/button-calls"
+case "${TEST_BUTTON_LAUNCH_RESULT:-accepted}" in
+	accepted) printf '%s\n' '{"version":"v2","accepted":true,"busy":true,"state":"running"}' ;;
+	busy) printf '%s\n' '{"version":"v2","accepted":false,"busy":true,"state":"running"}' ;;
+	rejected) printf '%s\n' '{"version":"v2","accepted":false,"busy":false,"state":"failed"}' ;;
+	malformed) printf '%s\n' 'not-json' ;;
+	failure) exit 7 ;;
+esac
 EOF
 chmod 0755 "$MOCKBIN/apn-autoconfig-button-command"
-rm -f "$STATE/button-calls"
+rm -f "$STATE/button-calls" "$STATE/button-logger-calls"
 TEST_BUTTON_ENABLED=0 BUTTON=BTN_0 ACTION=released \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
@@ -1345,6 +1353,7 @@ TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=pressed \
 	sh "$BUTTON_SCRIPT"
 [ ! -e "$STATE/button-calls" ] || fail 'button press triggered the action before release'
 TEST_BUTTON_ENABLED=1 BUTTON=BTN_0 ACTION=released \
+	TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
 	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
 	sh "$BUTTON_SCRIPT"
 button_wait=10
@@ -1354,6 +1363,30 @@ while [ ! -e "$STATE/button-calls" ] && [ "$button_wait" -gt 0 ]; do
 done
 grep -F -x -q 'action-start modem-reset' "$STATE/button-calls" || \
 	fail 'button release did not queue modem-reset through the job API'
+grep -F -q 'modem reset and APN reconciliation accepted' "$STATE/button-logger-calls" || \
+	fail 'accepted button release did not log its real launch result'
+
+printf '%s\n' 'TEST repeated button release reports busy coalescing instead of a second launch'
+: >"$STATE/button-calls"
+: >"$STATE/button-logger-calls"
+TEST_BUTTON_ENABLED=1 TEST_BUTTON_LAUNCH_RESULT=busy BUTTON=BTN_0 ACTION=released \
+	TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
+	APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+	sh "$BUTTON_SCRIPT"
+[ "$(grep -F -x -c 'action-start modem-reset' "$STATE/button-calls")" -eq 1 ] || \
+	fail 'busy button release invoked more than one launch request'
+grep -F -q 'operation is already running; duplicate ignored' "$STATE/button-logger-calls" || \
+	fail 'busy button release was logged as a newly started reset'
+
+printf '%s\n' 'TEST rejected or malformed button launch is an explicit hotplug failure'
+for result in rejected malformed failure; do
+	if TEST_BUTTON_ENABLED=1 TEST_BUTTON_LAUNCH_RESULT="$result" BUTTON=BTN_0 ACTION=released \
+		TEST_LOGGER_CALLS="$STATE/button-logger-calls" \
+		APN_AUTOCONFIG_BIN="$MOCKBIN/apn-autoconfig-button-command" \
+		sh "$BUTTON_SCRIPT"; then
+		fail "button launch result '$result' was converted into success"
+	fi
+done
 
 printf '%s\n' 'TEST reset-all restores every target baseline before package removal'
 rm -rf "$PERSIST/targets"

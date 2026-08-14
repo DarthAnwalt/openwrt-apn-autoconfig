@@ -37,6 +37,10 @@
   state with operation IDs and terminal blocked/retryable results. Live package
   installation enables the service and performs a delayed full scan, while
   offline image installation remains inert.
+- The verified WH3000 `BTN_0` release handler now parses the job launch result:
+  accepted work, a safely coalesced busy duplicate and a real rejection receive
+  distinct truthful logs. Press events remain inert and repeated releases still
+  cannot overlap modem resets.
 - Package removal preserves locks owned by live operations and no longer uses
   a broad wildcard to delete modem-control runtime paths.
 - `apn-autoconfig modem-reset` (and `action-start modem-reset`) delegate the

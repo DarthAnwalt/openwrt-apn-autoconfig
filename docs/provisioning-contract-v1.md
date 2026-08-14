@@ -104,6 +104,12 @@ runtime rather than stored as a separate field:
 `disabled=1` precisely so netifd cannot attempt an empty or vendor-default APN
 before reconciliation chooses one.
 
+This is also why provisioning must never call `ifup` itself. Clearing
+`disabled` only makes the section startable; `auto=0` keeps netifd from
+starting it on an unrelated reload, and the APN engine performs the actual
+bring-up after it has written a profile. Starting the section between those two
+points would produce exactly the APN-less dial the staging rules prevent.
+
 ## Workflow
 
 `provision` is one serialized composite operation:
@@ -113,11 +119,11 @@ before reconciliation chooses one.
 3. capture and atomically persist the provisioning baseline (below);
 4. create the staging section with `proto`, the resolved device binding,
    `disabled=1`, `auto=0` and the three ownership markers; `uci commit network`;
-5. clear `disabled` and bring the interface up through netifd;
+5. clear `disabled` so the section can be started, but **do not start it here**;
 6. run targeted APN reconciliation by invoking
    `apn-autoconfig reconcile --target network:<section>` with the borrowed
    operation lock (below); the APN engine owns matching, application,
-   connectivity verification and profile rollback;
+   connectivity verification, interface bring-up and profile rollback;
 7. verify connectivity through the selected target's effective L3 route;
 8. apply the requested autoconnect state (`auto=1` unless the caller asked
    otherwise) only after step 7 succeeds; and

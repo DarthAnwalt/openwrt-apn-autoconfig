@@ -1229,10 +1229,17 @@ grep -q "owner_pid=none" "$TEST_RECONCILE_CALLS" && \
 grep -qE "owner_pid=[0-9]+" "$TEST_RECONCILE_CALLS" || \
 	fail 'the borrowed lock owner PID was not passed to the APN engine'
 
+printf '%s\n' 'TEST provisioning never starts the section itself'
+# Bringing the section up before the APN engine has written a profile would
+# hand netifd a cellular section with no apn - the vendor-default dial staging
+# exists to prevent. Clearing "disabled" only makes it startable; the engine
+# owns bring-up.
+grep -F -q "up apnmodem1" "$TEST_EVENTS" && \
+	fail 'provisioning started the section before the APN engine chose a profile'
+
 printf '%s\n' 'TEST provisioning promotes autoconnect only after reconciliation succeeded'
 [ -z "$(uci -q get network.apnmodem1.auto)" ] || \
 	fail 'a promoted section should not keep auto=0'
-grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'the staged section was never brought up through netifd'
 
 printf '%s\n' 'TEST provisioning touches only the section it created'
 untouched="$(uci_touched_only_section apnmodem1)" || \

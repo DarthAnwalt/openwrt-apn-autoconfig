@@ -1225,9 +1225,14 @@ provision_cmd() {
 	uci set "network.${prov_section}.apn_autoconfig_provisioned=${prov_now}" || die "cannot mark provisioning time"
 	uci commit network || die "cannot commit the staging section"
 
+	# Clear "disabled" so the APN engine is able to start the section, but do
+	# not start it here. Bringing it up at this point would hand netifd a
+	# modemmanager/qmi section that still has no apn option, which is exactly
+	# the vendor-default dial the staging rules exist to prevent. The engine
+	# owns bring-up: it writes the profile and cycles the interface itself.
+	# auto=0 still keeps netifd from starting it on any unrelated reload.
 	uci delete "network.${prov_section}.disabled" || die "cannot enable the staging section"
 	uci commit network || die "cannot commit the enabled staging section"
-	ifup "$prov_section" >/dev/null 2>&1 || :
 
 	# The APN engine owns matching, profile application, connectivity
 	# verification and profile rollback. It borrows this operation's lock

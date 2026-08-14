@@ -1,15 +1,15 @@
 # 0.10.0 WH3000 hardware validation record
 
 Date: 2026-08-14
-Status: modem and button hardware paths passed; live signed-feed smoke pending
+Status: complete; modem, button and live signed-feed lifecycle passed
 
 ## Test system
 
 - Huasifei WH3000 Pro running OpenWrt 25.12.5;
 - internal Quectel RM520N connected through ModemManager and netifd target
   `wwan`;
-- draft PR 27, official SDK artifacts through commit `2cd8708` from GitHub
-  Actions run `31798760086`;
+- merged PR 27 and release `v0.10.0` at commit `5f79d74`, published by GitHub
+  Actions run `31804463795`;
 - recovery snapshot stored on the router before installation;
 - modem and SIM identifiers intentionally omitted from this record.
 
@@ -50,6 +50,10 @@ Status: modem and button hardware paths passed; live signed-feed smoke pending
   configuration was preserved, both operation locks remained clear, `wwan`
   stayed up on `wwan0`, and the installed handler hash matched the reviewed
   source (`8903bf03fd48c995ce9c60d3531f8daf53c1972b1e932689c51d04aba0ae9d41`).
+- Tag workflow `31804463795` passed release-mode tests and the official SDK
+  build, attached all five APKs plus `SHA256SUMS` to the GitHub Release, built
+  and verified the signed APK v3 index and deployed the project feed. An
+  independent read of the live index showed the expected five release versions.
 
 ## Router-clock timing of the successful reset
 
@@ -79,14 +83,27 @@ of the selected control device (or an equivalent kernel event), then verify the
 post-condition GPIO value; polling the value file for the transient off state
 is not a valid oracle.
 
-## Post-publication live repository smoke
+## Completed post-publication live repository smoke
 
-1. Publish the verified commit as `v0.10.0`, allowing the release workflow to
-   update the signed project feed.
-2. Install from that live feed without `--allow-untrusted`, remove the LuCI,
-   board integration, modem-control and core packages, then reinstall all five
-   first-party packages while verifying restored configuration and connectivity.
+- `apk update` accepted the project index through the pinned public key without
+  `--allow-untrusted` and exposed exactly the five expected package versions.
+- The pre-test install used checksum-bound `world` entries left by local APK
+  installation. A simulated removal selected only the five project packages.
+- The real five-package removal completed. Core `reset-all` restored the saved
+  mobile profile, all project entry points and configurations were removed,
+  both locks were clear, UCI was clean and `wwan` was already up on `wwan0` at
+  the first bounded follow-up check.
+- Installing all five packages by name from the live feed succeeded without
+  trust bypasses. `world` contained plain package names, button handling was
+  disabled, the reset binding was absent, the modem inventory service was
+  enabled and `wwan` remained up.
+- The protected pre-test configuration and persistent APN state were restored
+  with every recorded hash matching. `wwan` returned in eight seconds; the
+  normal 30-second boot reconcile completed successfully on its first attempt
+  in one second. A separate HTTPS connectivity request through `wwan0` passed.
+- Final inventory reported the expected ModemManager owner, strong USB-serial
+  evidence and enabled reset capability. Package upgrade simulation was empty,
+  UCI and both locks were clean and the recovery bundle verified successfully.
 
 No further GPIO or modem mutations should be run merely to reproduce desktop
-timing. The next session starts from the published `v0.10.0` feed and the
-package-lifecycle smoke test above.
+timing. The complete 0.10.0 hardware and package-lifecycle gate is closed.

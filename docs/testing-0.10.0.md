@@ -1,9 +1,9 @@
 # 0.10.0 modem-control foundation test and release plan
 
-Status: runtime hardening, synthetic tests, official SDK builds, live
-0.9.2-to-0.10.0 upgrade and the WH3000 hardware gate are complete. Tag
-publication and the final install/removal/reinstall smoke test through the live
-signed feed remain. See `router-test-0.10.0.md`.
+Status: complete. Runtime hardening, synthetic tests, official SDK builds, live
+0.9.2-to-0.10.0 upgrade, WH3000 hardware validation, release publication and
+the live signed-feed install/removal/reinstall smoke all passed. See
+`router-test-0.10.0.md`.
 
 ## Implementation status
 
@@ -178,7 +178,8 @@ interface/modem.
 
 ## Exit criteria
 
-0.10.0 may be released only when read-only discovery is independent of package
+All 0.10.0 exit criteria are met: read-only discovery is independent of package
 and modem attachment order, ownership conflicts fail closed, the coordinator
 cannot overlap same-modem mutations, all 0.9.2 APN behavior remains compatible,
-and the complete Huasifei reset-plus-reconcile path passes on hardware.
+the complete Huasifei reset-plus-reconcile path passed on hardware and the
+published signed-feed lifecycle completed without a trust bypass.

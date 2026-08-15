@@ -588,7 +588,7 @@ file_mode() {
 
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and all(t["network:cellqmi"]["capabilities"].values()); assert t["network:cellqmi"]["implementation_state"] == "stable" and t["network:cellqmi"]["validation_state"] == "hardware" and t["network:cellqmi"]["hardware_validated"] is True; assert t["network:cellqmi"]["unavailable_reason"] == ""; m=t["network:cellmbim"]; assert m["backend"] == "mbim" and all(m["capabilities"].values()) and m["unavailable_reason"] == ""; assert m["implementation_state"] == "alpha" and m["validation_state"] == "synthetic" and m["hardware_validated"] is False' "$targets_json" || fail 'invalid target inventory contract'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; q=t["network:cellqmi"]; assert q["backend"] == "qmi" and all(q["capabilities"][k] for k in ("discover","identity","profile_read","profile_write","profile_apply")); assert q["capabilities"]["roaming_policy_read"] is False and q["capabilities"]["roaming_policy_write"] is False; assert t["network:cellqmi"]["implementation_state"] == "stable" and t["network:cellqmi"]["validation_state"] == "hardware" and t["network:cellqmi"]["hardware_validated"] is True; assert t["network:cellqmi"]["unavailable_reason"] == ""; m=t["network:cellmbim"]; assert m["backend"] == "mbim" and all(m["capabilities"].values()) and m["unavailable_reason"] == ""; assert t["network:wwan"]["capabilities"]["roaming_policy_write"] is True; assert m["implementation_state"] == "alpha" and m["validation_state"] == "synthetic" and m["hardware_validated"] is False' "$targets_json" || fail 'invalid target inventory contract'
 mbim_unavailable_json="$(APN_AUTOCONFIG_MBIM_ADAPTER="$TESTROOT/missing-mbim-adapter" sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; m=t["network:cellmbim"]; assert m["capabilities"]["identity"] is False and m["unavailable_reason"] == "adapter-unavailable"' "$mbim_unavailable_json" || fail 'a missing MBIM adapter was reported as available'
 mbim_command_unavailable_json="$(APN_AUTOCONFIG_UMBIM="$TESTROOT/missing-umbim" sh "$SCRIPT" targets-json)"
@@ -676,7 +676,7 @@ printf '%s\n' 'TEST QMI identity is read-only and matches candidates from fixtur
 : >"$STATE/uqmi-calls"
 before="$(cat "$STATE/apn")"
 qmi_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"].values()); assert d["target_implementation_state"] == "stable" and d["target_validation_state"] == "hardware" and d["target_hardware_validated"] is True; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"][k] for k in ("identity","profile_read","profile_write","profile_apply")); assert d["target_capabilities"]["roaming_policy_write"] is False; assert d["target_implementation_state"] == "stable" and d["target_validation_state"] == "hardware" and d["target_hardware_validated"] is True; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'QMI identity changed the ModemManager APN'
 [ ! -s "$STATE/events" ] || fail 'QMI identity cycled a network interface'
 [ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 4 ] || fail 'QMI identity issued an unexpected command count'
@@ -1019,6 +1019,52 @@ TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
 rm -f "$CACHE/$MBIM_ICCID.tsv"
 MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/home"
 export MBIM_FIXTURE_DIR
+
+printf '%s\n' 'TEST MBIM roaming policy writes both options and never guesses a custom pair'
+rm -rf "$TEST_LOCK"
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "default-block" and d["roaming_allowed"] is False; assert d["target_capabilities"]["roaming_policy_read"] is True and d["target_capabilities"]["roaming_policy_write"] is True' \
+	"$mbim_policy_json" || fail 'an MBIM interface with no options was not reported as blocked by default'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set allow >/dev/null
+[ "$(cat "$STATE/mbim-allow_roaming")" = 1 ] || fail 'MBIM allow did not set allow_roaming'
+[ "$(cat "$STATE/mbim-allow_partner")" = 1 ] || fail 'MBIM allow left partner networks refused'
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "explicit-allow" and d["roaming_allowed"] is True' \
+	"$mbim_policy_json" || fail 'MBIM allow was not reported back'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set block >/dev/null
+[ "$(cat "$STATE/mbim-allow_roaming")" = 0 ] && [ "$(cat "$STATE/mbim-allow_partner")" = 0 ] || \
+	fail 'MBIM block did not clear both options'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set default >/dev/null
+[ ! -e "$STATE/mbim-allow_roaming" ] && [ ! -e "$STATE/mbim-allow_partner" ] || \
+	fail 'MBIM default did not remove both options'
+printf '%s\n' 1 >"$STATE/mbim-allow_roaming"
+printf '%s\n' 0 >"$STATE/mbim-allow_partner"
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "invalid" and d["roaming_allowed"] is False' \
+	"$mbim_policy_json" || fail 'a custom MBIM option pair was normalized instead of reported'
+if TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null 2>&1; then
+	fail 'an invalid MBIM roaming policy allowed profile testing'
+fi
+[ "$(cat "$STATE/mbim-allow_roaming")" = 1 ] && [ "$(cat "$STATE/mbim-allow_partner")" = 0 ] || \
+	fail 'a custom MBIM option pair was rewritten by the engine'
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+
+printf '%s\n' 'TEST MBIM roaming block stops an interface that is registered in roaming'
+rm -rf "$TEST_LOCK"
+: >"$STATE/events"
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/roaming" TEST_INTERFACE=cellmbim \
+	sh "$SCRIPT" roaming-policy-set block >/dev/null
+grep -q '^down cellmbim$' "$STATE/events" || fail 'blocking roaming left a roaming MBIM interface up'
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+
+printf '%s\n' 'TEST QMI still refuses roaming policy control it cannot implement'
+rm -rf "$TEST_LOCK"
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1; then
+	fail 'QMI accepted a roaming policy it has no tested mapping for'
+else
+	[ "$?" -eq 4 ] || fail 'QMI roaming policy refusal did not use the target-contract exit code'
+fi
 
 printf '%s\n' 'TEST narrow integration wrappers preserve and validate target IDs'
 cat >"$MOCKBIN/apn-autoconfig-wrapper-command" <<'EOF'

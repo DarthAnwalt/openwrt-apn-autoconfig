@@ -525,9 +525,17 @@ target_protocol_capabilities() {
 	TARGET_IMPLEMENTATION_STATE="unimplemented"
 	TARGET_VALIDATION_STATE="none"
 	TARGET_HARDWARE_VALIDATED=false
+	# Roaming policy is a property of the connection manager, not of the APN
+	# profile, so it is reported separately instead of being inferred from a
+	# backend name. Both are plain netifd options, so neither depends on a
+	# runtime command being installed.
+	TARGET_ROAMING_POLICY_READ=false
+	TARGET_ROAMING_POLICY_WRITE=false
 	case "$protocol" in
 		modemmanager)
 			TARGET_BACKEND="modemmanager"
+			TARGET_ROAMING_POLICY_READ=true
+			TARGET_ROAMING_POLICY_WRITE=true
 			TARGET_IMPLEMENTATION_STATE="stable"
 			TARGET_VALIDATION_STATE="hardware"
 			TARGET_HARDWARE_VALIDATED=true
@@ -560,6 +568,8 @@ target_protocol_capabilities() {
 		;;
 		mbim|umbim)
 			TARGET_BACKEND="mbim"
+			TARGET_ROAMING_POLICY_READ=true
+			TARGET_ROAMING_POLICY_WRITE=true
 			# Alpha until the live gate in docs/testing-0.12.0.md is recorded:
 			# fixtures written from the umbim source are not hardware evidence.
 			TARGET_IMPLEMENTATION_STATE="alpha"
@@ -886,11 +896,42 @@ resolve_sim_index() {
 	return 1
 }
 
+# OpenWrt's MBIM handler gates roaming with two options instead of one, and its
+# absent default is the opposite of ModemManager's: no options means blocked.
+mbim_read_roaming_policy() {
+	roaming_value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null || printf '%s' -)"
+	partner_value="$(uci -q get "network.${INTERFACE}.allow_partner" 2>/dev/null || printf '%s' -)"
+	case "$roaming_value:$partner_value" in
+		1:1)
+			ROAMING_POLICY="explicit-allow"
+			ROAMING_ALLOWED=true
+		;;
+		0:0)
+			ROAMING_POLICY="explicit-block"
+			ROAMING_ALLOWED=false
+		;;
+		-:-)
+			ROAMING_POLICY="default-block"
+			ROAMING_ALLOWED=false
+		;;
+		*)
+			# Somebody configured these two deliberately and this project does
+			# not own the answer, so the pair is reported, never guessed at.
+			ROAMING_POLICY="invalid"
+			ROAMING_ALLOWED=false
+		;;
+	esac
+}
+
 read_roaming_policy() {
 	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	if [ "$TARGET_BACKEND" = mbim ]; then
+		mbim_read_roaming_policy
+		return 0
+	fi
 	if [ "$TARGET_BACKEND" != modemmanager ]; then
-		# Roaming policy belongs to the connection manager. Only OpenWrt's
-		# ModemManager protocol has a tested allow_roaming contract here.
+		# Roaming policy belongs to the connection manager. QMI has no tested
+		# policy mapping, so it is reported as unsupported rather than guessed.
 		ROAMING_POLICY="unsupported"
 		ROAMING_ALLOWED=true
 		return 0
@@ -1592,7 +1633,9 @@ targets_json_cmd() {
 		printf '"identity":%s,' "$TARGET_IDENTITY"
 		printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 		printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-		printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+		printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+		printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+		printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 		printf '},'
 		json_key_string implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 		json_key_string validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -1643,7 +1686,9 @@ status_json_cmd() {
 	printf '"identity":%s,' "$TARGET_IDENTITY"
 	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+	printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+	printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 	printf '},'
 	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -1705,7 +1750,9 @@ detect_json_cmd() {
 	printf '"identity":%s,' "$TARGET_IDENTITY"
 	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+	printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+	printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 	printf '},'
 	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -2535,7 +2582,7 @@ reconcile_cmd() {
 roaming_policy_set_cmd() {
 	requested="${1:-}"
 	case "$requested" in default|allow|block) : ;; *) die "roaming policy must be default, allow or block" ;; esac
-	[ "$TARGET_BACKEND" = modemmanager ] || \
+	[ "$TARGET_ROAMING_POLICY_WRITE" = true ] || \
 		die_code 4 "roaming policy control is not implemented for backend $TARGET_BACKEND"
 	acquire_lock
 	migrate_target_state
@@ -2545,17 +2592,41 @@ roaming_policy_set_cmd() {
 	sim_available=0
 	SIM_INDEX=""
 	MODEM_INDEX=""
-	if resolve_sim_index && run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
-		mmcli -i "$SIM_INDEX" --output-keyvalue; then
-		sim_available=1
-		refresh_modem_status || :
-		was_roaming="$ROAMING_STATUS"
-	fi
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			if resolve_sim_index && run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
+				mmcli -i "$SIM_INDEX" --output-keyvalue; then
+				sim_available=1
+				refresh_modem_status || :
+				was_roaming="$ROAMING_STATUS"
+			fi
+		;;
+		*)
+			if refresh_modem_status; then
+				sim_available=1
+				was_roaming="$ROAMING_STATUS"
+			fi
+		;;
+	esac
 
-	case "$requested" in
-		default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
-		allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
-		block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
+	case "$TARGET_BACKEND:$requested" in
+		mbim:default)
+			uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || :
+			uci -q delete "network.${INTERFACE}.allow_partner" >/dev/null 2>&1 || :
+		;;
+		# mbim.sh gates a preferred-partner registration with its own option, so
+		# allowing roaming without it would still refuse a partner network.
+		mbim:allow)
+			uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming"
+			uci set "network.${INTERFACE}.allow_partner=1" >/dev/null 2>&1 || die "cannot allow partner networks"
+		;;
+		mbim:block)
+			uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming"
+			uci set "network.${INTERFACE}.allow_partner=0" >/dev/null 2>&1 || die "cannot block partner networks"
+		;;
+		*:default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
+		*:allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
+		*:block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
 	esac
 	uci commit network >/dev/null 2>&1 || die "cannot commit roaming policy"
 	read_roaming_policy

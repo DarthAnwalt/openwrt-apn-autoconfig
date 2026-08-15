@@ -57,9 +57,21 @@ named the exact interface and stated that interfaces the user created are never
 touched, and confirming it ran the operation through rpcd, the narrow wrapper
 and the coordinator.
 
-Unrelated `uci/get` 403 errors appear in the browser console on this router.
-They also appear on pages this project does not provide, including Overview, so
-they are pre-existing and belong to another application's ACL.
+Two `uci/get` "Access denied" errors appear in the browser console on every
+page load of this router, including pages this project does not provide. They
+were traced rather than assumed:
+
+- every UCI config on the router, including all of this project's, is readable
+  by the logged-in session, so no ACL grant is missing;
+- the router logs no denial, and every `ubus` call after load returns 200;
+- reproducing `uci.get` with the null session returns exactly the observed
+  `-32002 Access denied`;
+- the only LuCI resources that declare UCI calls are `luci-base`'s `uci.js`
+  and the wireless view.
+
+So it is a `luci-base` bootstrap call issued before the session is applied. It
+is harmless — the page works and the session is valid afterwards — and it is
+neither caused by nor fixable from this project without patching LuCI base.
 
 ## Provisioning with the installed package
 

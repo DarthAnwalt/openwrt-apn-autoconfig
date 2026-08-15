@@ -173,6 +173,61 @@ rules are asserted from behavior rather than by reading the adapter.
 42. identifiers stay masked, controls stay disabled while an operation runs, and
     every state-changing verb is confirmed first.
 
+## Mode switch: verified commands and abort gates
+
+The hardware gate changes the reference modem's USB composition, so the command
+sequence was audited before the run rather than during it. What is established,
+and how:
+
+- **The AT port survives any `usbnet` value.** The kernel's `option` driver
+  matches the RM520N's serial interfaces by interface class, not by interface
+  number, and its three entries carry no reserved-interface mask. The live
+  device matches that table exactly: `ff/ff/30` DIAG, `ff/00/40` NMEA, two
+  `ff/00/00` AT ports, and one `ff/ff/ff` QMI interface. Only the last is
+  replaced by CDC-MBIM interfaces, which `cdc_mbim` claims by class. The way
+  back therefore cannot be closed by the switch itself.
+- **The current value is `0`**, read back from the module with
+  `AT+QCFG="usbnet"` on the second AT port while ModemManager kept the first.
+- **The supported range cannot be read from this firmware.** Its complete
+  `AT+QCFG=?` response — 29 rows ending in `OK` — does not list `usbnet` at all,
+  although the read form answers normally. Absence from that list is not
+  evidence of non-support, so the range is proven by the write instead, below.
+- The module reports `data_interface,0,0`, i.e. the USB data path. That setting,
+  `pcie/mode`, `pcie_mbim` and `usbcfg` are **never** written: they move the data
+  path off USB or change the whole composition, and the board is USB-attached.
+  `AT+QPRTPARA`, DFOTA and any firmware-flashing path are likewise out of scope
+  for every test in this project.
+
+The sequence, with the condition that aborts it at each step:
+
+1. Record the baseline: `uci export network`, `AT+QCFG="usbnet"`,
+   `AT+QCFG="data_interface"`, `ATI`, `AT+CGSN`, `mmcli -m any`, and the installed
+   package set.
+2. Disable the BTN_0 integration for the duration
+   (`apn-autoconfig.main.button_enabled='0'`). It is enabled on this router, and
+   `reset_modem_id` still matches, so a stray press would power-cycle the modem
+   in the middle of the switch.
+3. Park `wwan` and stop ModemManager. Do not disable its init script: a reboot
+   should restore the production setup on its own.
+4. Write the value: `AT+QCFG="usbnet",2`. **Abort if the answer is not `OK`** —
+   an unsupported value is refused by the module and nothing has changed.
+5. Read it back **before any reset**: `AT+QCFG="usbnet"` must now answer `2`.
+   **Abort if it still answers `0`.** The composition only changes at the next
+   reset, so an abort here leaves the modem exactly as it was.
+6. Reset the module. Either `AT+CFUN=1,1` or the board's validated GPIO
+   power-cycle (`modem_power` 1, wait 5 s, 0).
+7. Verify re-enumeration before anything else: the AT ports are back, a
+   `/dev/cdc-wdm*` exists, `cdc_mbim` is bound, and `idProduct` is still `0801`.
+   A changed product id is not dangerous, but it changes the modem identity and
+   would make the pinned `reset_modem_id` stop matching, so it must be observed
+   rather than assumed.
+8. Reverting is the same sequence with `0`, and needs only the AT port.
+
+The worst outcome this sequence can produce is a modem left in a working MBIM
+composition, which is recoverable from the AT port that the kernel binding
+guarantees. Steps 4 and 5 exist so that an unsupported value never reaches a
+reset.
+
 ## Hardware gate
 
 Nothing below has been attempted. The reference modem is currently in QMI

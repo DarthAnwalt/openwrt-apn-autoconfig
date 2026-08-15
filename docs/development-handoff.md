@@ -2,9 +2,11 @@
 
 This is the shortest safe entry point for the next implementation task. Read it
 with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-contract-v1.md),
-[`testing-0.9.2.md`](testing-0.9.2.md), [`testing-0.10.0.md`](testing-0.10.0.md),
-[`testing-0.10.1.md`](testing-0.10.1.md)
-and [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
+[`modem-contract-v1.md`](modem-contract-v1.md),
+[`provisioning-contract-v1.md`](provisioning-contract-v1.md),
+[`mbim-contract-v1.md`](mbim-contract-v1.md), the latest version-specific test
+plan — currently [`testing-0.12.0.md`](testing-0.12.0.md) — and
+[`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
 
@@ -15,33 +17,36 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.10.0 is released. It preserves the target-aware APN engine for
-already configured ModemManager and QMI netifd sections and adds the optional
-read-only modem inventory and operation coordinator. It does not yet provision
-an unconfigured modem, mutate MBIM profiles or manage eSIM.
+Version 0.11.0 is released and hardware-validated. The suite discovers a modem,
+provisions a disabled project-owned staging section, applies an APN through the
+engine, verifies real Internet access, promotes autoconnect, and offers
+connect/disconnect/reconnect, manual APN entry and the LuCI first-run card. All
+of that works for ModemManager and native QMI targets only. It does not yet
+mutate MBIM profiles or manage eSIM.
 
-**0.10.1 is prepared but not released.** It is a defect-only patch: the
-operation-lock protocol published a lock in two steps, so a competitor could
-observe a lock with no recorded owner, treat it as crashed and delete it while
-it was live. See [`testing-0.10.1.md`](testing-0.10.1.md) for what is proven and
-what is still open. The synthetic gate passes; the SDK, lifecycle and hardware
-gates are open, and the 0.10.0 hardware evidence does not carry over because the
-reset path's lock protocol changed underneath it.
+The next feature release is **0.12.0**, the complete native MBIM vertical slice.
+A CDC-MBIM modem is currently recognised by inventory and refused everywhere
+after that: provisioning answers `unsupported_protocol` and the APN engine
+reports `backend-not-implemented`. 0.12.0 closes that gap end to end —
+inventory and ownership, provisioning, identity, profile capture/write/restore,
+dynamic IPv4/IPv6 readiness, connection control, roaming policy and the LuCI
+workflow — with hardware evidence covering discovery through post-connect
+verification and rollback.
 
-The next feature release is **0.11.0**, which adds safe first-run provisioning
-on top of the 0.10.0 modem-control boundary. MBIM remains scheduled for 0.12.0.
-Do not implement MBIM profile mutation in the old APN monolith as an isolated
-shortcut. Provisioning adds new callers to exactly the locks 0.10.1 repairs, so
-build it on the patched foundation rather than in parallel with it.
+Its accepted design is [`mbim-contract-v1.md`](mbim-contract-v1.md) and its plan
+is [`testing-0.12.0.md`](testing-0.12.0.md). Three facts there are easy to miss
+and expensive to get wrong: `umbim`'s exit status carries modem state rather
+than failure, so a roaming modem exits non-zero from a healthy query; `-t`
+suppresses the MBIM OPEN and `-n` suppresses the CLOSE, so the wrong combination
+tears down the session netifd holds for a live bearer; and `umbim connect`
+silently discards the username and password unless the auth value is exactly
+`pap`, `chap` or `mschapv2`, so a normalized `pap-or-chap` must expand into
+bounded attempts instead of being written verbatim.
 
-Its accepted design is [`provisioning-contract-v1.md`](provisioning-contract-v1.md)
-and its plan is [`testing-0.11.0.md`](testing-0.11.0.md). Three points there are
-easy to miss and expensive to get wrong: there is **no adoption** of
-user-created sections in v1; a staging section is created without an `apn`
-option so netifd cannot dial a vendor default before reconciliation chooses one;
-and a disabled project-owned section must be excluded from the APN engine's
-`auto` target selection, or provisioning a second modem silently breaks APN
-operations on a working one.
+Do not implement MBIM profile mutation as an isolated shortcut in the APN
+engine's older code paths. The transport is new, but the boundary is not: the
+adapter provides identity, the engine owns the five profile options and their
+rollback, `apn-autoconfig-modem` owns the section, and netifd owns the bearer.
 
 The agreed product and ownership rules are normative in `architecture.md`. In
 particular, the final suite must work both when the modem is attached after the
@@ -150,11 +155,12 @@ until the maintainer pins the strong identity of the internal modem as
 binding from QMI protocol or USB VID:PID alone.
 
 Official SDK build and APK inspection, clean/live/offline install behavior,
-0.9.2 upgrade, removal simulation and the WH3000 manual/BTN_0 interruption and
-reset-plus-reconcile hardware matrix are complete. The remaining release action
-is publication followed by the live signed-feed install/removal/reinstall smoke
-test recorded in `testing-0.10.0.md`. Any defect found there requires a fixture
-regression and a follow-up patch release rather than rewriting the release tag.
+0.9.2 upgrade, removal simulation, the WH3000 manual/BTN_0 interruption and
+reset-plus-reconcile hardware matrix, publication and the live signed-feed smoke
+test are all complete and recorded in `testing-0.10.0.md`; the 0.10.1 lock
+repair and the 0.11.0 provisioning release have since shipped on top of it. Any
+defect found after publication requires a fixture regression and a follow-up
+patch release rather than rewriting a release tag.
 
 The 0.10.0 scope is architecture foundation and read-only inventory. It does
 not automatically create network sections, add native MBIM profile writes,

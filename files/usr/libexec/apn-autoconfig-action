@@ -31,7 +31,7 @@ cleanup_start_lock() {
 
 trap cleanup_start_lock 0
 
-case "$ACTION" in reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;; *) exit 2 ;; esac
+case "$ACTION" in reconcile|modem-reset|apply-manual|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;; *) exit 2 ;; esac
 case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
 case "$ACTION:$TARGET" in
 	database-*:) : ;;
@@ -90,6 +90,35 @@ case "$ACTION" in
 	roaming-block) "$COMMAND" roaming-policy-set block --target "$TARGET" & ;;
 	database-check) "$DATABASE_COMMAND" check & ;;
 	database-install) "$DATABASE_COMMAND" install & ;;
+	apply-manual)
+		# The manual profile arrives in the environment, because rpcd can pass
+		# an environment table but not standard input, and a password must
+		# never become an argument: /proc/<pid>/cmdline is world-readable while
+		# /proc/<pid>/environ is not.
+		#
+		# Everything is captured and then removed from the environment before
+		# the engine runs, so the profile does not reach curl, mmcli, ifup or
+		# any other child the engine spawns. The password reaches the engine
+		# only through a pipe from a shell builtin.
+		manual_apn="${APN_AUTOCONFIG_MANUAL_APN:-}"
+		manual_username="${APN_AUTOCONFIG_MANUAL_USERNAME:-}"
+		manual_password="${APN_AUTOCONFIG_MANUAL_PASSWORD:-}"
+		manual_auth="${APN_AUTOCONFIG_MANUAL_AUTH:-}"
+		manual_ip_type="${APN_AUTOCONFIG_MANUAL_IP_TYPE:-}"
+		unset APN_AUTOCONFIG_MANUAL_APN APN_AUTOCONFIG_MANUAL_USERNAME \
+			APN_AUTOCONFIG_MANUAL_PASSWORD APN_AUTOCONFIG_MANUAL_AUTH \
+			APN_AUTOCONFIG_MANUAL_IP_TYPE
+		set -- apply-manual --target "$TARGET" --apn "$manual_apn"
+		[ -z "$manual_auth" ] || set -- "$@" --auth "$manual_auth"
+		[ -z "$manual_ip_type" ] || set -- "$@" --ip-type "$manual_ip_type"
+		[ -z "$manual_username" ] || set -- "$@" --username "$manual_username"
+		if [ -n "$manual_password" ]; then
+			printf '%s\n' "$manual_password" | "$COMMAND" "$@" --password-stdin &
+		else
+			"$COMMAND" "$@" </dev/null &
+		fi
+		manual_password=""
+	;;
 	*) "$COMMAND" "$ACTION" --target "$TARGET" & ;;
 esac
 CHILD_PID=$!

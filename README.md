@@ -309,11 +309,11 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.10.1-r1.apk \
-  ./luci-app-apn-autoconfig-0.10.0-r1.apk
+  ./apn-autoconfig-0.11.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.11.0-r1.apk
 ```
 
-`apn-autoconfig-modem-0.10.1-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.11.0-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it in 0.10.0. It adds
 read-only modem inventory and a coordinator-based `modem-reset` path alongside
 the compatibility path. Install it when those functions are required.
@@ -497,8 +497,43 @@ the new SIM even if the previous provider's APN happens to pass the Internet
 test. If ICCID, configured profile and the last successfully reconciled state all
 match, it verifies connectivity and exits without restarting `wwan`.
 
-Before APN changes, `apply` and `reconcile` wait for usable home or roaming
-registration. Explicitly blocked roaming, denied registration, emergency-only
+### Applying an APN yourself
+
+When the database has no profile for your SIM, or your operator issued you a
+private one, supply it directly. In LuCI this is the **Enter an APN yourself**
+card; the password field is sent to the router in the request environment and
+never as a command argument, because a command line is readable by any local
+process while an environment is not.
+
+From the command line:
+
+```sh
+apn-autoconfig apply-manual --apn internet.example
+```
+
+Optional fields are `--username`, `--auth` (`none`, `pap`, `chap` or
+`pap-or-chap`) and `--ip-type` (`ipv4`, `ipv6` or `ipv4v6`). The password is
+read from standard input and never taken as an argument, because command
+arguments are readable by any local process:
+
+```sh
+printf '%s\n' 'your-password' |
+  apn-autoconfig apply-manual --apn internet.example --username you --password-stdin
+```
+
+A manual profile is not a shortcut around the engine. It is tested as a single
+candidate through the same path as a database profile: the previous profile is
+captured as a baseline first, the interface is restarted, real Internet
+connectivity is verified, and a profile that fails is rolled back exactly. It
+does not need the provider database, since nothing is matched.
+
+Because the result is recorded like any other success, a later `reconcile`
+leaves the manual profile alone while it still verifies. If it stops working,
+the manual profile is retried first and the database is only a fallback, so a
+working manual profile is never silently replaced.
+
+Before APN changes, `apply`, `apply-manual` and `reconcile` wait for usable
+home or roaming registration. Explicitly blocked roaming, denied registration, emergency-only
 service and messaging-only registration stop without cycling APN profiles. A
 registration that remains pending is reported as retryable to the bounded boot
 worker.

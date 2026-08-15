@@ -1250,6 +1250,227 @@ else
 fi
 rm -f "$TEST_LOCK"
 
+printf '%s\n' 'TEST the manual profile reaches the engine without the password ever being an argument'
+rm -rf "$TEST_LOCK" "$TEST_ACTION_STATE"
+manual_probe="$STATE/manual-engine-probe"
+cat >"$manual_probe" <<'PROBEEOF'
+#!/bin/sh
+# Stands in for the engine and records exactly how it was invoked, including
+# whether the manual profile was still present in its environment.
+printf 'argv:%s\n' "$*" >>"$TEST_STATE/manual-invocation"
+printf 'stdin:%s\n' "$(cat)" >>"$TEST_STATE/manual-invocation"
+printf 'env_password:%s\n' "${APN_AUTOCONFIG_MANUAL_PASSWORD:-<unset>}" >>"$TEST_STATE/manual-invocation"
+printf 'env_apn:%s\n' "${APN_AUTOCONFIG_MANUAL_APN:-<unset>}" >>"$TEST_STATE/manual-invocation"
+exit 0
+PROBEEOF
+chmod 0755 "$manual_probe"
+: >"$STATE/manual-invocation"
+mkdir -p "$TEST_ACTION_STATE"
+APN_AUTOCONFIG_ACTION_COMMAND="$manual_probe" \
+	APN_AUTOCONFIG_MANUAL_APN=manual.example \
+	APN_AUTOCONFIG_MANUAL_USERNAME=someone \
+	APN_AUTOCONFIG_MANUAL_PASSWORD='top secret' \
+	APN_AUTOCONFIG_MANUAL_AUTH=pap \
+	APN_AUTOCONFIG_MANUAL_IP_TYPE=ipv4 \
+	sh "$BASE/files/usr/libexec/apn-autoconfig-action" apply-manual "$TEST_ACTION_STATE" '2026-01-01T00:00:00Z' network:wwan
+manual_seen="$(cat "$STATE/manual-invocation")"
+# Only the argv line: a glob over the whole record would also match the
+# password on the stdin line and report a leak that is not there.
+manual_argv="$(grep '^argv:' "$STATE/manual-invocation")"
+case "$manual_argv" in
+	*"top secret"*) fail 'the worker passed the password as a command argument' ;;
+esac
+assert_contains "$manual_seen" 'stdin:top secret'
+for needle in '--password-stdin' '--apn manual.example' '--username someone' \
+	'--auth pap' '--ip-type ipv4' '--target network:wwan'
+do
+	case "$manual_argv" in
+		*"$needle"*) : ;;
+		*) fail "the engine was not given $needle" ;;
+	esac
+done
+# The profile must be gone from the environment before the engine runs, so it
+# cannot reach curl, mmcli, ifup or anything else the engine spawns.
+assert_contains "$manual_seen" 'env_password:<unset>'
+assert_contains "$manual_seen" 'env_apn:<unset>'
+
+printf '%s\n' 'TEST a manual profile without credentials sends no credential options'
+: >"$STATE/manual-invocation"
+rm -rf "$TEST_ACTION_STATE"
+mkdir -p "$TEST_ACTION_STATE"
+APN_AUTOCONFIG_ACTION_COMMAND="$manual_probe" \
+	APN_AUTOCONFIG_MANUAL_APN=plain.example \
+	sh "$BASE/files/usr/libexec/apn-autoconfig-action" apply-manual "$TEST_ACTION_STATE" '2026-01-01T00:00:00Z' network:wwan
+manual_argv="$(grep '^argv:' "$STATE/manual-invocation")"
+manual_seen="$(cat "$STATE/manual-invocation")"
+case "$manual_argv" in
+	*--username*) fail 'a credential-free manual profile still sent a username' ;;
+	*--password-stdin*) fail 'a credential-free manual profile still asked for a password' ;;
+esac
+case "$manual_argv" in
+	*'--apn plain.example'*) : ;;
+	*) fail 'the engine was not given the manual APN' ;;
+esac
+
+printf '%s\n' 'TEST the control wrapper refuses a manual profile it cannot validate'
+for bad_target in '' 'wwan' 'network:' 'network:../etc' 'network:a b'; do
+	bad_status=0
+	APN_AUTOCONFIG_MANUAL_APN=ok.example \
+		sh "$CONTROL_SCRIPT" apply-manual "$bad_target" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the control wrapper accepted the unsafe target '$bad_target'"
+done
+bad_status=0
+sh "$CONTROL_SCRIPT" apply-manual network:wwan >/dev/null 2>&1 || bad_status=$?
+[ "$bad_status" -eq 2 ] || fail 'the control wrapper started a manual profile with no APN in the environment'
+
+printf '%s\n' 'TEST apply-manual applies a user profile through the normal candidate path'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=manual.example
+export CURL_SUCCESS_APN
+rm -f "$TARGET_PERSIST/baseline.tsv" "$TARGET_PERSIST/active.tsv"
+sh "$SCRIPT" apply-manual --apn manual.example >/dev/null 2>&1 || \
+	fail 'apply-manual failed for a profile that connects'
+[ "$(cat "$STATE/apn")" = manual.example ] || fail 'apply-manual did not write the requested APN'
+[ -s "$TARGET_PERSIST/baseline.tsv" ] || fail 'apply-manual did not capture a baseline before writing'
+[ -s "$TARGET_PERSIST/active.tsv" ] || fail 'apply-manual did not record reconciled state'
+grep -F -q 'manual.example' "$TARGET_PERSIST/active.tsv" || \
+	fail 'reconciled state does not name the manually applied APN'
+grep -F -q 'manual' "$CACHE/last-result" || \
+	fail 'the recorded result does not identify the profile as manual'
+
+printf '%s\n' 'TEST apply-manual stores optional credentials it was given'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=creds.example
+export CURL_SUCCESS_APN
+printf '%s\n' 'sekrit' | sh "$SCRIPT" apply-manual --apn creds.example \
+	--username someone --password-stdin --auth pap --ip-type ipv4 >/dev/null 2>&1 || \
+	fail 'apply-manual failed with a full credential set'
+[ "$(cat "$STATE/username")" = someone ] || fail 'apply-manual did not write the username'
+[ "$(cat "$STATE/password")" = sekrit ] || fail 'apply-manual did not read the password from stdin'
+[ "$(cat "$STATE/allowedauth")" = pap ] || fail 'apply-manual did not write the authentication mode'
+[ "$(cat "$STATE/iptype")" = ipv4 ] || fail 'apply-manual did not write the IP family'
+
+printf '%s\n' 'TEST a failing manual profile restores the exact previous profile'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=creds.example
+export CURL_SUCCESS_APN
+manual_fail_status=0
+sh "$SCRIPT" apply-manual --apn nothere.example >/dev/null 2>&1 || manual_fail_status=$?
+[ "$manual_fail_status" -ne 0 ] || fail 'a manual profile with no connectivity reported success'
+[ "$(cat "$STATE/apn")" = creds.example ] || \
+	fail "a failed manual profile left APN '$(cat "$STATE/apn")' instead of restoring creds.example"
+[ "$(cat "$STATE/username")" = someone ] || fail 'rollback did not restore the previous username'
+[ "$(cat "$STATE/password")" = sekrit ] || fail 'rollback did not restore the previous password'
+
+printf '%s\n' 'TEST apply-manual validates its input before touching the network'
+rm -rf "$TEST_LOCK"
+: >"$STATE/events"
+manual_before="$(cat "$STATE/apn")"
+for bad_case in \
+	'--apn' \
+	'--apn bad/apn' \
+	'--apn ok.example --auth wrong' \
+	'--apn ok.example --ip-type ipv5' \
+	'--apn ok.example --username someone'
+do
+	bad_status=0
+	# shellcheck disable=SC2086
+	sh "$SCRIPT" apply-manual $bad_case >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || \
+		fail "apply-manual $bad_case exited $bad_status instead of the usage class 2"
+done
+[ ! -s "$STATE/events" ] || fail 'a rejected manual profile still restarted the interface'
+[ "$(cat "$STATE/apn")" = "$manual_before" ] || fail 'a rejected manual profile changed the APN'
+
+printf '%s\n' 'TEST the manual password is never accepted as a command-line argument'
+rm -rf "$TEST_LOCK"
+argv_status=0
+sh "$SCRIPT" apply-manual --apn ok.example --username u --password secret \
+	>/dev/null 2>"$STATE/argv-password.err" || argv_status=$?
+[ "$argv_status" -ne 0 ] || fail 'apply-manual accepted a password as an argument, exposing it through ps'
+grep -q -- '--password' "$STATE/argv-password.err" || \
+	fail 'the password argument was rejected for some unrelated reason'
+
+printf '%s\n' 'TEST manual profile options are refused for other commands'
+rm -rf "$TEST_LOCK"
+sneaky_status=0
+sh "$SCRIPT" reconcile --apn sneaky.example >/dev/null 2>"$STATE/sneaky.err" || sneaky_status=$?
+[ "$sneaky_status" -ne 0 ] || fail 'reconcile accepted manual profile options'
+grep -q 'only valid for apply-manual' "$STATE/sneaky.err" || \
+	fail 'manual options on reconcile were refused for some unrelated reason'
+
+printf '%s\n' 'TEST a manual profile survives a later reconcile and is retried before the database'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=survives.example
+export CURL_SUCCESS_APN
+sh "$SCRIPT" apply-manual --apn survives.example >/dev/null 2>&1 || \
+	fail 'setup for the reconcile-preference test failed'
+: >"$STATE/events"
+sh "$SCRIPT" reconcile >/dev/null 2>&1 || fail 'reconcile failed on a working manual profile'
+[ "$(cat "$STATE/apn")" = survives.example ] || \
+	fail 'reconcile replaced a working manual profile with a database candidate'
+[ ! -s "$STATE/events" ] || fail 'reconcile restarted the interface for an already working manual profile'
+# When it stops verifying, the manual profile must still be tried first.
+printf '%s\n' 'wrong.apn' >"$STATE/apn"
+sh "$SCRIPT" reconcile >/dev/null 2>&1 || fail 'reconcile failed while restoring the manual profile'
+[ "$(cat "$STATE/apn")" = survives.example ] || \
+	fail 'reconcile did not restore the manual profile before falling back to the database'
+
+printf '%s\n' 'TEST apply-manual works without the provider database it does not consult'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=nodb.example
+export CURL_SUCCESS_APN
+mv "$DB" "$DB.hidden"
+nodb_status=0
+sh "$SCRIPT" apply-manual --apn nodb.example >/dev/null 2>&1 || nodb_status=$?
+mv "$DB.hidden" "$DB"
+[ "$nodb_status" -eq 0 ] || \
+	fail "apply-manual needed the provider database it does not consult (exit $nodb_status)"
+[ "$(cat "$STATE/apn")" = nodb.example ] || \
+	fail 'apply-manual did not apply the profile without a database'
+
+printf '%s\n' 'TEST forget-target drops one target and leaves the shared cache alone'
+rm -rf "$TEST_LOCK"
+mkdir -p "$PERSIST/targets/network_apnmodem1" "$PERSIST/targets/network_cellqmi" "$CACHE"
+printf 'v3\tapnmodem1\tnetwork:apnmodem1\tmodemmanager\tmodemmanager\n' \
+	>"$PERSIST/targets/network_apnmodem1/baseline.tsv"
+printf 'v3\t8949\tweb.example\t-\t-\t-\t-\tnetwork:apnmodem1\tmodemmanager\n' \
+	>"$PERSIST/targets/network_apnmodem1/active.tsv"
+printf 'v3\tcellqmi\tnetwork:cellqmi\tqmi\tqmi\n' \
+	>"$PERSIST/targets/network_cellqmi/baseline.tsv"
+printf 'keep-me\n' >"$CACHE/shared-cache-entry.tsv"
+sh "$SCRIPT" forget-target --target network:apnmodem1 >/dev/null 2>&1 || \
+	fail 'forget-target failed for a section that no longer exists'
+[ ! -e "$PERSIST/targets/network_apnmodem1" ] || \
+	fail 'forget-target left the target state behind'
+[ -f "$PERSIST/targets/network_cellqmi/baseline.tsv" ] || \
+	fail 'forget-target removed an unrelated target state'
+[ -f "$CACHE/shared-cache-entry.tsv" ] || \
+	fail 'forget-target cleared the cache shared by every target'
+
+printf '%s\n' 'TEST forget-target refuses while the network section still exists'
+mkdir -p "$PERSIST/targets/network_wwan"
+printf 'v3\twwan\tnetwork:wwan\tmodemmanager\tmodemmanager\n' \
+	>"$PERSIST/targets/network_wwan/baseline.tsv"
+forget_status=0
+sh "$SCRIPT" forget-target --target network:wwan >/dev/null 2>&1 || forget_status=$?
+[ "$forget_status" -eq 4 ] || \
+	fail "forget-target on a live section exited $forget_status instead of the blocked class 4"
+[ -f "$PERSIST/targets/network_wwan/baseline.tsv" ] || \
+	fail 'forget-target stranded a live target by dropping the baseline that restores it'
+
+printf '%s\n' 'TEST forget-target requires an explicit target and rejects an unsafe one'
+if sh "$SCRIPT" forget-target >/dev/null 2>&1; then
+	fail 'forget-target ran without --target'
+fi
+if sh "$SCRIPT" forget-target --target 'network:../../tmp/x' >/dev/null 2>&1; then
+	fail 'forget-target accepted an unsafe target ID'
+fi
+
+printf '%s\n' 'TEST forget-target is a no-op when there is no state for the target'
+sh "$SCRIPT" forget-target --target network:neverexisted >/dev/null 2>&1 || \
+	fail 'forget-target failed when there was nothing to forget'
+
 printf '%s\n' 'TEST a disabled project-owned staging section never joins automatic target selection'
 TEST_SINGLE_TARGET=1
 export TEST_SINGLE_TARGET

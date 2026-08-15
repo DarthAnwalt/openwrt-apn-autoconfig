@@ -25,6 +25,7 @@ MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
 MODEM_POLL_SECONDS="2"
+CONNECT_WAIT_SECONDS="60"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
 RESET_MODEM_ID=""
 
@@ -46,6 +47,11 @@ APN_LOCK_BORROWED=0
 MODEM_POWER_OFF_ARMED=0
 RESET_INTERFACE=""
 RESET_INTERFACE_RESTORE_ARMED=0
+PROVISION_ROLLBACK_ARMED=0
+PROVISION_CREATED_SECTION=""
+PROVISION_BASELINE_FILE=""
+PROVISION_CHILD_PID=""
+REQUESTED_AUTOCONNECT=1
 BOUNDED_CHILD_PID=""
 BOUNDED_WATCHDOG_PID=""
 
@@ -95,6 +101,14 @@ cleanup_files() {
 			log err "failed to restart interface $RESET_INTERFACE during cleanup"
 		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
+	if [ -n "$PROVISION_CHILD_PID" ]; then
+		kill -TERM "$PROVISION_CHILD_PID" 2>/dev/null || :
+		wait "$PROVISION_CHILD_PID" 2>/dev/null || :
+		PROVISION_CHILD_PID=""
+	fi
+	# Unwind provisioning before the locks are released, so no other operation
+	# can observe a half-created staging section.
+	provisioning_rollback
 	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE"
 	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
 	if [ "$LOCK_HELD" -eq 1 ] && [ -n "$LOCK_PATH" ]; then
@@ -137,6 +151,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
 }
@@ -164,9 +179,11 @@ validate_config() {
 	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
 	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
 	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	case "$CONNECT_WAIT_SECONDS" in ''|*[!0-9]*) die "connect_wait_seconds must be numeric" ;; esac
 	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
+	[ "$CONNECT_WAIT_SECONDS" -gt 0 ] || die "connect_wait_seconds must be greater than zero"
 	if [ -n "$RESET_MODEM_ID" ]; then
 		safe_token "$RESET_MODEM_ID" || die "reset_modem_id contains unsafe characters"
 		case "$RESET_MODEM_ID" in usb-serial:*|imei:*) : ;; *) die "reset_modem_id must use strong usb-serial or imei evidence" ;; esac
@@ -1109,6 +1126,280 @@ provision_evaluate() {
 	return 0
 }
 
+provisioning_baseline_file() {
+	printf '%s/provisioning/%s.tsv\n' "$STATE_DIR" "$(sanitize_token "$1")"
+}
+
+# Removes exactly the section this process created and nothing else. Armed
+# before the first write so a failure or signal in any later step unwinds it.
+provisioning_rollback() {
+	[ "$PROVISION_ROLLBACK_ARMED" -eq 1 ] || return 0
+	PROVISION_ROLLBACK_ARMED=0
+	if [ -n "$PROVISION_CREATED_SECTION" ]; then
+		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
+		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
+		if uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+			uci commit network >/dev/null 2>&1 || \
+				log err "failed to commit removal of staging section $PROVISION_CREATED_SECTION"
+		else
+			log err "failed to remove staging section $PROVISION_CREATED_SECTION during rollback"
+		fi
+		PROVISION_CREATED_SECTION=""
+	fi
+	if [ -n "$PROVISION_BASELINE_FILE" ]; then
+		rm -f "$PROVISION_BASELINE_FILE"
+		PROVISION_BASELINE_FILE=""
+	fi
+}
+
+provision_cmd() {
+	prov_modem="$REQUESTED_MODEM"
+	[ -n "$prov_modem" ] || die_code 2 "provision requires --modem"
+	command_exists uci || die "uci is required"
+	command_exists apn-autoconfig || \
+		die_code 4 "apn-autoconfig is required to reconcile a provisioned section"
+
+	provision_evaluate "$prov_modem"
+	prov_status=$?
+	case "$PROVISION_REASON" in
+		ok) : ;;
+		already_provisioned)
+			die_code 4 "modem $prov_modem already owns section $PROVISION_EXISTING; deprovision it first"
+		;;
+		*) die_code "$prov_status" "modem $prov_modem cannot be provisioned: $PROVISION_REASON" ;;
+	esac
+
+	# One global order, same as every other composite operation: the APN
+	# operation lock first, then the selected per-modem lock.
+	acquire_apn_lock
+	acquire_modem_lock "$prov_modem"
+
+	# Pre-lock validation alone is a time-of-check/time-of-use race, so
+	# presence, identity, capability, owner and the free section name are all
+	# re-resolved now that nothing else can mutate them.
+	provision_evaluate "$prov_modem"
+	prov_status=$?
+	[ "$PROVISION_REASON" = ok ] || \
+		die_code "$prov_status" "modem $prov_modem stopped being provisionable: $PROVISION_REASON"
+
+	prov_section="$PROVISION_SECTION"
+	prov_protocol="$PROVISION_PROTOCOL"
+	prov_device="$PROVISION_DEVICE"
+	case "$prov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	prov_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	prov_operation="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
+
+	mkdir -p "$STATE_DIR/provisioning" || die "cannot create provisioning state directory"
+	prov_baseline="$(provisioning_baseline_file "$prov_modem")"
+	prov_tmp="$prov_baseline.$$"
+	printf 'v1\t%s\t%s\t%s\t%s\t%s\n' \
+		"$prov_operation" "$prov_modem" "$prov_section" 0 "$prov_now" >"$prov_tmp" || \
+		die "cannot write provisioning baseline"
+	mv "$prov_tmp" "$prov_baseline" || {
+		rm -f "$prov_tmp"
+		die "cannot persist provisioning baseline"
+	}
+	PROVISION_BASELINE_FILE="$prov_baseline"
+
+	# Final free-name check immediately before the write. A name that appeared
+	# in the meantime aborts without mutating instead of silently picking
+	# another one.
+	if network_section_names | grep -F -x -q "$prov_section"; then
+		die_code 3 "section $prov_section appeared before it could be created; retry"
+	fi
+
+	PROVISION_ROLLBACK_ARMED=1
+	PROVISION_CREATED_SECTION="$prov_section"
+
+	log notice "provisioning modem $prov_modem as $prov_protocol section $prov_section"
+	# Staged: administratively disabled and carrying no apn option, so netifd
+	# cannot dial a vendor default before reconciliation chooses a profile.
+	uci set "network.${prov_section}=interface" || die "cannot create section $prov_section"
+	uci set "network.${prov_section}.proto=${prov_protocol}" || die "cannot set proto"
+	uci set "network.${prov_section}.device=${prov_device}" || die "cannot set device"
+	uci set "network.${prov_section}.disabled=1" || die "cannot stage the section as disabled"
+	uci set "network.${prov_section}.auto=0" || die "cannot stage the section without autostart"
+	uci set "network.${prov_section}.apn_autoconfig_owner=apn-autoconfig-modem" || die "cannot mark ownership"
+	uci set "network.${prov_section}.apn_autoconfig_modem_id=${prov_modem}" || die "cannot mark modem identity"
+	uci set "network.${prov_section}.apn_autoconfig_provisioned=${prov_now}" || die "cannot mark provisioning time"
+	uci commit network || die "cannot commit the staging section"
+
+	# Clear "disabled" so the APN engine is able to start the section, but do
+	# not start it here. Bringing it up at this point would hand netifd a
+	# modemmanager/qmi section that still has no apn option, which is exactly
+	# the vendor-default dial the staging rules exist to prevent. The engine
+	# owns bring-up: it writes the profile and cycles the interface itself.
+	# auto=0 still keeps netifd from starting it on any unrelated reload.
+	uci delete "network.${prov_section}.disabled" || die "cannot enable the staging section"
+	uci commit network || die "cannot commit the enabled staging section"
+
+	# The APN engine owns matching, profile application, connectivity
+	# verification and profile rollback. It borrows this operation's lock
+	# rather than trying to take one we already hold.
+	# Run the engine as a tracked child. A signal during reconciliation has to
+	# terminate and reap it before the staging section is unwound, otherwise an
+	# orphaned engine keeps mutating a target we are deleting underneath it.
+	prov_reconcile=0
+	APN_AUTOCONFIG_LOCK_OWNER_PID="$$" \
+		apn-autoconfig reconcile --target "network:${prov_section}" &
+	PROVISION_CHILD_PID=$!
+	wait "$PROVISION_CHILD_PID" || prov_reconcile=$?
+	PROVISION_CHILD_PID=""
+	if [ "$prov_reconcile" -ne 0 ]; then
+		case "$prov_reconcile" in
+			3) die_code 3 "APN reconciliation for $prov_section is temporarily unavailable" ;;
+			*) die_code 4 "APN reconciliation failed for $prov_section (exit $prov_reconcile)" ;;
+		esac
+	fi
+
+	# Promotion happens only after reconciliation verified real connectivity.
+	if [ "$REQUESTED_AUTOCONNECT" = 0 ]; then
+		uci set "network.${prov_section}.auto=0" || die "cannot record the requested autoconnect state"
+		prov_autoconnect=false
+	else
+		uci delete "network.${prov_section}.auto" >/dev/null 2>&1 || :
+		prov_autoconnect=true
+	fi
+	uci commit network || die "cannot commit the promoted section"
+
+	PROVISION_ROLLBACK_ARMED=0
+	PROVISION_CREATED_SECTION=""
+	PROVISION_BASELINE_FILE=""
+	release_modem_lock
+	log notice "modem $prov_modem provisioned as $prov_section"
+
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$prov_modem"; printf ','
+	json_key_string section "$prov_section"; printf ','
+	json_key_string protocol "$prov_protocol"; printf ','
+	json_key_string device "$prov_device"; printf ','
+	json_key_string state promoted; printf ','
+	json_key_boolean autoconnect "$prov_autoconnect"; printf ','
+	json_key_string operation_id "$prov_operation"
+	printf '}\n'
+}
+
+# netifd stays the bearer owner. These verbs only ask it to act on a section
+# this package created, and report what netifd then reports.
+interface_is_up() {
+	command_exists ubus || return 1
+	command_exists jsonfilter || return 1
+	conn_state="$(ubus call "network.interface.$1" status 2>/dev/null | \
+		jsonfilter -e '@.up' 2>/dev/null || :)"
+	[ "$conn_state" = true ]
+}
+
+wait_for_interface_up() {
+	conn_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		interface_is_up "$1" && return 0
+		conn_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		conn_elapsed=$((conn_now - conn_started))
+		[ "$conn_elapsed" -ge 0 ] || conn_elapsed="$CONNECT_WAIT_SECONDS"
+		[ "$conn_elapsed" -lt "$CONNECT_WAIT_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
+connection_cmd() {
+	conn_action="$1"
+	conn_modem="$REQUESTED_MODEM"
+	[ -n "$conn_modem" ] || die_code 2 "$conn_action requires --modem"
+	command_exists uci || die "uci is required"
+
+	# v1 acts only on sections this package owns. A user-created interface is
+	# never driven from here; see docs/provisioning-contract-v1.md.
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "no section owned by this package is bound to modem $conn_modem"
+	case "$conn_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	acquire_apn_lock
+	acquire_modem_lock "$conn_modem"
+
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "modem $conn_modem no longer owns a project-created section"
+
+	conn_result=up
+	case "$conn_action" in
+		disconnect)
+			ifdown "$conn_section" >/dev/null 2>&1 || die "failed to stop $conn_section"
+			conn_result=down
+		;;
+		connect|reconnect)
+			if [ "$conn_action" = reconnect ]; then
+				ifdown "$conn_section" >/dev/null 2>&1 || :
+			fi
+			ifup "$conn_section" >/dev/null 2>&1 || die "failed to start $conn_section"
+			if ! wait_for_interface_up "$conn_section"; then
+				die_code 3 "$conn_section did not come up within ${CONNECT_WAIT_SECONDS}s"
+			fi
+		;;
+		*) die_code 2 "unsupported connection action: $conn_action" ;;
+	esac
+
+	release_modem_lock
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$conn_modem"; printf ','
+	json_key_string section "$conn_section"; printf ','
+	json_key_string action "$conn_action"; printf ','
+	json_key_string state "$conn_result"
+	printf '}\n'
+}
+
+deprovision_cmd() {
+	deprov_modem="$REQUESTED_MODEM"
+	[ -n "$deprov_modem" ] || die_code 2 "deprovision requires --modem"
+	command_exists uci || die "uci is required"
+
+	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
+	[ -n "$deprov_section" ] || \
+		die_code 4 "no section owned by this package is bound to modem $deprov_modem"
+
+	acquire_apn_lock
+	acquire_modem_lock "$deprov_modem"
+
+	# Re-prove ownership under the locks. A section that lost or never had the
+	# marker is never deleted, however much it looks like one of ours.
+	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
+	[ -n "$deprov_section" ] || \
+		die_code 4 "modem $deprov_modem no longer owns a project-created section"
+	case "$deprov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	log notice "removing project-owned section $deprov_section for modem $deprov_modem"
+	ifdown "$deprov_section" >/dev/null 2>&1 || :
+	uci delete "network.${deprov_section}" || die "cannot remove section $deprov_section"
+	uci commit network || die "cannot commit removal of $deprov_section"
+	rm -f "$(provisioning_baseline_file "$deprov_modem")"
+
+	# The APN engine keeps its own per-target baseline and active state. Ask it
+	# to forget this now-deleted section rather than reaching into its files:
+	# left behind, that state accumulates and a later provisioning reusing the
+	# section name would meet state belonging to a different SIM.
+	deprov_engine_state=retained
+	if command_exists apn-autoconfig; then
+		if APN_AUTOCONFIG_LOCK_OWNER_PID="$$" \
+			apn-autoconfig forget-target --target "network:${deprov_section}" >/dev/null 2>&1; then
+			deprov_engine_state=dropped
+		else
+			log warning "apn-autoconfig kept its state for network:${deprov_section}"
+		fi
+	fi
+	release_modem_lock
+
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$deprov_modem"; printf ','
+	json_key_string section "$deprov_section"; printf ','
+	json_key_string state removed; printf ','
+	json_key_string engine_state "$deprov_engine_state"
+	printf '}\n'
+}
+
 provision_plan_cmd() {
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "provision-plan requires --modem"
 	plan_status=0
@@ -1333,7 +1624,7 @@ action_status_values() {
 		external_pid="$(lock_owner_pid "$external_lock" 2>/dev/null || :)"
 		if process_is_alive "$external_pid"; then
 			ACTION_STATUS="running"
-			ACTION_NAME="reset"
+			ACTION_NAME=""
 			ACTION_PID="$external_pid"
 			ACTION_STARTED=""
 			ACTION_FINISHED=""
@@ -1370,14 +1661,41 @@ action_status_cmd() {
 	print_action_json false "$REQUESTED_MODEM"
 }
 
+# Each background action states its own precondition here, before a worker is
+# accepted. A caller must never learn from a terminal failure that the
+# operation was never possible in the first place.
+action_precondition() {
+	precondition_action="$1"
+	precondition_modem="$2"
+	case "$precondition_action" in
+		reset)
+			line="$(find_record "$precondition_modem")" || \
+				die_code 4 "modem $precondition_modem is not currently present"
+			[ "$(field "$line" 14)" = 1 ] || \
+				die_code 4 "modem $precondition_modem is not bound to the supported board reset integration"
+		;;
+		provision)
+			provision_evaluate "$precondition_modem"
+			precondition_status=$?
+			[ "$PROVISION_REASON" = ok ] || \
+				die_code "$precondition_status" "modem $precondition_modem cannot be provisioned: $PROVISION_REASON"
+		;;
+		deprovision|connect|disconnect|reconnect)
+			[ -n "$(provision_existing_section "$precondition_modem" 2>/dev/null || :)" ] || \
+				die_code 4 "no section owned by this package is bound to modem $precondition_modem"
+		;;
+	esac
+}
+
 action_start_cmd() {
 	action="$1"
-	case "$action" in reset) : ;; *) die_code 2 "unsupported background action: $action" ;; esac
+	case "$action" in
+		reset|provision|deprovision|connect|disconnect|reconnect) : ;;
+		*) die_code 2 "unsupported background action: $action" ;;
+	esac
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "action-start requires --modem"
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
-	line="$(find_record "$REQUESTED_MODEM")" || die_code 4 "modem $REQUESTED_MODEM is not currently present"
-	capable_reset="$(field "$line" 14)"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $REQUESTED_MODEM is not bound to the supported board reset integration"
+	action_precondition "$action" "$REQUESTED_MODEM"
 
 	state_dir="$(action_state_dir_for "$REQUESTED_MODEM")"
 	mkdir -p "$ACTION_STATE_DIR" || die "cannot create action state parent"
@@ -1444,12 +1762,19 @@ rescan_async_cmd() {
 usage() {
 	cat <<EOF
 Usage: $PROG <command> [--modem <modem_id>] [--interface <network-section>]
+                       [--autoconnect 0|1]
 
 Commands:
   inventory-json    Read-only scan of currently present modems (JSON)
   status-json       Single modem record; requires --modem
   resolve           Print the modem_id bound to --interface, or fail closed
   provision-plan    Read-only check of whether --modem can be provisioned
+  provision         Create a project-owned section for --modem, reconcile its
+                    APN through apn-autoconfig and promote autoconnect
+  deprovision       Remove the project-owned section created for --modem
+  connect           Bring the project-owned section for --modem up
+  disconnect        Bring the project-owned section for --modem down
+  reconnect         Cycle the project-owned section for --modem
   action-start reset  Start a bounded power-cycle in background; requires --modem
   action-status     Show background/external reset operation state; requires --modem
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
@@ -1478,6 +1803,11 @@ main() {
 				REQUESTED_INTERFACE="$2"
 				shift 2
 			;;
+			--autoconnect)
+				[ "$#" -ge 2 ] || die_code 2 "--autoconnect requires a value"
+				case "$2" in 0|1) REQUESTED_AUTOCONNECT="$2" ;; *) die_code 2 "--autoconnect must be 0 or 1" ;; esac
+				shift 2
+			;;
 			*) die_code 2 "unexpected argument: $1" ;;
 		esac
 	done
@@ -1496,6 +1826,9 @@ main() {
 		status-json) status_json_cmd ;;
 		resolve) resolve_cmd ;;
 		provision-plan) provision_plan_cmd ;;
+		provision) provision_cmd ;;
+		deprovision) deprovision_cmd ;;
+		connect|disconnect|reconnect) connection_cmd "$COMMAND_NAME" ;;
 		action-start) action_start_cmd "$command_argument" ;;
 		action-status) action_status_cmd ;;
 		reset) reset_cmd ;;

@@ -15,7 +15,7 @@ COMMAND="${APN_AUTOCONFIG_MODEM_ACTION_COMMAND:-/usr/sbin/apn-autoconfig-modem}"
 STATE_FILE="$STATE_DIR/state.tsv"
 CHILD_PID=""
 
-case "$ACTION" in reset) : ;; *) exit 2 ;; esac
+case "$ACTION" in reset|provision|deprovision|connect|disconnect|reconnect) : ;; *) exit 2 ;; esac
 case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
 [ -n "$MODEM_ID" ] || exit 2
 case "$OPERATION_ID" in ''|*[!A-Za-z0-9_.:-]*) exit 2 ;; esac

@@ -22,6 +22,7 @@ sh -n "$ROOT/apn-autoconfig-modem/files/etc/hotplug.d/usb/50-apn-autoconfig-mode
 sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/tests/run-tests-modem.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
+sh -n "$ROOT/tests/test-package-lifecycle.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/build-repository.sh"
 sh -n "$ROOT/scripts/install.sh"
@@ -147,6 +148,7 @@ grep -F -q '/etc/init.d/apn-autoconfig-modem restart' "$ROOT/apn-autoconfig-mode
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 	node "$ROOT/tests/test-luci-roaming-policy.js"
+	node "$ROOT/tests/test-luci-provisioning.js"
 elif [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
 	printf '%s\n' 'Node.js is required for LuCI verification in CI and release builds.' >&2
 	exit 1
@@ -181,6 +183,7 @@ awk -F '\t' '
 sh "$ROOT/tests/test-provider-generator.sh"
 sh "$ROOT/tests/test-database-update.sh"
 sh "$ROOT/tests/test-installer.sh"
+sh "$ROOT/tests/test-package-lifecycle.sh"
 sh "$ROOT/tests/run-tests.sh"
 sh "$ROOT/tests/run-tests-modem.sh"
 printf '%s\n' 'Static and behavioral verification passed.'

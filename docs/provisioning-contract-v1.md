@@ -1,7 +1,10 @@
 # Provisioning contract v1 (0.11.0)
 
-Status: accepted design for 0.11.0, ahead of implementation. This document is
-normative for `apn-autoconfig-modem`'s provisioning API. It extends
+Status: accepted design for 0.11.0. `provision-plan`, `provision`,
+`deprovision`, `connect`, `disconnect` and `reconnect` are implemented and
+covered by fixtures; the manual APN path and the LuCI first-run view are not,
+and nothing here has run on hardware. This document is normative for
+`apn-autoconfig-modem`'s provisioning API. It extends
 [`modem-contract-v1.md`](modem-contract-v1.md) and inherits every rule in it,
 including the lock representation and lock ordering. The safety invariants in
 [`architecture.md`](architecture.md) remain binding.
@@ -101,6 +104,12 @@ runtime rather than stored as a separate field:
 `disabled=1` precisely so netifd cannot attempt an empty or vendor-default APN
 before reconciliation chooses one.
 
+This is also why provisioning must never call `ifup` itself. Clearing
+`disabled` only makes the section startable; `auto=0` keeps netifd from
+starting it on an unrelated reload, and the APN engine performs the actual
+bring-up after it has written a profile. Starting the section between those two
+points would produce exactly the APN-less dial the staging rules prevent.
+
 ## Workflow
 
 `provision` is one serialized composite operation:
@@ -110,11 +119,11 @@ before reconciliation chooses one.
 3. capture and atomically persist the provisioning baseline (below);
 4. create the staging section with `proto`, the resolved device binding,
    `disabled=1`, `auto=0` and the three ownership markers; `uci commit network`;
-5. clear `disabled` and bring the interface up through netifd;
+5. clear `disabled` so the section can be started, but **do not start it here**;
 6. run targeted APN reconciliation by invoking
    `apn-autoconfig reconcile --target network:<section>` with the borrowed
    operation lock (below); the APN engine owns matching, application,
-   connectivity verification and profile rollback;
+   connectivity verification, interface bring-up and profile rollback;
 7. verify connectivity through the selected target's effective L3 route;
 8. apply the requested autoconnect state (`auto=1` unless the caller asked
    otherwise) only after step 7 succeeds; and
@@ -191,10 +200,48 @@ used, and, when it cannot, a stable machine-readable reason:
 `not_present`, `name_unavailable`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
 
+The engine command is
+`apn-autoconfig apply-manual --apn <apn> [--username <u> --password-stdin]
+[--auth ...] [--ip-type ...]`. The password is read from standard input and is
+never an argument, because argv is readable by other local processes. The
+profile becomes a single candidate and goes through the same baseline capture,
+connectivity verification and exact rollback as a database candidate, so
+`apn-autoconfig-modem` and LuCI must call it rather than writing profile fields
+themselves.
+
 The manual APN path passes profile fields through to the APN engine's manual
 profile operation. Provisioning never writes `apn`, `username`, `password`,
 `auth` or `pdptype` itself; those remain APN-engine-owned fields applied through
 the same baseline, verification and rollback discipline as a database profile.
+
+## Forgetting a deprovisioned target
+
+Deleting the section is not the whole teardown. The APN engine keeps its own
+per-target `baseline.tsv` and `active.tsv`, and those survive the section that
+owned them. Left behind they accumulate across provision/deprovision cycles,
+and a later provisioning that reuses the section name meets state recorded for
+a different SIM.
+
+`deprovision` therefore asks the engine to forget the target, rather than
+reaching into the engine's state itself:
+
+```text
+apn-autoconfig forget-target --target network:<section>
+```
+
+`forget-target` drops exactly one target's state. It refuses while a network
+section of that name still exists, because that baseline is the only record of
+the profile the engine replaced and dropping it would strand a live target with
+no way back. It never touches the cache, which is shared by every target, and
+never touches another target's state.
+
+`reset --target` is **not** a substitute: when a target has no baseline its
+no-baseline path clears the whole shared cache, so using it as a per-target
+cleanup would discard every other target's cached profile.
+
+The result reports `engine_state` as `dropped` or `retained`. A failure to
+forget does not fail the deprovision — the section is already gone — but it is
+logged and reported.
 
 ## Removal
 

@@ -12,6 +12,7 @@ config apn_autoconfig_modem 'main'
 	option modem_power_off_seconds '5'
 	option modem_wait_seconds '90'
 	option modem_poll_seconds '2'
+	option connect_wait_seconds '60'
 	option hardware_integration_file '/usr/share/apn-autoconfig/integrations/huasifei-wh3000'
 	# Reset stays unavailable until the administrator pins the strong modem_id
 	# of the internal modem controlled by the board GPIO.

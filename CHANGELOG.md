@@ -1,5 +1,42 @@
 # Changelog
 
+## apn-autoconfig 0.11.0 / apn-autoconfig-modem 0.11.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.11.0 (2026-08-15)
+
+Safe first-run provisioning for a modem that has no network configuration yet.
+Until now the suite could only manage a cellular interface someone had already
+created by hand.
+
+- Added `apn-autoconfig-modem provision`. It creates one disabled,
+  project-owned staging section for an unambiguous unconfigured modem, hands
+  APN selection to the APN engine over a borrowed operation lock, and enables
+  automatic connection only after the engine verified real Internet access.
+  The staging section carries no `apn` option and `disabled=1`, so netifd
+  cannot dial a vendor default before a profile is chosen. Rollback is armed
+  before the first write and unwinds a failure at any later step, a signal, and
+  a reconciliation that fails or reports retryable.
+- Added `deprovision`, which is the exact inverse and refuses any section that
+  does not carry the ownership marker, and `connect`, `disconnect` and
+  `reconnect` for sections this package owns. netifd remains the bearer owner.
+- An interface you created yourself is never adopted, rewritten or removed. A
+  modem already bound to one is refused with `already_configured`.
+- A disabled project-owned section is excluded from the APN engine's automatic
+  target selection, so preparing a second modem cannot break APN operations on
+  one that already works.
+- Added `apn-autoconfig apply-manual` for an APN the database does not cover,
+  running through the same baseline, verification and rollback path as a
+  database candidate. A password is accepted only on standard input.
+- Added `apn-autoconfig forget-target`, which drops one target's engine state
+  and refuses while its section still exists. `reset --target` cannot be used
+  for this, because with no baseline it clears a cache shared by every target.
+- LuCI gained a modem setup card and manual APN entry. Controls appear only for
+  what is actually possible; anything refused is explained instead. The manual
+  password travels in the request environment, never as a command argument,
+  because `/proc/<pid>/cmdline` is readable by any local process while
+  `/proc/<pid>/environ` is not.
+- Package removal now clears provisioning state as well as the inventory
+  registry. Sections this package created are deliberately left in place and
+  keep working, because netifd owns the bearer.
+
 ## apn-autoconfig 0.10.1 / apn-autoconfig-modem 0.10.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.10.0 (2026-08-14)
 
 Mainly a defect-fix release for the operation-lock protocol. It also carries two

@@ -60,6 +60,7 @@ get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
 get:apn-autoconfig-modem.main.modem_power_off_seconds) printf '%s\n' "${TEST_MODEM_POWER_OFF_SECONDS:-1}" ;;
 get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' 3 ;;
 get:apn-autoconfig-modem.main.modem_poll_seconds) printf '%s\n' 1 ;;
+get:apn-autoconfig-modem.main.connect_wait_seconds) printf '%s\n' "${TEST_CONNECT_WAIT_SECONDS:-2}" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
@@ -69,6 +70,68 @@ get:network.*)
 	awk -F'\t' -v name="$name" -v option="$option" \
 		'$1 == name && $2 == option { print $3; found=1 } END { exit found ? 0 : 1 }' \
 		"$TEST_NETWORK_OPTIONS" 2>/dev/null
+;;
+set:network.*)
+	# Every write is journalled so a test can assert exactly which keys were
+	# touched, not merely that the end state looks right.
+	printf 'set\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	assignment="${2#network.}"
+	target="${assignment%%=*}"
+	value="${assignment#*=}"
+	case "$target" in
+		*.*)
+			name="${target%%.*}"
+			option="${target#*.}"
+			tmp="$TEST_NETWORK_OPTIONS.tmp"
+			awk -F'\t' -v name="$name" -v option="$option" \
+				'!($1 == name && $2 == option)' "$TEST_NETWORK_OPTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_OPTIONS"
+			printf '%s\t%s\t%s\n' "$name" "$option" "$value" >>"$TEST_NETWORK_OPTIONS"
+			tmp="$TEST_NETWORK_SECTIONS.tmp"
+			grep -v "^network\.${name}\.${option}=" "$TEST_NETWORK_SECTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_SECTIONS"
+			printf "network.%s.%s='%s'\n" "$name" "$option" "$value" >>"$TEST_NETWORK_SECTIONS"
+		;;
+		*)
+			grep -q "^network\.${target}=" "$TEST_NETWORK_SECTIONS" 2>/dev/null || \
+				printf 'network.%s=%s\n' "$target" "$value" >>"$TEST_NETWORK_SECTIONS"
+		;;
+	esac
+	exit 0
+;;
+delete:network.*)
+	printf 'delete\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	target="${2#network.}"
+	case "$target" in
+		*.*)
+			name="${target%%.*}"
+			option="${target#*.}"
+			tmp="$TEST_NETWORK_OPTIONS.tmp"
+			awk -F'\t' -v name="$name" -v option="$option" \
+				'!($1 == name && $2 == option)' "$TEST_NETWORK_OPTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_OPTIONS"
+			tmp="$TEST_NETWORK_SECTIONS.tmp"
+			grep -v "^network\.${name}\.${option}=" "$TEST_NETWORK_SECTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_SECTIONS"
+		;;
+		*)
+			tmp="$TEST_NETWORK_OPTIONS.tmp"
+			awk -F'\t' -v name="$target" '$1 != name' "$TEST_NETWORK_OPTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_OPTIONS"
+			tmp="$TEST_NETWORK_SECTIONS.tmp"
+			grep -v -E "^network\.${target}(=|\.)" "$TEST_NETWORK_SECTIONS" >"$tmp" 2>/dev/null || :
+			mv "$tmp" "$TEST_NETWORK_SECTIONS"
+		;;
+	esac
+	exit 0
+;;
+commit:*)
+	printf 'commit\t%s\n' "${2:-}" >>"$TEST_UCI_WRITES"
+	exit 0
+;;
+revert:*)
+	printf 'revert\t%s\n' "${2:-}" >>"$TEST_UCI_WRITES"
+	exit 0
 ;;
 *) exit 1 ;;
 esac
@@ -134,6 +197,40 @@ cat >"$MOCKBIN/logger" <<'EOF'
 exit 0
 EOF
 
+# netifd state as seen through ubus. TEST_IFACE_UP names the section netifd
+# reports as up, so a connect can be made to succeed or to time out.
+cat >"$MOCKBIN/ubus" <<'EOF'
+#!/bin/sh
+case "${1:-}" in
+call)
+	section="${2#network.interface.}"
+	if [ "$section" = "${TEST_IFACE_UP:-}" ]; then
+		printf '{"up":true,"l3_device":"wwan0"}\n'
+	else
+		printf '{"up":false}\n'
+	fi
+	exit 0
+;;
+esac
+exit 1
+EOF
+
+cat >"$MOCKBIN/jsonfilter" <<'EOF'
+#!/bin/sh
+expression=""
+document=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-e) expression="$2"; shift 2 ;;
+		-s) document="$2"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+[ -n "$document" ] || document="$(cat)"
+key="${expression#@.}"
+printf '%s' "$document" | sed -n "s/.*\"${key}\":\([^,}]*\).*/\1/p" | tr -d '"'
+EOF
+
 cat >"$MOCKBIN/sleep" <<'EOF'
 #!/bin/sh
 exit 0
@@ -160,6 +257,7 @@ export TEST_MODEM_POWER_OFF_SECONDS=1
 export TEST_HOTPLUG_COALESCE_SECONDS=0
 export TEST_NETWORK_SECTIONS="$STATE/network-sections"
 export TEST_NETWORK_OPTIONS="$STATE/network-options"
+export TEST_UCI_WRITES="$STATE/uci-writes"
 export TEST_EVENTS="$STATE/events"
 export TEST_UQMI_CALLS="$STATE/uqmi-calls"
 export TEST_STATE="$STATE"
@@ -175,6 +273,31 @@ export APN_AUTOCONFIG_MODEM_BIN="$SCRIPT"
 reset_network_config() {
 	: >"$TEST_NETWORK_SECTIONS"
 	: >"$TEST_NETWORK_OPTIONS"
+	: >"$TEST_UCI_WRITES"
+}
+
+# Every network key the run under test wrote, in order.
+uci_writes() {
+	cat "$TEST_UCI_WRITES" 2>/dev/null
+}
+
+uci_wrote_nothing() {
+	[ ! -s "$TEST_UCI_WRITES" ]
+}
+
+# Sections other than the named one must never be touched.
+uci_touched_only_section() {
+	wanted="$1"
+	awk -F'\t' -v want="$wanted" '
+		$1 == "commit" || $1 == "revert" { next }
+		{
+			key = $2
+			sub(/^network\./, "", key)
+			sub(/[.=].*$/, "", key)
+			if (key != want) { print key; bad = 1 }
+		}
+		END { exit bad ? 1 : 0 }
+	' "$TEST_UCI_WRITES" 2>/dev/null
 }
 
 add_network_section() {
@@ -195,6 +318,13 @@ add_section_option() {
 add_plain_section() {
 	# A section with no proto, so it occupies a name without being a target.
 	printf 'network.%s=interface\n' "$1" >>"$TEST_NETWORK_SECTIONS"
+}
+
+network_section_count() {
+	awk -v prefix="$1" '
+		$0 ~ ("^network\\." prefix "[0-9]*=") { n++ }
+		END { print n + 0 }
+	' "$TEST_NETWORK_SECTIONS" 2>/dev/null
 }
 
 reset_sysfs() {
@@ -1027,6 +1157,390 @@ printf '%s\n' 'TEST provision-plan requires an explicit modem identity'
 if sh "$SCRIPT" provision-plan >/dev/null 2>&1; then
 	fail 'provision-plan ran without --modem'
 fi
+
+# ---- provisioning mutation, rollback and removal (0.11.0) ----
+
+# A stand-in APN engine, so provisioning can be exercised without the real one.
+# It records how it was invoked, which is how the borrowed-lock contract and the
+# "reconcile only after staging" ordering are asserted.
+setup_apn_engine_mock() {
+	cat >"$MOCKBIN/apn-autoconfig" <<'MOCKEOF'
+#!/bin/sh
+printf '%s\towner_pid=%s\tsection_disabled=%s\tsection_apn=%s\n' \
+	"$*" "${APN_AUTOCONFIG_LOCK_OWNER_PID:-none}" \
+	"$(uci -q get "network.${3#network:}.disabled" 2>/dev/null || printf 'unset')" \
+	"$(uci -q get "network.${3#network:}.apn" 2>/dev/null || printf 'unset')" \
+	>>"$TEST_RECONCILE_CALLS"
+# Publishes its own PID and then holds the operation open, so a signal can be
+# delivered while the staging section exists and the locks are held. Checking
+# that PID afterwards detects an engine left running as an orphan.
+case "${1:-}" in
+forget-target)
+	# Mirrors the engine: drop only this target's state directory.
+	section="${3#network:}"
+	rm -rf "$TEST_ENGINE_STATE/targets/network_${section}"
+	exit "${FORGET_EXIT:-0}"
+;;
+esac
+printf '%s\n' "$$" >"$TEST_RECONCILE_PID"
+[ "${RECONCILE_HANG:-0}" = 1 ] && /bin/sleep 30
+exit "${RECONCILE_EXIT:-0}"
+MOCKEOF
+	chmod 0755 "$MOCKBIN/apn-autoconfig"
+}
+export TEST_RECONCILE_CALLS="$STATE/reconcile-calls"
+export TEST_RECONCILE_PID="$STATE/reconcile-pid"
+export TEST_ENGINE_STATE="$STATE/engine-state"
+
+# Records how the narrow control wrapper invokes the coordinator, so the
+# wrapper's forwarding can be asserted without starting real operations.
+cat >"$MOCKBIN/record-modem-bin" <<'RECEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/control-calls"
+exit 0
+RECEOF
+chmod 0755 "$MOCKBIN/record-modem-bin"
+: >"$STATE/control-calls"
+setup_apn_engine_mock
+
+provision_fixture() {
+	reset_sysfs
+	reset_network_config
+	add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0
+	rm -rf "$TEST_MODEM_STATE_DIR/provisioning"
+	: >"$TEST_RECONCILE_CALLS"
+	: >"$TEST_EVENTS"
+	PROV_MODEM='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+}
+
+printf '%s\n' 'TEST provision creates one staged, marked, project-owned section and promotes it'
+provision_fixture
+prov_out="$(sh "$SCRIPT" provision --modem "$PROV_MODEM")" || fail 'provision failed on a provisionable modem'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["version"] == "v1", d
+assert d["section"] == "apnmodem1", d
+assert d["protocol"] == "qmi", d
+assert d["state"] == "promoted", d
+assert d["autoconnect"] is True, d
+' "$prov_out" || fail 'provision did not report a promoted project-owned section'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_owner)" = apn-autoconfig-modem ] || \
+	fail 'the created section is not marked as project-owned'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_modem_id)" = "$PROV_MODEM" ] || \
+	fail 'the created section does not record the modem identity'
+[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_provisioned)" ] || \
+	fail 'the created section does not record a provisioning timestamp'
+[ "$(uci -q get network.apnmodem1.proto)" = qmi ] || fail 'the created section has the wrong protocol'
+[ "$(uci -q get network.apnmodem1.device)" = /dev/cdc-wdm0 ] || fail 'the created section has the wrong device'
+
+printf '%s\n' 'TEST the staged section can never dial a default APN before reconciliation'
+grep -q "section_disabled=1" "$TEST_RECONCILE_CALLS" && \
+	fail 'reconcile ran while the section was still administratively disabled'
+grep -q "section_apn=unset" "$TEST_RECONCILE_CALLS" || \
+	fail 'the section carried an apn option before the APN engine chose one'
+grep -F -q "reconcile --target network:apnmodem1" "$TEST_RECONCILE_CALLS" || \
+	fail 'provisioning did not reconcile the section it created'
+
+printf '%s\n' 'TEST provisioning hands the APN engine a proven borrowed lock rather than a bare variable'
+grep -q "owner_pid=none" "$TEST_RECONCILE_CALLS" && \
+	fail 'the APN engine was invoked without the coordinator lock owner'
+grep -qE "owner_pid=[0-9]+" "$TEST_RECONCILE_CALLS" || \
+	fail 'the borrowed lock owner PID was not passed to the APN engine'
+
+printf '%s\n' 'TEST provisioning never starts the section itself'
+# Bringing the section up before the APN engine has written a profile would
+# hand netifd a cellular section with no apn - the vendor-default dial staging
+# exists to prevent. Clearing "disabled" only makes it startable; the engine
+# owns bring-up.
+grep -F -q "up apnmodem1" "$TEST_EVENTS" && \
+	fail 'provisioning started the section before the APN engine chose a profile'
+
+printf '%s\n' 'TEST provisioning promotes autoconnect only after reconciliation succeeded'
+[ -z "$(uci -q get network.apnmodem1.auto)" ] || \
+	fail 'a promoted section should not keep auto=0'
+
+printf '%s\n' 'TEST provisioning touches only the section it created'
+untouched="$(uci_touched_only_section apnmodem1)" || \
+	fail "provisioning wrote to unrelated sections: $untouched"
+
+printf '%s\n' 'TEST provision refuses a second section for an already provisioned modem'
+second_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || second_status=$?
+[ "$second_status" -eq 4 ] || fail "a repeated provision exited $second_status instead of the blocked class 4"
+[ "$(network_section_count apnmodem)" -eq 1 ] || fail 'a repeated provision created a second section'
+
+printf '%s\n' 'TEST deprovision asks the engine to forget the deleted target'
+mkdir -p "$TEST_ENGINE_STATE/targets/network_apnmodem1"
+printf 'v3\tapnmodem1\tnetwork:apnmodem1\tmodemmanager\tmodemmanager\n' \
+	>"$TEST_ENGINE_STATE/targets/network_apnmodem1/baseline.tsv"
+mkdir -p "$TEST_ENGINE_STATE/targets/network_other"
+printf 'v3\tother\tnetwork:other\tqmi\tqmi\n' \
+	>"$TEST_ENGINE_STATE/targets/network_other/baseline.tsv"
+
+printf '%s\n' 'TEST deprovision removes exactly the project-owned section and its state'
+deprov_out="$(sh "$SCRIPT" deprovision --modem "$PROV_MODEM")" || fail 'deprovision failed'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["state"] == "removed", d
+assert d["section"] == "apnmodem1", d
+assert d["engine_state"] == "dropped", d
+' "$deprov_out" || fail 'deprovision did not report the removed section and dropped engine state'
+[ ! -e "$TEST_ENGINE_STATE/targets/network_apnmodem1" ] || \
+	fail 'deprovision left the engine state for the deleted target behind'
+[ -f "$TEST_ENGINE_STATE/targets/network_other/baseline.tsv" ] || \
+	fail 'deprovision dropped engine state belonging to an unrelated target'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'deprovision left the section behind'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'deprovision did not stop the interface first'
+[ ! -e "$TEST_MODEM_STATE_DIR/provisioning/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01.tsv" ] || \
+	fail 'deprovision left the provisioning baseline behind'
+
+printf '%s\n' 'TEST deprovision refuses a section that is not marked project-owned'
+provision_fixture
+add_network_section handmade qmi /dev/cdc-wdm0
+add_section_option handmade apn_autoconfig_modem_id "$PROV_MODEM"
+unowned_status=0
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || unowned_status=$?
+[ "$unowned_status" -eq 4 ] || fail "deprovision of an unowned section exited $unowned_status instead of 4"
+[ "$(uci -q get network.handmade.proto)" = qmi ] || fail 'deprovision deleted a section it does not own'
+
+printf '%s\n' 'TEST a failed reconciliation rolls the staging section back completely'
+provision_fixture
+RECONCILE_EXIT=1
+export RECONCILE_EXIT
+rollback_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || rollback_status=$?
+RECONCILE_EXIT=0
+export RECONCILE_EXIT
+[ "$rollback_status" -eq 4 ] || fail "a failed reconciliation exited $rollback_status instead of 4"
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'a failed reconciliation left the staging section behind'
+[ "$(network_section_count apnmodem)" -eq 0 ] || fail 'rollback left a project-owned section behind'
+[ ! -e "$TEST_MODEM_STATE_DIR/provisioning/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01.tsv" ] || \
+	fail 'rollback left the provisioning baseline behind'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'rollback did not stop the interface it had started'
+untouched="$(uci_touched_only_section apnmodem1)" || \
+	fail "rollback wrote to unrelated sections: $untouched"
+
+printf '%s\n' 'TEST a retryable reconciliation keeps the retryable exit class through provisioning'
+provision_fixture
+RECONCILE_EXIT=3
+export RECONCILE_EXIT
+retry_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || retry_status=$?
+RECONCILE_EXIT=0
+export RECONCILE_EXIT
+[ "$retry_status" -eq 3 ] || fail "a retryable reconciliation exited $retry_status instead of 3"
+[ "$(network_section_count apnmodem)" -eq 0 ] || fail 'a retryable failure left a staging section behind'
+
+printf '%s\n' 'TEST provisioning refuses to start while another operation holds the shared APN lock'
+provision_fixture
+/bin/sleep 30 &
+prov_lock_pid=$!
+mkdir -p "$(dirname "$TEST_APN_LOCK_DIR")"
+rm -rf "$TEST_APN_LOCK_DIR"
+printf '%s\n' "$prov_lock_pid" >"$TEST_APN_LOCK_DIR"
+busy_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || busy_status=$?
+[ "$busy_status" -eq 3 ] || fail "contended provisioning exited $busy_status instead of the retryable class 3"
+uci_wrote_nothing || fail 'a blocked provisioning attempt still wrote network configuration'
+kill "$prov_lock_pid" 2>/dev/null || :
+wait "$prov_lock_pid" 2>/dev/null || :
+rm -f "$TEST_APN_LOCK_DIR"
+
+printf '%s\n' 'TEST a real TERM during provisioning rolls back and releases both locks'
+provision_fixture
+RECONCILE_HANG=1
+export RECONCILE_HANG
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 &
+term_pid=$!
+term_wait=0
+while [ "$term_wait" -lt 100 ]; do
+	[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_owner 2>/dev/null)" ] && break
+	term_wait=$((term_wait + 1))
+	/bin/sleep 0.1
+done
+[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_owner 2>/dev/null)" ] || \
+	fail 'the signal test never observed the staging section it needs to interrupt'
+kill -TERM "$term_pid"
+term_status=0
+wait "$term_pid" || term_status=$?
+RECONCILE_HANG=0
+export RECONCILE_HANG
+[ "$term_status" -eq 143 ] || fail "interrupted provisioning exited $term_status instead of 143"
+# The engine must be terminated and reaped, not left running against a target
+# that is about to be deleted underneath it.
+orphan_pid="$(cat "$TEST_RECONCILE_PID" 2>/dev/null || :)"
+if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
+	kill -TERM "$orphan_pid" 2>/dev/null || :
+	fail 'the APN engine was left running as an orphan after the interruption'
+fi
+[ "$(network_section_count apnmodem)" -eq 0 ] || \
+	fail 'interrupted provisioning left its staging section behind'
+[ ! -e "$TEST_MODEM_STATE_DIR/provisioning/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01.tsv" ] || \
+	fail 'interrupted provisioning left the baseline behind'
+[ ! -e "$TEST_APN_LOCK_DIR" ] || fail 'interrupted provisioning left the shared APN lock behind'
+[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+	fail 'interrupted provisioning left the per-modem lock behind'
+untouched="$(uci_touched_only_section apnmodem1)" || \
+	fail "interrupted provisioning wrote to unrelated sections: $untouched"
+
+printf '%s\n' 'TEST two simultaneous provisioning attempts create exactly one section'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >"$STATE/prov-a.json" 2>/dev/null &
+race_prov_a=$!
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >"$STATE/prov-b.json" 2>/dev/null &
+race_prov_b=$!
+prov_a_status=0; wait "$race_prov_a" || prov_a_status=$?
+prov_b_status=0; wait "$race_prov_b" || prov_b_status=$?
+prov_winners=0
+[ "$prov_a_status" -eq 0 ] && prov_winners=$((prov_winners + 1))
+[ "$prov_b_status" -eq 0 ] && prov_winners=$((prov_winners + 1))
+[ "$prov_winners" -eq 1 ] || \
+	fail "parallel provisioning produced $prov_winners winners instead of exactly one"
+[ "$(network_section_count apnmodem)" -eq 1 ] || \
+	fail 'parallel provisioning created more than one section'
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+
+printf '%s\n' 'TEST provisioning aborts without mutating when the chosen section name is taken'
+provision_fixture
+add_plain_section apnmodem1
+add_plain_section apnmodem2
+name_out="$(sh "$SCRIPT" provision --modem "$PROV_MODEM")" || fail 'provision failed with free names available'
+[ "$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["section"])' "$name_out")" = apnmodem3 ] || \
+	fail 'provision did not skip the occupied section names'
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+
+# ---- connection control on a project-owned section ----
+
+printf '%s\n' 'TEST connect brings up the project-owned section and reports netifd state'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed'
+: >"$TEST_EVENTS"
+TEST_IFACE_UP=apnmodem1
+export TEST_IFACE_UP
+conn_out="$(sh "$SCRIPT" connect --modem "$PROV_MODEM")" || fail 'connect failed on an up interface'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["section"] == "apnmodem1", d
+assert d["action"] == "connect", d
+assert d["state"] == "up", d
+' "$conn_out" || fail 'connect did not report the interface as up'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the interface'
+
+printf '%s\n' 'TEST disconnect stops the section and reconnect cycles it'
+: >"$TEST_EVENTS"
+disc_out="$(sh "$SCRIPT" disconnect --modem "$PROV_MODEM")" || fail 'disconnect failed'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="down" and d["action"]=="disconnect", d' \
+	"$disc_out" || fail 'disconnect did not report the interface as down'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'disconnect did not ask netifd to stop the interface'
+: >"$TEST_EVENTS"
+sh "$SCRIPT" reconnect --modem "$PROV_MODEM" >/dev/null || fail 'reconnect failed'
+grep -F -q "down apnmodem1" "$TEST_EVENTS" || fail 'reconnect did not stop the interface first'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'reconnect did not start the interface again'
+
+printf '%s\n' 'TEST connect is retryable rather than successful when netifd never comes up'
+TEST_IFACE_UP=
+export TEST_IFACE_UP
+timeout_status=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || timeout_status=$?
+[ "$timeout_status" -eq 3 ] || \
+	fail "a section that never came up exited $timeout_status instead of the retryable class 3"
+
+printf '%s\n' 'TEST connection control refuses a modem with no project-owned section'
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+unowned_conn=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || unowned_conn=$?
+[ "$unowned_conn" -eq 4 ] || fail "connect without a project-owned section exited $unowned_conn instead of 4"
+
+printf '%s\n' 'TEST connection control never drives a user-created interface'
+provision_fixture
+add_network_section usermade qmi /dev/cdc-wdm0
+: >"$TEST_EVENTS"
+usercontrol=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || usercontrol=$?
+[ "$usercontrol" -eq 4 ] || fail "connect adopted a user-created interface (exit $usercontrol)"
+[ ! -s "$TEST_EVENTS" ] || fail 'connect touched netifd for an interface it does not own'
+TEST_IFACE_UP=
+export TEST_IFACE_UP
+
+printf '%s\n' 'TEST background provisioning is accepted and reaches a terminal result'
+provision_fixture
+bg_out="$(sh "$SCRIPT" action-start provision --modem "$PROV_MODEM")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is True, d' "$bg_out" \
+	|| fail 'action-start provision was not accepted'
+bg_waited=0
+while [ "$bg_waited" -lt 15 ]; do
+	bg_state="$(sh "$SCRIPT" action-status --modem "$PROV_MODEM" | \
+		python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["state"])')"
+	case "$bg_state" in success|failed|blocked|retryable) break ;; esac
+	bg_waited=$((bg_waited + 1))
+	/bin/sleep 1
+done
+[ "$bg_state" = success ] || fail "background provisioning ended in state $bg_state"
+[ "$(network_section_count apnmodem)" -eq 1 ] || fail 'background provisioning did not create the section'
+
+printf '%s\n' 'TEST background deprovision removes what background provisioning created'
+sh "$SCRIPT" action-start deprovision --modem "$PROV_MODEM" >/dev/null || fail 'action-start deprovision was rejected'
+bg_waited=0
+while [ "$bg_waited" -lt 15 ]; do
+	bg_state="$(sh "$SCRIPT" action-status --modem "$PROV_MODEM" | \
+		python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["state"])')"
+	case "$bg_state" in success|failed|blocked|retryable) break ;; esac
+	bg_waited=$((bg_waited + 1))
+	/bin/sleep 1
+done
+[ "$bg_state" = success ] || fail "background deprovision ended in state $bg_state"
+[ "$(network_section_count apnmodem)" -eq 0 ] || fail 'background deprovision left the section behind'
+
+printf '%s\n' 'TEST an impossible background action is refused at launch, not at its terminal state'
+provision_fixture
+add_network_section taken qmi /dev/cdc-wdm0
+refuse_status=0
+sh "$SCRIPT" action-start provision --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
+[ "$refuse_status" -eq 4 ] || \
+	fail "provisioning an already configured modem exited $refuse_status instead of 4 at launch"
+refuse_status=0
+sh "$SCRIPT" action-start connect --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
+[ "$refuse_status" -eq 4 ] || \
+	fail "connect without a project-owned section exited $refuse_status instead of 4 at launch"
+
+printf '%s\n' 'TEST the narrow control wrapper exposes every provisioning verb and nothing else'
+provision_fixture
+for verb in reset provision deprovision connect disconnect reconnect; do
+	APN_AUTOCONFIG_MODEM_BIN="$MOCKBIN/record-modem-bin" sh "$CONTROL_SCRIPT" "$verb" "$PROV_MODEM" >/dev/null 2>&1 || :
+	grep -F -q "action-start $verb --modem $PROV_MODEM" "$STATE/control-calls" || \
+		fail "the control wrapper did not forward $verb as a background action"
+done
+for bad in provision-plan inventory status rescan reset-all 'reset;id' ''; do
+	bad_status=0
+	sh "$CONTROL_SCRIPT" "$bad" "$PROV_MODEM" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the control wrapper accepted the unlisted verb '$bad'"
+done
+
+printf '%s\n' 'TEST the control wrapper refuses an unsafe or oversized modem identity'
+for bad_id in 'a b' 'a/../b' '$(id)' "$(awk 'BEGIN { while (i++ < 201) printf "a" }')"; do
+	bad_status=0
+	sh "$CONTROL_SCRIPT" reset "$bad_id" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail 'the control wrapper accepted an unsafe modem identity'
+done
+bad_status=0
+sh "$CONTROL_SCRIPT" reset "$PROV_MODEM" extra >/dev/null 2>&1 || bad_status=$?
+[ "$bad_status" -eq 2 ] || fail 'the control wrapper accepted a third argument'
+
+printf '%s\n' 'TEST the query wrapper exposes provision-plan read-only and stays read-only'
+provision_fixture
+reset_network_config
+plan_out="$(sh "$QUERY_SCRIPT" provision-plan "$PROV_MODEM")" || fail 'the query wrapper could not run provision-plan'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["can_provision"] is True, d' "$plan_out" \
+	|| fail 'provision-plan through the query wrapper did not report a provisionable modem'
+uci_wrote_nothing || fail 'the read-only query wrapper wrote network configuration'
+for bad in provision deprovision connect reset rescan; do
+	bad_status=0
+	sh "$QUERY_SCRIPT" "$bad" "$PROV_MODEM" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the read-only query wrapper accepted the mutating verb '$bad'"
+done
 
 printf '%s\n' 'TEST the narrow query wrapper rejects unlisted verbs and out-of-range arguments'
 if "$QUERY_SCRIPT" inventory extra-arg >/dev/null 2>&1; then

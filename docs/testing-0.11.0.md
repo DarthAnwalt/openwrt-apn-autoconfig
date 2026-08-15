@@ -30,8 +30,10 @@ Writing it found a real gap: `postrm` cleared the inventory registry but not the
 provisioning baselines, so removal left state behind that the contract says it
 must clear.
 
-Still to verify: a live upgrade of a 0.11.0 package, which needs a built
-package and hardware, and the hardware gate as a whole.
+The live 0.10.1-to-0.11.0 upgrade, provisioning and removal through the narrow
+LuCI path all passed on the WH3000 with the SDK-built packages. What remains
+needs the release to exist: the signed-feed install without a trust bypass and
+the final removal/reinstall smoke.
 
 The LuCI first-run card is implemented. `provision`, `deprovision`, `connect`,
 `disconnect` and `reconnect` are background actions whose preconditions are
@@ -60,7 +62,11 @@ Each layer has a regression test that was verified to fail when the leak was
 reintroduced: the view passing the password in arguments, the worker passing it
 in arguments, and the worker leaving the profile in the environment.
 
-None of the LuCI work has been exercised against a real browser or on hardware.
+The LuCI work has now been exercised in a real browser against the built
+packages; see [`router-test-0.11.0-packages.md`](router-test-0.11.0-packages.md).
+That run found a defect the fixtures could not: a refusal delivered with a
+non-zero exit code was rendered as an error, putting raw output and an unmasked
+modem identity on the page.
 
 The manual APN path is implemented as `apn-autoconfig apply-manual`. Its
 fixtures assert that the profile goes through the shared candidate path rather

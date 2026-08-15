@@ -166,6 +166,14 @@ esac
 exit 1
 EOF
 
+cat >"$MOCKBIN/umbim" <<'EOF'
+#!/bin/sh
+# Recorded, never answered: nothing in inventory or provisioning may open an
+# MBIM control channel.
+printf '%s\n' "$*" >>"${TEST_UMBIM_CALLS:-/dev/null}"
+exit 1
+EOF
+
 cat >"$MOCKBIN/uqmi" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"${TEST_UQMI_CALLS:-/dev/null}"
@@ -260,6 +268,7 @@ export TEST_NETWORK_OPTIONS="$STATE/network-options"
 export TEST_UCI_WRITES="$STATE/uci-writes"
 export TEST_EVENTS="$STATE/events"
 export TEST_UQMI_CALLS="$STATE/uqmi-calls"
+export TEST_UMBIM_CALLS="$STATE/umbim-calls"
 export TEST_STATE="$STATE"
 export APN_AUTOCONFIG_MODEM_ACTION_WORKER="$ACTION_WORKER"
 export APN_AUTOCONFIG_MODEM_ACTION_COMMAND="$SCRIPT"
@@ -269,6 +278,7 @@ export APN_AUTOCONFIG_MODEM_BIN="$SCRIPT"
 : >"$TEST_NETWORK_OPTIONS"
 : >"$TEST_EVENTS"
 : >"$TEST_UQMI_CALLS"
+: >"$TEST_UMBIM_CALLS"
 
 reset_network_config() {
 	: >"$TEST_NETWORK_SECTIONS"
@@ -1264,7 +1274,54 @@ printf '%s\n' 'TEST provisioning touches only the section it created'
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "provisioning wrote to unrelated sections: $untouched"
 
+printf '%s\n' 'TEST an MBIM modem is provisioned as an MBIM section on its control device'
+reset_sysfs
+reset_network_config
+add_mbim_modem 2-1.3 2cb7 0007 MBIMSERIAL02 4 wwan4
+rm -rf "$TEST_MODEM_STATE_DIR/provisioning"
+: >"$TEST_RECONCILE_CALLS"
+: >"$TEST_EVENTS"
+mbim_prov_modem='usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02'
+mbim_plan_out="$(sh "$SCRIPT" provision-plan --modem "$mbim_prov_modem")" || \
+	fail 'provision-plan refused a provisionable MBIM modem'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["can_provision"] is True, d
+assert d["protocol"] == "mbim", d
+assert d["device"] == "/dev/cdc-wdm4", d
+' "$mbim_plan_out" || fail 'provision-plan did not plan an MBIM section'
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'planning an MBIM modem opened a control channel'
+mbim_prov_out="$(sh "$SCRIPT" provision --modem "$mbim_prov_modem")" || \
+	fail 'provision failed on a provisionable MBIM modem'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["protocol"] == "mbim", d
+assert d["state"] == "promoted", d
+' "$mbim_prov_out" || fail 'provisioning an MBIM modem did not promote its section'
+[ "$(uci -q get network.apnmodem1.proto)" = mbim ] || fail 'the created MBIM section has the wrong protocol'
+[ "$(uci -q get network.apnmodem1.device)" = /dev/cdc-wdm4 ] || fail 'the created MBIM section has the wrong device'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_owner)" = apn-autoconfig-modem ] || \
+	fail 'the created MBIM section is not marked as project-owned'
+grep -q "section_apn=unset" "$TEST_RECONCILE_CALLS" || \
+	fail 'the MBIM section carried an apn option before the APN engine chose one'
+grep -F -q "reconcile --target network:apnmodem1" "$TEST_RECONCILE_CALLS" || \
+	fail 'provisioning did not reconcile the MBIM section it created'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" && \
+	fail 'provisioning started the MBIM section before the APN engine chose a profile'
+untouched="$(uci_touched_only_section apnmodem1)" || \
+	fail "MBIM provisioning wrote to unrelated sections: $untouched"
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'provisioning an MBIM modem opened a control channel itself'
+
+printf '%s\n' 'TEST deprovision removes an MBIM section exactly as it does a QMI one'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || \
+	fail 'deprovision failed for an MBIM section'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'deprovision left the MBIM section behind'
+
 printf '%s\n' 'TEST provision refuses a second section for an already provisioned modem'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed on a provisionable modem'
 second_status=0
 sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || second_status=$?
 [ "$second_status" -eq 4 ] || fail "a repeated provision exited $second_status instead of the blocked class 4"
@@ -1428,6 +1485,30 @@ assert d["action"] == "connect", d
 assert d["state"] == "up", d
 ' "$conn_out" || fail 'connect did not report the interface as up'
 grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the interface'
+
+printf '%s\n' 'TEST connection control drives an MBIM section the same way'
+reset_sysfs
+reset_network_config
+add_mbim_modem 2-1.3 2cb7 0007 MBIMSERIAL02 4 wwan4
+rm -rf "$TEST_MODEM_STATE_DIR/provisioning"
+: >"$TEST_RECONCILE_CALLS"
+: >"$TEST_EVENTS"
+sh "$SCRIPT" provision --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02 >/dev/null || \
+	fail 'provision failed for the MBIM connection-control fixture'
+: >"$TEST_EVENTS"
+mbim_conn_out="$(sh "$SCRIPT" connect --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02)" || \
+	fail 'connect failed on a project-owned MBIM section'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="up" and d["action"]=="connect", d' \
+	"$mbim_conn_out" || fail 'connect did not report the MBIM interface as up'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the MBIM interface'
+sh "$SCRIPT" disconnect --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02 >/dev/null || \
+	fail 'disconnect failed on a project-owned MBIM section'
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'connection control talked to the modem instead of netifd'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed'
+TEST_IFACE_UP=apnmodem1
+export TEST_IFACE_UP
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null || fail 'connect failed on an up interface'
 
 printf '%s\n' 'TEST disconnect stops the section and reconnect cycles it'
 : >"$TEST_EVENTS"

@@ -1025,6 +1025,7 @@ provision_protocol_for_record() {
 	esac
 	case "$provision_observed_protocol" in
 		qmi) printf '%s\n' qmi; return 0 ;;
+		mbim) printf '%s\n' mbim; return 0 ;;
 	esac
 	return 1
 }
@@ -1032,7 +1033,9 @@ provision_protocol_for_record() {
 provision_device_for_record() {
 	case "$1" in
 		modemmanager) printf '%s\n' "$3" ;;
-		qmi) printf '%s\n' "$2" ;;
+		# Both native protocols dial through their own control device; only the
+		# ModemManager section is bound by physical path.
+		qmi|mbim) printf '%s\n' "$2" ;;
 		*) return 1 ;;
 	esac
 }

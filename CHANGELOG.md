@@ -1,5 +1,65 @@
 # Changelog
 
+## apn-autoconfig 0.12.0 / apn-autoconfig-modem 0.12.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.12.0 (unreleased)
+
+Native MBIM support, from discovering the modem to verifying its connection.
+Until now a CDC-MBIM modem was recognised and then refused everywhere after
+that: provisioning called it an unsupported protocol and the APN engine had no
+backend for it.
+
+- Added `/usr/libexec/apn-autoconfig-mbim`, a strictly read-only identity
+  adapter over `umbim`'s `subscriber`, `home` and `registration` queries. It
+  never issues a command that could change a profile, the SIM, the radio or a
+  bearer. `umbim` is not a new package dependency: a missing one makes the MBIM
+  capabilities false without hiding the configured target.
+- The adapter decides from netifd's own state whether to open a control
+  session. `mbim.sh` holds one open for the life of a bearer, so an identity
+  query borrows it with a transaction id from a separate range and never closes
+  it. An interface up without a recorded session, a pending interface, two
+  sections claiming one device and an unresolvable active section are all
+  retryable and issue no command at all. A session id left behind by a killed
+  teardown is treated as stale rather than blocking identity forever.
+- `umbim` exits with the observed modem state rather than a failure for several
+  perfectly valid answers, so validated output decides: a modem registered in
+  roaming or on a partner network produces normal identity, while a truncated
+  or unparseable message is a hard failure and a SIM that is not ready is
+  retryable with its state named in the log.
+- The APN engine owns the same five netifd options as for QMI, but writes MBIM's
+  `pdptype` vocabulary — `ipv4`, not qmi.sh's canonical `ip`, which `umbim` would
+  read as "let the modem decide".
+- A normalized `pap-or-chap` profile is expanded into bounded `chap`-then-`pap`
+  attempts, because `umbim connect` accepts one protocol and **silently discards
+  the username and password** for any other value. The protocol that carried the
+  session is what gets cached and reconciled, and the provider-label refresh
+  still matches the `pap-or-chap` database row it came from.
+- A rejected dual-stack bearer gets the same single bounded IPv4 retry QMI has,
+  now expressed in a shared per-backend attempt planner. A pre-existing `ipv6=0`
+  is read as an external constraint: an IPv6-only candidate is skipped rather
+  than attempted, a dual-stack one becomes an IPv4 attempt, and the option is
+  never rewritten.
+- Connectivity verification waits for an addressed `<interface>_4` or
+  `<interface>_6` dynamic interface, which is where `mbim.sh` puts the address.
+- MBIM roaming policy is readable and writable through its real option pair:
+  `allow` sets `allow_roaming` and `allow_partner`, `block` clears both,
+  `default` deletes both. OpenWrt's absent MBIM default **blocks** roaming,
+  unlike ModemManager's, and LuCI now says so. A mixed pair is reported as a
+  custom configuration and is never normalized by opening the page or running an
+  operation.
+- Capability is reported as separate `roaming_policy_read` and
+  `roaming_policy_write` booleans, additively; the existing `roaming_policy`
+  string keeps its meaning, and LuCI drives the control from the capability
+  instead of a backend name. QMI still reports it unsupported.
+- `apn-autoconfig-modem` provisions an MBIM modem as a `proto=mbim` staging
+  section on its own control device, with the same ownership markers,
+  `disabled=1`, `auto=0` and absent `apn` as a QMI one. Inventory and
+  provisioning still never open an MBIM control channel, which the tests assert
+  from recorded invocations.
+
+MBIM ships as `implementation_state: alpha` and `validation_state: synthetic`.
+Its fixtures were written from the exact `umbim` revision OpenWrt 25.12.5 ships
+(`2025.10.04~2939b7d0`) rather than from hardware, and the live gate in
+`docs/testing-0.12.0.md` has not been run. See `docs/mbim-contract-v1.md`.
+
 ## apn-autoconfig 0.11.0 / apn-autoconfig-modem 0.11.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.11.0 (2026-08-15)
 
 Safe first-run provisioning for a modem that has no network configuration yet.

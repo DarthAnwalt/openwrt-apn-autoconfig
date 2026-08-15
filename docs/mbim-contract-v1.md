@@ -1,8 +1,11 @@
 # MBIM contract v1 (0.12.0)
 
-Status: accepted design for 0.12.0. Nothing here is implemented yet. This
-document is normative for the native MBIM backend and for the MBIM parts of
-`apn-autoconfig-modem`. It extends [`backend-contract-v1.md`](backend-contract-v1.md)
+Status: accepted design for 0.12.0, implemented and covered by fixtures. The
+adapter, the APN backend, the attempt planner, readiness, roaming policy,
+provisioning and the LuCI control all exist; **nothing here has run on
+hardware**, so MBIM ships as `alpha`/`synthetic` until the gate in
+[`testing-0.12.0.md`](testing-0.12.0.md) is recorded. This document is normative
+for the native MBIM backend and for the MBIM parts of `apn-autoconfig-modem`. It extends [`backend-contract-v1.md`](backend-contract-v1.md)
 and [`provisioning-contract-v1.md`](provisioning-contract-v1.md) and inherits
 every rule in them, including the lock representation, the lock ordering and the
 ownership markers. The safety invariants in [`architecture.md`](architecture.md)
@@ -100,7 +103,13 @@ bound to the selected device and decides from that section's runtime state:
 |---|---|
 | no `tid` state and the interface is down | open a private session: no `-t`, no `-n`, so `umbim` closes it again |
 | `tid` state present and the interface is up | `umbim -n -t <own id> …`: no OPEN, no CLOSE |
-| `tid` present while the interface is not up, or the interface is pending | exit 3 retryable; a transition is in flight |
+| no `tid` state while the interface is up, or the interface is pending | exit 3 retryable; a transition is in flight |
+| `tid` present while the interface is down | stale record: open a private session and log it |
+
+The last row matters for recovery. `mbim.sh` reverts the id during teardown, so
+an id left behind on a down interface belongs to a session nothing is using —
+one killed teardown would otherwise make identity permanently retryable, and a
+private OPEN both works and clears the orphan.
 
 Own transaction ids come from a fixed high range that cannot collide with
 netifd's small ascending counter, and increment per message within one adapter

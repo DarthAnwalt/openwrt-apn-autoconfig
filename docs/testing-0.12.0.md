@@ -1,6 +1,10 @@
 # 0.12.0 native MBIM test and release plan
 
-Status: planned. Nothing in this document has been implemented or attempted.
+Status: the runtime work is implemented and the fixture gate passes. The SDK,
+package-lifecycle and hardware gates are open, and nothing here has been
+attempted on hardware. The contract tests below are written as requirements;
+each one that now exists is an executable assertion in `tests/run-tests.sh`,
+`tests/run-tests-modem.sh` or `tests/test-luci-roaming-policy.js`.
 
 0.12.0 completes the native MBIM vertical slice defined in
 [`roadmap.md`](roadmap.md), against the accepted

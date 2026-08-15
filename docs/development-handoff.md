@@ -24,14 +24,20 @@ connect/disconnect/reconnect, manual APN entry and the LuCI first-run card. All
 of that works for ModemManager and native QMI targets only. It does not yet
 mutate MBIM profiles or manage eSIM.
 
-The next feature release is **0.12.0**, the complete native MBIM vertical slice.
-A CDC-MBIM modem is currently recognised by inventory and refused everywhere
-after that: provisioning answers `unsupported_protocol` and the APN engine
-reports `backend-not-implemented`. 0.12.0 closes that gap end to end —
+The next feature release is **0.12.0**, the complete native MBIM vertical slice:
 inventory and ownership, provisioning, identity, profile capture/write/restore,
 dynamic IPv4/IPv6 readiness, connection control, roaming policy and the LuCI
-workflow — with hardware evidence covering discovery through post-connect
-verification and rollback.
+workflow.
+
+**Its runtime work is implemented locally and passes `sh scripts/verify.sh`.**
+What that does *not* mean is recorded honestly in
+[`testing-0.12.0.md`](testing-0.12.0.md): the official SDK build and APK
+inspection, the package-lifecycle matrix and the hardware gate are all open, and
+the fixtures were written from the `umbim` source rather than from a modem. MBIM
+therefore reports `implementation_state: alpha` and `validation_state:
+synthetic`, and must not be relabelled until `docs/router-test-0.12.0.md`
+exists. The hardware run switches the reference RM520N-GL into MBIM composition
+and restores it afterwards, so it needs the recovery rehearsal described there.
 
 Its accepted design is [`mbim-contract-v1.md`](mbim-contract-v1.md) and its plan
 is [`testing-0.12.0.md`](testing-0.12.0.md). Three facts there are easy to miss

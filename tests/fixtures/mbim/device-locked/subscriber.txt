@@ -1,0 +1,3 @@
+  readystate: 0006 - device-locked
+  simiccid: 89490200002186275443
+  subscriberid: 

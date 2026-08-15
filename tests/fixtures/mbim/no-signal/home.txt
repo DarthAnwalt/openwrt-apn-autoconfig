@@ -1,0 +1,5 @@
+  provider_id: 26201
+  provider_name: Kaufland Mobil
+  cellularclass: 0001 - gsm
+  rssi: 0063
+  errorrate: 0063

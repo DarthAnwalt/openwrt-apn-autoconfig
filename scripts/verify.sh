@@ -22,6 +22,7 @@ sh -n "$ROOT/apn-autoconfig-modem/files/etc/hotplug.d/usb/50-apn-autoconfig-mode
 sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/tests/run-tests-modem.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
+sh -n "$ROOT/tests/test-package-lifecycle.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
 sh -n "$ROOT/scripts/build-repository.sh"
 sh -n "$ROOT/scripts/install.sh"
@@ -182,6 +183,7 @@ awk -F '\t' '
 sh "$ROOT/tests/test-provider-generator.sh"
 sh "$ROOT/tests/test-database-update.sh"
 sh "$ROOT/tests/test-installer.sh"
+sh "$ROOT/tests/test-package-lifecycle.sh"
 sh "$ROOT/tests/run-tests.sh"
 sh "$ROOT/tests/run-tests-modem.sh"
 printf '%s\n' 'Static and behavioral verification passed.'

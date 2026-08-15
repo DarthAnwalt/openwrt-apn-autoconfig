@@ -9,7 +9,29 @@ the borrowed operation lock in both directions; and `provision` /
 `deprovision` including the staging section, ownership markers, promotion,
 the provisioning baseline, exact rollback and interruption.
 
-Still to implement: the install/upgrade/removal lifecycle tests.
+The install and removal lifecycle is covered by
+`tests/test-package-lifecycle.sh`, which **executes** the maintainer scripts
+extracted from the Makefiles rather than grepping their text. An offline
+image-root install runs each hook unmodified with `rm`, `rmdir`, `uci`, `kill`
+and `logger` replaced by recorders, so a broken `IPKG_INSTROOT` guard is caught
+as a recorded attempt instead of a performed one. The live checks rewrite only
+the absolute state path prefixes into a sandbox, leaving the loops, PID checks
+and guards under test as shipped.
+
+It asserts that removal clears provisioning state as well as the inventory
+registry, never deletes UCI configuration — a section this package created keeps
+working after removal, because netifd owns the bearer — preserves a lock held by
+a live operation in both the current and the pre-0.10.1 representation, clears a
+provably stale lock in either representation, never touches another package's
+lock or the APN engine's own, and takes its own configuration with it. Each of
+those was verified to fail with the corresponding guard removed.
+
+Writing it found a real gap: `postrm` cleared the inventory registry but not the
+provisioning baselines, so removal left state behind that the contract says it
+must clear.
+
+Still to verify: a live upgrade of a 0.11.0 package, which needs a built
+package and hardware, and the hardware gate as a whole.
 
 The LuCI first-run card is implemented. `provision`, `deprovision`, `connect`,
 `disconnect` and `reconnect` are background actions whose preconditions are

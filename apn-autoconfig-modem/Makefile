@@ -83,10 +83,17 @@ define Package/apn-autoconfig-modem/postrm
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
 # Runtime state is ephemeral, but never remove a live operation lock during an
 # uninstall. Clean regular registry files and provably stale locks only.
+#
+# Sections this package created are deliberately left in place: netifd owns the
+# bearer, so they keep working after removal. Only their bookkeeping goes.
 for state_file in /var/run/apn-autoconfig-modem/modems/*.tsv; do
 	[ -f "$${state_file}" ] && rm -f "$${state_file}"
 done
+for state_file in /var/run/apn-autoconfig-modem/provisioning/*.tsv; do
+	[ -f "$${state_file}" ] && rm -f "$${state_file}"
+done
 rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
+rmdir /var/run/apn-autoconfig-modem/provisioning 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem 2>/dev/null || :
 for lock_path in /var/lock/apn-autoconfig-modem.*; do
 	[ -e "$${lock_path}" ] || continue

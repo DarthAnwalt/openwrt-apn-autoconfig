@@ -288,8 +288,12 @@ resolve_session_mode() {
 		;;
 		*:1) SESSION_MODE=shared ;;
 		*)
-			log notice "$resolve_section holds an MBIM session while down; identity is retryable"
-			return 3
+			# mbim.sh reverts the id during teardown, so an id left behind on a
+			# down interface belongs to a session nothing is using. Refusing here
+			# would make identity permanently retryable after one killed
+			# teardown; opening a private session is both safe and the recovery.
+			log notice "ignoring a stale MBIM session record for $resolve_section"
+			SESSION_MODE=private
 		;;
 	esac
 	return 0

@@ -1,0 +1,3 @@
+  readystate: 0001 - initialized
+  simiccid: 89204040000000000123
+  subscriberid: 204040123456789

@@ -1250,6 +1250,112 @@ else
 fi
 rm -f "$TEST_LOCK"
 
+printf '%s\n' 'TEST apply-manual applies a user profile through the normal candidate path'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=manual.example
+export CURL_SUCCESS_APN
+rm -f "$TARGET_PERSIST/baseline.tsv" "$TARGET_PERSIST/active.tsv"
+sh "$SCRIPT" apply-manual --apn manual.example >/dev/null 2>&1 || \
+	fail 'apply-manual failed for a profile that connects'
+[ "$(cat "$STATE/apn")" = manual.example ] || fail 'apply-manual did not write the requested APN'
+[ -s "$TARGET_PERSIST/baseline.tsv" ] || fail 'apply-manual did not capture a baseline before writing'
+[ -s "$TARGET_PERSIST/active.tsv" ] || fail 'apply-manual did not record reconciled state'
+grep -F -q 'manual.example' "$TARGET_PERSIST/active.tsv" || \
+	fail 'reconciled state does not name the manually applied APN'
+grep -F -q 'manual' "$CACHE/last-result" || \
+	fail 'the recorded result does not identify the profile as manual'
+
+printf '%s\n' 'TEST apply-manual stores optional credentials it was given'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=creds.example
+export CURL_SUCCESS_APN
+printf '%s\n' 'sekrit' | sh "$SCRIPT" apply-manual --apn creds.example \
+	--username someone --password-stdin --auth pap --ip-type ipv4 >/dev/null 2>&1 || \
+	fail 'apply-manual failed with a full credential set'
+[ "$(cat "$STATE/username")" = someone ] || fail 'apply-manual did not write the username'
+[ "$(cat "$STATE/password")" = sekrit ] || fail 'apply-manual did not read the password from stdin'
+[ "$(cat "$STATE/allowedauth")" = pap ] || fail 'apply-manual did not write the authentication mode'
+[ "$(cat "$STATE/iptype")" = ipv4 ] || fail 'apply-manual did not write the IP family'
+
+printf '%s\n' 'TEST a failing manual profile restores the exact previous profile'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=creds.example
+export CURL_SUCCESS_APN
+manual_fail_status=0
+sh "$SCRIPT" apply-manual --apn nothere.example >/dev/null 2>&1 || manual_fail_status=$?
+[ "$manual_fail_status" -ne 0 ] || fail 'a manual profile with no connectivity reported success'
+[ "$(cat "$STATE/apn")" = creds.example ] || \
+	fail "a failed manual profile left APN '$(cat "$STATE/apn")' instead of restoring creds.example"
+[ "$(cat "$STATE/username")" = someone ] || fail 'rollback did not restore the previous username'
+[ "$(cat "$STATE/password")" = sekrit ] || fail 'rollback did not restore the previous password'
+
+printf '%s\n' 'TEST apply-manual validates its input before touching the network'
+rm -rf "$TEST_LOCK"
+: >"$STATE/events"
+manual_before="$(cat "$STATE/apn")"
+for bad_case in \
+	'--apn' \
+	'--apn bad/apn' \
+	'--apn ok.example --auth wrong' \
+	'--apn ok.example --ip-type ipv5' \
+	'--apn ok.example --username someone'
+do
+	bad_status=0
+	# shellcheck disable=SC2086
+	sh "$SCRIPT" apply-manual $bad_case >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || \
+		fail "apply-manual $bad_case exited $bad_status instead of the usage class 2"
+done
+[ ! -s "$STATE/events" ] || fail 'a rejected manual profile still restarted the interface'
+[ "$(cat "$STATE/apn")" = "$manual_before" ] || fail 'a rejected manual profile changed the APN'
+
+printf '%s\n' 'TEST the manual password is never accepted as a command-line argument'
+rm -rf "$TEST_LOCK"
+argv_status=0
+sh "$SCRIPT" apply-manual --apn ok.example --username u --password secret \
+	>/dev/null 2>"$STATE/argv-password.err" || argv_status=$?
+[ "$argv_status" -ne 0 ] || fail 'apply-manual accepted a password as an argument, exposing it through ps'
+grep -q -- '--password' "$STATE/argv-password.err" || \
+	fail 'the password argument was rejected for some unrelated reason'
+
+printf '%s\n' 'TEST manual profile options are refused for other commands'
+rm -rf "$TEST_LOCK"
+sneaky_status=0
+sh "$SCRIPT" reconcile --apn sneaky.example >/dev/null 2>"$STATE/sneaky.err" || sneaky_status=$?
+[ "$sneaky_status" -ne 0 ] || fail 'reconcile accepted manual profile options'
+grep -q 'only valid for apply-manual' "$STATE/sneaky.err" || \
+	fail 'manual options on reconcile were refused for some unrelated reason'
+
+printf '%s\n' 'TEST a manual profile survives a later reconcile and is retried before the database'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=survives.example
+export CURL_SUCCESS_APN
+sh "$SCRIPT" apply-manual --apn survives.example >/dev/null 2>&1 || \
+	fail 'setup for the reconcile-preference test failed'
+: >"$STATE/events"
+sh "$SCRIPT" reconcile >/dev/null 2>&1 || fail 'reconcile failed on a working manual profile'
+[ "$(cat "$STATE/apn")" = survives.example ] || \
+	fail 'reconcile replaced a working manual profile with a database candidate'
+[ ! -s "$STATE/events" ] || fail 'reconcile restarted the interface for an already working manual profile'
+# When it stops verifying, the manual profile must still be tried first.
+printf '%s\n' 'wrong.apn' >"$STATE/apn"
+sh "$SCRIPT" reconcile >/dev/null 2>&1 || fail 'reconcile failed while restoring the manual profile'
+[ "$(cat "$STATE/apn")" = survives.example ] || \
+	fail 'reconcile did not restore the manual profile before falling back to the database'
+
+printf '%s\n' 'TEST apply-manual works without the provider database it does not consult'
+rm -rf "$TEST_LOCK"
+CURL_SUCCESS_APN=nodb.example
+export CURL_SUCCESS_APN
+mv "$DB" "$DB.hidden"
+nodb_status=0
+sh "$SCRIPT" apply-manual --apn nodb.example >/dev/null 2>&1 || nodb_status=$?
+mv "$DB.hidden" "$DB"
+[ "$nodb_status" -eq 0 ] || \
+	fail "apply-manual needed the provider database it does not consult (exit $nodb_status)"
+[ "$(cat "$STATE/apn")" = nodb.example ] || \
+	fail 'apply-manual did not apply the profile without a database'
+
 printf '%s\n' 'TEST forget-target drops one target and leaves the shared cache alone'
 rm -rf "$TEST_LOCK"
 mkdir -p "$PERSIST/targets/network_apnmodem1" "$PERSIST/targets/network_cellqmi" "$CACHE"

@@ -11,6 +11,11 @@ CONFIG="apn-autoconfig"
 INTERFACE="wwan"
 CONFIGURED_INTERFACE="auto"
 REQUESTED_TARGET=""
+MANUAL_APN=""
+MANUAL_USERNAME="-"
+MANUAL_PASSWORD="-"
+MANUAL_AUTH="-"
+MANUAL_IP_TYPE="-"
 TARGET_ID=""
 TARGET_PROTOCOL=""
 TARGET_BACKEND=""
@@ -714,15 +719,21 @@ validate_config() {
 				''|2) : ;;
 				*) die "unsupported provider database format: $database_format" ;;
 			esac
+		;;
+	esac
+	# apply-manual needs a working backend, connectivity check and netifd, but
+	# deliberately not the provider database: the profile came from the user.
+	case "$COMMAND_NAME" in
+		detect|detect-json|apply|reconcile|modem-reset|status|status-json|apply-manual)
 			case "$TARGET_BACKEND" in
 				modemmanager) command_exists mmcli || die "mmcli is required" ;;
 				qmi) [ -x "$QMI_ADAPTER" ] || die "QMI identity adapter is not executable" ;;
 			esac
 		;;
 	esac
-	case "$COMMAND_NAME" in apply|reconcile|modem-reset) command_exists curl || die "curl is required" ;; esac
+	case "$COMMAND_NAME" in apply|reconcile|modem-reset|apply-manual) command_exists curl || die "curl is required" ;; esac
 	case "$COMMAND_NAME" in
-		apply|reconcile|modem-reset|roaming-policy-set|reset)
+		apply|reconcile|modem-reset|roaming-policy-set|reset|apply-manual)
 			command_exists ifup || die "ifup is required"
 			command_exists ifdown || die "ifdown is required"
 		;;
@@ -2145,19 +2156,17 @@ configured_connectivity_ip_type() {
 	case "$value" in ip|ipv4) printf '%s\n' ipv4 ;; ipv6|ipv4v6) printf '%s\n' "$value" ;; *) printf '%s\n' - ;; esac
 }
 
-apply_cmd() {
-	read_sim
-	acquire_lock
-	migrate_target_state
-	registration_preflight || return $?
-	find_candidates
-	build_apply_candidates
-	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or set APN manually"
+# The candidate loop is shared by database-driven and manual application so
+# that both get the identical baseline, connectivity verification and exact
+# rollback. A manual profile is one candidate, not a separate write path.
+apply_candidate_list() {
+	attempt_description="$1"
+	exhausted_message="$2"
 	capture_old_profile
 	migrate_legacy_baseline
 	save_baseline
 	ROLLBACK_ARMED=1
-	log notice "starting APN detection for ICCID $ICCID on $INTERFACE"
+	log notice "$attempt_description"
 	saw_bearer_up=0
 
 	while IFS="$(printf '\t')" read -r apn provider username password auth ip_type; do
@@ -2234,7 +2243,69 @@ apply_cmd() {
 		write_last_result bearer-rejected \
 			"failed: no tested mobile profile produced a usable data session"
 	fi
-	die "all mobile profiles failed; previous profile will be restored"
+	die "$exhausted_message"
+}
+
+apply_cmd() {
+	read_sim
+	acquire_lock
+	migrate_target_state
+	registration_preflight || return $?
+	find_candidates
+	build_apply_candidates
+	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or apply a manual profile"
+	apply_candidate_list \
+		"starting APN detection for ICCID $ICCID on $INTERFACE" \
+		"all mobile profiles failed; previous profile will be restored"
+}
+
+# Applies an operator profile the user supplied instead of one the database
+# matched. It is deliberately not a shortcut around the engine: the profile
+# becomes a single candidate and goes through the same baseline capture,
+# connectivity verification and exact rollback as a database candidate. LuCI
+# and apn-autoconfig-modem must use this rather than writing profile fields.
+apply_manual_cmd() {
+	# Validate before touching anything. add_candidate silently skips malformed
+	# database rows, which is right for a 4000-line TSV and wrong for a person
+	# typing one profile: they get a specific reason instead.
+	case "$MANUAL_APN" in
+		'') die_code 2 "apply-manual requires --apn" ;;
+		*[!A-Za-z0-9._-]*) die_code 2 "the APN may only contain letters, digits, dot, underscore and hyphen" ;;
+	esac
+	[ "${#MANUAL_APN}" -le 63 ] || die_code 2 "the APN is longer than 63 characters"
+	state_value_is_safe "$MANUAL_USERNAME" || die_code 2 "the username contains characters this engine cannot store safely"
+	state_value_is_safe "$MANUAL_PASSWORD" || die_code 2 "the password contains characters this engine cannot store safely"
+	case "$MANUAL_AUTH" in
+		-|none|pap|chap|pap-or-chap) : ;;
+		*) die_code 2 "auth must be none, pap, chap or pap-or-chap" ;;
+	esac
+	case "$MANUAL_IP_TYPE" in
+		-|ipv4|ipv6|ipv4v6) : ;;
+		*) die_code 2 "ip-type must be ipv4, ipv6 or ipv4v6" ;;
+	esac
+	# A username without a password, or the reverse, is almost always a mistake
+	# that would fail as an opaque bearer rejection much later.
+	if [ "$MANUAL_USERNAME" = - ] && [ "$MANUAL_PASSWORD" != - ]; then
+		die_code 2 "a password was given without a username"
+	fi
+	if [ "$MANUAL_USERNAME" != - ] && [ "$MANUAL_PASSWORD" = - ]; then
+		die_code 2 "a username was given without a password"
+	fi
+
+	read_sim
+	acquire_lock
+	migrate_target_state
+	registration_preflight || return $?
+
+	: >"$SEEN_APNS"
+	: >"${CANDIDATES}.apply"
+	add_candidate "$MANUAL_APN" manual \
+		"$MANUAL_USERNAME" "$MANUAL_PASSWORD" "$MANUAL_AUTH" "$MANUAL_IP_TYPE"
+	[ -s "${CANDIDATES}.apply" ] || die_code 2 "the manual profile was rejected before it could be tried"
+
+	apply_candidate_list \
+		"applying a manual profile for ICCID $ICCID on $INTERFACE" \
+		"the manual profile failed; previous profile will be restored"
 }
 
 reconcile_cmd() {
@@ -2481,6 +2552,10 @@ Commands:
            Start one operation in background
   action-status  Show background/external operation state as JSON
   roaming-policy-set <default|allow|block>  Change OpenWrt's canonical policy
+  apply-manual --apn <apn> [--username <u> --password-stdin]
+           [--auth none|pap|chap|pap-or-chap] [--ip-type ipv4|ipv6|ipv4v6]
+           Apply a profile you supply through the same baseline, connectivity
+           verification and rollback as a database candidate
   reset    Restore the APN state saved before the first apply; clear cache
   reset-all  Restore every target baseline; intended for safe package removal
   forget-target  Drop this engine's state for --target, whose section must
@@ -2507,9 +2582,45 @@ main() {
 				REQUESTED_TARGET="$2"
 				shift 2
 			;;
+			--apn)
+				[ "$#" -ge 2 ] || die_code 2 "--apn requires a value"
+				MANUAL_APN="$2"
+				shift 2
+			;;
+			--username)
+				[ "$#" -ge 2 ] || die_code 2 "--username requires a value"
+				MANUAL_USERNAME="$2"
+				shift 2
+			;;
+			--password-stdin)
+				# The password is never an argument: argv is world-readable
+				# through ps, and this engine must not leak credentials.
+				IFS= read -r MANUAL_PASSWORD || MANUAL_PASSWORD=""
+				[ -n "$MANUAL_PASSWORD" ] || die_code 2 "--password-stdin received an empty password"
+				shift
+			;;
+			--auth)
+				[ "$#" -ge 2 ] || die_code 2 "--auth requires a value"
+				MANUAL_AUTH="$2"
+				shift 2
+			;;
+			--ip-type)
+				[ "$#" -ge 2 ] || die_code 2 "--ip-type requires a value"
+				MANUAL_IP_TYPE="$2"
+				shift 2
+			;;
 			*) die_code 4 "unexpected argument: $1" ;;
 		esac
 	done
+	case "$COMMAND_NAME" in
+		apply-manual) : ;;
+		*)
+			[ -z "$MANUAL_APN" ] && [ "$MANUAL_USERNAME" = - ] && \
+				[ "$MANUAL_PASSWORD" = - ] && [ "$MANUAL_AUTH" = - ] && \
+				[ "$MANUAL_IP_TYPE" = - ] || \
+				die_code 4 "manual profile options are only valid for apply-manual"
+		;;
+	esac
 	load_config
 	if [ "$COMMAND_NAME" = targets-json ]; then
 		[ -z "$REQUESTED_TARGET" ] || die_code 4 "targets-json does not accept --target"
@@ -2554,7 +2665,7 @@ main() {
 	esac
 	case "$COMMAND_NAME" in
 		detect|detect-json|status|status-json) require_target_capability identity ;;
-		apply|reconcile|modem-reset) require_target_capability profile-apply ;;
+		apply|reconcile|modem-reset|apply-manual) require_target_capability profile-apply ;;
 		roaming-policy-set) require_target_capability profile-write ;;
 		action-start)
 			case "$command_argument" in
@@ -2568,6 +2679,7 @@ main() {
 		detect) detect_cmd ;;
 		detect-json) detect_json_cmd ;;
 		apply) apply_cmd ;;
+		apply-manual) apply_manual_cmd ;;
 		reconcile) reconcile_cmd ;;
 		modem-reset) modem_reset_cmd ;;
 		status) status_cmd ;;

@@ -497,8 +497,38 @@ the new SIM even if the previous provider's APN happens to pass the Internet
 test. If ICCID, configured profile and the last successfully reconciled state all
 match, it verifies connectivity and exits without restarting `wwan`.
 
-Before APN changes, `apply` and `reconcile` wait for usable home or roaming
-registration. Explicitly blocked roaming, denied registration, emergency-only
+### Applying an APN yourself
+
+When the database has no profile for your SIM, or your operator issued you a
+private one, supply it directly:
+
+```sh
+apn-autoconfig apply-manual --apn internet.example
+```
+
+Optional fields are `--username`, `--auth` (`none`, `pap`, `chap` or
+`pap-or-chap`) and `--ip-type` (`ipv4`, `ipv6` or `ipv4v6`). The password is
+read from standard input and never taken as an argument, because command
+arguments are readable by any local process:
+
+```sh
+printf '%s\n' 'your-password' |
+  apn-autoconfig apply-manual --apn internet.example --username you --password-stdin
+```
+
+A manual profile is not a shortcut around the engine. It is tested as a single
+candidate through the same path as a database profile: the previous profile is
+captured as a baseline first, the interface is restarted, real Internet
+connectivity is verified, and a profile that fails is rolled back exactly. It
+does not need the provider database, since nothing is matched.
+
+Because the result is recorded like any other success, a later `reconcile`
+leaves the manual profile alone while it still verifies. If it stops working,
+the manual profile is retried first and the database is only a fallback, so a
+working manual profile is never silently replaced.
+
+Before APN changes, `apply`, `apply-manual` and `reconcile` wait for usable
+home or roaming registration. Explicitly blocked roaming, denied registration, emergency-only
 service and messaging-only registration stop without cycling APN profiles. A
 registration that remains pending is reported as retryable to the bounded boot
 worker.

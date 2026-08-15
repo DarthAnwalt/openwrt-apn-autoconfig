@@ -9,8 +9,21 @@ the borrowed operation lock in both directions; and `provision` /
 `deprovision` including the staging section, ownership markers, promotion,
 the provisioning baseline, exact rollback and interruption.
 
-Still to implement: the manual APN path, the LuCI first-run view and the
-install/upgrade/removal lifecycle tests.
+Still to implement: the LuCI first-run view and the install/upgrade/removal
+lifecycle tests.
+
+The manual APN path is implemented as `apn-autoconfig apply-manual`. Its
+fixtures assert that the profile goes through the shared candidate path rather
+than a second write path — the suite was verified to fail with
+`apply-manual did not capture a baseline before writing` when the
+implementation was replaced by a direct profile write. They also cover input
+validation before any network change, refusal of a password given as an
+argument, refusal of manual options on other commands, exact rollback of a
+profile that does not verify, operation without the provider database, and
+preference for a working manual profile over database candidates on a later
+`reconcile`. It has not run on hardware. LuCI still has no manual-profile
+input, and the narrow rpcd wrapper does not expose `apply-manual` yet: routing
+a password through rpcd needs its own design and belongs with the LuCI work.
 
 The provisioning path has had one exploratory hardware run, recorded in
 [`router-test-0.11.0.md`](router-test-0.11.0.md): refusal paths, provisioning,

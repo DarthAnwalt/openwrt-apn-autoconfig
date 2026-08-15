@@ -200,6 +200,15 @@ used, and, when it cannot, a stable machine-readable reason:
 `not_present`, `name_unavailable`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
 
+The engine command is
+`apn-autoconfig apply-manual --apn <apn> [--username <u> --password-stdin]
+[--auth ...] [--ip-type ...]`. The password is read from standard input and is
+never an argument, because argv is readable by other local processes. The
+profile becomes a single candidate and goes through the same baseline capture,
+connectivity verification and exact rollback as a database candidate, so
+`apn-autoconfig-modem` and LuCI must call it rather than writing profile fields
+themselves.
+
 The manual APN path passes profile fields through to the APN engine's manual
 profile operation. Provisioning never writes `apn`, `username`, `password`,
 `auth` or `pdptype` itself; those remain APN-engine-owned fields applied through

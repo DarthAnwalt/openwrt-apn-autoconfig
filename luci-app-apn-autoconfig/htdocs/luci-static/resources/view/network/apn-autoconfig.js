@@ -156,7 +156,10 @@ function roamingPolicyLabel(status) {
 	case 'explicit-allow': return _('Explicitly allowed');
 	case 'explicit-block': return _('Explicitly blocked');
 	case 'default-allow': return _('Allowed by the OpenWrt default');
-	case 'invalid': return _('Invalid configuration');
+	/* The absent default is backend-specific: OpenWrt's MBIM handler refuses
+	 * roaming when neither option is set, where ModemManager allows it. */
+	case 'default-block': return _('Blocked by the OpenWrt default');
+	case 'invalid': return _('Custom configuration this page will not change');
 	default: return _('Unknown');
 	}
 }
@@ -165,8 +168,18 @@ function policyValue(status) {
 	switch (status && status.roaming_policy) {
 	case 'explicit-allow': return 'allow';
 	case 'explicit-block': return 'block';
+	/* A custom option pair cannot be represented by any of the three policies.
+	 * Showing "default" would invite an accidental normalization of something
+	 * somebody configured deliberately. */
+	case 'invalid': return 'custom';
 	default: return 'default';
 	}
+}
+
+function defaultPolicyOptionLabel(status) {
+	if (status && status.target_backend === 'mbim')
+		return _('OpenWrt default (blocked)');
+	return _('OpenWrt default (allowed)');
 }
 
 function targetCapability(status, name) {
@@ -177,16 +190,28 @@ function targetCapability(status, name) {
 }
 
 function roamingPolicySupported(status) {
-	return !!(status && !status.error && status.version === 'v2' &&
-		status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write'));
+	if (!status || status.error || status.version !== 'v2')
+		return false;
+	/* Capability is reported explicitly. A backend name is not a substitute:
+	 * an engine that predates roaming_policy_write still describes exactly the
+	 * one backend that had it. */
+	if (status.target_capabilities && 'roaming_policy_write' in status.target_capabilities)
+		return status.target_capabilities.roaming_policy_write === true;
+	return status.target_backend === 'modemmanager' && targetCapability(status, 'profile_write');
 }
 
 function roamingPolicyDescription(status) {
 	var target = status && status.interface || 'wwan';
 	var backend = status && status.target_backend || _('unknown');
-	if (roamingPolicySupported(status))
-		return _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(target);
-	return _('Roaming policy control is unavailable for the selected %s backend. APN Auto-Config manages only APN profiles; configure roaming in the package or interface that manages this connection.').format(backend);
+	if (!roamingPolicySupported(status))
+		return _('Roaming policy control is unavailable for the selected %s backend. APN Auto-Config manages only APN profiles; configure roaming in the package or interface that manages this connection.').format(backend);
+	if (backend === 'mbim')
+		return _('This edits the canonical network.%s.allow_roaming and allow_partner options used by netifd. Both are needed: OpenWrt refuses roaming and partner networks when they are unset, and APN profiles never change them automatically.').format(target);
+	return _('This edits the canonical network.%s.allow_roaming option used by netifd and ModemManager. APN profiles never change it automatically.').format(target);
+}
+
+function roamingPolicyCustom(status) {
+	return !!(status && status.roaming_policy === 'invalid');
 }
 
 function trustLabel(value, positive, negative) {
@@ -394,6 +419,18 @@ return view.extend({
 			dom.content(this.actionStatus, [ this.actionDescription(action) ]);
 	},
 
+	/* The three policies cannot express a custom option pair, so that state is
+	 * shown as its own disabled entry: applying then requires deliberately
+	 * choosing one, instead of an Apply click silently normalizing it. */
+	setPolicyOptions: function(status) {
+		if (this.policyDefaultOption)
+			dom.content(this.policyDefaultOption, [ defaultPolicyOptionLabel(status) ]);
+		if (this.policyCustomOption)
+			this.policyCustomOption.hidden = !roamingPolicyCustom(status);
+		if (this.policySelect)
+			this.policySelect.value = policyValue(status);
+	},
+
 	updatePolicyControls: function() {
 		if (this.policyButton)
 			this.policyButton.disabled = this.busy || !this.policySupported || !this.policyDirty;
@@ -441,7 +478,7 @@ return view.extend({
 			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
 			self.policySupported = roamingPolicySupported(status);
 			if (self.policySelect && self.policySupported) {
-				self.policySelect.value = policyValue(status);
+				self.setPolicyOptions(status);
 				self.policyDirty = false;
 			}
 			if (self.policyDescription)
@@ -1060,6 +1097,11 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmDatabaseInstall(); }
 		}, [ _('Install update') ]);
+		/* Kept as fields so a refresh can relabel the default option: what
+		 * "OpenWrt default" means depends on the backend. */
+		self.policyCustomOption = E('option', { 'value': 'custom', 'disabled': 'disabled' },
+			[ _('Custom configuration (unchanged)') ]);
+		self.policyDefaultOption = E('option', { 'value': 'default' }, [ defaultPolicyOptionLabel(status) ]);
 		self.policySelect = E('select', {
 			'class': 'cbi-input-select',
 			'change': function() {
@@ -1067,14 +1109,15 @@ return view.extend({
 				self.updatePolicyControls();
 			}
 		}, [
-			E('option', { 'value': 'default' }, [ _('OpenWrt default (allowed)') ]),
+			self.policyCustomOption,
+			self.policyDefaultOption,
 			E('option', { 'value': 'allow' }, [ _('Explicitly allow') ]),
 			E('option', { 'value': 'block' }, [ _('Explicitly block') ])
 		]);
 		/* LuCI's E()/dom.attr() serializes false as selected="false". HTML
 		 * boolean attributes are true whenever present, so assigning the value
 		 * after construction is required to avoid selecting the last option. */
-		self.policySelect.value = policyValue(status);
+		self.setPolicyOptions(status);
 		self.policyButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',

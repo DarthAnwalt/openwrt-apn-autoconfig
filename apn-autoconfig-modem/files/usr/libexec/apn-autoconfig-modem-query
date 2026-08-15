@@ -13,6 +13,7 @@ fi
 case "${1:-}" in
 	inventory) [ -z "$MODEM_ID" ] || exit 2; exec "$COMMAND" inventory-json ;;
 	status) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" status-json --modem "$MODEM_ID" ;;
+	provision-plan) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" provision-plan --modem "$MODEM_ID" ;;
 	action-status) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" action-status --modem "$MODEM_ID" ;;
 	*) exit 2 ;;
 esac

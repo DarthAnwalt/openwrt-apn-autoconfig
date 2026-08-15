@@ -1624,7 +1624,7 @@ action_status_values() {
 		external_pid="$(lock_owner_pid "$external_lock" 2>/dev/null || :)"
 		if process_is_alive "$external_pid"; then
 			ACTION_STATUS="running"
-			ACTION_NAME="reset"
+			ACTION_NAME=""
 			ACTION_PID="$external_pid"
 			ACTION_STARTED=""
 			ACTION_FINISHED=""
@@ -1661,14 +1661,41 @@ action_status_cmd() {
 	print_action_json false "$REQUESTED_MODEM"
 }
 
+# Each background action states its own precondition here, before a worker is
+# accepted. A caller must never learn from a terminal failure that the
+# operation was never possible in the first place.
+action_precondition() {
+	precondition_action="$1"
+	precondition_modem="$2"
+	case "$precondition_action" in
+		reset)
+			line="$(find_record "$precondition_modem")" || \
+				die_code 4 "modem $precondition_modem is not currently present"
+			[ "$(field "$line" 14)" = 1 ] || \
+				die_code 4 "modem $precondition_modem is not bound to the supported board reset integration"
+		;;
+		provision)
+			provision_evaluate "$precondition_modem"
+			precondition_status=$?
+			[ "$PROVISION_REASON" = ok ] || \
+				die_code "$precondition_status" "modem $precondition_modem cannot be provisioned: $PROVISION_REASON"
+		;;
+		deprovision|connect|disconnect|reconnect)
+			[ -n "$(provision_existing_section "$precondition_modem" 2>/dev/null || :)" ] || \
+				die_code 4 "no section owned by this package is bound to modem $precondition_modem"
+		;;
+	esac
+}
+
 action_start_cmd() {
 	action="$1"
-	case "$action" in reset) : ;; *) die_code 2 "unsupported background action: $action" ;; esac
+	case "$action" in
+		reset|provision|deprovision|connect|disconnect|reconnect) : ;;
+		*) die_code 2 "unsupported background action: $action" ;;
+	esac
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "action-start requires --modem"
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
-	line="$(find_record "$REQUESTED_MODEM")" || die_code 4 "modem $REQUESTED_MODEM is not currently present"
-	capable_reset="$(field "$line" 14)"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $REQUESTED_MODEM is not bound to the supported board reset integration"
+	action_precondition "$action" "$REQUESTED_MODEM"
 
 	state_dir="$(action_state_dir_for "$REQUESTED_MODEM")"
 	mkdir -p "$ACTION_STATE_DIR" || die "cannot create action state parent"

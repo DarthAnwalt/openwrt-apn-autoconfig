@@ -1,18 +1,35 @@
 {
-	"luci-app-apn-autoconfig": {
-		"description": "Grant access to APN Auto-Config",
-		"read": {
-			"uci": [ "apn-autoconfig" ],
-			"file": {
-				"/usr/libexec/apn-autoconfig-query": [ "list", "exec" ],
-				"/usr/libexec/apn-autoconfig-modem-query": [ "list", "exec" ]
-			}
-		},
-		"write": {
-			"uci": [ "apn-autoconfig" ],
-			"file": {
-				"/usr/libexec/apn-autoconfig-control": [ "list", "exec" ]
-			}
-		}
-	}
+    "luci-app-apn-autoconfig": {
+        "description": "Grant access to APN Auto-Config",
+        "read": {
+            "uci": [
+                "apn-autoconfig"
+            ],
+            "file": {
+                "/usr/libexec/apn-autoconfig-query": [
+                    "list",
+                    "exec"
+                ],
+                "/usr/libexec/apn-autoconfig-modem-query": [
+                    "list",
+                    "exec"
+                ]
+            }
+        },
+        "write": {
+            "uci": [
+                "apn-autoconfig"
+            ],
+            "file": {
+                "/usr/libexec/apn-autoconfig-control": [
+                    "list",
+                    "exec"
+                ],
+                "/usr/libexec/apn-autoconfig-modem-control": [
+                    "list",
+                    "exec"
+                ]
+            }
+        }
+    }
 }

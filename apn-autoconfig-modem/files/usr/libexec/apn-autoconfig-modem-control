@@ -1,17 +1,23 @@
 #!/bin/sh
 
 # Narrow mutating entry point for rpcd/LuCI ACLs.
+#
+# Every verb is a fixed background action on one validated modem identity.
+# LuCI never receives the general-purpose CLI, and nothing here accepts a
+# section name, a device path or a profile field: those are resolved by the
+# coordinator from the modem identity alone.
 
 COMMAND="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
 MODEM_ID="${2:-}"
 [ "$#" -le 2 ] || exit 2
 
 case "$MODEM_ID" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+[ "${#MODEM_ID}" -le 200 ] || exit 2
 
 case "${1:-}" in
-	reset)
+	reset|provision|deprovision|connect|disconnect|reconnect)
 		[ -n "$MODEM_ID" ] || exit 2
-		exec "$COMMAND" action-start reset --modem "$MODEM_ID"
+		exec "$COMMAND" action-start "$1" --modem "$MODEM_ID"
 	;;
 	*) exit 2 ;;
 esac

@@ -1191,6 +1191,16 @@ MOCKEOF
 export TEST_RECONCILE_CALLS="$STATE/reconcile-calls"
 export TEST_RECONCILE_PID="$STATE/reconcile-pid"
 export TEST_ENGINE_STATE="$STATE/engine-state"
+
+# Records how the narrow control wrapper invokes the coordinator, so the
+# wrapper's forwarding can be asserted without starting real operations.
+cat >"$MOCKBIN/record-modem-bin" <<'RECEOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/control-calls"
+exit 0
+RECEOF
+chmod 0755 "$MOCKBIN/record-modem-bin"
+: >"$STATE/control-calls"
 setup_apn_engine_mock
 
 provision_fixture() {
@@ -1454,6 +1464,83 @@ sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || usercontrol=$?
 [ ! -s "$TEST_EVENTS" ] || fail 'connect touched netifd for an interface it does not own'
 TEST_IFACE_UP=
 export TEST_IFACE_UP
+
+printf '%s\n' 'TEST background provisioning is accepted and reaches a terminal result'
+provision_fixture
+bg_out="$(sh "$SCRIPT" action-start provision --modem "$PROV_MODEM")"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["accepted"] is True, d' "$bg_out" \
+	|| fail 'action-start provision was not accepted'
+bg_waited=0
+while [ "$bg_waited" -lt 15 ]; do
+	bg_state="$(sh "$SCRIPT" action-status --modem "$PROV_MODEM" | \
+		python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["state"])')"
+	case "$bg_state" in success|failed|blocked|retryable) break ;; esac
+	bg_waited=$((bg_waited + 1))
+	/bin/sleep 1
+done
+[ "$bg_state" = success ] || fail "background provisioning ended in state $bg_state"
+[ "$(network_section_count apnmodem)" -eq 1 ] || fail 'background provisioning did not create the section'
+
+printf '%s\n' 'TEST background deprovision removes what background provisioning created'
+sh "$SCRIPT" action-start deprovision --modem "$PROV_MODEM" >/dev/null || fail 'action-start deprovision was rejected'
+bg_waited=0
+while [ "$bg_waited" -lt 15 ]; do
+	bg_state="$(sh "$SCRIPT" action-status --modem "$PROV_MODEM" | \
+		python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["state"])')"
+	case "$bg_state" in success|failed|blocked|retryable) break ;; esac
+	bg_waited=$((bg_waited + 1))
+	/bin/sleep 1
+done
+[ "$bg_state" = success ] || fail "background deprovision ended in state $bg_state"
+[ "$(network_section_count apnmodem)" -eq 0 ] || fail 'background deprovision left the section behind'
+
+printf '%s\n' 'TEST an impossible background action is refused at launch, not at its terminal state'
+provision_fixture
+add_network_section taken qmi /dev/cdc-wdm0
+refuse_status=0
+sh "$SCRIPT" action-start provision --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
+[ "$refuse_status" -eq 4 ] || \
+	fail "provisioning an already configured modem exited $refuse_status instead of 4 at launch"
+refuse_status=0
+sh "$SCRIPT" action-start connect --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
+[ "$refuse_status" -eq 4 ] || \
+	fail "connect without a project-owned section exited $refuse_status instead of 4 at launch"
+
+printf '%s\n' 'TEST the narrow control wrapper exposes every provisioning verb and nothing else'
+provision_fixture
+for verb in reset provision deprovision connect disconnect reconnect; do
+	APN_AUTOCONFIG_MODEM_BIN="$MOCKBIN/record-modem-bin" sh "$CONTROL_SCRIPT" "$verb" "$PROV_MODEM" >/dev/null 2>&1 || :
+	grep -F -q "action-start $verb --modem $PROV_MODEM" "$STATE/control-calls" || \
+		fail "the control wrapper did not forward $verb as a background action"
+done
+for bad in provision-plan inventory status rescan reset-all 'reset;id' ''; do
+	bad_status=0
+	sh "$CONTROL_SCRIPT" "$bad" "$PROV_MODEM" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the control wrapper accepted the unlisted verb '$bad'"
+done
+
+printf '%s\n' 'TEST the control wrapper refuses an unsafe or oversized modem identity'
+for bad_id in 'a b' 'a/../b' '$(id)' "$(awk 'BEGIN { while (i++ < 201) printf "a" }')"; do
+	bad_status=0
+	sh "$CONTROL_SCRIPT" reset "$bad_id" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail 'the control wrapper accepted an unsafe modem identity'
+done
+bad_status=0
+sh "$CONTROL_SCRIPT" reset "$PROV_MODEM" extra >/dev/null 2>&1 || bad_status=$?
+[ "$bad_status" -eq 2 ] || fail 'the control wrapper accepted a third argument'
+
+printf '%s\n' 'TEST the query wrapper exposes provision-plan read-only and stays read-only'
+provision_fixture
+reset_network_config
+plan_out="$(sh "$QUERY_SCRIPT" provision-plan "$PROV_MODEM")" || fail 'the query wrapper could not run provision-plan'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["can_provision"] is True, d' "$plan_out" \
+	|| fail 'provision-plan through the query wrapper did not report a provisionable modem'
+uci_wrote_nothing || fail 'the read-only query wrapper wrote network configuration'
+for bad in provision deprovision connect reset rescan; do
+	bad_status=0
+	sh "$QUERY_SCRIPT" "$bad" "$PROV_MODEM" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the read-only query wrapper accepted the mutating verb '$bad'"
+done
 
 printf '%s\n' 'TEST the narrow query wrapper rejects unlisted verbs and out-of-range arguments'
 if "$QUERY_SCRIPT" inventory extra-arg >/dev/null 2>&1; then

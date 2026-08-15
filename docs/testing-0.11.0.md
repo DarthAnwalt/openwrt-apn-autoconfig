@@ -1,7 +1,7 @@
 # 0.11.0 first-run provisioning test and release plan
 
-Status: contract accepted, implementation in progress. No hardware gate has
-been attempted.
+Status: released as v0.11.0 on 2026-08-15. All fixture, SDK, lifecycle,
+hardware and signed-feed gates passed.
 
 Implemented and covered so far: `provision-plan` with its stable refusal
 reasons; the `auto`-selection protection for disabled project-owned sections;
@@ -30,10 +30,10 @@ Writing it found a real gap: `postrm` cleared the inventory registry but not the
 provisioning baselines, so removal left state behind that the contract says it
 must clear.
 
-The live 0.10.1-to-0.11.0 upgrade, provisioning and removal through the narrow
-LuCI path all passed on the WH3000 with the SDK-built packages. What remains
-needs the release to exist: the signed-feed install without a trust bypass and
-the final removal/reinstall smoke.
+All gates are complete. The live 0.10.1-to-0.11.0 upgrade, provisioning and
+removal through the narrow LuCI path passed on the WH3000 with the SDK-built
+packages, and after `v0.11.0` published, the signed-feed removal and reinstall
+smoke passed without a trust bypass.
 
 The LuCI first-run card is implemented. `provision`, `deprovision`, `connect`,
 `disconnect` and `reconnect` are background actions whose preconditions are

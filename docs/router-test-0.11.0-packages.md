@@ -102,9 +102,28 @@ a **new** operation id rather than on any terminal state: polling for
 `success` after starting an operation can return the previous operation's
 result before the new worker has written anything.
 
+## Signed-feed lifecycle, after publication
+
+`v0.11.0` published the GitHub Release and the signed feed. The router
+refreshed the index from the live feed with no signature or trust complaint,
+and the feed offered 0.11.0-r1.
+
+Removal ran the real `prerm`: it restored the original mobile profile and
+removed the cache and baseline, saying so, and `wwan` stayed up with verified
+Internet afterwards. Installation then ran **from the live feed without
+`--allow-untrusted`** and pulled all four packages plus the provider database.
+
+Final state: five packages installed, no modified file, `wwan` up with verified
+connectivity, reset capability true again, `provision-plan` correctly refusing
+the configured modem, and no project-owned section or lock left behind.
+
+One consequence worth knowing: a **purge removes the package configuration**, so
+the pinned `reset_modem_id` and the enabled `BTN_0` were lost and had to be
+restored from the pre-upgrade snapshot. An upgrade preserves them; this applies
+only to removal. Anyone who has pinned a reset identity should keep a copy
+before removing the package.
+
 ## Remaining
 
-The signed-feed install without a trust bypass, and the final removal and
-reinstall smoke, both of which need the release published. No physical `BTN_0`
-press was performed in this run; that path is unchanged since its 0.10.1
-validation.
+No physical `BTN_0` press was performed in this run; that path is unchanged
+since its 0.10.1 validation.

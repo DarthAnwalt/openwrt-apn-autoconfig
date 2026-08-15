@@ -147,6 +147,7 @@ grep -F -q '/etc/init.d/apn-autoconfig-modem restart' "$ROOT/apn-autoconfig-mode
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 	node "$ROOT/tests/test-luci-roaming-policy.js"
+	node "$ROOT/tests/test-luci-provisioning.js"
 elif [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
 	printf '%s\n' 'Node.js is required for LuCI verification in CI and release builds.' >&2
 	exit 1

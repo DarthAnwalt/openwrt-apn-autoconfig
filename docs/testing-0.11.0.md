@@ -9,8 +9,29 @@ the borrowed operation lock in both directions; and `provision` /
 `deprovision` including the staging section, ownership markers, promotion,
 the provisioning baseline, exact rollback and interruption.
 
-Still to implement: the LuCI first-run view and the install/upgrade/removal
+Still to implement: manual APN input in LuCI, and the install/upgrade/removal
 lifecycle tests.
+
+The LuCI first-run card is implemented. `provision`, `deprovision`, `connect`,
+`disconnect` and `reconnect` are background actions whose preconditions are
+checked at launch, so an impossible operation is refused before a worker
+starts rather than failing at its terminal state. The mutating wrapper accepts
+only a fixed verb and one validated modem identity — no section name, device
+path or profile field — so LuCI cannot name a section it should not touch.
+`tests/test-luci-provisioning.js` asserts that a modem refused for any reason
+offers no controls at all and is explained instead, that a project-owned modem
+gets connection control and removal, that an absent package explains itself
+rather than rendering dead buttons, that identifiers stay masked, that controls
+are disabled while an operation runs, that every state-changing verb is
+confirmed first, and that a lost launch answer keeps polling instead of
+inventing a result.
+
+Manual APN input is deliberately absent from the view: the engine command
+exists, but routing a password through rpcd needs its own design. A password
+must never become an argv, since `/proc/<pid>/cmdline` is world-readable while
+`/proc/<pid>/environ` is not.
+
+None of the LuCI work has been exercised against a real browser or on hardware.
 
 The manual APN path is implemented as `apn-autoconfig apply-manual`. Its
 fixtures assert that the profile goes through the shared candidate path rather

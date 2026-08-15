@@ -10,6 +10,7 @@
 var queryCommand = '/usr/libexec/apn-autoconfig-query';
 var controlCommand = '/usr/libexec/apn-autoconfig-control';
 var modemQueryCommand = '/usr/libexec/apn-autoconfig-modem-query';
+var modemControlCommand = '/usr/libexec/apn-autoconfig-modem-control';
 
 function call(command, args) {
 	return fs.exec(command, args).then(function(result) {
@@ -187,6 +188,25 @@ return view.extend({
 			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; }),
 			call(queryCommand, [ 'targets' ]).catch(function(error) { return { error: error.message }; }),
 			call(modemQueryCommand, [ 'inventory' ]).catch(function(error) { return { error: error.message }; })
+				.then(function(inventory) {
+					var modems = inventory && Array.isArray(inventory.modems) ? inventory.modems : [];
+					if (!modems.length)
+						return inventory;
+					/* One plan and one operation state per modem. Both are
+					 * read-only and bounded; neither starts modem traffic. */
+					return Promise.all(modems.map(function(modem) {
+						return Promise.all([
+							call(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
+								.catch(function(error) { return { error: error.message }; }),
+							call(modemQueryCommand, [ 'action-status', modem.modem_id ])
+								.catch(function(error) { return { error: error.message }; })
+						]).then(function(pair) {
+							modem.plan = pair[0];
+							modem.operation = pair[1];
+							return modem;
+						});
+					})).then(function() { return inventory; });
+				})
 		]);
 	},
 
@@ -546,6 +566,191 @@ return view.extend({
 		}
 	},
 
+	/* Why a modem cannot be set up, in the user's terms. A missing control is
+	 * always explained; the view never shows a button that is going to fail. */
+	provisionReasonText: function(reason) {
+		switch (reason) {
+		case 'already_configured':
+			return _('This modem already belongs to an existing network interface, so it is left alone. Remove or repoint that interface first if you want this package to manage it.');
+		case 'already_provisioned':
+			return _('This modem is set up by this package.');
+		case 'ambiguous':
+			return _('This modem could not be told apart from another one, so nothing will be changed automatically.');
+		case 'unsupported_protocol':
+			return _('Setting up this modem automatically is not supported yet for its control protocol.');
+		case 'conflicting_owner':
+			return _('Another component is claiming control of this modem, so it is left alone.');
+		case 'no_device':
+			return _('No usable control device was found for this modem.');
+		}
+		return _('This modem cannot be set up automatically right now.');
+	},
+
+	modemOperationText: function(operation) {
+		if (!operation || operation.error)
+			return '';
+		if (operation.busy)
+			return _('Working on this modem…');
+		switch (operation.state) {
+		case 'success': return _('Last operation finished successfully.');
+		case 'failed': return _('Last operation failed: %s').format(operation.message || _('unknown error'));
+		case 'blocked': return _('Last operation was refused: %s').format(operation.message || _('not permitted'));
+		case 'retryable': return _('Last operation could not finish and may be retried: %s').format(operation.message || '');
+		}
+		return '';
+	},
+
+	modemActionButton: function(modem, verb, label, cssClass) {
+		var self = this;
+		var button = E('button', {
+			'class': 'btn cbi-button ' + cssClass,
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmModemAction(modem, verb); }
+		}, [ label ]);
+		button.disabled = !!(modem.operation && modem.operation.busy);
+		self.modemButtons.push(button);
+		return button;
+	},
+
+	provisioningNodes: function(inventory) {
+		var self = this;
+		self.modemButtons = [];
+
+		if (!inventory || inventory.error)
+			return [ E('p', {}, [
+				_('Modem setup is unavailable. The optional apn-autoconfig-modem package may be absent or unable to complete its bounded scan.')
+			]) ];
+
+		var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
+		if (!modems.length)
+			return [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
+
+		return modems.map(function(modem) {
+			var plan = modem.plan || {};
+			var rows = [ row(_('Modem'), sensitiveIdentifier(modem.modem_id, _('modem identity'))) ];
+			var buttons = [];
+			var explanation = '';
+
+			if (plan.error) {
+				explanation = _('The setup check could not run: %s').format(plan.error);
+			}
+			else if (plan.can_provision) {
+				rows.push(row(_('Would create interface'), text(plan.section)));
+				rows.push(row(_('Protocol'), text(plan.protocol)));
+				explanation = _('This modem is not configured yet. Setting it up creates a new network interface, finds the right APN for its SIM, verifies real Internet access and only then enables automatic connection. If anything fails, everything is undone.');
+				buttons.push(self.modemActionButton(modem, 'provision', _('Set up this modem'), 'cbi-button-action important'));
+			}
+			else if (plan.reason === 'already_provisioned') {
+				rows.push(row(_('Interface'), text(plan.existing_section)));
+				explanation = self.provisionReasonText(plan.reason);
+				buttons.push(self.modemActionButton(modem, 'connect', _('Connect'), 'cbi-button-action'));
+				buttons.push(self.modemActionButton(modem, 'reconnect', _('Reconnect'), 'cbi-button-neutral'));
+				buttons.push(self.modemActionButton(modem, 'disconnect', _('Disconnect'), 'cbi-button-neutral'));
+				buttons.push(self.modemActionButton(modem, 'deprovision', _('Remove setup'), 'cbi-button-remove'));
+			}
+			else {
+				explanation = self.provisionReasonText(plan.reason);
+			}
+
+			var operationText = self.modemOperationText(modem.operation);
+			var nodes = [ table(rows), E('p', {}, [ explanation ]) ];
+			if (operationText)
+				nodes.push(E('p', { 'class': 'apn-action-status' }, [ operationText ]));
+			if (buttons.length)
+				nodes.push(E('div', { 'class': 'apn-button-row' }, buttons));
+			return E('div', { 'class': 'apn-modem-entry' }, nodes);
+		});
+	},
+
+	confirmModemAction: function(modem, verb) {
+		var self = this;
+		if (modem.operation && modem.operation.busy)
+			return;
+
+		var plan = modem.plan || {};
+		var titles = {
+			provision: _('Set up this modem'),
+			deprovision: _('Remove setup'),
+			connect: _('Connect'),
+			disconnect: _('Disconnect'),
+			reconnect: _('Reconnect')
+		};
+		var warnings = {
+			provision: _('A new network interface called %s will be created for this modem. Its APN is chosen and verified before automatic connection is enabled. Nothing else on this router is changed.').format(plan.section || ''),
+			deprovision: _('The network interface %s created for this modem will be stopped and removed. Interfaces you created yourself are never touched.').format(plan.existing_section || ''),
+			connect: _('This asks netifd to bring the interface up.'),
+			disconnect: _('This stops the mobile interface for this modem. Any connection through it will be interrupted.'),
+			reconnect: _('This stops and restarts the mobile interface for this modem. Connectivity will be interrupted briefly.')
+		};
+		var destructive = verb === 'deprovision' || verb === 'disconnect';
+
+		ui.showModal(titles[verb], [
+			E('p', {}, [ warnings[verb] ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn important ' + (destructive ? 'cbi-button-remove' : 'cbi-button-action'),
+					'click': function() {
+						ui.hideModal();
+						self.startModemAction(modem, verb);
+					}
+				}, [ titles[verb] ])
+			])
+		]);
+	},
+
+	startModemAction: function(modem, verb) {
+		var self = this;
+		self.setModemButtonsBusy(true);
+
+		return call(modemControlCommand, [ verb, modem.modem_id ]).then(function(result) {
+			if (!result.accepted && !result.busy)
+				throw new Error(result.message || _('The operation could not be started'));
+			/* Accepted or safely coalesced: polling decides when it is over. */
+			self.modemPollPending = true;
+		}).catch(function(error) {
+			/* The launch answer may have been lost after the job was accepted,
+			 * so this never reports success or failure on its own. */
+			self.modemPollPending = true;
+			ui.addNotification(null, E('p', {}, [ error.message ]), 'error');
+		});
+	},
+
+	setModemButtonsBusy: function(busy) {
+		(this.modemButtons || []).forEach(function(button) { button.disabled = !!busy; });
+	},
+
+	refreshProvisioning: function() {
+		var self = this;
+		return call(modemQueryCommand, [ 'inventory' ]).then(function(inventory) {
+			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
+			return Promise.all(modems.map(function(modem) {
+				return Promise.all([
+					call(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
+						.catch(function(error) { return { error: error.message }; }),
+					call(modemQueryCommand, [ 'action-status', modem.modem_id ])
+						.catch(function(error) { return { error: error.message }; })
+				]).then(function(pair) {
+					modem.plan = pair[0];
+					modem.operation = pair[1];
+				});
+			})).then(function() { return inventory; });
+		}).then(function(inventory) {
+			self.modemInventory = inventory;
+			var anyBusy = (Array.isArray(inventory.modems) ? inventory.modems : []).some(function(modem) {
+				return modem.operation && modem.operation.busy;
+			});
+			self.modemPollPending = anyBusy;
+			if (self.provisioningBox)
+				dom.content(self.provisioningBox, self.provisioningNodes(inventory));
+			if (self.modemBox)
+				dom.content(self.modemBox, self.modemInventoryNodes(inventory));
+		}).catch(function() {
+			/* A lost poll never invents a result; the next tick tries again. */
+		});
+	},
+
 	modemInventoryNodes: function(inventory) {
 		if (!inventory || inventory.error)
 			return [ E('p', { 'class': 'apn-modem-unavailable' }, [
@@ -725,6 +930,8 @@ return view.extend({
 		self.apnBox = E('div', {}, self.apnNodes(status));
 		self.databaseBox = E('div', {}, self.databaseNodes(database, status));
 		self.modemBox = E('div', {}, self.modemInventoryNodes(modemInventory));
+		self.provisioningBox = E('div', {}, self.provisioningNodes(modemInventory));
+		self.modemPollPending = false;
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
@@ -735,6 +942,9 @@ return view.extend({
 		self.panelRetryPending = !status || !!status.error ||
 			status.signal_quality == null || status.signal_quality === '';
 		poll.add(function() { return self.refreshStatus(); }, 2);
+		poll.add(function() {
+			return self.modemPollPending ? self.refreshProvisioning() : Promise.resolve();
+		}, 3);
 
 		return m.render().then(function(mapNode) {
 			var mobileActionButtons = [ self.reconcileButton ];
@@ -768,8 +978,13 @@ return view.extend({
 					]),
 					E('section', { 'class': 'cbi-section apn-card' }, [
 						E('h3', {}, [ _('Modem inventory') ]),
-						E('p', {}, [ _('Read-only, from the optional apn-autoconfig-modem package. Modem control and reset are not yet exposed here.') ]),
+						E('p', {}, [ _('Read-only, from the optional apn-autoconfig-modem package.') ]),
 						self.modemBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
+						E('h3', {}, [ _('Modem setup') ]),
+						E('p', {}, [ _('Prepares an unconfigured modem for use. An interface you created yourself is never adopted or changed.') ]),
+						self.provisioningBox
 					]),
 					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
 						E('h3', {}, [ _('Provider database') ]),

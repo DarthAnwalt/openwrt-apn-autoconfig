@@ -26,6 +26,20 @@ function call(command, args, env) {
 	});
 }
 
+/* provision-plan always prints a complete answer and uses its exit code to
+ * carry the refusal class, so a non-zero exit is a result rather than a
+ * failure. Whether the body parses is what decides. */
+function callPlan(command, args) {
+	return fs.exec(command, args).then(function(result) {
+		try {
+			return JSON.parse(result.stdout);
+		}
+		catch (e) {
+			throw new Error(_('The modem helper returned invalid JSON'));
+		}
+	});
+}
+
 function text(value) {
 	return value == null || value === '' ? '—' : String(value);
 }
@@ -196,7 +210,7 @@ return view.extend({
 					 * read-only and bounded; neither starts modem traffic. */
 					return Promise.all(modems.map(function(modem) {
 						return Promise.all([
-							call(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
+							callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
 								.catch(function(error) { return { error: error.message }; }),
 							call(modemQueryCommand, [ 'action-status', modem.modem_id ])
 								.catch(function(error) { return { error: error.message }; })
@@ -634,7 +648,7 @@ return view.extend({
 			var explanation = '';
 
 			if (plan.error) {
-				explanation = _('The setup check could not run: %s').format(plan.error);
+				explanation = _('The setup check could not run. See the system log for details.');
 			}
 			else if (plan.can_provision) {
 				rows.push(row(_('Would create interface'), text(plan.section)));
@@ -729,7 +743,7 @@ return view.extend({
 			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
 			return Promise.all(modems.map(function(modem) {
 				return Promise.all([
-					call(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
+					callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
 						.catch(function(error) { return { error: error.message }; }),
 					call(modemQueryCommand, [ 'action-status', modem.modem_id ])
 						.catch(function(error) { return { error: error.message }; })

@@ -368,7 +368,73 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.ok(collectText(unsupported).join(' ').trim().length > 0,
 			'an unsupported target must be explained instead of showing an empty form');
 	}).then(function() {
+	/* ---- transport: a refusal arrives with a non-zero exit code ---- */
+
+	/* provision-plan carries its refusal class in the exit status while still
+	 * printing a complete answer. Treating that as a failure once put the raw
+	 * JSON on the page, unmasked modem identity included. */
+	var planApp = loadView(function(command, args) {
+		if (args[0] === 'inventory')
+			return { code: 0, stdout: JSON.stringify({
+				version: 'v1',
+				modems: [ { modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01', protocol: 'qmi' } ]
+			}) };
+		if (args[0] === 'provision-plan')
+			return { code: 4, stdout: JSON.stringify({
+				version: 'v1',
+				modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01',
+				can_provision: false,
+				reason: 'already_configured',
+				section: '',
+				existing_section: '',
+				protocol: '',
+				device: ''
+			}) };
+		return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
+	});
+	planApp.provisioningBox = element('div');
+	planApp.modemBox = element('div');
+	return Promise.resolve(planApp.refreshProvisioning()).then(function() {
+		var plan = planApp.modemInventory.modems[0].plan;
+		assert.strictEqual(plan.reason, 'already_configured',
+			'a refusal delivered with a non-zero exit code must be read as a result');
+		assert.ok(!plan.error,
+			'a complete answer must not be turned into an error by its exit code');
+
+		var rendered = collectText(planApp.provisioningBox.children).join(' ');
+		assert.strictEqual(rendered.indexOf('can_provision'), -1,
+			'raw command output must never be rendered into the page');
+		assert.strictEqual(rendered.indexOf('SERIAL01'), -1,
+			'a refusal must not leak the unmasked modem identity');
+		assert.ok(rendered.indexOf('already belongs to an existing network interface') !== -1,
+			'a refused modem must get its plain-language explanation');
+
+		/* Output that is not an answer at all is still reported, without
+		 * echoing whatever the command printed. */
+		var brokenApp = loadView(function(command, args) {
+			if (args[0] === 'inventory')
+				return { code: 0, stdout: JSON.stringify({
+					version: 'v1',
+					modems: [ { modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01' } ]
+				}) };
+			if (args[0] === 'provision-plan')
+				return { code: 127, stdout: 'usb-serial:1-1.2:2c7c:0801:SERIAL01 exploded' };
+			return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
+		});
+		brokenApp.provisioningBox = element('div');
+		brokenApp.modemBox = element('div');
+		return Promise.resolve(brokenApp.refreshProvisioning()).then(function() {
+			var brokenText = collectText(brokenApp.provisioningBox.children).join(' ');
+			assert.strictEqual(brokenText.indexOf('exploded'), -1,
+				'raw command output must not reach the page even when it fails');
+			assert.strictEqual(brokenText.indexOf('SERIAL01'), -1,
+				'a failed check must not leak the unmasked modem identity');
+			assert.ok(brokenText.indexOf('could not run') !== -1,
+				'a failed check must still be reported');
+		});
+	}).then(function() {
 	console.log('LuCI provisioning card regression tests passed.');
+	});
 	});
 }).catch(function(error) {
 	console.error(error && error.stack || String(error));

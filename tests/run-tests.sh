@@ -1250,6 +1250,79 @@ else
 fi
 rm -f "$TEST_LOCK"
 
+printf '%s\n' 'TEST the manual profile reaches the engine without the password ever being an argument'
+rm -rf "$TEST_LOCK" "$TEST_ACTION_STATE"
+manual_probe="$STATE/manual-engine-probe"
+cat >"$manual_probe" <<'PROBEEOF'
+#!/bin/sh
+# Stands in for the engine and records exactly how it was invoked, including
+# whether the manual profile was still present in its environment.
+printf 'argv:%s\n' "$*" >>"$TEST_STATE/manual-invocation"
+printf 'stdin:%s\n' "$(cat)" >>"$TEST_STATE/manual-invocation"
+printf 'env_password:%s\n' "${APN_AUTOCONFIG_MANUAL_PASSWORD:-<unset>}" >>"$TEST_STATE/manual-invocation"
+printf 'env_apn:%s\n' "${APN_AUTOCONFIG_MANUAL_APN:-<unset>}" >>"$TEST_STATE/manual-invocation"
+exit 0
+PROBEEOF
+chmod 0755 "$manual_probe"
+: >"$STATE/manual-invocation"
+mkdir -p "$TEST_ACTION_STATE"
+APN_AUTOCONFIG_ACTION_COMMAND="$manual_probe" \
+	APN_AUTOCONFIG_MANUAL_APN=manual.example \
+	APN_AUTOCONFIG_MANUAL_USERNAME=someone \
+	APN_AUTOCONFIG_MANUAL_PASSWORD='top secret' \
+	APN_AUTOCONFIG_MANUAL_AUTH=pap \
+	APN_AUTOCONFIG_MANUAL_IP_TYPE=ipv4 \
+	sh "$BASE/files/usr/libexec/apn-autoconfig-action" apply-manual "$TEST_ACTION_STATE" '2026-01-01T00:00:00Z' network:wwan
+manual_seen="$(cat "$STATE/manual-invocation")"
+# Only the argv line: a glob over the whole record would also match the
+# password on the stdin line and report a leak that is not there.
+manual_argv="$(grep '^argv:' "$STATE/manual-invocation")"
+case "$manual_argv" in
+	*"top secret"*) fail 'the worker passed the password as a command argument' ;;
+esac
+assert_contains "$manual_seen" 'stdin:top secret'
+for needle in '--password-stdin' '--apn manual.example' '--username someone' \
+	'--auth pap' '--ip-type ipv4' '--target network:wwan'
+do
+	case "$manual_argv" in
+		*"$needle"*) : ;;
+		*) fail "the engine was not given $needle" ;;
+	esac
+done
+# The profile must be gone from the environment before the engine runs, so it
+# cannot reach curl, mmcli, ifup or anything else the engine spawns.
+assert_contains "$manual_seen" 'env_password:<unset>'
+assert_contains "$manual_seen" 'env_apn:<unset>'
+
+printf '%s\n' 'TEST a manual profile without credentials sends no credential options'
+: >"$STATE/manual-invocation"
+rm -rf "$TEST_ACTION_STATE"
+mkdir -p "$TEST_ACTION_STATE"
+APN_AUTOCONFIG_ACTION_COMMAND="$manual_probe" \
+	APN_AUTOCONFIG_MANUAL_APN=plain.example \
+	sh "$BASE/files/usr/libexec/apn-autoconfig-action" apply-manual "$TEST_ACTION_STATE" '2026-01-01T00:00:00Z' network:wwan
+manual_argv="$(grep '^argv:' "$STATE/manual-invocation")"
+manual_seen="$(cat "$STATE/manual-invocation")"
+case "$manual_argv" in
+	*--username*) fail 'a credential-free manual profile still sent a username' ;;
+	*--password-stdin*) fail 'a credential-free manual profile still asked for a password' ;;
+esac
+case "$manual_argv" in
+	*'--apn plain.example'*) : ;;
+	*) fail 'the engine was not given the manual APN' ;;
+esac
+
+printf '%s\n' 'TEST the control wrapper refuses a manual profile it cannot validate'
+for bad_target in '' 'wwan' 'network:' 'network:../etc' 'network:a b'; do
+	bad_status=0
+	APN_AUTOCONFIG_MANUAL_APN=ok.example \
+		sh "$CONTROL_SCRIPT" apply-manual "$bad_target" >/dev/null 2>&1 || bad_status=$?
+	[ "$bad_status" -eq 2 ] || fail "the control wrapper accepted the unsafe target '$bad_target'"
+done
+bad_status=0
+sh "$CONTROL_SCRIPT" apply-manual network:wwan >/dev/null 2>&1 || bad_status=$?
+[ "$bad_status" -eq 2 ] || fail 'the control wrapper started a manual profile with no APN in the environment'
+
 printf '%s\n' 'TEST apply-manual applies a user profile through the normal candidate path'
 rm -rf "$TEST_LOCK"
 CURL_SUCCESS_APN=manual.example

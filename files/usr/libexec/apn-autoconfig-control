@@ -7,6 +7,17 @@ TARGET="${2:-}"
 [ "$#" -le 2 ] || exit 2
 
 case "${1:-}" in
+	apply-manual)
+		# The profile itself travels in the environment and is validated by the
+		# engine, which is the single place that decides what a profile may
+		# contain. This wrapper only proves the target is safe and refuses a
+		# password given as an argument, which would be world-readable.
+		[ -n "$TARGET" ] || exit 2
+		case "$TARGET" in network:*) target_interface="${TARGET#network:}" ;; *) exit 2 ;; esac
+		case "$target_interface" in ''|*[!A-Za-z0-9_]*) exit 2 ;; esac
+		[ -n "${APN_AUTOCONFIG_MANUAL_APN:-}" ] || exit 2
+		exec "$COMMAND" action-start apply-manual --target "$TARGET"
+	;;
 	reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install)
 		case "$1:$TARGET" in database-*:?*) exit 2 ;; esac
 		if [ -n "$TARGET" ]; then

@@ -9,8 +9,7 @@ the borrowed operation lock in both directions; and `provision` /
 `deprovision` including the staging section, ownership markers, promotion,
 the provisioning baseline, exact rollback and interruption.
 
-Still to implement: manual APN input in LuCI, and the install/upgrade/removal
-lifecycle tests.
+Still to implement: the install/upgrade/removal lifecycle tests.
 
 The LuCI first-run card is implemented. `provision`, `deprovision`, `connect`,
 `disconnect` and `reconnect` are background actions whose preconditions are
@@ -26,10 +25,18 @@ are disabled while an operation runs, that every state-changing verb is
 confirmed first, and that a lost launch answer keeps polling instead of
 inventing a result.
 
-Manual APN input is deliberately absent from the view: the engine command
-exists, but routing a password through rpcd needs its own design. A password
-must never become an argv, since `/proc/<pid>/cmdline` is world-readable while
-`/proc/<pid>/environ` is not.
+Manual APN input is in the view. rpcd's `file.exec` accepts an environment
+table but no standard input — verified against the running OpenWrt 25.12.5
+rather than assumed — so the profile travels in the environment: a command line
+is world-readable through `/proc/<pid>/cmdline`, an environment is not. The
+background worker captures the profile, removes it from its environment before
+the engine runs so it cannot reach `curl`, `mmcli` or `ifup`, and pipes the
+password to `--password-stdin` from a shell builtin. The engine still accepts a
+password only on standard input.
+
+Each layer has a regression test that was verified to fail when the leak was
+reintroduced: the view passing the password in arguments, the worker passing it
+in arguments, and the worker leaving the profile in the environment.
 
 None of the LuCI work has been exercised against a real browser or on hardware.
 
@@ -42,9 +49,7 @@ validation before any network change, refusal of a password given as an
 argument, refusal of manual options on other commands, exact rollback of a
 profile that does not verify, operation without the provider database, and
 preference for a working manual profile over database candidates on a later
-`reconcile`. It has not run on hardware. LuCI still has no manual-profile
-input, and the narrow rpcd wrapper does not expose `apply-manual` yet: routing
-a password through rpcd needs its own design and belongs with the LuCI work.
+`reconcile`. It has not run on hardware.
 
 The provisioning path has had one exploratory hardware run, recorded in
 [`router-test-0.11.0.md`](router-test-0.11.0.md): refusal paths, provisioning,

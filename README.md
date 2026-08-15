@@ -500,7 +500,12 @@ match, it verifies connectivity and exits without restarting `wwan`.
 ### Applying an APN yourself
 
 When the database has no profile for your SIM, or your operator issued you a
-private one, supply it directly:
+private one, supply it directly. In LuCI this is the **Enter an APN yourself**
+card; the password field is sent to the router in the request environment and
+never as a command argument, because a command line is readable by any local
+process while an environment is not.
+
+From the command line:
 
 ```sh
 apn-autoconfig apply-manual --apn internet.example

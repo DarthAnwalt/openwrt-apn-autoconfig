@@ -139,9 +139,9 @@ function loadView(execHandler) {
 	};
 	var execCalls = [];
 	var fsStub = {
-		exec: function(command, args) {
-			execCalls.push({ command: command, args: args });
-			var handled = execHandler ? execHandler(command, args) : null;
+		exec: function(command, args, env) {
+			execCalls.push({ command: command, args: args, env: env });
+			var handled = execHandler ? execHandler(command, args, env) : null;
 			if (handled == null)
 				handled = { code: 0, stdout: '{}' };
 			if (handled instanceof Error)
@@ -283,7 +283,93 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 	assert.strictEqual(confirmApp.testExecCalls.length, 0,
 		'showing a confirmation must not start anything');
 
+	/* ---- manual APN entry ---- */
+
+	function manualApp(execHandler) {
+		var app = loadView(execHandler);
+		app.currentStatus = { target_id: 'network:wwan' };
+		app.profileApplySupported = true;
+		app.busy = false;
+		app.manualApn = { value: '' };
+		app.manualUsername = { value: '' };
+		app.manualPassword = { value: '' };
+		app.manualAuth = { value: '' };
+		app.manualIpType = { value: '' };
+		return app;
+	}
+
+	/* The password must never reach the argument vector, which any local
+	 * process can read through /proc/<pid>/cmdline. */
+	var secretApp = manualApp(function() {
+		return { code: 0, stdout: JSON.stringify({ accepted: true, busy: true }) };
+	});
+	secretApp.manualApn.value = 'internet.example';
+	secretApp.manualUsername.value = 'someone';
+	secretApp.manualPassword.value = 'top-secret-value';
+	return Promise.resolve(secretApp.startManualApn(secretApp.manualApnValues())).then(function() {
+		var call = secretApp.testExecCalls[secretApp.testExecCalls.length - 1];
+		assert.strictEqual(JSON.stringify(call.args).indexOf('top-secret-value'), -1,
+			'the password must never appear in the command arguments');
+		assert.deepStrictEqual(call.args, [ 'apply-manual', 'network:wwan' ],
+			'the wrapper must receive only the verb and the target');
+		assert.strictEqual(call.env.APN_AUTOCONFIG_MANUAL_PASSWORD, 'top-secret-value',
+			'the password must be passed through the environment instead');
+		assert.strictEqual(call.env.APN_AUTOCONFIG_MANUAL_APN, 'internet.example',
+			'the APN must be passed through the environment');
+		assert.strictEqual(secretApp.manualPassword.value, '',
+			'the password field must be cleared once the operation was accepted');
+
+		/* Optional fields are omitted rather than sent empty. */
+		var minimalApp = manualApp(function() {
+			return { code: 0, stdout: JSON.stringify({ accepted: true, busy: true }) };
+		});
+		minimalApp.manualApn.value = 'plain.example';
+		return Promise.resolve(minimalApp.startManualApn(minimalApp.manualApnValues())).then(function() {
+			var env = minimalApp.testExecCalls[minimalApp.testExecCalls.length - 1].env;
+			assert.deepStrictEqual(Object.keys(env), [ 'APN_AUTOCONFIG_MANUAL_APN' ],
+				'a profile without credentials must not send empty credential values');
+		});
+	}).then(function() {
+		/* Invalid input is refused in the browser, before anything is started. */
+		var cases = [
+			{ apn: '', why: 'an empty APN' },
+			{ apn: 'bad apn', why: 'an APN with a space' },
+			{ apn: 'bad/apn', why: 'an APN with a slash' },
+			{ apn: 'ok.example', username: 'someone', why: 'a username without a password' },
+			{ apn: 'ok.example', password: 'secret', why: 'a password without a username' }
+		];
+		cases.forEach(function(testCase) {
+			var app = manualApp();
+			app.manualApn.value = testCase.apn;
+			app.manualUsername.value = testCase.username || '';
+			app.manualPassword.value = testCase.password || '';
+			app.confirmManualApn();
+			assert.strictEqual(app.testExecCalls.length, 0,
+				'nothing may be started for ' + testCase.why);
+			assert.strictEqual(app.testUi.modals.length, 0,
+				'no confirmation may be shown for ' + testCase.why);
+			assert.ok(app.testUi.notifications.length > 0,
+				testCase.why + ' must be explained to the user');
+		});
+
+		/* Valid input is confirmed before it is applied. */
+		var confirmApp = manualApp();
+		confirmApp.manualApn.value = 'internet.example';
+		confirmApp.confirmManualApn();
+		assert.strictEqual(confirmApp.testUi.modals.length, 1,
+			'a valid manual APN must be confirmed before it is applied');
+		assert.strictEqual(confirmApp.testExecCalls.length, 0,
+			'showing the confirmation must not start anything');
+
+		/* Without profile-apply support the form is replaced by an explanation. */
+		var unsupported = loadView().manualApnNodes({ version: 'v2', target_capabilities: {} });
+		assert.deepStrictEqual(buttonLabels(unsupported), [],
+			'manual entry must offer no control when the target cannot apply a profile');
+		assert.ok(collectText(unsupported).join(' ').trim().length > 0,
+			'an unsupported target must be explained instead of showing an empty form');
+	}).then(function() {
 	console.log('LuCI provisioning card regression tests passed.');
+	});
 }).catch(function(error) {
 	console.error(error && error.stack || String(error));
 	process.exit(1);

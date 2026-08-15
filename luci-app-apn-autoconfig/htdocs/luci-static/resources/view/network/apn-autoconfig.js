@@ -12,8 +12,8 @@ var controlCommand = '/usr/libexec/apn-autoconfig-control';
 var modemQueryCommand = '/usr/libexec/apn-autoconfig-modem-query';
 var modemControlCommand = '/usr/libexec/apn-autoconfig-modem-control';
 
-function call(command, args) {
-	return fs.exec(command, args).then(function(result) {
+function call(command, args, env) {
+	return fs.exec(command, args, env).then(function(result) {
 		if (result.code !== 0)
 			throw new Error((result.stderr || result.stdout || _('Command failed')).trim());
 
@@ -368,6 +368,8 @@ return view.extend({
 
 	setBusy: function(busy, action) {
 		this.busy = !!busy;
+		if (this.manualButton)
+			this.manualButton.disabled = this.busy || !this.profileApplySupported;
 		if (this.reconcileButton)
 			this.reconcileButton.disabled = this.busy || !this.profileApplySupported;
 		if (this.resetButton)
@@ -751,6 +753,146 @@ return view.extend({
 		});
 	},
 
+	manualApnNodes: function(status) {
+		var self = this;
+		var supported = status && !status.error && targetCapability(status, 'profile_apply');
+
+		if (!supported)
+			return [ E('p', {}, [
+				_('A profile cannot be applied to the selected target, so manual entry is unavailable.')
+			]) ];
+
+		self.manualApn = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('internet.example') });
+		self.manualUsername = E('input', { 'type': 'text', 'class': 'cbi-input-text' });
+		self.manualPassword = E('input', { 'type': 'password', 'class': 'cbi-input-password' });
+		self.manualAuth = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { 'value': '' }, [ _('Not specified') ]),
+			E('option', { 'value': 'none' }, [ _('None') ]),
+			E('option', { 'value': 'pap' }, [ 'PAP' ]),
+			E('option', { 'value': 'chap' }, [ 'CHAP' ]),
+			E('option', { 'value': 'pap-or-chap' }, [ _('PAP or CHAP') ])
+		]);
+		self.manualIpType = E('select', { 'class': 'cbi-input-select' }, [
+			E('option', { 'value': '' }, [ _('Not specified') ]),
+			E('option', { 'value': 'ipv4' }, [ 'IPv4' ]),
+			E('option', { 'value': 'ipv6' }, [ 'IPv6' ]),
+			E('option', { 'value': 'ipv4v6' }, [ _('IPv4 and IPv6') ])
+		]);
+		self.manualButton = E('button', {
+			'class': 'btn cbi-button cbi-button-action important',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmManualApn(); }
+		}, [ _('Apply this APN') ]);
+		self.manualButton.disabled = !!self.busy;
+
+		return [
+			E('p', {}, [
+				_('Use this when the database has no profile for your SIM, or your operator issued you a private one. The profile is tested like any other: the current one is saved first, real Internet access is verified, and a profile that does not work is undone.')
+			]),
+			table([
+				row(_('APN'), self.manualApn),
+				row(_('Username'), self.manualUsername),
+				row(_('Password'), self.manualPassword),
+				row(_('Authentication'), self.manualAuth),
+				row(_('IP family'), self.manualIpType)
+			]),
+			E('div', { 'class': 'apn-button-row' }, [ self.manualButton ])
+		];
+	},
+
+	manualApnValues: function() {
+		return {
+			apn: (this.manualApn && this.manualApn.value || '').trim(),
+			username: (this.manualUsername && this.manualUsername.value || '').trim(),
+			password: this.manualPassword && this.manualPassword.value || '',
+			auth: this.manualAuth && this.manualAuth.value || '',
+			ip_type: this.manualIpType && this.manualIpType.value || ''
+		};
+	},
+
+	/* Mirrors the engine's rules so a mistake is reported here instead of
+	 * surfacing much later as an opaque bearer rejection. The engine still
+	 * validates; this never becomes the only check. */
+	manualApnError: function(values) {
+		if (!values.apn)
+			return _('Enter an APN.');
+		if (!/^[A-Za-z0-9._-]+$/.test(values.apn))
+			return _('The APN may only contain letters, digits, dot, underscore and hyphen.');
+		if (values.apn.length > 63)
+			return _('The APN is longer than 63 characters.');
+		if (values.username && !values.password)
+			return _('A username was given without a password.');
+		if (values.password && !values.username)
+			return _('A password was given without a username.');
+		return null;
+	},
+
+	confirmManualApn: function() {
+		var self = this;
+		if (self.busy)
+			return;
+
+		var values = self.manualApnValues();
+		var error = self.manualApnError(values);
+		if (error) {
+			ui.addNotification(null, E('p', {}, [ error ]), 'warning');
+			return;
+		}
+
+		ui.showModal(_('Apply this APN'), [
+			E('p', {}, [ _('The APN %s will be applied to the mobile interface and tested. Mobile connectivity will be interrupted briefly.').format(values.apn) ]),
+			E('p', {}, [ _('If it does not provide real Internet access, the previous profile is restored automatically.') ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-action important',
+					'click': function() {
+						ui.hideModal();
+						self.startManualApn(values);
+					}
+				}, [ _('Apply this APN') ])
+			])
+		]);
+	},
+
+	startManualApn: function(values) {
+		var self = this;
+		var target = self.currentStatus && self.currentStatus.target_id || '';
+		if (!target) {
+			ui.addNotification(null, E('p', {}, [ _('No mobile target is selected.') ]), 'error');
+			return;
+		}
+
+		/* The profile travels in the environment, never in the arguments: a
+		 * command line is readable by any local process, an environment is
+		 * not. */
+		var env = { APN_AUTOCONFIG_MANUAL_APN: values.apn };
+		if (values.username) {
+			env.APN_AUTOCONFIG_MANUAL_USERNAME = values.username;
+			env.APN_AUTOCONFIG_MANUAL_PASSWORD = values.password;
+		}
+		if (values.auth)
+			env.APN_AUTOCONFIG_MANUAL_AUTH = values.auth;
+		if (values.ip_type)
+			env.APN_AUTOCONFIG_MANUAL_IP_TYPE = values.ip_type;
+
+		self.setBusy(true, { state: 'starting', action: 'apply-manual' });
+
+		return call(controlCommand, [ 'apply-manual', target ], env).then(function(result) {
+			if (self.manualPassword)
+				self.manualPassword.value = '';
+			self.setBusy(result.busy, result);
+			if (!result.accepted && !result.busy)
+				throw new Error(result.message || _('The operation could not be started'));
+		}).catch(function(error) {
+			/* As elsewhere: a lost launch answer keeps polling rather than
+			 * reporting a result it does not have. */
+			self.setBusy(true, { error: error.message });
+			ui.addNotification(null, E('p', {}, [ error.message ]), 'error');
+		});
+	},
+
 	modemInventoryNodes: function(inventory) {
 		if (!inventory || inventory.error)
 			return [ E('p', { 'class': 'apn-modem-unavailable' }, [
@@ -931,6 +1073,7 @@ return view.extend({
 		self.databaseBox = E('div', {}, self.databaseNodes(database, status));
 		self.modemBox = E('div', {}, self.modemInventoryNodes(modemInventory));
 		self.provisioningBox = E('div', {}, self.provisioningNodes(modemInventory));
+		self.manualApnBox = E('div', {}, self.manualApnNodes(status));
 		self.modemPollPending = false;
 		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
@@ -980,6 +1123,10 @@ return view.extend({
 						E('h3', {}, [ _('Modem inventory') ]),
 						E('p', {}, [ _('Read-only, from the optional apn-autoconfig-modem package.') ]),
 						self.modemBox
+					]),
+					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
+						E('h3', {}, [ _('Enter an APN yourself') ]),
+						self.manualApnBox
 					]),
 					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
 						E('h3', {}, [ _('Modem setup') ]),

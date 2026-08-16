@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.12.0 / apn-autoconfig-modem 0.12.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.12.0 (unreleased)
+## apn-autoconfig 0.12.0 / apn-autoconfig-modem 0.12.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.12.0 (2026-08-16)
 
 Native MBIM support, from discovering the modem to verifying its connection.
 Until now a CDC-MBIM modem was recognised and then refused everywhere after

@@ -1,11 +1,11 @@
 # 0.13.0 WH3000 frontend and bearer-control validation
 
 Date: 2026-08-16
-Status: complete for everything that can be proven before publication. The
-reorganized page and the corrected bearer-control rule both ran on hardware
-against the maintainer's production modem. The signed-feed smoke remains,
-because it requires the release to be published first, and the legibility
-judgement remains, because it is the maintainer's and not a fixture's.
+Status: complete except for the signed-feed smoke, which requires the release to
+be published first. The reorganized page and the corrected bearer-control rule
+both ran on hardware against the maintainer's production modem, and the
+maintainer's own review of the page — the one judgement no fixture can make —
+raised no objections.
 
 ## Environment
 
@@ -145,9 +145,15 @@ open. The following were verified directly:
   in the session came from the console buffer of an earlier navigation, not from
   this view; a clean tab loading only this page produced none.
 
-Two things remain the maintainer's own judgement and are not claimed here: that
-the page is comprehensible at a glance, and that help opens by tap on a real
-touch device rather than only under a pointer.
+The two judgements a fixture cannot make were the maintainer's, and they made
+them on the installed package: the reorganized page raised no objections. That
+is the gate this release could not ship without, and it passed.
+
+It passed with a stated expectation rather than a claim of completeness — that
+practical use will surface small things the first look does not, to be handled
+as patch releases when they appear. Recorded that way deliberately: "no
+objections after review" is what happened, and it is not the same as "nothing
+will be found later."
 
 ## One change considered and rejected
 

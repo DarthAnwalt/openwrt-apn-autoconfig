@@ -55,10 +55,32 @@ backend for it.
   provisioning still never open an MBIM control channel, which the tests assert
   from recorded invocations.
 
-MBIM ships as `implementation_state: alpha` and `validation_state: synthetic`.
-Its fixtures were written from the exact `umbim` revision OpenWrt 25.12.5 ships
-(`2025.10.04~2939b7d0`) rather than from hardware, and the live gate in
-`docs/testing-0.12.0.md` has not been run. See `docs/mbim-contract-v1.md`.
+Two defects that only a router with a working uplink could reveal, both found
+by the hardware run and fixed with regression tests:
+
+- **A provisioned modem no longer takes the default route.** netifd defaults a
+  section's `metric` to 0, so a freshly provisioned modem outranked the uplink
+  the router was already using and moved its own traffic onto metered cellular
+  data without asking. Sections this package creates now carry
+  `provision_metric`, defaulting to 1024, and with no other uplink the modem
+  still becomes the default route. The default is compiled in as well as
+  shipped in the config, because a new config default never reaches an existing
+  installation.
+- **The board power-cycle follows the modem, not its protocol.** The reset
+  capability required `protocol=qmi`, so the validated BTN_0 path silently
+  disappeared when the same pinned modem ran MBIM. The GPIO cuts power to the
+  slot, which is a property of the board and the physical modem. Either proven
+  native protocol now qualifies, with the explicit strong pin, board marker,
+  writable GPIO, no ambiguity and no conflicting owner all unchanged — protocol
+  alone still never implies reset. The button itself was not re-tested in MBIM
+  composition, so that combination has synthetic coverage only.
+
+MBIM ships as `implementation_state: stable` and `validation_state: hardware`.
+The live gate passed on the WH3000 with an RM520N-GL switched into MBIM
+composition: discovery, provisioning, APN selection, real Internet access over
+the MBIM bearer, roaming policy, interruption and exact rollback, followed by a
+byte-identical restore. See `docs/router-test-0.12.0.md` and
+`docs/mbim-contract-v1.md`.
 
 ## apn-autoconfig 0.11.0 / apn-autoconfig-modem 0.11.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.11.0 (2026-08-15)
 

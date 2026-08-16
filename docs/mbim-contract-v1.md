@@ -1,10 +1,11 @@
 # MBIM contract v1 (0.12.0)
 
-Status: accepted design for 0.12.0, implemented and covered by fixtures. The
-adapter, the APN backend, the attempt planner, readiness, roaming policy,
-provisioning and the LuCI control all exist; **nothing here has run on
-hardware**, so MBIM ships as `alpha`/`synthetic` until the gate in
-[`testing-0.12.0.md`](testing-0.12.0.md) is recorded. This document is normative
+Status: accepted design for 0.12.0, implemented and **validated on hardware**.
+The adapter, the APN backend, the attempt planner, readiness, roaming policy,
+provisioning and the LuCI control all exist, and discovery through post-connect
+verification and rollback passed on the reference WH3000 with an RM520N-GL in
+MBIM composition; see [`router-test-0.12.0.md`](router-test-0.12.0.md). MBIM
+therefore ships as `stable`/`hardware`. This document is normative
 for the native MBIM backend and for the MBIM parts of `apn-autoconfig-modem`. It extends [`backend-contract-v1.md`](backend-contract-v1.md)
 and [`provisioning-contract-v1.md`](provisioning-contract-v1.md) and inherits
 every rule in them, including the lock representation, the lock ordering and the
@@ -173,11 +174,11 @@ and the project's rule is that unknown values stay empty.
 
 `signal_quality` is parsed from the home provider's `rssi` field only when it is
 in the MBIM range `1`–`31`, mapped as `-113 + 2·rssi` dBm and then to percent
-with the existing clamp. `0` and `99` mean "unknown" often enough on real
-firmware that they are treated as unknown, not as -113 dBm. Whether this field
-tracks real signal on the reference modem is a question for the hardware gate;
-until it is answered the empty result is the correct one, and an empty signal
-never makes otherwise valid identity unavailable.
+with the existing clamp. `0` and `99` mean "unknown", and the hardware gate
+settled the open question: the reference RM520N-GL reports `rssi: 0063` — 99 —
+in its home provider response, so MBIM signal stays empty on this modem. Had the
+value been taken at face value it would have been published as -113 dBm. An
+empty signal never makes otherwise valid identity unavailable.
 
 ### Exit codes
 

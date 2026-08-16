@@ -1,10 +1,12 @@
 # 0.12.0 native MBIM test and release plan
 
-Status: the runtime work is implemented and the fixture gate passes. The SDK,
-package-lifecycle and hardware gates are open, and nothing here has been
-attempted on hardware. The contract tests below are written as requirements;
-each one that now exists is an executable assertion in `tests/run-tests.sh`,
-`tests/run-tests-modem.sh` or `tests/test-luci-roaming-policy.js`.
+Status: complete except for the post-publication feed smoke and the LuCI page in
+a real browser. The fixture, SDK, package-lifecycle and hardware gates all
+passed; the run is recorded in [`router-test-0.12.0.md`](router-test-0.12.0.md)
+and it found two defects, both now fixed with regression tests. The contract
+tests below are written as requirements; each is an executable assertion in
+`tests/run-tests.sh`, `tests/run-tests-modem.sh` or
+`tests/test-luci-roaming-policy.js`.
 
 0.12.0 completes the native MBIM vertical slice defined in
 [`roadmap.md`](roadmap.md), against the accepted
@@ -275,7 +277,8 @@ removal, reinstall) with hardware already present; the hardware gate above; then
 tag, publish and the signed-feed install/removal/reinstall smoke with no
 `--allow-untrusted`.
 
-MBIM stays `implementation_state: alpha`, `validation_state: synthetic` and
-`hardware_validated: false` until step 11 of the hardware gate is recorded.
+MBIM stayed `implementation_state: alpha`, `validation_state: synthetic` and
+`hardware_validated: false` until the hardware gate was recorded in
+[`router-test-0.12.0.md`](router-test-0.12.0.md); it is now `stable`/`hardware`.
 Every defect found at any gate gets a fixture regression before the fix is
-considered complete.
+considered complete, which is what happened to the two the run found.

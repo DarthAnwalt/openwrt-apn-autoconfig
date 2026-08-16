@@ -54,6 +54,7 @@ get:apn-autoconfig.main.qmi_identity_lock_root) printf '%s\n' "$TEST_QMI_IDENTIT
 get:apn-autoconfig-modem.main.action_state_dir) printf '%s\n' "$TEST_MODEM_ACTION_DIR" ;;
 get:apn-autoconfig-modem.main.hotplug_coalesce_seconds) printf '%s\n' "${TEST_HOTPLUG_COALESCE_SECONDS:-0}" ;;
 get:apn-autoconfig-modem.main.boot_delay) printf '%s\n' 0 ;;
+get:apn-autoconfig-modem.main.provision_metric) printf '%s\n' "${TEST_PROVISION_METRIC-1024}" ;;
 get:apn-autoconfig-modem.main.modem_power_path) printf '%s\n' "$TEST_GPIO" ;;
 get:apn-autoconfig-modem.main.modem_power_off_value) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
@@ -527,6 +528,32 @@ assert by_protocol["at"]["at_device"] == "/dev/ttyUSB8", by_protocol
 assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
+
+printf '%s\n' 'TEST the board power-cycle follows the pinned modem, not its control protocol'
+# The GPIO cuts power to the slot, so the capability belongs to the board and
+# the physical modem. Gating it on QMI disabled the validated button path as
+# soon as the same modem ran MBIM.
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+TEST_RESET_MODEM_ID='usb-serial:3-1.1:2cb7:0007:MBIMSERIAL'
+export TEST_RESET_MODEM_ID
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+by_protocol = {m["protocol"]: m for m in json.loads(sys.argv[1])["modems"]}
+assert by_protocol["mbim"]["capabilities"]["reset"] is True, by_protocol
+assert by_protocol["at"]["capabilities"]["reset"] is False, by_protocol
+' "$out" || fail 'a pinned MBIM modem lost the board power-cycle capability'
+TEST_RESET_MODEM_ID='usb-serial:3-1.2:2cb7:01a2:ATSERIAL'
+export TEST_RESET_MODEM_ID
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+by_protocol = {m["protocol"]: m for m in json.loads(sys.argv[1])["modems"]}
+assert by_protocol["at"]["capabilities"]["reset"] is False, by_protocol
+assert by_protocol["mbim"]["capabilities"]["reset"] is False, by_protocol
+' "$out" || fail 'an AT-only modem advertised reset, or an unpinned MBIM modem kept it'
+TEST_RESET_MODEM_ID=''
+export TEST_RESET_MODEM_ID
 
 printf '%s\n' 'TEST a QMI modem with multiple optional AT ports keeps its proven control binding'
 reset_sysfs
@@ -1313,6 +1340,25 @@ grep -F -q "up apnmodem1" "$TEST_EVENTS" && \
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "MBIM provisioning wrote to unrelated sections: $untouched"
 [ ! -s "$TEST_UMBIM_CALLS" ] || fail 'provisioning an MBIM modem opened a control channel itself'
+# A provisioned modem must not take the default route away from an uplink that
+# already works. netifd's own default is metric 0, which does exactly that.
+[ "$(uci -q get network.apnmodem1.metric)" = 1024 ] || \
+	fail 'the created MBIM section did not get the conservative route metric'
+
+printf '%s\n' 'TEST the provisioning route metric is configurable and can be switched off'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || fail 'deprovision failed before the metric test'
+TEST_PROVISION_METRIC=77
+export TEST_PROVISION_METRIC
+sh "$SCRIPT" provision --modem "$mbim_prov_modem" >/dev/null || fail 'provision failed with a configured metric'
+[ "$(uci -q get network.apnmodem1.metric)" = 77 ] || fail 'the configured route metric was ignored'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || fail 'deprovision failed after the metric test'
+TEST_PROVISION_METRIC=''
+export TEST_PROVISION_METRIC
+sh "$SCRIPT" provision --modem "$mbim_prov_modem" >/dev/null || fail 'provision failed with an empty metric'
+[ -z "$(uci -q get network.apnmodem1.metric)" ] || \
+	fail 'an empty metric still wrote one instead of leaving the netifd default'
+TEST_PROVISION_METRIC=1024
+export TEST_PROVISION_METRIC
 
 printf '%s\n' 'TEST deprovision removes an MBIM section exactly as it does a QMI one'
 sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || \

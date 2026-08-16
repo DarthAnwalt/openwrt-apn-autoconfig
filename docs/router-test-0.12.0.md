@@ -1,11 +1,11 @@
-# 0.12.0 WH3000 package and upgrade validation
+# 0.12.0 WH3000 package, upgrade and native MBIM validation
 
 Date: 2026-08-16
-Status: package, upgrade and read-only interface checks complete. The native
-MBIM hardware run is **not** in this record — it requires switching the module's
-USB composition and is covered separately by the pre-flight in
-[`testing-0.12.0.md`](testing-0.12.0.md). MBIM therefore remains
-`implementation_state: alpha`, `validation_state: synthetic`.
+Status: complete for everything that can be proven before publication. The
+native MBIM path passed on hardware from discovery through post-connect
+verification and rollback, so MBIM is `implementation_state: stable`,
+`validation_state: hardware`. The signed-feed smoke remains, because it requires
+the release to be published first.
 
 ## Environment
 
@@ -65,12 +65,82 @@ introduced as a config option alone.
   wrappers only, and the mutating wrapper exposes a fixed verb list that
   includes the three roaming-policy verbs the LuCI control uses.
 
+## Native MBIM run
+
+The module was switched to its MBIM composition through the audited sequence in
+[`testing-0.12.0.md`](testing-0.12.0.md), with BTN_0 disabled, ModemManager
+stopped and the production interface parked first. A restore script generated
+from the live values was rehearsed before the first mutation and left the
+configuration byte-identical when run in its config-only mode.
+
+The switch behaved exactly as the audit predicted. All four serial ports came
+back and `cdc_mbim` bound the new control and data interfaces, so the AT path —
+the way back — was never at risk. The product id and serial did not change, so
+the modem kept its stable identity across the composition change: inventory
+reported the *same* `modem_id` with its original `first_seen`, now with
+`protocol=mbim`.
+
+What passed, in order:
+
+- inventory classified the modem as MBIM with `owner_state=none` once
+  ModemManager was stopped, and `provision-plan` answered `can_provision` with
+  the MBIM protocol and the control device;
+- the identity adapter read the real modem correctly. MBIM supplies a genuine
+  home PLMN, which QMI cannot, so the operator came straight from the module
+  rather than from an IMSI prefix;
+- **`signal_quality` came back empty, and that is the correct answer.** This
+  firmware reports `rssi: 0063` — 99, the MBIM value for "unknown" — in the home
+  provider response. The contract's decision to treat 0 and 99 as unknown rather
+  than as -113 dBm is what kept this honest;
+- `provision` created the staging section, the APN engine selected the operator
+  profile from the database, wrote it, brought the bearer up and verified real
+  Internet access. The verification was re-run by hand bound to the modem's own
+  interface and returned HTTP 200 from the carrier-assigned address, so the
+  result is the modem path and not the WiFi uplink the router also has;
+- roaming policy in all three states, with the option pair written and read back
+  exactly, and `default` correctly reported as **blocked** for MBIM where
+  ModemManager's default is allowed. A deliberately mixed pair read back as
+  `invalid` and was left untouched;
+- `disconnect` / `reconnect`, each ending in a verified bearer;
+- a wrong APN failed within its bound, restored the exact previous profile and
+  reported the failure class; a real `TERM` during the destructive window did
+  the same and left no lock behind;
+- `deprovision` removed the section and dropped that target's engine state while
+  the production target's state stayed untouched;
+- the restore returned the QMI composition, ModemManager, the production
+  interface and the button, with `network.wwan` byte-identical to the snapshot,
+  no leftover sections, no pending UCI changes and the production modem
+  connected again.
+
+## Two defects the run found
+
+Neither could have been caught by fixtures, because both are about how the
+system behaves next to a real, already-working router.
+
+**The board power-cycle was gated on the control protocol.** `capabilities.reset`
+turned false the moment the same pinned modem ran MBIM, because the check
+required `protocol = qmi`. The GPIO cuts power to the slot: that is a property
+of the board and the physical modem, not of the protocol, so the validated BTN_0
+path silently disappeared in MBIM. Fixed to accept either proven native
+protocol, with every other condition — the explicit strong pin, the board
+marker, a writable GPIO, no ambiguity, no conflicting owner — unchanged.
+Protocol alone still never implies reset. The button itself was not re-tested in
+MBIM composition, so that specific combination remains synthetic.
+
+**A provisioned modem took the default route.** Provisioning wrote no `metric`,
+so netifd installed the section's default route at metric 0 — ahead of the
+router's existing WiFi uplink at 100. Every packet the router originated,
+including a tunnel daemon's, moved onto metered cellular data without anyone
+asking. The behaviour is inherited from 0.11.0 and had simply never been looked
+at on a router that already had an uplink. A provisioned section now carries a
+conservative `provision_metric`, defaulting to 1024 in code as well as in the
+shipped config, so an upgraded installation gets it too; with no other uplink
+the modem still becomes the default route.
+
 ## Still open
 
 1. The LuCI page in a real browser. The 0.11.0 run found a defect there that no
    fixture could have caught, so this is a required step, performed by the
    maintainer rather than from a script.
-2. The native MBIM hardware run: composition switch, discovery, provisioning,
-   profile write, verification, roaming policy, rollback and restore.
-3. The signed-feed install/removal/reinstall smoke, which is only possible after
+2. The signed-feed install/removal/reinstall smoke, which is only possible after
    publication.

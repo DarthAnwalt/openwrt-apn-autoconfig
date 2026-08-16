@@ -26,6 +26,14 @@ MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
 MODEM_POLL_SECONDS="2"
 CONNECT_WAIT_SECONDS="60"
+# Route metric written onto a section this package creates. The default lives
+# here rather than only in the shipped config, because a new config default
+# never reaches an already installed system: apk keeps the existing conffile
+# and writes .apk-new beside it. Netifd defaults to metric 0, which makes a
+# freshly provisioned modem outrank an uplink that already works and silently
+# moves the router's own traffic onto metered data. An empty value restores
+# that netifd default for anyone who wants it.
+PROVISION_METRIC="1024"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
 RESET_MODEM_ID=""
 
@@ -154,6 +162,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
+	value="$(uci -q get "${CONFIG}.main.provision_metric")" && PROVISION_METRIC="$value"
 }
 
 hardware_integration_name() {
@@ -184,6 +193,7 @@ validate_config() {
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
 	[ "$CONNECT_WAIT_SECONDS" -gt 0 ] || die "connect_wait_seconds must be greater than zero"
+	case "$PROVISION_METRIC" in ''|*[!0-9]*) [ -z "$PROVISION_METRIC" ] || die "provision_metric must be numeric" ;; esac
 	if [ -n "$RESET_MODEM_ID" ]; then
 		safe_token "$RESET_MODEM_ID" || die "reset_modem_id contains unsafe characters"
 		case "$RESET_MODEM_ID" in usb-serial:*|imei:*) : ;; *) die "reset_modem_id must use strong usb-serial or imei evidence" ;; esac
@@ -875,8 +885,16 @@ scan_inventory() {
 
 		first_seen="$(record_seen "$modem_id" "$now")"
 
+		# The board's GPIO cuts power to the modem slot, which is a property of
+		# the board and the physical modem rather than of the control protocol.
+		# Requiring QMI here silently disabled the validated BTN_0 path as soon
+		# as the same pinned modem ran MBIM. Every other condition stays: an
+		# explicit strong pin, the board marker, a writable GPIO, no ambiguity
+		# and no conflicting owner. Protocol alone still never implies reset.
 		capable_reset=0
-		if [ "$protocol" = qmi ] && [ "$ambiguous" -eq 0 ] && [ "$owner_state" != conflicting ] && \
+		reset_protocol_proven=0
+		case "$protocol" in qmi|mbim) reset_protocol_proven=1 ;; esac
+		if [ "$reset_protocol_proven" -eq 1 ] && [ "$ambiguous" -eq 0 ] && [ "$owner_state" != conflicting ] && \
 		   [ -n "$RESET_MODEM_ID" ] && [ "$modem_id" = "$RESET_MODEM_ID" ] && \
 		   hardware_integration_name >/dev/null 2>&1 && [ -w "$MODEM_POWER_PATH" ]; then
 			capable_reset=1
@@ -1223,6 +1241,12 @@ provision_cmd() {
 	uci set "network.${prov_section}.device=${prov_device}" || die "cannot set device"
 	uci set "network.${prov_section}.disabled=1" || die "cannot stage the section as disabled"
 	uci set "network.${prov_section}.auto=0" || die "cannot stage the section without autostart"
+	# Losing the default route to a modem the administrator has not chosen as
+	# the primary path is a side effect nobody asked for, so a provisioned
+	# section is deliberately the least preferred route. With no other uplink it
+	# still becomes the default one.
+	[ -z "$PROVISION_METRIC" ] || \
+		uci set "network.${prov_section}.metric=${PROVISION_METRIC}" || die "cannot set the route metric"
 	uci set "network.${prov_section}.apn_autoconfig_owner=apn-autoconfig-modem" || die "cannot mark ownership"
 	uci set "network.${prov_section}.apn_autoconfig_modem_id=${prov_modem}" || die "cannot mark modem identity"
 	uci set "network.${prov_section}.apn_autoconfig_provisioned=${prov_now}" || die "cannot mark provisioning time"

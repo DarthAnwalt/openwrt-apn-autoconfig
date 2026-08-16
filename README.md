@@ -866,12 +866,15 @@ packages enter an official feed.
   uses the strictly same-device AT fallback. This path is hardware-validated
   on one Huasifei WH3000 Pro + RM520N-GL; other modem/board combinations still
   require compatibility reports and should not be inferred from that evidence.
-- MBIM profile operations are implemented but ship as `alpha` with
-  `validation_state: synthetic`: their fixtures were written from the `umbim`
-  source rather than from hardware, and the live gate in
-  `docs/testing-0.12.0.md` has not been run. Fibocom and AT-managed profile
-  operations remain unavailable; mutating commands for those targets exit 4
-  before changing UCI, state or interfaces.
+- MBIM profile operations ship as `stable` with `validation_state: hardware`:
+  discovery, provisioning, profile write, verified Internet access, roaming
+  policy and exact rollback passed on the Huasifei WH3000 Pro with an
+  RM520N-GL in MBIM composition, recorded in `docs/router-test-0.12.0.md`. As
+  with QMI, that is evidence for one modem and board, not for MBIM in general.
+  The board power-cycle in MBIM composition is implemented but has only
+  synthetic coverage. Fibocom and AT-managed profile operations remain
+  unavailable; mutating commands for those targets exit 4 before changing UCI,
+  state or interfaces.
 - MBIM uses `umbim` only for read-only identity. It never opens a control
   session netifd is holding for a live bearer, and a netifd transition in
   flight is reported as retryable rather than probed through.

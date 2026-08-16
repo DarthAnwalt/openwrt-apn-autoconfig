@@ -570,10 +570,13 @@ target_protocol_capabilities() {
 			TARGET_BACKEND="mbim"
 			TARGET_ROAMING_POLICY_READ=true
 			TARGET_ROAMING_POLICY_WRITE=true
-			# Alpha until the live gate in docs/testing-0.12.0.md is recorded:
-			# fixtures written from the umbim source are not hardware evidence.
-			TARGET_IMPLEMENTATION_STATE="alpha"
-			TARGET_VALIDATION_STATE="synthetic"
+			# Discovery through provisioning, profile write, verified Internet
+			# access, roaming policy and exact rollback passed on the WH3000
+			# with an RM520N-GL in MBIM composition; see
+			# docs/router-test-0.12.0.md.
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
 			if [ ! -x "$MBIM_ADAPTER" ]; then
 				TARGET_REASON="adapter-unavailable"
 			elif "$MBIM_ADAPTER" capabilities >/dev/null 2>&1; then

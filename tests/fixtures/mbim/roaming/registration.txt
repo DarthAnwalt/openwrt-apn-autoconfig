@@ -1,7 +1,7 @@
   nwerror: 0000 - unknown
   registerstate: 0004 - roaming
   registermode: 0002 - automatic
-  availabledataclasses: 0080 - unknown
+  availabledataclasses: 80000020 - (null)
   currentcellularclass: 0001 - gsm
   provider_id: 26202
   provider_name: Vodafone.de

@@ -188,6 +188,34 @@ All controls disable together. The connection controls re-enable about a second
 after the others, because the card is refreshed on its own poll; that lag is in
 the conservative direction and is left as is.
 
+## 0.13.2 scratch-file fix, measured on hardware
+
+The same six read-only calls through the narrow LuCI wrapper, before and after
+upgrading from the signed feed:
+
+```text
+0.13.1 → 6 calls leaked 6 scratch files in /tmp
+0.13.2 → 6 calls leaked 0
+```
+
+Measured by comparing the exact set of filenames, not a count, and with
+`grep -F -x -v -f` rather than `comm`, which BusyBox does not provide. An
+earlier attempt used `comm` on the router and printed `new scratch files: 0`
+purely because the command was missing — a reminder that a number produced by a
+failed command looks exactly like a pass.
+
+## A second cause of the same symptom
+
+The first 0.13.2 upgrade from the feed also reported `OK` and changed nothing,
+with every package still on 0.13.1 and `/etc/apk/world` unpinned. This time it
+was neither: `apk update` had reported `1 stale`, because the GitHub Pages index
+had not yet propagated to the router. A second `apk update` a minute later saw
+0.13.2 and the upgrade proceeded.
+
+Two different causes now produce the identical `OK` with nothing installed —
+a world pin, and a stale index. That is the argument for the rule this release
+cycle added: verify `apk list -I`, never the exit status.
+
 ## What the smoke test nearly failed to notice
 
 The first 0.13.1 upgrade moved only two of the four packages and reported

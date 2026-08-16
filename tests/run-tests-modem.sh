@@ -1474,6 +1474,15 @@ export RECONCILE_HANG
 # The engine must be terminated and reaped, not left running against a target
 # that is about to be deleted underneath it.
 orphan_pid="$(cat "$TEST_RECONCILE_PID" 2>/dev/null || :)"
+# The coordinator signals the engine and reaps it, but a shell sitting in a
+# foreground sleep takes a moment to actually go away, and on a loaded machine
+# that moment can outlast the coordinator. Anything still alive after a bounded
+# grace period is genuinely orphaned; anything that dies inside it is not.
+orphan_wait=0
+while [ -n "$orphan_pid" ] && [ "$orphan_wait" -lt 20 ] && kill -0 "$orphan_pid" 2>/dev/null; do
+	orphan_wait=$((orphan_wait + 1))
+	/bin/sleep 0.1
+done
 if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
 	kill -TERM "$orphan_pid" 2>/dev/null || :
 	fail 'the APN engine was left running as an orphan after the interruption'

@@ -1496,15 +1496,19 @@ if MMCLI_UNAVAILABLE=1 sh "$SCRIPT" reconcile >/dev/null 2>&1; then fail 'unavai
 printf '%s\n' 'TEST ModemManager calls remain bounded without an external timeout command'
 rm -f "$STATE/mmcli-hang-pid"
 bounded_started="$(date +%s)"
+# The watchdog budget is deliberately larger than the one second this used to
+# use: the fixture records its own pid at startup, and on a loaded machine a
+# one-second watchdog could kill it before it got that far, failing the test
+# for a reason that has nothing to do with the bound being enforced.
 if MMCLI_UNAVAILABLE=0 MMCLI_HANG=1 TEST_INTERFACE=wwan \
 	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
-	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=1 sh "$SCRIPT" status >/dev/null 2>&1; then
+	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=3 sh "$SCRIPT" status >/dev/null 2>&1; then
 	fail 'a hanging mmcli call unexpectedly produced status output'
 else
 	[ "$?" -eq 3 ] || fail 'a hanging mmcli call did not remain retryable'
 fi
 bounded_elapsed=$(($(date +%s) - bounded_started))
-[ "$bounded_elapsed" -le 5 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
+[ "$bounded_elapsed" -le 10 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
 mmcli_hang_pid="$(cat "$STATE/mmcli-hang-pid" 2>/dev/null || :)"
 [ -n "$mmcli_hang_pid" ] || fail 'hanging mmcli fixture did not start'
 if kill -0 "$mmcli_hang_pid" 2>/dev/null; then

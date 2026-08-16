@@ -938,9 +938,21 @@ print_modem_json() {
 	json_key_string data_device "$data_device"; printf ','
 	json_key_string at_device "$at_device"; printf ','
 	json_key_string protocol "$protocol"; printf ','
-	json_key_string implementation_state experimental; printf ','
-	json_key_string validation_state synthetic; printf ','
-	json_key_boolean hardware_validated false; printf ','
+	# Maturity of this inventory implementation and the evidence behind it, kept
+	# separate exactly as in the APN backend contract. The code is the same for
+	# every record, so implementation state does not vary; the evidence does.
+	# QMI and MBIM classification have both been validated on real hardware,
+	# while AT-only and unclassified devices have fixture coverage alone. As
+	# with the APN backends, that evidence is one modem on one board and does
+	# not transfer to other hardware by itself.
+	record_validation=synthetic
+	record_hardware_validated=false
+	case "$protocol" in
+		qmi|mbim) record_validation=hardware; record_hardware_validated=true ;;
+	esac
+	json_key_string implementation_state stable; printf ','
+	json_key_string validation_state "$record_validation"; printf ','
+	json_key_boolean hardware_validated "$record_hardware_validated"; printf ','
 	json_key_string owner_state "$owner_state"; printf ','
 	json_key_string netifd_interface "$netifd_interface"; printf ','
 	printf '"capabilities":{"inventory":true,'

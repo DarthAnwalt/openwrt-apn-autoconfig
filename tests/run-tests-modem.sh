@@ -451,9 +451,9 @@ assert m["modem_id"].startswith("usb-serial:1-1.2:"), m
 assert m["control_device"] == "/dev/cdc-wdm0", m
 assert m["data_device"] == "wwan0", m
 assert m["protocol"] == "qmi", m
-assert m["implementation_state"] == "experimental", m
-assert m["validation_state"] == "synthetic", m
-assert m["hardware_validated"] is False, m
+assert m["implementation_state"] == "stable", m
+assert m["validation_state"] == "hardware", m
+assert m["hardware_validated"] is True, m
 assert m["owner_state"] == "none", m
 assert m["ambiguous"] is False, m
 ' "$out" || fail 'single QMI modem record is wrong'
@@ -527,6 +527,14 @@ assert by_protocol["mbim"]["data_device"] == "wwan4", by_protocol
 assert by_protocol["at"]["at_device"] == "/dev/ttyUSB8", by_protocol
 assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
+# Maturity is about this implementation, evidence about the protocol: MBIM
+# classification has a hardware record, AT-only has fixtures alone.
+assert by_protocol["mbim"]["implementation_state"] == "stable", by_protocol
+assert by_protocol["mbim"]["validation_state"] == "hardware", by_protocol
+assert by_protocol["mbim"]["hardware_validated"] is True, by_protocol
+assert by_protocol["at"]["implementation_state"] == "stable", by_protocol
+assert by_protocol["at"]["validation_state"] == "synthetic", by_protocol
+assert by_protocol["at"]["hardware_validated"] is False, by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
 
 printf '%s\n' 'TEST the board power-cycle follows the pinned modem, not its control protocol'

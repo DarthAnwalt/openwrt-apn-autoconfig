@@ -213,6 +213,38 @@ assert.deepStrictEqual(buttonLabels(ownedNodes),
 	[ 'Connect', 'Reconnect', 'Disconnect', 'Remove setup' ],
 	'a project-owned modem must offer connection control and removal');
 
+/* The read-only inventory card looks exactly like the place controls would be,
+ * so a modem this package will not drive has to say why there are none. Without
+ * this the page shows a modem, no controls and no reason - which is what a real
+ * browser session found. */
+var inventoryApp = loadView();
+var foreignInventory = inventoryApp.modemInventoryNodes({
+	version: 'v1',
+	modems: [ Object.assign(modemFixture({ can_provision: false, reason: 'already_configured' }),
+		{ owner_state: 'modemmanager', netifd_interface: 'wwan' }) ]
+});
+var foreignText = collectText(foreignInventory).join(' ');
+assert.ok(foreignText.indexOf('wwan') !== -1,
+	'the inventory card must name the interface that owns the modem');
+assert.ok(/only reported here/.test(foreignText),
+	'the inventory card must explain that it will not drive this modem');
+assert.deepStrictEqual(buttonLabels(foreignInventory), [],
+	'the inventory card must stay read-only');
+
+var ownedInventory = loadView().modemInventoryNodes({
+	version: 'v1',
+	modems: [ modemFixture({ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1' }) ]
+});
+assert.ok(!/only reported here/.test(collectText(ownedInventory).join(' ')),
+	'a modem this package set up must not be described as merely reported');
+
+var setupInventory = loadView().modemInventoryNodes({
+	version: 'v1',
+	modems: [ modemFixture({ can_provision: true, reason: 'ok', section: 'apnmodem1', protocol: 'qmi' }) ]
+});
+assert.ok(!/only reported here/.test(collectText(setupInventory).join(' ')),
+	'a modem that can be set up must not be described as merely reported');
+
 /* A missing optional package explains itself rather than showing dead buttons. */
 var absentNodes = loadView().provisioningNodes({ error: 'not installed' });
 assert.deepStrictEqual(buttonLabels(absentNodes), [],

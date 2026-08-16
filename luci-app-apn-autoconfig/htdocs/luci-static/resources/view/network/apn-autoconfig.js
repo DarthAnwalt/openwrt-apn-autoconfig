@@ -966,7 +966,21 @@ return view.extend({
 			];
 			if (modem.ambiguous)
 				rows.push(row(_('Ambiguous'), modem.ambiguity_reason || _('yes')));
-			return E('div', { 'class': 'apn-modem-entry' }, [ table(rows) ]);
+
+			/* This card is a read-only report, and it looks exactly like the
+			 * place controls would live. Saying nothing here leaves the absence
+			 * of controls unexplained, so a modem this package will not drive
+			 * says so and points at the section that does have controls. */
+			var nodes = [ table(rows) ];
+			var plan = modem.plan || {};
+			if (!plan.error && !plan.can_provision && plan.reason !== 'already_provisioned') {
+				nodes.push(E('p', { 'class': 'apn-modem-note' }, [
+					modem.netifd_interface
+						? _('This modem is only reported here: it belongs to the existing interface "%s", which this package did not create and does not drive. Setup and connection controls appear for modems it set up itself.').format(modem.netifd_interface)
+						: _('This modem is only reported here. See "Modem setup" below for why it cannot be set up yet.')
+				]));
+			}
+			return E('div', { 'class': 'apn-modem-entry' }, nodes);
 		}, this);
 	},
 

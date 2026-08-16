@@ -1,5 +1,32 @@
 # Changelog
 
+## apn-autoconfig 0.13.1 / apn-autoconfig-modem 0.13.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.1 (2026-08-16)
+
+A defect-only patch with no feature or API change.
+
+0.13.0 offered **Connect**, **Reconnect** and **Disconnect** for any resolvable
+cellular interface, and those three controls did not grey out while an operation
+started anywhere else was running — a reconcile or power-cycle from the page, a
+command over SSH, or the physical button. Every one of them takes the same
+global lock, so the controls were live buttons that could only fail on it.
+
+Nothing unsafe happened: the coordinator refused the launch and reported it as
+retryable, exactly as it does for any second operation. But the page's own rule
+is that a control is never offered for something that cannot work, and this
+broke it. It also removed the protection against a second click that the
+reconcile and power-cycle buttons have always had.
+
+The busy state is now symmetric. The modem card's controls are disabled both
+when the card is rendered while the engine is busy and when a poll learns the
+engine became busy, which is what covers an operation this page did not start.
+The reverse direction already worked, because the engine reports a modem
+operation holding the shared lock as an external one.
+
+The regression this adds is the case the existing fixtures did not have: a modem
+that is idle while the engine is not. They asserted only that a control is
+disabled while *that modem's* operation runs, which was true in 0.13.0 and
+missed the defect entirely.
+
 ## apn-autoconfig 0.13.0 / apn-autoconfig-modem 0.13.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.0 (2026-08-16)
 
 A coherent web interface, and one correction to who may start a connection.

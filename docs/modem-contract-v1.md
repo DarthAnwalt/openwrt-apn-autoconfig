@@ -203,6 +203,19 @@ Resolution never runs at all while `owner_state` is `modemmanager` or
 and probing underneath it is exactly the race the single-owner invariant
 forbids. This is the same gate that already precedes a direct `uqmi` probe.
 
+This restraint is deliberate rather than forced, and the distinction is worth
+recording because the temptation to relax it is concrete. A multi-port modem
+under ModemManager typically leaves a *second* AT port apparently free, and
+probing it usually appears to work. It is still not permission: ownership is of
+the modem, not of one node. Firmware may serialize AT internally across ports,
+unsolicited result codes can reach the wrong reader, and which port ModemManager
+holds varies by version and plugin, so a rule built on observing the free one is
+built on an accident. Nothing is lost by refusing — a ModemManager-owned modem
+already has a native identity path — and what would be lost by allowing it is
+the single-owner invariant itself. When a later milestone genuinely needs the
+port under ModemManager, the answer is a bounded ownership transition, not an
+unannounced second reader.
+
 ### Quirk table
 
 Vendor divergence is carried by a table keyed by `manufacturer` and `model`,

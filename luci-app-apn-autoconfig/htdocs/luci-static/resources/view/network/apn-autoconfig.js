@@ -95,15 +95,54 @@ function sensitiveIdentifier(value, label) {
 	}, [ display, button ]);
 }
 
-function row(label, value) {
+/* Help opens on activation, never on hover: a hover tooltip is unreachable on
+ * a touch screen, and touch screens are how many people administer a router.
+ * The text is created when it is asked for rather than hidden with CSS, so
+ * "not shown" and "not there" are the same state. */
+function helpfulLabel(label, help) {
+	if (!help)
+		return E('strong', {}, [ label ]);
+
+	var body = E('div', { 'class': 'apn-help-body' }, []);
+	var opened = false;
+	var button = E('button', {
+		'class': 'btn cbi-button cbi-button-neutral apn-help-toggle',
+		'type': 'button',
+		'aria-expanded': 'false',
+		'title': _('What does “%s” mean?').format(label),
+		'aria-label': _('What does “%s” mean?').format(label),
+		'click': function(ev) {
+			ev.preventDefault();
+			opened = !opened;
+			dom.content(body, opened ? [ E('p', { 'class': 'apn-help-text' }, [ help ]) ] : []);
+			button.setAttribute('aria-expanded', opened ? 'true' : 'false');
+		}
+	}, [ '?' ]);
+
+	return E('div', { 'class': 'apn-help' }, [
+		E('span', { 'class': 'apn-help-label' }, [ E('strong', {}, [ label ]), button ]),
+		body
+	]);
+}
+
+function row(label, value, help) {
 	return E('tr', { 'class': 'tr' }, [
-		E('td', { 'class': 'td left apn-label', 'style': 'width:40%' }, [ E('strong', {}, [ label ]) ]),
+		E('td', { 'class': 'td left apn-label', 'style': 'width:40%' }, [ helpfulLabel(label, help) ]),
 		E('td', { 'class': 'td left apn-value' }, [ valueNode(value) ])
 	]);
 }
 
 function table(rows) {
 	return E('table', { 'class': 'table apn-table' }, rows);
+}
+
+/* Evidence-grade fields stay truthful and stay available; they simply stop
+ * being the first thing a person reads. Closed by default, every time. */
+function advanced(rows) {
+	return E('details', { 'class': 'apn-details apn-advanced' }, [
+		E('summary', {}, [ _('Advanced and diagnostic details') ]),
+		table(rows)
+	]);
 }
 
 function networkLabel(name, id) {
@@ -218,6 +257,14 @@ function trustLabel(value, positive, negative) {
 	return E('span', { 'class': value ? 'apn-state-good' : 'apn-state-bad' }, [ value ? positive : negative ]);
 }
 
+function registrationLabel(status) {
+	if (!status || status.error)
+		return _('unknown');
+	if (status.roaming === true)
+		return _('%s (roaming)').format(status.registration_state || _('registered'));
+	return status.registration_state || _('unknown');
+}
+
 return view.extend({
 	load: function() {
 		return Promise.all([
@@ -247,6 +294,366 @@ return view.extend({
 					})).then(function() { return inventory; });
 				})
 		]);
+	},
+
+	/* ---- status strip -------------------------------------------------- */
+
+	/* Tabs hide state, and the state most worth seeing is exactly the state a
+	 * user is least likely to be looking at when it breaks. Everything here is
+	 * visible from every tab. */
+	stripNodes: function(status, action) {
+		var items = [];
+
+		function item(label, value, cssClass) {
+			return E('div', { 'class': 'apn-strip-item ' + (cssClass || '') }, [
+				E('span', { 'class': 'apn-strip-label' }, [ label ]),
+				E('span', { 'class': 'apn-strip-value' }, [ valueNode(value) ])
+			]);
+		}
+
+		if (!status || status.error) {
+			items.push(item(_('Target'), _('unavailable'), 'apn-strip-bad'));
+			items.push(item(_('Status'), status && status.error || _('unknown error'), 'apn-strip-bad'));
+			return [ E('div', { 'class': 'apn-strip' }, items) ];
+		}
+
+		items.push(item(_('Target'), '%s (%s)'.format(status.interface, status.target_backend || _('unknown'))));
+		items.push(item(_('Registration'), registrationLabel(status),
+			status.registration_state === 'denied' || status.registration_state === 'emergency-only'
+				? 'apn-strip-bad' : ''));
+		items.push(item(_('Connection'), status.interface_up ? _('up') : _('down or pending'),
+			status.interface_up ? 'apn-strip-good' : 'apn-strip-warn'));
+
+		var failed = status.result_code && status.result_code !== 'success';
+		items.push(item(_('Last result'), status.last_result || _('nothing recorded yet'),
+			failed ? 'apn-strip-bad' : ''));
+
+		var running = action && !action.error && action.busy;
+		if (running)
+			items.push(item(_('Running'), this.actionDescription(action), 'apn-strip-busy'));
+
+		return [ E('div', { 'class': 'apn-strip' }, items) ];
+	},
+
+	refreshStrip: function() {
+		if (this.stripBox)
+			dom.content(this.stripBox, this.stripNodes(this.currentStatus, this.currentAction));
+	},
+
+	/* ---- modem area ---------------------------------------------------- */
+
+	modemOwnerStateLabel: function(state) {
+		switch (state) {
+		case 'none': return _('No active control session');
+		case 'netifd-direct': return _('Controlled directly by netifd');
+		case 'modemmanager': return _('Controlled by ModemManager');
+		case 'transitioning': return _('Reset in progress');
+		case 'conflicting': return _('Conflicting owners — no operation will start');
+		default: return text(state);
+		}
+	},
+
+	/* Why a modem cannot be set up, in the user's terms. A missing control is
+	 * always explained; the view never shows a button that is going to fail. */
+	provisionReasonText: function(reason) {
+		switch (reason) {
+		case 'already_configured':
+			return _('This modem belongs to a network interface you created, so its configuration is left alone. It can still be connected and disconnected from here.');
+		case 'already_provisioned':
+			return _('This modem is set up by this package.');
+		case 'ambiguous':
+			return _('This modem could not be told apart from another one, so nothing will be changed automatically.');
+		case 'unsupported_protocol':
+			return _('Setting up this modem automatically is not supported yet for its control protocol.');
+		case 'conflicting_owner':
+			return _('Another component is claiming control of this modem, so it is left alone.');
+		case 'no_device':
+			return _('No usable control device was found for this modem.');
+		}
+		return _('This modem cannot be set up automatically right now.');
+	},
+
+	modemOperationText: function(operation) {
+		if (!operation || operation.error)
+			return '';
+		if (operation.busy)
+			return _('Working on this modem…');
+		switch (operation.state) {
+		case 'success': return _('Last operation finished successfully.');
+		case 'failed': return _('Last operation failed: %s').format(operation.message || _('unknown error'));
+		case 'blocked': return _('Last operation was refused: %s').format(operation.message || _('not permitted'));
+		case 'retryable': return _('Last operation could not finish and may be retried: %s').format(operation.message || '');
+		}
+		return '';
+	},
+
+	modemActionButton: function(modem, verb, label, cssClass) {
+		var self = this;
+		var button = E('button', {
+			'class': 'btn cbi-button ' + cssClass,
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmModemAction(modem, verb); }
+		}, [ label ]);
+		button.disabled = !!(modem.operation && modem.operation.busy);
+		self.modemButtons.push(button);
+		return button;
+	},
+
+	/* One card per modem, answering "what is the hardware doing?". The old page
+	 * answered it twice, in two cards far enough apart that they never appeared
+	 * together and nobody could say what separated them. */
+	modemAreaNodes: function(inventory, status) {
+		var self = this;
+		self.modemButtons = [];
+		self.resetButtons = [];
+		self.resetButton = null;
+
+		var radio = [];
+		if (status && !status.error)
+			radio.push(table([
+				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id),
+					_('The network currently carrying the radio link. While roaming this differs from the provider your APN profile was matched from.')),
+				row(_('Registration'), registrationLabel(status),
+					_('Whether the modem is registered on a network. APN profiles are never tested before registration succeeds.')),
+				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
+				row(_('Signal quality'), signalQuality(status.signal_quality)),
+				row(_('Mobile interface'), '%s: %s'.format(status.interface,
+					status.interface_up ? _('up') : _('down or pending')))
+			]));
+
+		var cards;
+		if (!inventory || inventory.error)
+			cards = [ E('p', { 'class': 'apn-modem-unavailable' }, [
+				_('Modem inventory is unavailable. The optional apn-autoconfig-modem package may be absent, disabled or unable to complete its bounded scan. The APN functions remain independent of it.')
+			]) ];
+		else {
+			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
+			if (!modems.length)
+				cards = [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
+			else
+				cards = modems.map(function(modem) { return self.modemCard(modem); });
+		}
+
+		return radio.concat(cards);
+	},
+
+	modemCard: function(modem) {
+		var self = this;
+		var plan = modem.plan || {};
+		var buttons = [];
+		var explanation = '';
+
+		var rows = [
+			row(_('Protocol'), modem.protocol),
+			row(_('Control owner'), self.modemOwnerStateLabel(modem.owner_state),
+				_('Which component is allowed to talk to this modem. Two components claiming it at once stops every operation rather than racing them.')),
+			row(_('Network interface'), modem.netifd_interface || plan.connection_section || _('none'))
+		];
+		if (modem.ambiguous)
+			rows.push(row(_('Ambiguous'), modem.ambiguity_reason || _('yes')));
+
+		if (plan.error)
+			explanation = _('The setup check could not run. See the system log for details.');
+		else {
+			/* Bearer control and configuration control are separate questions,
+			 * and the backend answers the first one for us: connect is offered
+			 * exactly when the runtime would accept it. */
+			if (plan.can_control_bearer) {
+				buttons.push(self.modemActionButton(modem, 'connect', _('Connect'), 'cbi-button-action'));
+				buttons.push(self.modemActionButton(modem, 'reconnect', _('Reconnect'), 'cbi-button-neutral'));
+				buttons.push(self.modemActionButton(modem, 'disconnect', _('Disconnect'), 'cbi-button-neutral'));
+			}
+			if (plan.can_provision) {
+				rows.push(row(_('Would create interface'), text(plan.section)));
+				explanation = _('This modem is not configured yet. Setting it up creates a new network interface, finds the right APN for its SIM, verifies real Internet access and only then enables automatic connection. If anything fails, everything is undone.');
+				buttons.push(self.modemActionButton(modem, 'provision', _('Set up this modem'), 'cbi-button-action important'));
+			}
+			else {
+				explanation = self.provisionReasonText(plan.reason);
+				if (plan.reason === 'already_provisioned')
+					buttons.push(self.modemActionButton(modem, 'deprovision', _('Remove setup'), 'cbi-button-remove'));
+			}
+		}
+
+		if (self.hardwareIntegration && modem.capabilities && modem.capabilities.reset === true)
+			buttons.push(self.resetButtonFor(modem));
+
+		var nodes = [ table(rows), E('p', {}, [ explanation ]) ];
+		var operationText = self.modemOperationText(modem.operation);
+		if (operationText)
+			nodes.push(E('p', { 'class': 'apn-action-status' }, [ operationText ]));
+		if (buttons.length)
+			nodes.push(E('div', { 'class': 'apn-button-row' }, buttons));
+
+		nodes.push(advanced([
+			row(_('Modem identity'), sensitiveIdentifier(modem.modem_id, _('modem identity'))),
+			row(_('Evidence'), modem.evidence_tier),
+			row(_('Implementation'), modem.implementation_state),
+			row(_('Validation'), modem.hardware_validated ? _('hardware') : modem.validation_state),
+			row(_('USB path'), modem.usb_path),
+			row(_('Vendor / product'), modem.vendor_id && modem.product_id
+				? '%s:%s'.format(modem.vendor_id, modem.product_id) : ''),
+			row(_('Control device'), modem.control_device),
+			row(_('Data device'), modem.data_device),
+			row(_('First seen'), formatTimestamp(modem.first_seen))
+		]));
+
+		return E('div', { 'class': 'apn-modem-entry' }, nodes);
+	},
+
+	/* The power-cycle keeps running through the engine command the hardware
+	 * button already uses, so the validated reset-then-reconcile behaviour is
+	 * unchanged; only where the control lives has moved. */
+	resetButtonFor: function() {
+		var self = this;
+		var button = E('button', {
+			'class': 'btn cbi-button cbi-button-negative',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
+		}, [ _('Power-cycle modem') ]);
+		button.disabled = !!self.busy;
+		/* Tracked as a list because a board could pin more than one modem, and
+		 * disabling only the most recently rendered one would leave a live
+		 * control behind during an operation. */
+		self.resetButtons.push(button);
+		self.resetButton = self.resetButtons[0];
+		self.modemButtons.push(button);
+		return button;
+	},
+
+	confirmModemAction: function(modem, verb) {
+		var self = this;
+		if (modem.operation && modem.operation.busy)
+			return;
+
+		var plan = modem.plan || {};
+		var section = plan.connection_section || plan.existing_section || modem.netifd_interface || '';
+		var titles = {
+			provision: _('Set up this modem'),
+			deprovision: _('Remove setup'),
+			connect: _('Connect'),
+			disconnect: _('Disconnect'),
+			reconnect: _('Reconnect')
+		};
+		/* Every bearer-control confirmation names the interface it will act on,
+		 * because offering to start an interface is not a claim to own it and
+		 * the user has to be able to tell which one this is. */
+		var warnings = {
+			provision: _('A new network interface called %s will be created for this modem. Its APN is chosen and verified before automatic connection is enabled. Nothing else on this router is changed.').format(plan.section || ''),
+			deprovision: _('The network interface %s created for this modem will be stopped and removed. Interfaces you created yourself are never touched.').format(plan.existing_section || ''),
+			connect: _('This asks netifd to bring the interface %s up. No configuration is changed.').format(section),
+			disconnect: _('This stops the interface %s. Any connection through it will be interrupted. No configuration is changed.').format(section),
+			reconnect: _('This stops and restarts the interface %s. Connectivity will be interrupted briefly. No configuration is changed.').format(section)
+		};
+		var destructive = verb === 'deprovision' || verb === 'disconnect';
+
+		ui.showModal(titles[verb], [
+			E('p', {}, [ warnings[verb] ]),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn important ' + (destructive ? 'cbi-button-remove' : 'cbi-button-action'),
+					'click': function() {
+						ui.hideModal();
+						self.startModemAction(modem, verb);
+					}
+				}, [ titles[verb] ])
+			])
+		]);
+	},
+
+	startModemAction: function(modem, verb) {
+		var self = this;
+		self.setModemButtonsBusy(true);
+
+		return call(modemControlCommand, [ verb, modem.modem_id ]).then(function(result) {
+			if (!result.accepted && !result.busy)
+				throw new Error(result.message || _('The operation could not be started'));
+			/* Accepted or safely coalesced: polling decides when it is over. */
+			self.modemPollPending = true;
+		}).catch(function(error) {
+			/* The launch answer may have been lost after the job was accepted,
+			 * so this never reports success or failure on its own. */
+			self.modemPollPending = true;
+			ui.addNotification(null, E('p', {}, [ error.message ]), 'error');
+		});
+	},
+
+	setModemButtonsBusy: function(busy) {
+		(this.modemButtons || []).forEach(function(button) { button.disabled = !!busy; });
+	},
+
+	refreshProvisioning: function() {
+		var self = this;
+		return call(modemQueryCommand, [ 'inventory' ]).then(function(inventory) {
+			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
+			return Promise.all(modems.map(function(modem) {
+				return Promise.all([
+					callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
+						.catch(function(error) { return { error: error.message }; }),
+					call(modemQueryCommand, [ 'action-status', modem.modem_id ])
+						.catch(function(error) { return { error: error.message }; })
+				]).then(function(pair) {
+					modem.plan = pair[0];
+					modem.operation = pair[1];
+				});
+			})).then(function() { return inventory; });
+		}).then(function(inventory) {
+			self.modemInventory = inventory;
+			var anyBusy = (Array.isArray(inventory.modems) ? inventory.modems : []).some(function(modem) {
+				return modem.operation && modem.operation.busy;
+			});
+			self.modemPollPending = anyBusy;
+			if (self.modemBox)
+				dom.content(self.modemBox, self.modemAreaNodes(inventory, self.currentStatus));
+		}).catch(function() {
+			/* A lost poll never invents a result; the next tick tries again. */
+		});
+	},
+
+	/* ---- APN area ------------------------------------------------------ */
+
+	apnAreaNodes: function(status) {
+		var self = this;
+		/* An unavailable status is where the guidance about other discovered
+		 * targets belongs: it is the one place that can say what to select
+		 * instead, and it must not be lost behind an "unavailable" line. */
+		if (!status || status.error)
+			return this.statusWarnings(status);
+
+		var nodes = this.statusWarnings(status);
+		nodes.push(table([
+			row(_('Matched provider'), simProviderLabel(status),
+				_('The database record this APN profile was selected from. While roaming it differs from the network currently carrying the link, which is shown under Modem.')),
+			row(_('Configured APN'), status.configured_apn || _('<empty>')),
+			row(_('Cached APN for this SIM'), status.cached_apn,
+				_('The profile last verified for this SIM. It is reused instead of searching the database again.')),
+			row(_('Reconciled APN'), status.reconciled_apn),
+			row(_('Last result'), status.last_result)
+		]));
+
+		nodes.push(E('div', { 'class': 'apn-button-row' }, [ self.reconcileButton, self.manualButton ]));
+
+		nodes.push(E('h4', {}, [ _('Roaming data policy') ]));
+		nodes.push(self.policyDescription);
+		nodes.push(E('div', { 'class': 'apn-policy-controls' }, [ self.policySelect, self.policyButton ]));
+
+		nodes.push(advanced([
+			row(_('Engine target'), status.target_id),
+			row(_('Protocol / backend'), '%s / %s'.format(status.target_protocol, status.target_backend)),
+			row(_('Implementation / validation'), '%s / %s'.format(
+				status.target_implementation_state || '—', status.target_validation_state || '—')),
+			row(_('Hardware validated'), status.target_hardware_validated ? _('yes') : _('no')),
+			row(_('Effective data device'), status.l3_device || status.device),
+			row(_('Manual operator lock (PLMN)'), status.configured_plmn),
+			row(_('Database format'), status.database_format ? 'v%s'.format(status.database_format) : ''),
+			row(_('Sources'), status.database_sources),
+			row(_('Source revisions'), status.database_revisions),
+			row(_('Database path'), status.database_path)
+		]));
+
+		return nodes;
 	},
 
 	statusWarnings: function(status) {
@@ -284,50 +691,35 @@ return view.extend({
 		return nodes;
 	},
 
-	connectionNodes: function(status) {
+	/* ---- SIM area ------------------------------------------------------ */
+
+	simAreaNodes: function(status) {
 		if (!status || status.error)
-			return this.statusWarnings(status);
-		return this.statusWarnings(status).concat([
+			return [ E('p', { 'class': 'alert-message warning' }, [
+				_('SIM status is unavailable: %s').format(status && status.error || _('unknown error'))
+			]) ];
+
+		return [
 			table([
 				row(_('SIM / eSIM provider'), simProviderLabel(status)),
-				row(_('Home network'), homeNetworkLabel(status)),
-				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id)),
-				row(_('Registration'), status.registration_state),
-				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
-				row(_('Signal quality'), signalQuality(status.signal_quality)),
-				row(_('Mobile interface'), '%s: %s'.format(status.interface, status.interface_up ? _('up') : _('down or pending')))
+				row(_('Home network'), homeNetworkLabel(status),
+					_('The network the SIM belongs to, which is what the APN profile is chosen for even while roaming on another one.')),
+				row(_('Reconciled SIM'), sensitiveIdentifier(status.reconciled_iccid, _('SIM identifier'))),
+				row(_('SIM slot / backend index'), status.sim_index)
 			]),
-			E('details', { 'class': 'apn-details' }, [
-				E('summary', {}, [ _('SIM and modem details') ]),
-				table([
-					row(_('ICCID'), sensitiveIdentifier(status.iccid, _('ICCID'))),
-					row(_('IMSI'), sensitiveIdentifier(status.imsi, _('IMSI'))),
-					row(_('EID'), sensitiveIdentifier(status.eid, _('EID'))),
-					row(_('SIM slot / backend index'), status.sim_index),
-					row(_('Modem / control identifier'), status.modem_index),
-					row(_('Engine target'), status.target_id),
-					row(_('Protocol / backend'), '%s / %s'.format(status.target_protocol, status.target_backend)),
-					row(_('Implementation / validation'), '%s / %s'.format(
-						status.target_implementation_state || '—', status.target_validation_state || '—')),
-					row(_('Hardware validated'), status.target_hardware_validated ? _('yes') : _('no')),
-					row(_('Effective data device'), status.l3_device || status.device),
-					row(_('Manual operator lock (PLMN)'), status.configured_plmn)
-				])
+			E('p', {}, [
+				_('eSIM profile management is not part of this release. This area holds the subscription identity the APN engine reads today.')
+			]),
+			advanced([
+				row(_('ICCID'), sensitiveIdentifier(status.iccid, _('ICCID'))),
+				row(_('IMSI'), sensitiveIdentifier(status.imsi, _('IMSI'))),
+				row(_('EID'), sensitiveIdentifier(status.eid, _('EID'))),
+				row(_('Modem / control identifier'), status.modem_index)
 			])
-		]);
+		];
 	},
 
-	apnNodes: function(status) {
-		if (!status || status.error)
-			return [ E('p', { 'class': 'alert-message warning' }, [ _('APN status is unavailable.') ]) ];
-		return [ table([
-			row(_('Configured APN'), status.configured_apn || _('<empty>')),
-			row(_('Cached APN for this SIM'), status.cached_apn),
-			row(_('Last result'), status.last_result),
-			row(_('Reconciled APN'), status.reconciled_apn),
-			row(_('Reconciled SIM'), sensitiveIdentifier(status.reconciled_iccid, _('SIM identifier')))
-		]) ];
-	},
+	/* ---- provider database --------------------------------------------- */
 
 	databaseAlert: function(database) {
 		if (!database || database.error)
@@ -341,7 +733,7 @@ return view.extend({
 		]);
 	},
 
-	databaseNodes: function(database, status) {
+	databaseNodes: function(database) {
 		if (!database || database.error)
 			return [ this.databaseAlert(database) ];
 		var rows = [
@@ -349,36 +741,33 @@ return view.extend({
 			row(_('Database version'), database.database_version),
 			row(_('Data release date'), databaseReleaseDate(database.database_version)),
 			row(_('Last update check'), formatTimestamp(database.checked_at) || _('Not checked yet')),
-			row(_('Last installation through this page'), formatTimestamp(database.installed_at) || _('Not recorded')),
-			row(_('Signed package feed'), trustLabel(database.feed_configured, _('Configured'), _('Not configured'))),
-			row(_('Repository signing key'), trustLabel(database.key_trusted, _('Trusted'), _('Not installed')))
+			row(_('Last installation through this page'), formatTimestamp(database.installed_at) || _('Not recorded'))
 		];
 		if (database.update_available)
 			rows.splice(3, 0, row(_('Available package version'), database.available_package_version));
 
-		var nodes = [ this.databaseAlert(database), table(rows) ];
-		if (status && !status.error)
-			nodes.push(E('details', { 'class': 'apn-details' }, [
-				E('summary', {}, [ _('Database technical details') ]),
-				table([
-					row(_('Database format'), status.database_format ? 'v%s'.format(status.database_format) : ''),
-					row(_('Sources'), status.database_sources),
-					row(_('Source revisions'), status.database_revisions),
-					row(_('Database path'), status.database_path),
-					row(_('Feed URL'), database.feed_url)
-				])
-			]));
-		nodes.push(E('div', { 'class': 'apn-button-row' }, [
-			this.databaseCheckButton,
-			this.databaseInstallButton
-		]));
-		return nodes;
+		return [
+			this.databaseAlert(database),
+			table(rows),
+			E('div', { 'class': 'apn-button-row' }, [
+				this.databaseCheckButton,
+				this.databaseInstallButton
+			]),
+			advanced([
+				row(_('Signed package feed'), trustLabel(database.feed_configured, _('Configured'), _('Not configured'))),
+				row(_('Repository signing key'), trustLabel(database.key_trusted, _('Trusted'), _('Not installed'))),
+				row(_('Feed URL'), database.feed_url)
+			])
+		];
 	},
+
+	/* ---- operations ----------------------------------------------------- */
 
 	actionLabel: function(action) {
 		switch (action) {
 		case 'reconcile': return _('APN re-detection');
 		case 'modem-reset': return _('modem power-cycle');
+		case 'apply-manual': return _('manual APN');
 		case 'roaming-default':
 		case 'roaming-allow':
 		case 'roaming-block': return _('roaming policy change');
@@ -407,16 +796,17 @@ return view.extend({
 
 	setBusy: function(busy, action) {
 		this.busy = !!busy;
+		this.currentAction = action;
 		if (this.manualButton)
 			this.manualButton.disabled = this.busy || !this.profileApplySupported;
 		if (this.reconcileButton)
 			this.reconcileButton.disabled = this.busy || !this.profileApplySupported;
-		if (this.resetButton)
-			this.resetButton.disabled = this.busy || !this.profileApplySupported;
+		(this.resetButtons || []).forEach(function(button) {
+			button.disabled = this.busy || !this.profileApplySupported;
+		}, this);
 		this.updatePolicyControls();
 		this.updateDatabaseControls();
-		if (this.actionStatus)
-			dom.content(this.actionStatus, [ this.actionDescription(action) ]);
+		this.refreshStrip();
 	},
 
 	/* The three policies cannot express a custom option pair, so that state is
@@ -448,12 +838,10 @@ return view.extend({
 		}
 	},
 
-	setDatabaseStatus: function(database, status) {
+	setDatabaseStatus: function(database) {
 		this.databaseStatus = database;
-		if (status)
-			this.currentStatus = status;
 		if (this.databaseBox)
-			dom.content(this.databaseBox, this.databaseNodes(database, this.currentStatus));
+			dom.content(this.databaseBox, this.databaseNodes(database));
 		this.updateDatabaseControls();
 	},
 
@@ -462,7 +850,7 @@ return view.extend({
 		return call(queryCommand, [ 'database-status' ]).catch(function(error) {
 			return { error: error.message };
 		}).then(function(database) {
-			self.setDatabaseStatus(database, null);
+			self.setDatabaseStatus(database);
 		});
 	},
 
@@ -473,8 +861,7 @@ return view.extend({
 			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
 		]).then(function(values) {
 			var status = values[0];
-			dom.content(self.connectionBox, self.connectionNodes(status));
-			dom.content(self.apnBox, self.apnNodes(status));
+			self.currentStatus = status;
 			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
 			self.policySupported = roamingPolicySupported(status);
 			if (self.policySelect && self.policySupported) {
@@ -483,8 +870,15 @@ return view.extend({
 			}
 			if (self.policyDescription)
 				dom.content(self.policyDescription, [ roamingPolicyDescription(status) ]);
-			self.setDatabaseStatus(values[1], status);
+			if (self.apnBox)
+				dom.content(self.apnBox, self.apnAreaNodes(status));
+			if (self.simBox)
+				dom.content(self.simBox, self.simAreaNodes(status));
+			if (self.modemBox)
+				dom.content(self.modemBox, self.modemAreaNodes(self.modemInventory, status));
+			self.setDatabaseStatus(values[1]);
 			self.updatePolicyControls();
+			self.refreshStrip();
 		});
 	},
 
@@ -608,210 +1002,16 @@ return view.extend({
 		]);
 	},
 
-	modemOwnerStateLabel: function(state) {
-		switch (state) {
-		case 'none': return _('No active control session');
-		case 'netifd-direct': return _('Controlled directly by netifd');
-		case 'modemmanager': return _('Controlled by ModemManager');
-		case 'transitioning': return _('Reset in progress');
-		case 'conflicting': return _('Conflicting owners — no operation will start');
-		default: return text(state);
-		}
-	},
+	/* ---- manual APN entry ----------------------------------------------- */
 
-	/* Why a modem cannot be set up, in the user's terms. A missing control is
-	 * always explained; the view never shows a button that is going to fail. */
-	provisionReasonText: function(reason) {
-		switch (reason) {
-		case 'already_configured':
-			return _('This modem already belongs to an existing network interface, so it is left alone. Remove or repoint that interface first if you want this package to manage it.');
-		case 'already_provisioned':
-			return _('This modem is set up by this package.');
-		case 'ambiguous':
-			return _('This modem could not be told apart from another one, so nothing will be changed automatically.');
-		case 'unsupported_protocol':
-			return _('Setting up this modem automatically is not supported yet for its control protocol.');
-		case 'conflicting_owner':
-			return _('Another component is claiming control of this modem, so it is left alone.');
-		case 'no_device':
-			return _('No usable control device was found for this modem.');
-		}
-		return _('This modem cannot be set up automatically right now.');
-	},
-
-	modemOperationText: function(operation) {
-		if (!operation || operation.error)
-			return '';
-		if (operation.busy)
-			return _('Working on this modem…');
-		switch (operation.state) {
-		case 'success': return _('Last operation finished successfully.');
-		case 'failed': return _('Last operation failed: %s').format(operation.message || _('unknown error'));
-		case 'blocked': return _('Last operation was refused: %s').format(operation.message || _('not permitted'));
-		case 'retryable': return _('Last operation could not finish and may be retried: %s').format(operation.message || '');
-		}
-		return '';
-	},
-
-	modemActionButton: function(modem, verb, label, cssClass) {
+	/* Manual entry is the fallback for a SIM the database does not cover.
+	 * Presented as a permanently expanded form it asked every user to fill in
+	 * something almost nobody should need, on a page whose normal answer is
+	 * "the automatic path already worked". */
+	openManualApn: function() {
 		var self = this;
-		var button = E('button', {
-			'class': 'btn cbi-button ' + cssClass,
-			'type': 'button',
-			'click': function(ev) { ev.preventDefault(); self.confirmModemAction(modem, verb); }
-		}, [ label ]);
-		button.disabled = !!(modem.operation && modem.operation.busy);
-		self.modemButtons.push(button);
-		return button;
-	},
-
-	provisioningNodes: function(inventory) {
-		var self = this;
-		self.modemButtons = [];
-
-		if (!inventory || inventory.error)
-			return [ E('p', {}, [
-				_('Modem setup is unavailable. The optional apn-autoconfig-modem package may be absent or unable to complete its bounded scan.')
-			]) ];
-
-		var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
-		if (!modems.length)
-			return [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
-
-		return modems.map(function(modem) {
-			var plan = modem.plan || {};
-			var rows = [ row(_('Modem'), sensitiveIdentifier(modem.modem_id, _('modem identity'))) ];
-			var buttons = [];
-			var explanation = '';
-
-			if (plan.error) {
-				explanation = _('The setup check could not run. See the system log for details.');
-			}
-			else if (plan.can_provision) {
-				rows.push(row(_('Would create interface'), text(plan.section)));
-				rows.push(row(_('Protocol'), text(plan.protocol)));
-				explanation = _('This modem is not configured yet. Setting it up creates a new network interface, finds the right APN for its SIM, verifies real Internet access and only then enables automatic connection. If anything fails, everything is undone.');
-				buttons.push(self.modemActionButton(modem, 'provision', _('Set up this modem'), 'cbi-button-action important'));
-			}
-			else if (plan.reason === 'already_provisioned') {
-				rows.push(row(_('Interface'), text(plan.existing_section)));
-				explanation = self.provisionReasonText(plan.reason);
-				buttons.push(self.modemActionButton(modem, 'connect', _('Connect'), 'cbi-button-action'));
-				buttons.push(self.modemActionButton(modem, 'reconnect', _('Reconnect'), 'cbi-button-neutral'));
-				buttons.push(self.modemActionButton(modem, 'disconnect', _('Disconnect'), 'cbi-button-neutral'));
-				buttons.push(self.modemActionButton(modem, 'deprovision', _('Remove setup'), 'cbi-button-remove'));
-			}
-			else {
-				explanation = self.provisionReasonText(plan.reason);
-			}
-
-			var operationText = self.modemOperationText(modem.operation);
-			var nodes = [ table(rows), E('p', {}, [ explanation ]) ];
-			if (operationText)
-				nodes.push(E('p', { 'class': 'apn-action-status' }, [ operationText ]));
-			if (buttons.length)
-				nodes.push(E('div', { 'class': 'apn-button-row' }, buttons));
-			return E('div', { 'class': 'apn-modem-entry' }, nodes);
-		});
-	},
-
-	confirmModemAction: function(modem, verb) {
-		var self = this;
-		if (modem.operation && modem.operation.busy)
+		if (self.busy || !self.profileApplySupported)
 			return;
-
-		var plan = modem.plan || {};
-		var titles = {
-			provision: _('Set up this modem'),
-			deprovision: _('Remove setup'),
-			connect: _('Connect'),
-			disconnect: _('Disconnect'),
-			reconnect: _('Reconnect')
-		};
-		var warnings = {
-			provision: _('A new network interface called %s will be created for this modem. Its APN is chosen and verified before automatic connection is enabled. Nothing else on this router is changed.').format(plan.section || ''),
-			deprovision: _('The network interface %s created for this modem will be stopped and removed. Interfaces you created yourself are never touched.').format(plan.existing_section || ''),
-			connect: _('This asks netifd to bring the interface up.'),
-			disconnect: _('This stops the mobile interface for this modem. Any connection through it will be interrupted.'),
-			reconnect: _('This stops and restarts the mobile interface for this modem. Connectivity will be interrupted briefly.')
-		};
-		var destructive = verb === 'deprovision' || verb === 'disconnect';
-
-		ui.showModal(titles[verb], [
-			E('p', {}, [ warnings[verb] ]),
-			E('div', { 'class': 'right' }, [
-				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
-				' ',
-				E('button', {
-					'class': 'btn important ' + (destructive ? 'cbi-button-remove' : 'cbi-button-action'),
-					'click': function() {
-						ui.hideModal();
-						self.startModemAction(modem, verb);
-					}
-				}, [ titles[verb] ])
-			])
-		]);
-	},
-
-	startModemAction: function(modem, verb) {
-		var self = this;
-		self.setModemButtonsBusy(true);
-
-		return call(modemControlCommand, [ verb, modem.modem_id ]).then(function(result) {
-			if (!result.accepted && !result.busy)
-				throw new Error(result.message || _('The operation could not be started'));
-			/* Accepted or safely coalesced: polling decides when it is over. */
-			self.modemPollPending = true;
-		}).catch(function(error) {
-			/* The launch answer may have been lost after the job was accepted,
-			 * so this never reports success or failure on its own. */
-			self.modemPollPending = true;
-			ui.addNotification(null, E('p', {}, [ error.message ]), 'error');
-		});
-	},
-
-	setModemButtonsBusy: function(busy) {
-		(this.modemButtons || []).forEach(function(button) { button.disabled = !!busy; });
-	},
-
-	refreshProvisioning: function() {
-		var self = this;
-		return call(modemQueryCommand, [ 'inventory' ]).then(function(inventory) {
-			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
-			return Promise.all(modems.map(function(modem) {
-				return Promise.all([
-					callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
-						.catch(function(error) { return { error: error.message }; }),
-					call(modemQueryCommand, [ 'action-status', modem.modem_id ])
-						.catch(function(error) { return { error: error.message }; })
-				]).then(function(pair) {
-					modem.plan = pair[0];
-					modem.operation = pair[1];
-				});
-			})).then(function() { return inventory; });
-		}).then(function(inventory) {
-			self.modemInventory = inventory;
-			var anyBusy = (Array.isArray(inventory.modems) ? inventory.modems : []).some(function(modem) {
-				return modem.operation && modem.operation.busy;
-			});
-			self.modemPollPending = anyBusy;
-			if (self.provisioningBox)
-				dom.content(self.provisioningBox, self.provisioningNodes(inventory));
-			if (self.modemBox)
-				dom.content(self.modemBox, self.modemInventoryNodes(inventory));
-		}).catch(function() {
-			/* A lost poll never invents a result; the next tick tries again. */
-		});
-	},
-
-	manualApnNodes: function(status) {
-		var self = this;
-		var supported = status && !status.error && targetCapability(status, 'profile_apply');
-
-		if (!supported)
-			return [ E('p', {}, [
-				_('A profile cannot be applied to the selected target, so manual entry is unavailable.')
-			]) ];
 
 		self.manualApn = E('input', { 'type': 'text', 'class': 'cbi-input-text', 'placeholder': _('internet.example') });
 		self.manualUsername = E('input', { 'type': 'text', 'class': 'cbi-input-text' });
@@ -829,14 +1029,8 @@ return view.extend({
 			E('option', { 'value': 'ipv6' }, [ 'IPv6' ]),
 			E('option', { 'value': 'ipv4v6' }, [ _('IPv4 and IPv6') ])
 		]);
-		self.manualButton = E('button', {
-			'class': 'btn cbi-button cbi-button-action important',
-			'type': 'button',
-			'click': function(ev) { ev.preventDefault(); self.confirmManualApn(); }
-		}, [ _('Apply this APN') ]);
-		self.manualButton.disabled = !!self.busy;
 
-		return [
+		ui.showModal(_('Enter an APN yourself'), [
 			E('p', {}, [
 				_('Use this when the database has no profile for your SIM, or your operator issued you a private one. The profile is tested like any other: the current one is saved first, real Internet access is verified, and a profile that does not work is undone.')
 			]),
@@ -847,8 +1041,23 @@ return view.extend({
 				row(_('Authentication'), self.manualAuth),
 				row(_('IP family'), self.manualIpType)
 			]),
-			E('div', { 'class': 'apn-button-row' }, [ self.manualButton ])
-		];
+			E('div', { 'class': 'right' }, [
+				E('button', {
+					'class': 'btn',
+					'click': function() {
+						/* Cancelling writes nothing and keeps nothing: the
+						 * password field must not survive the dialog. */
+						self.manualPassword = null;
+						ui.hideModal();
+					}
+				}, [ _('Cancel') ]),
+				' ',
+				E('button', {
+					'class': 'btn cbi-button-action important',
+					'click': function() { self.confirmManualApn(); }
+				}, [ _('Apply this APN') ])
+			])
+		]);
 	},
 
 	manualApnValues: function() {
@@ -886,6 +1095,8 @@ return view.extend({
 		var values = self.manualApnValues();
 		var error = self.manualApnError(values);
 		if (error) {
+			/* Refused before any wrapper call: the dialog stays open so the
+			 * entry can be corrected. */
 			ui.addNotification(null, E('p', {}, [ error ]), 'warning');
 			return;
 		}
@@ -944,44 +1155,19 @@ return view.extend({
 		});
 	},
 
-	modemInventoryNodes: function(inventory) {
-		if (!inventory || inventory.error)
-			return [ E('p', { 'class': 'apn-modem-unavailable' }, [
-				_('Modem inventory is unavailable. The optional apn-autoconfig-modem package may be absent, disabled or unable to complete its bounded scan. The APN functions above remain independent.')
-			]) ];
+	/* ---- tabs ------------------------------------------------------------ */
 
-		var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
-		if (!modems.length)
-			return [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
-
-		return modems.map(function(modem) {
-			var rows = [
-				row(_('Modem identity'), sensitiveIdentifier(modem.modem_id, _('modem identity'))),
-				row(_('Evidence'), modem.evidence_tier),
-				row(_('Protocol'), modem.protocol),
-				row(_('Implementation'), modem.implementation_state),
-				row(_('Validation'), modem.hardware_validated ? _('hardware') : modem.validation_state),
-				row(_('Control owner'), this.modemOwnerStateLabel(modem.owner_state)),
-				row(_('Bound netifd interface'), modem.netifd_interface || _('none'))
-			];
-			if (modem.ambiguous)
-				rows.push(row(_('Ambiguous'), modem.ambiguity_reason || _('yes')));
-
-			/* This card is a read-only report, and it looks exactly like the
-			 * place controls would live. Saying nothing here leaves the absence
-			 * of controls unexplained, so a modem this package will not drive
-			 * says so and points at the section that does have controls. */
-			var nodes = [ table(rows) ];
-			var plan = modem.plan || {};
-			if (!plan.error && !plan.can_provision && plan.reason !== 'already_provisioned') {
-				nodes.push(E('p', { 'class': 'apn-modem-note' }, [
-					modem.netifd_interface
-						? _('This modem is only reported here: it belongs to the existing interface "%s", which this package did not create and does not drive. Setup and connection controls appear for modems it set up itself.').format(modem.netifd_interface)
-						: _('This modem is only reported here. See "Modem setup" below for why it cannot be set up yet.')
-				]));
-			}
-			return E('div', { 'class': 'apn-modem-entry' }, nodes);
-		}, this);
+	selectTab: function(name) {
+		this.activeTab = name;
+		(this.tabPanels || []).forEach(function(panel) {
+			panel.node.style.display = panel.name === name ? '' : 'none';
+			panel.node.setAttribute('aria-hidden', panel.name === name ? 'false' : 'true');
+		});
+		(this.tabButtons || []).forEach(function(entry) {
+			entry.node.setAttribute('aria-selected', entry.name === name ? 'true' : 'false');
+			entry.node.className = 'btn cbi-button apn-tab' +
+				(entry.name === name ? ' cbi-button-action apn-tab-active' : '');
+		});
 	},
 
 	render: function(data) {
@@ -991,8 +1177,8 @@ return view.extend({
 		var database = data[3];
 		var targets = data[4];
 		var modemInventory = data[5];
-		var m = new form.Map('apn-autoconfig', _('Settings'),
-			_('Automatic APN selection through the target-aware cellular engine.'));
+		var m = new form.Map('apn-autoconfig', null,
+			_('How the program behaves on its own, without anyone opening this page.'));
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
 		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
@@ -1000,6 +1186,7 @@ return view.extend({
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
+		self.currentAction = action;
 		self.targetInventory = targets;
 		self.hardwareIntegration = status && status.hardware_integration || '';
 		self.modemInventory = modemInventory;
@@ -1094,13 +1281,12 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('reconcile'); }
 		}, [ _('Re-detect and verify APN') ]);
+		self.manualButton = E('button', {
+			'class': 'btn cbi-button cbi-button-neutral',
+			'type': 'button',
+			'click': function(ev) { ev.preventDefault(); self.openManualApn(); }
+		}, [ _('Enter an APN yourself') ]);
 		self.resetButton = null;
-		if (self.hardwareIntegration)
-			self.resetButton = E('button', {
-				'class': 'btn cbi-button cbi-button-negative',
-				'type': 'button',
-				'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
-			}, [ _('Power-cycle WH3000 modem and re-read SIM') ]);
 		self.databaseCheckButton = E('button', {
 			'class': 'btn cbi-button cbi-button-action',
 			'type': 'button',
@@ -1139,14 +1325,12 @@ return view.extend({
 		}, [ _('Apply roaming policy') ]);
 		self.policyDescription = E('p', {}, [ roamingPolicyDescription(status) ]);
 
-		self.connectionBox = E('div', {}, self.connectionNodes(status));
-		self.apnBox = E('div', {}, self.apnNodes(status));
-		self.databaseBox = E('div', {}, self.databaseNodes(database, status));
-		self.modemBox = E('div', {}, self.modemInventoryNodes(modemInventory));
-		self.provisioningBox = E('div', {}, self.provisioningNodes(modemInventory));
-		self.manualApnBox = E('div', {}, self.manualApnNodes(status));
+		self.modemBox = E('div', {}, self.modemAreaNodes(modemInventory, status));
+		self.apnBox = E('div', {}, self.apnAreaNodes(status));
+		self.simBox = E('div', {}, self.simAreaNodes(status));
+		self.databaseBox = E('div', {}, self.databaseNodes(database));
+		self.stripBox = E('div', {}, self.stripNodes(status, action));
 		self.modemPollPending = false;
-		self.actionStatus = E('p', { 'class': 'notice apn-action-status' }, [ self.actionDescription(action) ]);
 		self.setBusy(!action || !!action.error || !!action.busy, action);
 
 		/* Poll only cheap action state continuously. A page loaded during modem
@@ -1161,67 +1345,77 @@ return view.extend({
 		}, 3);
 
 		return m.render().then(function(mapNode) {
-			var mobileActionButtons = [ self.reconcileButton ];
-			if (self.resetButton)
-				mobileActionButtons.push(self.resetButton);
-			return E('div', { 'class': 'apn-autoconfig-page' }, [
+			/* Four areas, one question each: what is the hardware doing, which
+			 * profile did we choose, whose subscription is this, and how should
+			 * the program behave on its own. */
+			var areas = [
+				{ name: 'modem', label: _('Modem'), nodes: [ self.modemBox ] },
+				{ name: 'apn', label: _('APN'), nodes: [
+					self.apnBox,
+					E('h4', {}, [ _('Provider database') ]),
+					E('p', {}, [ _('The signed provider package can be checked and updated independently from the program and LuCI. Updating it does not change the active APN.') ]),
+					self.databaseBox
+				] },
+				{ name: 'sim', label: _('SIM'), nodes: [ self.simBox ] },
+				{ name: 'settings', label: _('Settings'), nodes: [ mapNode ] }
+			];
+
+			self.tabPanels = [];
+			self.tabButtons = [];
+			var panels = areas.map(function(area) {
+				var panel = E('div', {
+					'class': 'cbi-section apn-card apn-panel',
+					'role': 'tabpanel'
+				}, area.nodes);
+				self.tabPanels.push({ name: area.name, node: panel });
+				return panel;
+			});
+			var buttons = areas.map(function(area) {
+				var button = E('button', {
+					'class': 'btn cbi-button apn-tab',
+					'type': 'button',
+					'role': 'tab',
+					'click': function(ev) { ev.preventDefault(); self.selectTab(area.name); }
+				}, [ area.label ]);
+				self.tabButtons.push({ name: area.name, node: button });
+				return button;
+			});
+
+			var page = E('div', { 'class': 'apn-autoconfig-page' }, [
 				E('style', { 'type': 'text/css' }, [
-					'.apn-autoconfig-page .apn-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(22rem,1fr));gap:1rem;margin-bottom:1rem}' +
-					'.apn-autoconfig-page .apn-card{margin:0!important;padding:1rem}' +
+					'.apn-autoconfig-page .apn-card{margin:0 0 1rem 0!important;padding:1rem}' +
 					'.apn-autoconfig-page .apn-card>h3{margin-top:0}' +
-					'.apn-autoconfig-page .apn-full{grid-column:1/-1}' +
+					'.apn-autoconfig-page .apn-strip{display:flex;flex-wrap:wrap;gap:1rem 2rem;padding:.75rem 1rem;' +
+						'margin-bottom:1rem;border:1px solid rgba(128,128,128,.35);border-radius:4px}' +
+					'.apn-autoconfig-page .apn-strip-item{display:flex;flex-direction:column;min-width:9rem}' +
+					'.apn-autoconfig-page .apn-strip-label{font-size:85%;opacity:.7}' +
+					'.apn-autoconfig-page .apn-strip-value{font-weight:600}' +
+					'.apn-autoconfig-page .apn-strip-good .apn-strip-value{color:#2d8a43}' +
+					'.apn-autoconfig-page .apn-strip-warn .apn-strip-value{color:#b58100}' +
+					'.apn-autoconfig-page .apn-strip-bad .apn-strip-value{color:#b11}' +
+					'.apn-autoconfig-page .apn-tabs{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem}' +
 					'.apn-autoconfig-page .apn-label strong{font-weight:600}' +
+					'.apn-autoconfig-page .apn-help-label{display:inline-flex;align-items:center;gap:.4em}' +
+					'.apn-autoconfig-page .apn-help-toggle{padding:0 .5em;line-height:1.4;min-width:1.8em}' +
+					'.apn-autoconfig-page .apn-help-text{margin:.4rem 0 0 0;font-weight:400;opacity:.85}' +
 					'.apn-autoconfig-page .apn-details{margin-top:.75rem}' +
 					'.apn-autoconfig-page .apn-details summary{cursor:pointer;font-weight:600;padding:.35rem 0}' +
+					'.apn-autoconfig-page .apn-modem-entry{padding:.75rem 0;border-top:1px solid rgba(128,128,128,.25)}' +
 					'.apn-autoconfig-page .apn-button-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-policy-controls{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-state-good{color:#2d8a43;font-weight:600}' +
 					'.apn-autoconfig-page .apn-state-bad{color:#b11;font-weight:600}' +
 					'.apn-autoconfig-page .apn-action-status{min-height:1.5em}' +
-					'@media(max-width:600px){.apn-autoconfig-page .apn-grid{grid-template-columns:1fr}.apn-autoconfig-page .apn-card{padding:.75rem}.apn-autoconfig-page .apn-table .apn-label{width:45%!important}}'
+					'@media(max-width:600px){.apn-autoconfig-page .apn-card{padding:.75rem}' +
+						'.apn-autoconfig-page .apn-table .apn-label{width:45%!important}}'
 				]),
 				E('h2', {}, [ _('APN Auto-Config') ]),
-				E('div', { 'class': 'apn-grid' }, [
-					E('section', { 'class': 'cbi-section apn-card' }, [
-						E('h3', {}, [ _('Mobile connection') ]),
-						self.connectionBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card' }, [
-						E('h3', {}, [ _('Current APN') ]),
-						self.apnBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card' }, [
-						E('h3', {}, [ _('Modem inventory') ]),
-						E('p', {}, [ _('Read-only, from the optional apn-autoconfig-modem package.') ]),
-						self.modemBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
-						E('h3', {}, [ _('Enter an APN yourself') ]),
-						self.manualApnBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
-						E('h3', {}, [ _('Modem setup') ]),
-						E('p', {}, [ _('Prepares an unconfigured modem for use. An interface you created yourself is never adopted or changed.') ]),
-						self.provisioningBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card apn-full' }, [
-						E('h3', {}, [ _('Provider database') ]),
-						E('p', {}, [ _('The signed provider package can be checked and updated independently from the program and LuCI. Updating it does not change the active APN.') ]),
-						self.databaseBox
-					]),
-					E('section', { 'class': 'cbi-section apn-card' }, [
-						E('h3', {}, [ _('Roaming data policy') ]),
-						self.policyDescription,
-						E('div', { 'class': 'apn-policy-controls' }, [ self.policySelect, self.policyButton ])
-					]),
-					E('section', { 'class': 'cbi-section apn-card' }, [
-						E('h3', {}, [ _('Actions') ]),
-						self.actionStatus,
-						E('div', { 'class': 'apn-button-row' }, mobileActionButtons)
-					])
-				]),
-				mapNode
-			]);
+				self.stripBox,
+				E('div', { 'class': 'apn-tabs', 'role': 'tablist' }, buttons)
+			].concat(panels));
+
+			self.selectTab('modem');
+			return page;
 		});
 	}
 });

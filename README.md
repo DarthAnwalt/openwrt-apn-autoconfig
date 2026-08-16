@@ -99,11 +99,11 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
   installs one, and it remains inert while `option button_enabled '0'` is set.
 - A modem reset uses the same operation lock as APN changes. Repeated button
   presses cannot start overlapping resets.
-- LuCI starts long operations in the background. Both virtual action buttons
-  remain disabled while the core reports a queued, running, SSH-initiated or
+- LuCI starts long operations in the background. Its action buttons remain
+  disabled while the core reports a queued, running, SSH-initiated or
   physical-button-initiated operation.
 - A lost or invalid polling response does not falsely mark an operation as
-  finished. The buttons are re-enabled only after a successful status response
+  finished. Buttons are re-enabled only after a successful status response
   reports a terminal state.
 - If the reset command is interrupted while modem power is off, its exit trap
   attempts to restore the configured power-on value and bring `wwan` back up.
@@ -312,11 +312,11 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.12.0-r1.apk \
-  ./luci-app-apn-autoconfig-0.12.0-r1.apk
+  ./apn-autoconfig-0.13.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.13.0-r1.apk
 ```
 
-`apn-autoconfig-modem-0.12.0-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.13.0-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it in 0.10.0. It adds
 read-only modem inventory and a coordinator-based `modem-reset` path alongside
 the compatibility path. Install it when those functions are required.
@@ -376,23 +376,60 @@ The optional Huasifei integration owns only:
 /usr/share/licenses/apn-autoconfig-integration-huasifei-wh3000/LICENSE
 ```
 
-## LuCI actions and operation state
+## LuCI layout, actions and operation state
 
-The web interface always provides the backend-supported APN action:
+The page is four areas, each answering one question, presented as tabs:
+
+- **Modem** — what is the hardware doing: serving network, registration, signal,
+  the discovered modems, their control owner and bound interface, connection
+  controls and, where the board integration provides it, the power-cycle;
+- **APN** — which profile was chosen and whether it is still right: the matched
+  database provider, configured, cached and reconciled APN, re-detection, manual
+  entry, roaming policy and the provider database;
+- **SIM** — whose subscription this is: SIM provider, home network and the
+  subscriber identifiers;
+- **Settings** — how the program behaves on its own.
+
+Above the tabs a status strip stays visible from every area with the selected
+target and backend, registration, connection state, the last engine result and
+any running operation. A failure is never hidden behind the tab you are not on.
+
+The operator name appears in two areas because they are different facts:
+**Serving network** under Modem is who carries the radio link right now, while
+**Matched provider** under APN is the database record the profile was selected
+from. While roaming these differ.
+
+The backend-supported actions are:
 
 - **Re-detect and verify APN** runs `reconcile`;
-- **Power-cycle WH3000 modem and re-read SIM** appears only when the separate
-  Huasifei board integration is installed and runs the guarded `modem-reset`.
+- **Connect**, **Disconnect** and **Reconnect** ask netifd to start or stop the
+  cellular interface bound to a modem. They are offered whenever exactly one
+  unambiguous cellular section is bound to it — including an interface you
+  created yourself — and change no configuration. Setting up and removing a
+  modem's interface remain restricted to sections this project created;
+- **Set up this modem** / **Remove setup** appear only for provisioning;
+- **Enter an APN yourself** opens a dialog for a SIM the database does not
+  cover. The profile is tested like any other: the current one is saved first,
+  real Internet access is verified, and a profile that does not work is undone;
+- **Power-cycle modem** appears only when the separate Huasifei board
+  integration is installed and runs the guarded `modem-reset`.
 
-It groups mobile registration and signal, the current APN, provider-database
-state, roaming policy and actions into separate responsive sections. Technical
-SIM identifiers and database source revisions remain available in collapsible
-details. Signal quality uses LuCI's native progress visualization and keeps the
-numeric percentage visible.
+Every one of them confirms first, and a connection control names the interface
+it will act on.
+
+Maintainer-grade fields — full modem identity, discovery evidence tier,
+implementation and validation state, device and USB paths, database source
+revisions — sit behind an **Advanced and diagnostic details** disclosure that is
+closed by default. Identifiers stay masked until explicitly revealed. Signal
+quality uses LuCI's native progress visualization.
+
+Non-obvious fields carry a short explanation opened by the question control next
+to the label. It opens on activation rather than hover, because a hover tooltip
+is unreachable on a touch screen.
 
 The provider-database section shows the installed package and data versions,
-data release date, last check, available version, configured feed and trusted
-key. **Check for updates** refreshes only the configured project repository.
+data release date, last check and available version, with the configured feed
+and trusted key under its advanced disclosure. **Check for updates** refreshes only the configured project repository.
 When a newer database exists, **Install update** confirms and upgrades only
 `apn-autoconfig-providers`; it does not upgrade the core or LuCI, change the
 active APN, or restart the mobile interface. The candidate package is fetched
@@ -402,11 +439,11 @@ installation.
 Version 0.6.0 retains the policy-selection fix: the Apply button remains
 disabled until the user deliberately changes the selection.
 
-Both show a confirmation first. After confirmation the HTTP request only starts
-a background job; it does not remain open for the full modem reset. The page
-polls the machine API and disables both buttons for the entire operation. The
-same busy indicator also covers a command started through SSH or the physical
-button, so entry points cannot overlap. The packaged button handler submits its
+After confirmation the HTTP request only starts a background job; it does not
+remain open for the full modem reset. The page polls the machine API and
+disables every action for the entire operation, and the status strip names the
+operation that is running. The same busy indicator also covers a command started
+through SSH or the physical button, so entry points cannot overlap. The packaged button handler submits its
 reset through the same background job API, allowing LuCI to show the exact
 action and its final success or failure. Database checks and installations use
 the same dispatcher and lock, so the provider file cannot be replaced while an

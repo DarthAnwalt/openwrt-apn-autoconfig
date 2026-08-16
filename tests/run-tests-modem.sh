@@ -1867,4 +1867,32 @@ assert "apn-autoconfig-modem resolve --interface" in text
 assert "apn-autoconfig-modem reset --modem" in text
 ' "$CORE_SCRIPT" || fail 'apn-autoconfig no longer contains the expected coordinator delegation hooks'
 
+printf '%s\n' 'TEST no command leaves a scratch file behind in /tmp'
+# Compares the exact set of scratch files, not their count: /tmp is shared, so a
+# count is affected by anything else on the machine and by leftovers from an
+# earlier run. Only a file that appears and stays is a leak.
+#
+# The fixtures never caught this because the names carry the PID: every run made
+# its own, so nothing collided and nothing failed. LuCI polls provision-plan and
+# status-json, which is how an open page grew /tmp without bound.
+scratch_list() {
+	ls /tmp/apn-autoconfig-modem.*.inventory /tmp/apn-autoconfig-modem.*.candidates \
+		/tmp/apn-autoconfig-modem.*.mm-usb-paths 2>/dev/null | sort
+}
+scratch_list >"$STATE/scratch-before"
+provision_fixture
+for scratch_cmd in inventory-json rescan; do
+	sh "$SCRIPT" "$scratch_cmd" >/dev/null 2>&1 || :
+done
+for scratch_cmd in provision-plan status-json action-status; do
+	sh "$SCRIPT" "$scratch_cmd" --modem "$PROV_MODEM" >/dev/null 2>&1 || :
+done
+sh "$SCRIPT" resolve --interface wwan >/dev/null 2>&1 || :
+scratch_list >"$STATE/scratch-after"
+scratch_new="$(comm -13 "$STATE/scratch-before" "$STATE/scratch-after")"
+[ -z "$scratch_new" ] || {
+	printf 'leaked scratch files:\n%s\n' "$scratch_new" >&2
+	fail 'a command left a scratch file behind in /tmp'
+}
+
 printf 'All modem-control tests passed.\n'

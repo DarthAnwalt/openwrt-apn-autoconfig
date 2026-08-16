@@ -813,19 +813,41 @@ if grep -q '/dev/ttyUSB40' "$TEST_AT_PROBES"; then
 	fail "a probe for one modem reached the other modem's port"
 fi
 
-printf '%s\n' 'TEST AT access is refused for a modem owned by ModemManager'
+printf '%s\n' 'TEST a port cached while unowned grants nothing once ModemManager claims the modem'
+# The reference router publishes a freshly attached modem in ModemManager only
+# after it has finished probing every port, so a scan at attach time sees the
+# modem unowned and a later one sees it owned. That makes unowned-then-owned the
+# normal sequence rather than a race, and a selection cached in the first window
+# must not survive as a licence into the second.
 reset_sysfs
 reset_at_ports
 add_qmi_modem 6-1.1 2c7c 0801 MMOWNED 7 wwan7
 add_at_port 6-1.1 45 1.2 control
+MM_OWNED="usb-serial:6-1.1:2c7c:0801:MMOWNED"
+port="$(sh "$SCRIPT" at-port --modem "$MM_OWNED")" || fail 'at-port failed while the modem was unowned'
+[ "$port" = /dev/ttyUSB45 ] || fail "unowned resolution returned $port"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["capabilities"]["at_identity"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved unowned modem did not report at_identity'
+
 MM_MODEM_INDEX=0
 MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/6-1.1"
 MM_PHYSDEV="$MM_DEVICE"
 export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+: >"$TEST_AT_PROBES"
 mm_refused=0
-sh "$SCRIPT" at-port --modem "usb-serial:6-1.1:2c7c:0801:MMOWNED" >/dev/null 2>&1 || mm_refused=$?
+sh "$SCRIPT" at-port --modem "$MM_OWNED" >/dev/null 2>&1 || mm_refused=$?
 [ "$mm_refused" -eq 4 ] || fail "AT access under ModemManager exited $mm_refused instead of the blocked class 4"
 [ ! -s "$TEST_AT_PROBES" ] || fail 'a ModemManager-owned modem was probed anyway'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["capabilities"]["at_identity"] is False, m
+' "$(sh "$SCRIPT" inventory-json)" || \
+	fail 'a cached selection kept at_identity true after ModemManager took the modem'
 unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
 
 printf '%s\n' 'TEST two distinct physically present modems are both reported, not merged'

@@ -100,61 +100,66 @@ grepped.
 16. a port recorded as failed is skipped on the next sweep;
 17. the cache is keyed by stable USB interface path: after a re-enumeration that
     renumbers tty nodes, no verdict is applied to a port it was not recorded
-    for, and entries whose interface path is gone are discarded.
+    for, and entries whose interface path is gone are discarded;
+18. a selection cached while a modem was unowned grants nothing once
+    ModemManager claims it: `at_identity` drops to false and access is refused.
+    This is not hypothetical — on the reference router ModemManager publishes a
+    freshly attached modem only after a delay, so the unowned-then-owned
+    sequence is the normal one rather than a race.
 
 ### Lock
 
-18. two concurrent identity requests for one port serialize, and neither
+19. two concurrent identity requests for one port serialize, and neither
     proceeds without the lock;
-19. two concurrent requests for *different* ports do not serialize against each
+20. two concurrent requests for *different* ports do not serialize against each
     other at this level;
-20. a lock whose owner is dead is reclaimed only under the `.reclaim` guard,
+21. a lock whose owner is dead is reclaimed only under the `.reclaim` guard,
     reusing the existing shared assertions;
-21. the AT adapter and the QMI adapter's AT fallback contend on one device and
+22. the AT adapter and the QMI adapter's AT fallback contend on one device and
     exactly one proceeds at a time.
 
 ### Identity
 
-22. the v1 identity TSV is complete and well-formed from a fixture modem;
-23. `operator_id` is empty and the matcher still selects the right provider from
+23. the v1 identity TSV is complete and well-formed from a fixture modem;
+24. `operator_id` is empty and the matcher still selects the right provider from
     the IMSI prefix, for both a five-digit and a six-digit database row;
-24. `<stat>` 3 maps to denied and is reported as permanent, not retryable;
-25. `<stat>` 6 and 7 map to home and roaming rather than to unregistered, from
+25. `<stat>` 3 maps to denied and is reported as permanent, not retryable;
+26. `<stat>` 6 and 7 map to home and roaming rather than to unregistered, from
     `AT+CREG?` specifically, since that is the source that produces them;
-26. `AT+CSQ` 99 and `AT+CESQ` 255 leave `signal_quality` empty rather than
+27. `AT+CSQ` 99 and `AT+CESQ` 255 leave `signal_quality` empty rather than
     reporting zero signal;
-27. a `CESQ` reply carrying more than six fields is parsed rather than
+28. a `CESQ` reply carrying more than six fields is parsed rather than
     discarded, with the NR fields unknown and the LTE fields usable;
-28. malformed, truncated and echo-polluted replies fail closed rather than
+29. malformed, truncated and echo-polluted replies fail closed rather than
     yielding a partial identity;
-29. an ICCID of implausible length is rejected, reusing the existing digit
+30. an ICCID of implausible length is rejected, reusing the existing digit
     validation;
-30. the ICCID ladder stops at the first spelling that answers, and a modem that
+31. the ICCID ladder stops at the first spelling that answers, and a modem that
     rejects the vendor spelling with an immediate error still yields an ICCID
     from the standard one.
 
 ### Reset methods
 
-31. each of `gpio`, `modemmanager` and `at` is selected exactly when its
+32. each of `gpio`, `modemmanager` and `at` is selected exactly when its
     preconditions hold, and `reset_method` reports it;
-32. `gpio` wins where its preconditions hold, preserving released behaviour;
-33. a second modem on the same board does not inherit the pinned modem's GPIO
+33. `gpio` wins where its preconditions hold, preserving released behaviour;
+34. a second modem on the same board does not inherit the pinned modem's GPIO
     reset;
-34. a soft reset whose port disappears without a final `OK` is treated as
+35. a soft reset whose port disappears without a final `OK` is treated as
     success pending re-enumeration, not as a transport failure;
-35. a soft reset whose modem never returns is a terminal failure with the
-    correct class, distinguishable from 34;
-36. a real `TERM` during the destructive window restores the interface and
+36. a soft reset whose modem never returns is a terminal failure with the
+    correct class, distinguishable from 35;
+37. a real `TERM` during the destructive window restores the interface and
     releases both locks in reverse order;
-37. `capabilities.reset` true never implies any method has been observed to
+38. `capabilities.reset` true never implies any method has been observed to
     work.
 
 ### Compatibility
 
-38. `apn-autoconfig modem-reset` and `action-start modem-reset` keep their
+39. `apn-autoconfig modem-reset` and `action-start modem-reset` keep their
     released behaviour and exit codes on the pinned GPIO modem;
-39. a v1 consumer that ignores the new schema fields behaves exactly as before;
-40. no command leaves a scratch file in `/tmp`, extending the 0.13.2 regression
+40. a v1 consumer that ignores the new schema fields behaves exactly as before;
+41. no command leaves a scratch file in `/tmp`, extending the 0.13.2 regression
     to the new commands.
 
 ## Hardware gate
@@ -180,8 +185,15 @@ the release are these, and three of them changed the contract:
    per-port property and the first exchange must tolerate its own echo;
 4. the modem exposes **no USB serial**, so its strong identity depends on
    AT-supplied IMEI — the `imei` tier finally has a device that needs it;
-5. ModemManager claims the internal modem and **does not claim the FM350**, so
-   the AT work has an unowned modem to use without touching the owned one;
+5. ModemManager claims **both** modems — but it publishes the second one only
+   after a delay, so a scan run at attach time sees it unowned and a later scan
+   sees it owned. It is slow for the same reason our own sweep is: most of the
+   ports never answer, so every probe has to reach its timeout. It also holds
+   the second modem as "model unknown", having claimed a device it cannot drive.
+   Two consequences: exercising the AT path on that modem needs a window in
+   which ModemManager does not own it, and **ownership can change after
+   attachment**, so a port selection cached during an unowned window must never
+   become a licence once ownership arrives;
 6. a live SIM is registered on 5G NSA and its network has 23 rows in the shipped
    provider database, so identity through matching can be exercised end to end;
 7. **the router has no `timeout` executable.** See the gate note below.

@@ -1,6 +1,6 @@
 # Changelog
 
-## apn-autoconfig 0.13.0 / apn-autoconfig-modem 0.13.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.0 (unreleased)
+## apn-autoconfig 0.13.0 / apn-autoconfig-modem 0.13.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.0 (2026-08-16)
 
 A coherent web interface, and one correction to who may start a connection.
 

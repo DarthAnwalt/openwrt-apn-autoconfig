@@ -339,6 +339,15 @@ async function verifyLayout() {
 		'Show label must be visible after hiding again');
 	assert.strictEqual(simToggle.children[1].style.visibility, 'hidden',
 		'Hide label must keep contributing width while visually hidden');
+	/* LuCI's own Save & Apply footer sits outside the view's tabs by platform
+	 * convention, and this page contains exactly one form.Map — the Settings
+	 * area — so that footer has exactly one thing to act on. Nothing in the
+	 * other three areas is saved through it; their controls act immediately
+	 * through the narrow wrappers. */
+	assert.strictEqual(app.tabPanels.filter(function(panel) {
+		return panel.name === 'settings';
+	}).length, 1, 'the settings form must live in exactly one area');
+
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');
 	assert.strictEqual(app.databaseInstallButton.disabled, false,

@@ -1,6 +1,7 @@
 # 0.13.0 frontend test and release plan
 
-Status: planned. Nothing in this document has been implemented or attempted.
+Status: complete except for the signed-feed smoke, which requires publication
+first. Evidence is recorded in [`router-test-0.13.0.md`](router-test-0.13.0.md).
 
 0.13.0 reorganizes the optional LuCI package against
 [`frontend-contract-v1.md`](frontend-contract-v1.md) and makes one runtime

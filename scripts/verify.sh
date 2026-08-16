@@ -150,6 +150,7 @@ fi
 grep -F -q "option autostart '1'" "$ROOT/apn-autoconfig-modem/files/etc/config/apn-autoconfig-modem"
 grep -F -q '[ -n "$${IPKG_INSTROOT}" ] && exit 0' "$ROOT/apn-autoconfig-modem/Makefile"
 grep -F -q '/etc/init.d/apn-autoconfig-modem restart' "$ROOT/apn-autoconfig-modem/Makefile"
+luci_suites_skipped=0
 if command -v node >/dev/null 2>&1; then
 	node --check "$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
 	node "$ROOT/tests/test-luci-roaming-policy.js"
@@ -157,6 +158,20 @@ if command -v node >/dev/null 2>&1; then
 elif [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
 	printf '%s\n' 'Node.js is required for LuCI verification in CI and release builds.' >&2
 	exit 1
+else
+	luci_suites_skipped=1
+	{
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+		printf '%s\n' '!! WARNING: the LuCI frontend suites did NOT run: node was not found.'
+		printf '%s\n' '!!   - tests/test-luci-roaming-policy.js'
+		printf '%s\n' '!!   - tests/test-luci-provisioning.js'
+		printf '%s\n' '!! The syntax check of the LuCI view was skipped as well. This run'
+		printf '%s\n' '!! gives NO frontend coverage; a LuCI-only change is unverified here.'
+		printf '%s\n' '!! CI is the authoritative run for these suites on a machine without'
+		printf '%s\n' '!! Node.js. Install Node.js locally to close the gap before relying'
+		printf '%s\n' '!! on this gate for frontend work.'
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+	} >&2
 fi
 grep -F -q "form.Flag, 'autostart'" \
 	"$ROOT/luci-app-apn-autoconfig/htdocs/luci-static/resources/view/network/apn-autoconfig.js"
@@ -191,4 +206,8 @@ sh "$ROOT/tests/test-installer.sh"
 sh "$ROOT/tests/test-package-lifecycle.sh"
 sh "$ROOT/tests/run-tests.sh"
 sh "$ROOT/tests/run-tests-modem.sh"
-printf '%s\n' 'Static and behavioral verification passed.'
+if [ "$luci_suites_skipped" -eq 1 ]; then
+	printf '%s\n' 'Static and behavioral verification passed (LuCI suites SKIPPED: node not found).'
+else
+	printf '%s\n' 'Static and behavioral verification passed.'
+fi

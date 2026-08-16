@@ -182,6 +182,16 @@ LuCI or documentation edits run:
 sh scripts/verify.sh
 ```
 
+The two LuCI regression suites (`tests/test-luci-roaming-policy.js` and
+`tests/test-luci-provisioning.js`, plus the `node --check` syntax check of the
+view) need Node.js. On a machine without Node.js they are skipped, the run
+prints a loud warning to stderr and the success line reports
+`(LuCI suites SKIPPED: node not found)`. That result is not full coverage: CI
+is the authoritative run for the LuCI suites there, and a green local gate
+alone must never be cited as frontend evidence for a LuCI change. CI (`CI=true`)
+and release builds (`EXPECTED_RELEASE_TAG` set) still fail hard when Node.js is
+missing, so the suites always run before a release.
+
 The release gate additionally requires the official OpenWrt 25.12 SDK build,
 APK install/upgrade/removal simulation, the order-independent discovery matrix,
 real hardware tests recorded in `testing-0.10.0.md`, rollback/recovery

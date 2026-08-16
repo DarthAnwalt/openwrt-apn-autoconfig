@@ -102,7 +102,12 @@ unavailable for the device class:
    exposes no USB serial. Read through the same bounded, read-only backend
    calls the APN engine already uses for identity (QMI `--get-imei` or the
    AT fallback), never through free-form AT. Survives port changes but
-   requires the modem to be enumerable and responsive.
+   requires the modem to be enumerable and responsive. A modem that exposes no
+   USB serial and no QMI/MBIM control channel therefore reaches a strong tier
+   only through AT, and only after resolution has run: it is first recorded at
+   `weak-vidpid` and upgraded to `imei` once identity is obtained. This is not
+   circular, but it does mean such a modem is weakly identified until something
+   asks for its identity, and two of them would stay ambiguous until then.
 3. **`weak-vidpid`: bus/port + vendor:product only.** Used only for initial
    classification when neither `usb-serial` nor `imei` evidence is available.
    Never sufficient alone to rebind an existing record to a new `/dev` name
@@ -178,7 +183,11 @@ within the bounded executor:
 1. `ATE0` followed by a bare `AT`. No reply, a timeout or anything other than a
    final `OK` removes the candidate. A timed-out port is removed immediately and
    is not retried with alternate spellings: it is not a command channel, and
-   repeating the attempt only repeats the delay.
+   repeating the attempt only repeats the delay. The parser must tolerate a
+   leading echo of the command itself on this first exchange, because `ATE0` has
+   not taken effect yet when it is echoed — and echo state is per port, not per
+   modem: one modem can present one port with echo off and another with echo on
+   at the same moment.
 2. `AT+CGMM`. A candidate that answers phase 1 but returns no plausible model
    string is a port that speaks AT without being the control channel, and is
    removed.
@@ -197,6 +206,29 @@ selected deterministically. The selection is cached per `modem_id` and
 revalidated before reuse; a cached node that is absent, no longer correlated to
 the same USB device, or no longer passing phase 1 is discarded and resolution
 runs again.
+
+### Resolution is lazy, and its cache is negative as well as positive
+
+A sweep is expensive, and not marginally so. Ports that accept a write and never
+answer are the common case rather than the exception — on the first modem
+measured for this contract, five of seven ports behaved that way — so a full
+sweep costs the per-port bound multiplied by the number of dead ports, and a
+modem with no command port at all costs the maximum every time.
+
+Two rules follow, and both are normative rather than performance advice, because
+LuCI calls inventory on page load and a synchronous sweep there is a visible
+multi-second hang:
+
+- **Discovery does not sweep.** A scan reports what is already cached, and
+  `capabilities.at_identity` is false until a resolution has actually happened.
+  Resolution is triggered by a request that needs AT identity, not by
+  enumeration.
+- **Failures are cached too.** A port that failed phase 1 is recorded as such
+  and skipped on later sweeps, keyed by its **stable USB interface path**, never
+  by the volatile tty index. Keying by index would let a re-enumeration silently
+  apply one port's verdict to a different port; keying by interface path makes
+  re-enumeration invalidate the entries that genuinely changed and keep the ones
+  that did not.
 
 Resolution never runs at all while `owner_state` is `modemmanager` or
 `conflicting`. ModemManager holds the command port of the modems it manages,

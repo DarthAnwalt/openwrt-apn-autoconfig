@@ -1,7 +1,8 @@
 # 0.14.0 AT test and release plan
 
-Status: planned. No implementation has started and no evidence has been
-recorded.
+Status: planned. No implementation has started. The hardware first-contact
+census was performed on 2026-08-16 before implementation and is recorded below;
+three of its findings changed the contracts, which is why it was done first.
 
 0.14.0 adds the third and last identity backend, the bounded AT transport it
 needs, and the reset-method contract, against
@@ -75,58 +76,85 @@ grepped.
 
 8. a port that accepts a write and never answers is abandoned within the bound,
    and the command returns the retryable class;
-9. the same holds with no external `timeout` on `PATH`, exercising the watchdog;
+9. the same holds with no external `timeout` on `PATH`. This is **not** the
+   exotic case it looks like: the reference router has no `timeout` executable,
+   so the watchdog is the only path that has ever run there, including for the
+   already hardware-validated QMI AT fallback. It is tested as the primary
+   implementation and the external-`timeout` path as the variant, not the other
+   way round;
 10. the watchdog terminates and reaps its child, leaving no process behind,
     asserted against the process table rather than inferred;
 11. a timed-out port is not retried with an alternate ICCID spelling, while a
     port returning an immediate command error is;
-12. a `TERM` during a probe releases the port lock and leaves no scratch file.
+12. a `TERM` during a probe releases the port lock and leaves no scratch file;
+13. the first exchange on a port whose echo is still on parses correctly, and a
+    modem presenting one echoing and one silent port yields identical identity
+    from both.
+
+### Cache and laziness
+
+14. an inventory scan performs **no** probe at all, asserted from an empty probe
+    record, and reports `at_identity: false` until a resolution has run;
+15. a request that needs AT identity triggers resolution, and a second request
+    reuses the cache without probing;
+16. a port recorded as failed is skipped on the next sweep;
+17. the cache is keyed by stable USB interface path: after a re-enumeration that
+    renumbers tty nodes, no verdict is applied to a port it was not recorded
+    for, and entries whose interface path is gone are discarded.
 
 ### Lock
 
-13. two concurrent identity requests for one port serialize, and neither
+18. two concurrent identity requests for one port serialize, and neither
     proceeds without the lock;
-14. two concurrent requests for *different* ports do not serialize against each
+19. two concurrent requests for *different* ports do not serialize against each
     other at this level;
-15. a lock whose owner is dead is reclaimed only under the `.reclaim` guard,
+20. a lock whose owner is dead is reclaimed only under the `.reclaim` guard,
     reusing the existing shared assertions;
-16. the AT adapter and the QMI adapter's AT fallback contend on one device and
+21. the AT adapter and the QMI adapter's AT fallback contend on one device and
     exactly one proceeds at a time.
 
 ### Identity
 
-17. the v1 identity TSV is complete and well-formed from a fixture modem;
-18. `operator_id` is empty and the matcher still selects the right provider from
+22. the v1 identity TSV is complete and well-formed from a fixture modem;
+23. `operator_id` is empty and the matcher still selects the right provider from
     the IMSI prefix, for both a five-digit and a six-digit database row;
-19. `<stat>` 3 maps to denied and is reported as permanent, not retryable;
-20. `AT+CSQ` 99 leaves `signal_quality` empty rather than reporting zero;
-21. malformed, truncated and echo-polluted replies fail closed rather than
+24. `<stat>` 3 maps to denied and is reported as permanent, not retryable;
+25. `<stat>` 6 and 7 map to home and roaming rather than to unregistered, from
+    `AT+CREG?` specifically, since that is the source that produces them;
+26. `AT+CSQ` 99 and `AT+CESQ` 255 leave `signal_quality` empty rather than
+    reporting zero signal;
+27. a `CESQ` reply carrying more than six fields is parsed rather than
+    discarded, with the NR fields unknown and the LTE fields usable;
+28. malformed, truncated and echo-polluted replies fail closed rather than
     yielding a partial identity;
-22. an ICCID of implausible length is rejected, reusing the existing digit
-    validation.
+29. an ICCID of implausible length is rejected, reusing the existing digit
+    validation;
+30. the ICCID ladder stops at the first spelling that answers, and a modem that
+    rejects the vendor spelling with an immediate error still yields an ICCID
+    from the standard one.
 
 ### Reset methods
 
-23. each of `gpio`, `modemmanager` and `at` is selected exactly when its
+31. each of `gpio`, `modemmanager` and `at` is selected exactly when its
     preconditions hold, and `reset_method` reports it;
-24. `gpio` wins where its preconditions hold, preserving released behaviour;
-25. a second modem on the same board does not inherit the pinned modem's GPIO
+32. `gpio` wins where its preconditions hold, preserving released behaviour;
+33. a second modem on the same board does not inherit the pinned modem's GPIO
     reset;
-26. a soft reset whose port disappears without a final `OK` is treated as
+34. a soft reset whose port disappears without a final `OK` is treated as
     success pending re-enumeration, not as a transport failure;
-27. a soft reset whose modem never returns is a terminal failure with the
-    correct class, distinguishable from 26;
-28. a real `TERM` during the destructive window restores the interface and
+35. a soft reset whose modem never returns is a terminal failure with the
+    correct class, distinguishable from 34;
+36. a real `TERM` during the destructive window restores the interface and
     releases both locks in reverse order;
-29. `capabilities.reset` true never implies any method has been observed to
+37. `capabilities.reset` true never implies any method has been observed to
     work.
 
 ### Compatibility
 
-30. `apn-autoconfig modem-reset` and `action-start modem-reset` keep their
+38. `apn-autoconfig modem-reset` and `action-start modem-reset` keep their
     released behaviour and exit codes on the pinned GPIO modem;
-31. a v1 consumer that ignores the new schema fields behaves exactly as before;
-32. no command leaves a scratch file in `/tmp`, extending the 0.13.2 regression
+39. a v1 consumer that ignores the new schema fields behaves exactly as before;
+40. no command leaves a scratch file in `/tmp`, extending the 0.13.2 regression
     to the new commands.
 
 ## Hardware gate
@@ -136,56 +164,73 @@ ModemManager and resettable through the Huasifei GPIO. For this gate an FM350-GL
 in a USB carrier is attached alongside it, giving both control-owner classes and
 both reset methods on one board at the same time.
 
-### First contact, recorded before anything else
+### First contact — done 2026-08-16, before implementation
 
-1. what the FM350 enumerates as: VID:PID, USB composition, whether the carrier
-   introduces a hub level in `usb_path`, which network device appears and under
-   which driver;
-2. how many tty nodes it exposes, and for each: whether it answers bare `AT`,
-   whether it answers `AT+CGMM`, and what it returns;
-3. the same census for the RM520N, for comparison against the port the QMI
-   adapter's existing AT fallback already selects.
+Completed on the reference router with both modems attached. Identifiers and
+host topology stay in the maintainer's local notes; the conclusions that shape
+the release are these, and three of them changed the contract:
 
-These facts are needed for 0.15.0 regardless of how this release turns out, so
-they are captured even if a later step fails.
+1. the FM350 exposes **seven tty nodes and no network device at all.** Its
+   RNDIS interface pair has no driver bound and `rndis_host` is not loaded, so
+   0.15.0's protocol handler must bind the driver itself before a netdev exists;
+2. **five of the seven ports accept a write and never answer.** Two answer, both
+   return the same model string and the same values for every later read, which
+   is the live case for "redundancy, not ambiguity";
+3. the two responders differ in **echo state at the same moment**, so echo is a
+   per-port property and the first exchange must tolerate its own echo;
+4. the modem exposes **no USB serial**, so its strong identity depends on
+   AT-supplied IMEI — the `imei` tier finally has a device that needs it;
+5. ModemManager claims the internal modem and **does not claim the FM350**, so
+   the AT work has an unowned modem to use without touching the owned one;
+6. a live SIM is registered on 5G NSA and its network has 23 rows in the shipped
+   provider database, so identity through matching can be exercised end to end;
+7. **the router has no `timeout` executable.** See the gate note below.
+8. `AT+CREG?` reports `<stat> 6`, and `AT+CESQ` returns more than six fields.
+   Both were absent from the planned mapping and are now in the backend
+   contract.
+
+The remaining hardware steps below have not been performed.
 
 ### Two modems at once
 
-4. both modems appear in inventory with distinct `modem_id`s and
+9. both modems appear in inventory with distinct `modem_id`s and
    `ambiguous: false`;
-5. neither record borrows the other's `at_device`, `control_device` or
-   `data_device`, checked against the census above rather than assumed;
-6. the RM520N reports `owner_state: modemmanager` and receives no AT probe at
-   all, verified from the router's own process/serial activity, not only from
-   our logs;
-7. the FM350 resolves exactly one AT port by role and yields a complete
-   identity;
-8. its identity matches the correct provider from the database with
-   `operator_id` empty;
-9. an APN operation on one modem reports the other as busy — the deferred
-   global-lock behaviour, recorded here as expected so it is not filed as a
-   defect.
+10. neither record borrows the other's `at_device`, `control_device` or
+    `data_device`, checked against the census above rather than assumed;
+11. the RM520N reports `owner_state: modemmanager` and receives no AT probe at
+    all, verified from the router's own process/serial activity, not only from
+    our logs;
+12. the FM350 resolves exactly one AT port by role and yields a complete
+    identity;
+13. its identity matches the correct provider from the database with
+    `operator_id` empty;
+14. an APN operation on one modem reports the other as busy — the deferred
+    global-lock behaviour, recorded here as expected so it is not filed as a
+    defect.
 
 ### Reset
 
-10. `modem-reset` on the RM520N selects `gpio`, behaves exactly as released, and
+15. `modem-reset` on the RM520N selects `gpio`, behaves exactly as released, and
     the FM350 is unaffected throughout;
-11. `modem-reset` on the FM350 selects `at`, and the vanished port during
+16. `modem-reset` on the FM350 selects `at`, and the vanished port during
     `AT+CFUN=1,1` is reported as success pending re-enumeration;
-12. after that reset the FM350 returns with the same `modem_id`, even if its tty
-    indices changed;
-13. **the neighbouring modem survives the renumbering**: if the kernel reassigns
+17. after that reset the FM350 returns with the same `modem_id`, even if its tty
+    indices changed. Note that its `modem_id` depends on AT-supplied IMEI, so
+    this also exercises re-resolution after the cache was invalidated;
+18. **the neighbouring modem survives the renumbering**: if the kernel reassigns
     tty indices across the re-enumeration, the RM520N's record still resolves to
     its own ports and its own identity. This is the headline test of the
-    "names are attributes, not identity" invariant;
-14. `modem-reset` on the RM520N with ModemManager stopped, or a deliberate
+    "names are attributes, not identity" invariant, and the census showed the
+    two modems' tty ranges are adjacent, so renumbering is plausible rather than
+    theoretical;
+19. `modem-reset` on the RM520N with ModemManager stopped, or a deliberate
     `mmcli --reset` run, covers the `modemmanager` method;
-15. an interruption during the FM350 reset leaves the interface and both locks
+20. an interruption during the FM350 reset leaves the interface and both locks
     restored.
 
 ### Optional window: netifd-direct QMI
 
-16. with ModemManager stopped and the RM520N raised as a native QMI target, the
+21. with ModemManager stopped and the RM520N raised as a native QMI target, the
     record reports `owner_state: netifd-direct`, AT resolution is now permitted
     on it, and `reset_method` becomes `at`.
 
@@ -196,13 +241,15 @@ must be recorded as such.
 
 ### Browser pass
 
-17. both modems appear, each with its identity, protocol, owner and
+22. both modems appear, each with its identity, protocol, owner and
     `reset_method`;
-18. the AT-only modem explains that no connection path is installed rather than
+23. the AT-only modem explains that no connection path is installed rather than
     offering a control that would fail;
-19. manufacturer, model and firmware appear where they belong, and identifiers
+24. manufacturer, model and firmware appear where they belong, and identifiers
     stay masked until revealed;
-20. the console is clean.
+25. the page does not hang while a modem's ports are being resolved, which is
+    the user-visible half of the laziness rule;
+26. the console is clean.
 
 ## Release gate
 

@@ -225,10 +225,22 @@ the matcher and the GUI see one shape regardless of transport:
   `AT+CGREG?`, `AT+CREG?` that answers, mapping `<stat>` 1 to home, 5 to
   roaming, 2 to searching, 3 to denied and 0 to idle. A denied registration is
   permanent and must not be reported as retryable.
+
+  `<stat>` **6 and 7 also mean registered** — SMS-only on the home and visited
+  network respectively — and map to home and roaming. This is not a
+  specification curiosity: a device attached over LTE or 5G with no CS domain
+  reports exactly this from `AT+CREG?`, and the first modem measured for this
+  contract did. Omitting 6 and 7 would report a fully registered modem as
+  unregistered whenever `CREG` is the source that answers, which is also why
+  `CEREG` and `CGREG` are preferred over it rather than merely listed first.
 - `signal_quality` uses `AT+CESQ` RSRP through the same -120 dBm to -80 dBm
   mapping the QMI adapter documents, falling back to `AT+CSQ` RSSI through the
   same -110 dBm to -50 dBm scale. `AT+CSQ` value 99 means unknown and leaves the
-  field empty rather than reporting zero signal.
+  field empty rather than reporting zero signal, and `AT+CESQ` uses 255 for the
+  same purpose per field. The parser must accept **more than the six standard
+  `CESQ` fields**: a 5G-capable modem appends NR fields, which are frequently
+  255 while the LTE fields carry real values, so a strict six-field match would
+  discard a usable reading.
 
 ICCID uses an ordered attempt list — the standard spelling first, then the
 vendor variants — advancing only on an immediate command error. A timeout stops

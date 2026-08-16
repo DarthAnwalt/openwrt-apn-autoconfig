@@ -161,10 +161,36 @@ cleared so the router's status is truthful again, but the scoping itself is a
 pre-existing wart from the single-target era and is left for a later release
 rather than widened into this one.
 
+## The browser gate, and the two things it found
+
+Opening the page in a real browser earned its place again. Neither finding was
+visible to any fixture, and both came from the first question a person asked
+while looking at the modem card.
+
+**The card described a validated implementation as experimental.**
+`implementation_state` and `validation_state` were string constants written in
+0.10.0 and never revisited, while the same code went through four hardware gates
+and three releases. Maturity now describes the implementation — one code path,
+so one value — and evidence describes the classified protocol: `hardware` for
+QMI and MBIM, `synthetic` for AT-only and unclassified devices. The rule that
+these fields stay separate also requires them to stay current; a stale
+`experimental` understates a validated implementation exactly as badly as an
+unearned `stable` overstates one.
+
+**A modem with no controls did not say why.** That a modem bound to a
+user-created interface offers no connect, disconnect or removal is correct: this
+package does not adopt or drive interfaces it did not create. But the
+explanation lived in the setup card, while the inventory card — which looks
+exactly like the place controls belong — said nothing. It now names the owning
+interface and states that it only reports that modem. Both directions are
+asserted, so a modem that can be set up, or one this package owns, is never
+described as merely reported.
+
+Both fixes were built by the SDK and installed on the router, which then
+reported `stable` / `hardware` for the production modem with its pin, button
+setting and `wwan` untouched.
+
 ## Still open
 
-1. The LuCI page in a real browser. The 0.11.0 run found a defect there that no
-   fixture could have caught, so this is a required step, performed by the
-   maintainer rather than from a script.
-2. The signed-feed install/removal/reinstall smoke, which is only possible after
-   publication.
+The signed-feed install/removal/reinstall smoke, which is only possible after
+publication.

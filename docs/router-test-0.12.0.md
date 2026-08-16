@@ -137,6 +137,30 @@ conservative `provision_metric`, defaulting to 1024 in code as well as in the
 shipped config, so an upgraded installation gets it too; with no other uplink
 the modem still becomes the default route.
 
+## The packages that were tested are the packages that ship
+
+The two fixes above were built and installed on the router before this record
+was closed, so the validated binaries are the ones the release publishes. The
+reinstall demonstrated the conffile rule again from the other side: the new
+`provision_metric` option arrived as `.apk-new` and the live configuration kept
+its existing file, so the option is **absent** on this installation and the
+compiled-in default is what applies. That is exactly why the default was put in
+code rather than only in the shipped config.
+
+The production QMI modem still reports `reset: true` after the capability change,
+`wwan` is up, the modem path answers, and no operation lock or pending UCI
+change was left behind.
+
+## A third, smaller finding, not fixed here
+
+`last_result` is stored once per installation rather than once per target. The
+deliberately failed APN test on the MBIM section therefore showed up in the
+production target's status afterwards, describing a failure that had nothing to
+do with it. Everything else in that response is per-target. The stale value was
+cleared so the router's status is truthful again, but the scoping itself is a
+pre-existing wart from the single-target era and is left for a later release
+rather than widened into this one.
+
 ## Still open
 
 1. The LuCI page in a real browser. The 0.11.0 run found a defect there that no

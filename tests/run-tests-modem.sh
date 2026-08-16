@@ -1592,20 +1592,116 @@ sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || timeout_status=$?
 [ "$timeout_status" -eq 3 ] || \
 	fail "a section that never came up exited $timeout_status instead of the retryable class 3"
 
-printf '%s\n' 'TEST connection control refuses a modem with no project-owned section'
+printf '%s\n' 'TEST connection control refuses a modem bound to no cellular interface'
 sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || :
 unowned_conn=0
 sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || unowned_conn=$?
-[ "$unowned_conn" -eq 4 ] || fail "connect without a project-owned section exited $unowned_conn instead of 4"
+[ "$unowned_conn" -eq 4 ] || fail "connect with no bound interface exited $unowned_conn instead of 4"
 
-printf '%s\n' 'TEST connection control never drives a user-created interface'
+# Bearer control is ifup/ifdown, which the APN engine already performs on
+# user-created interfaces during every reconcile. Refusing the verb while
+# performing the action was the inconsistency 0.13.0 corrects; adoption is a
+# separate decision and stays refused below.
+printf '%s\n' 'TEST bearer control drives a user-created cellular interface'
 provision_fixture
 add_network_section usermade qmi /dev/cdc-wdm0
 : >"$TEST_EVENTS"
-usercontrol=0
-sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || usercontrol=$?
-[ "$usercontrol" -eq 4 ] || fail "connect adopted a user-created interface (exit $usercontrol)"
-[ ! -s "$TEST_EVENTS" ] || fail 'connect touched netifd for an interface it does not own'
+TEST_IFACE_UP=usermade
+export TEST_IFACE_UP
+user_conn_out="$(sh "$SCRIPT" connect --modem "$PROV_MODEM")" || \
+	fail 'connect refused a user-created cellular interface'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["section"] == "usermade", d
+assert d["action"] == "connect", d
+assert d["state"] == "up", d
+' "$user_conn_out" || fail 'connect did not report the user-created interface as up'
+grep -F -x -q 'up usermade' "$TEST_EVENTS" || \
+	fail 'connect did not ask netifd to start the user-created interface'
+: >"$TEST_EVENTS"
+sh "$SCRIPT" disconnect --modem "$PROV_MODEM" >/dev/null || \
+	fail 'disconnect refused a user-created cellular interface'
+grep -F -x -q 'down usermade' "$TEST_EVENTS" || \
+	fail 'disconnect did not ask netifd to stop the user-created interface'
+: >"$TEST_EVENTS"
+sh "$SCRIPT" reconnect --modem "$PROV_MODEM" >/dev/null || \
+	fail 'reconnect refused a user-created cellular interface'
+grep -F -x -q 'down usermade' "$TEST_EVENTS" || \
+	fail 'reconnect did not stop the user-created interface first'
+grep -F -x -q 'up usermade' "$TEST_EVENTS" || \
+	fail 'reconnect did not start the user-created interface again'
+
+printf '%s\n' 'TEST configuration-changing verbs still refuse a user-created interface'
+: >"$TEST_EVENTS"
+: >"$TEST_UCI_WRITES"
+user_deprov=0
+sh "$SCRIPT" deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || user_deprov=$?
+[ "$user_deprov" -eq 4 ] || fail "deprovision acted on a user-created interface (exit $user_deprov)"
+user_prov=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || user_prov=$?
+[ "$user_prov" -eq 4 ] || fail "provision adopted a user-created interface (exit $user_prov)"
+[ ! -s "$TEST_EVENTS" ] || fail 'a refused configuration verb still touched netifd'
+[ ! -s "$TEST_UCI_WRITES" ] || fail 'a refused configuration verb still wrote UCI'
+grep -F -x -q "network.usermade=interface" "$TEST_NETWORK_SECTIONS" || \
+	fail 'a refused configuration verb removed the user-created section'
+
+printf '%s\n' 'TEST the plan reports bearer control for a user-created interface and no provisioning'
+user_plan="$(sh "$SCRIPT" provision-plan --modem "$PROV_MODEM" 2>/dev/null || :)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["can_provision"] is False, d
+assert d["reason"] == "already_configured", d
+assert d["can_control_bearer"] is True, d
+assert d["connection_section"] == "usermade", d
+assert d["connection_owned"] is False, d
+' "$user_plan" || fail 'the plan misreported bearer control for a user-created interface'
+
+printf '%s\n' 'TEST an ambiguous modem gets no bearer control at all'
+add_network_section second qmi /dev/cdc-wdm0
+: >"$TEST_EVENTS"
+ambiguous_conn=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || ambiguous_conn=$?
+[ "$ambiguous_conn" -eq 4 ] || \
+	fail "connect acted on a modem claimed by two interfaces (exit $ambiguous_conn)"
+[ ! -s "$TEST_EVENTS" ] || fail 'an ambiguous modem still had its interface touched'
+ambiguous_plan="$(sh "$SCRIPT" provision-plan --modem "$PROV_MODEM" 2>/dev/null || :)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["can_control_bearer"] is False, d
+assert d["connection_section"] == "", d
+' "$ambiguous_plan" || fail 'the plan offered bearer control for an ambiguous modem'
+
+printf '%s\n' 'TEST a non-cellular section bound to the same device is never driven'
+provision_fixture
+add_network_section wired static /dev/cdc-wdm0
+: >"$TEST_EVENTS"
+wired_conn=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || wired_conn=$?
+[ "$wired_conn" -eq 4 ] || fail "connect drove a non-cellular section (exit $wired_conn)"
+[ ! -s "$TEST_EVENTS" ] || fail 'a non-cellular section was still touched'
+
+printf '%s\n' 'TEST a staged project-owned section is never started from connection control'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed'
+add_section_option apnmodem1 disabled 1
+: >"$TEST_EVENTS"
+staged_conn=0
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null 2>&1 || staged_conn=$?
+[ "$staged_conn" -eq 4 ] || fail "connect started a staged section (exit $staged_conn)"
+[ ! -s "$TEST_EVENTS" ] || fail 'connect touched netifd for a staged section'
+staged_plan="$(sh "$SCRIPT" provision-plan --modem "$PROV_MODEM" 2>/dev/null || :)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["can_control_bearer"] is False, d' \
+	"$staged_plan" || fail 'the plan offered to start a staged section'
+# Stopping one is still allowed: a staged section cannot dial, so there is
+# nothing unsafe about asking netifd to ensure it is down.
+TEST_IFACE_UP=
+export TEST_IFACE_UP
+sh "$SCRIPT" disconnect --modem "$PROV_MODEM" >/dev/null || \
+	fail 'disconnect refused a staged section'
+
 TEST_IFACE_UP=
 export TEST_IFACE_UP
 
@@ -1646,9 +1742,28 @@ sh "$SCRIPT" action-start provision --modem "$PROV_MODEM" >/dev/null 2>&1 || ref
 [ "$refuse_status" -eq 4 ] || \
 	fail "provisioning an already configured modem exited $refuse_status instead of 4 at launch"
 refuse_status=0
-sh "$SCRIPT" action-start connect --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
+sh "$SCRIPT" action-start deprovision --modem "$PROV_MODEM" >/dev/null 2>&1 || refuse_status=$?
 [ "$refuse_status" -eq 4 ] || \
-	fail "connect without a project-owned section exited $refuse_status instead of 4 at launch"
+	fail "deprovisioning a section this package does not own exited $refuse_status instead of 4 at launch"
+
+# The same launch, for the verb class that no longer depends on ownership: the
+# precondition must accept it rather than refuse it at launch.
+accept_status=0
+sh "$SCRIPT" action-start connect --modem "$PROV_MODEM" >/dev/null 2>&1 || accept_status=$?
+[ "$accept_status" -eq 0 ] || \
+	fail "connect on a user-created interface exited $accept_status instead of being accepted at launch"
+bg_waited=0
+while [ "$bg_waited" -lt 15 ]; do
+	bg_state="$(sh "$SCRIPT" action-status --modem "$PROV_MODEM" | \
+		python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["state"])')"
+	case "$bg_state" in success|failed|blocked|retryable) break ;; esac
+	bg_waited=$((bg_waited + 1))
+	/bin/sleep 1
+done
+case "$bg_state" in
+	success|retryable) : ;;
+	*) fail "the accepted connect ended in state $bg_state instead of a netifd outcome" ;;
+esac
 
 printf '%s\n' 'TEST the narrow control wrapper exposes every provisioning verb and nothing else'
 provision_fixture

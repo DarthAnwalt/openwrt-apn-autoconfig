@@ -67,27 +67,51 @@ tests.
 
 ## 0.12.0 — complete native MBIM vertical slice
 
-Add MBIM inventory and ownership, safe network-section provisioning, SIM and
-registration identity, backend-owned profile capture/write/restore, dynamic
-IPv4/IPv6 readiness, connection control, roaming policy where proven and the
-complete common-GUI workflow. Hardware evidence covers discovery through
-post-connect verification and rollback, not an isolated parser.
+Released. Added MBIM inventory and ownership, safe network-section
+provisioning, SIM and registration identity, backend-owned profile
+capture/write/restore, dynamic IPv4/IPv6 readiness, connection control and
+roaming policy over OpenWrt's `allow_roaming`/`allow_partner` pair. Hardware
+evidence covers discovery through post-connect verification and rollback on a
+modem switched into MBIM composition, not an isolated parser.
 
-## 0.13.0 — bounded generic AT framework
+## 0.13.0 — coherent frontend
+
+Reorganize the optional LuCI package around the four things a user actually
+reasons about — the modem, the APN policy, the SIM and the program's own
+settings — instead of the order features were added in. A persistent status
+strip keeps the target, its registration and the last result visible while the
+areas themselves become tabs, so a failure is never hidden behind the tab a
+user is not on. Manual APN entry moves behind a control into a dialog, because
+it is the rare fallback rather than something the page should ask everyone to
+fill in. Maintainer-grade evidence fields collapse under an explicit advanced
+disclosure, and non-obvious fields gain short help opened by click rather than
+hover, because touch devices have no hover.
+
+Connection control stops depending on who created the interface. Operations
+that change configuration — provisioning, removal and profile writes — stay
+restricted to sections this project owns, but bringing a bearer up or down is
+`ifup`/`ifdown`, which the APN engine already performs on user-created
+interfaces during every reconcile. Refusing the button while performing the
+action was inconsistent, and explaining the refusal read as the project's
+convenience rather than the user's.
+
+No machine API changes shape or meaning in this release.
+
+## 0.14.0 — bounded generic AT framework
 
 Add stable same-device AT-port resolution, bounded probing, normalized
 identity and a capability/quirk extension contract. No public control accepts
 free-form AT commands. Manual APN remains an APN-engine operation using the
 same baseline, verification and rollback discipline as database profiles.
 
-## 0.14.0 — Fibocom FM350 connection path
+## 0.15.0 — Fibocom FM350 connection path
 
 Add separately packaged netifd protocol support and capability modules needed
 for the practical FM350 connection lifecycle. Validate provisioning,
 connection, interruption, recovery and coexistence on hardware without moving
 bearer ownership outside netifd.
 
-## 0.15.0 — eSIM lifecycle and live APN recovery
+## 0.16.0 — eSIM lifecycle and live APN recovery
 
 Add `apn-autoconfig-esim` and, if still required, the private upstream-tracking
 `apn-autoconfig-lpac` build. Provide protected activation-code handling,
@@ -96,7 +120,7 @@ profile switch, optional capability-gated modem reset, refreshed SIM identity,
 targeted APN reconcile and verified connectivity. Add the eSIM area to the
 common LuCI package.
 
-## 0.16.0 — 1.0 release-candidate hardening
+## 0.17.0 — 1.0 release-candidate hardening
 
 Complete multi-modem, hotplug/re-enumeration, ownership coexistence, fresh
 install, upgrade, removal and failure-recovery matrices. Freeze package names,

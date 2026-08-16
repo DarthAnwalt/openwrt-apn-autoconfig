@@ -1,5 +1,71 @@
 # Changelog
 
+## apn-autoconfig 0.13.0 / apn-autoconfig-modem 0.13.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.0 (2026-08-16)
+
+A coherent web interface, and one correction to who may start a connection.
+
+The page had grown feature by feature across six releases into eight cards and
+a settings form, arranged in the order the features had been added. Two of them
+described the same modem from different angles, far enough apart that they
+never appeared together.
+
+- The page is now four areas, each answering one question, presented as tabs:
+  **Modem** (what is the hardware doing), **APN** (which profile was chosen and
+  is it still right), **SIM** (whose subscription is this) and **Settings** (how
+  the program behaves on its own). The two modem cards became one.
+- A status strip above the tabs stays visible from every area and shows the
+  selected target and backend, registration, connection state, the last engine
+  result and any running operation. A failure is no longer something you find by
+  opening the right tab.
+- The operator name still appears in two areas, now labelled by which fact it
+  is: **Serving network** is who carries the radio link, **Matched provider** is
+  the database record the profile was selected from. In roaming they differ,
+  which is exactly when both matter.
+- Manual APN entry moved behind a control into a dialog. It is the fallback for
+  a SIM the database does not cover, not something to ask every user to fill in
+  on a page whose normal answer is that the automatic path already worked. Every
+  safety property is unchanged: validation first, one candidate through the same
+  baseline, verification and rollback path, and the password in the request
+  environment and on standard input rather than in argv. Cancelling now drops
+  the password field instead of leaving it populated.
+- Maintainer-grade fields — full modem identity, evidence tier, implementation
+  and validation state, device and USB paths, database source revisions —
+  collapse under an advanced disclosure, closed by default. They stay truthful
+  and stay available; they stop being the first thing a person reads.
+- Non-obvious fields gained short help that opens on activation rather than
+  hover, because a hover tooltip is unreachable on the touch screens many people
+  administer a router from. The text enters the page when it is asked for.
+
+**Connection control no longer depends on who created the interface.**
+`connect`, `disconnect` and `reconnect` are `ifup` and `ifdown`; netifd owns the
+bearer either way, and the APN engine already performs both on user-created
+interfaces during every reconcile. Refusing the button while performing the
+action was inconsistent rather than safe, and a modem bound to an interface the
+user created showed no controls and a paragraph explaining why.
+
+- Bearer control now requires one present, unambiguous modem whose control owner
+  is not conflicting, bound to exactly one section whose protocol is cellular —
+  whoever created it. Both checks run again after the operation locks are held,
+  and an operation whose section or ownership changed in between aborts.
+- Operations that change configuration — provisioning, removal and profile
+  writes — still require this project's ownership markers. Adoption of a
+  user-created section remains refused. Starting an interface is not a claim to
+  own it, and each confirmation names the interface and says so.
+- A staged project-owned section is still never started: it has no profile yet,
+  and starting it is the APN-less dial the staging rules prevent. Stopping one
+  stays allowed.
+- `provision-plan` gained the read-only `can_control_bearer`,
+  `connection_section` and `connection_owned` fields, produced by the same
+  resolver the action uses, so the rule that a control is never rendered for
+  something that cannot work cannot drift from what the runtime accepts. No
+  existing field changed shape or meaning and no wrapper gained a verb.
+
+Also fixed: `last_result` was stored per installation rather than per target,
+left over from the single-target era, so a failure recorded for one target was
+reported as every other target's last result. It now lives in per-target state.
+An installation upgraded from 0.12.0 reports no result rather than attributing
+the old shared one to a target it cannot identify.
+
 ## apn-autoconfig 0.12.0 / apn-autoconfig-modem 0.12.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.12.0 (2026-08-16)
 
 Native MBIM support, from discovering the modem to verifying its connection.

@@ -1108,6 +1108,7 @@ provision_evaluate() {
 	PROVISION_DEVICE=""
 
 	provision_line="$(find_inventory_record "$1" 2>/dev/null || :)"
+	PROVISION_RECORD="$provision_line"
 	if [ -z "$provision_line" ]; then
 		PROVISION_REASON="not_present"
 		return 3
@@ -1342,25 +1343,116 @@ wait_for_interface_up() {
 	done
 }
 
+section_proto_is_cellular() {
+	sect_proto="$(uci -q get "network.${1}.proto" 2>/dev/null || :)"
+	[ -n "$sect_proto" ] || return 1
+	protocol_is_netifd_direct "$sect_proto" && return 0
+	[ "$sect_proto" = modemmanager ]
+}
+
+# Bearer control resolves one unambiguous cellular section, whoever created it.
+# This is deliberately not the provisioning ownership gate: ifup/ifdown change
+# no configuration, netifd owns the bearer either way, and the APN engine
+# already cycles user-created interfaces during every reconcile. Refusing the
+# verb while performing the action was inconsistent. Configuration-changing
+# verbs keep their gate; see docs/frontend-contract-v1.md.
+#
+# Sets CONNECTION_SECTION, CONNECTION_OWNED and CONNECTION_REASON, and returns
+# the coordinator exit class.
+#
+# A caller that already holds a fresh inventory record passes it as the third
+# argument. Scanning is bounded but not free, and provision-plan runs per modem
+# on every page poll; a caller that needs a *new* observation — anything
+# revalidating after acquiring locks — must omit it and force the rescan.
+connection_resolve_section() {
+	conn_resolve_modem="$1"
+	conn_resolve_verb="$2"
+	conn_record="${3:-}"
+	CONNECTION_SECTION=""
+	CONNECTION_OWNED=0
+	CONNECTION_REASON=""
+
+	[ -n "$conn_record" ] || \
+		conn_record="$(find_inventory_record "$conn_resolve_modem" 2>/dev/null || :)"
+	if [ -z "$conn_record" ]; then
+		CONNECTION_REASON="modem $conn_resolve_modem is not currently present"
+		return 3
+	fi
+	if [ "$(field "$conn_record" 12)" = 1 ]; then
+		CONNECTION_REASON="modem $conn_resolve_modem is ambiguous; refusing to drive any interface"
+		return 4
+	fi
+	if [ "$(field "$conn_record" 8)" = conflicting ]; then
+		CONNECTION_REASON="modem $conn_resolve_modem has a conflicting control-owner state"
+		return 4
+	fi
+
+	conn_owned_section="$(provision_existing_section "$conn_resolve_modem" 2>/dev/null || :)"
+	if [ -n "$conn_owned_section" ]; then
+		CONNECTION_SECTION="$conn_owned_section"
+		CONNECTION_OWNED=1
+	else
+		CONNECTION_SECTION="$(field "$conn_record" 9)"
+		if [ -z "$CONNECTION_SECTION" ]; then
+			CONNECTION_REASON="no cellular interface is bound to modem $conn_resolve_modem"
+			return 4
+		fi
+	fi
+
+	case "$CONNECTION_SECTION" in
+		''|*[!A-Za-z0-9_]*)
+			CONNECTION_SECTION=""
+			CONNECTION_REASON="refusing an unsafe section name"
+			return 4
+		;;
+	esac
+
+	if ! section_proto_is_cellular "$CONNECTION_SECTION"; then
+		CONNECTION_REASON="interface $CONNECTION_SECTION is not a cellular section"
+		CONNECTION_SECTION=""
+		return 4
+	fi
+
+	# A staged section has no profile yet, so starting it is exactly the
+	# APN-less dial the staging rules exist to prevent; provisioning stays the
+	# only path that brings it up. Stopping one remains allowed because it
+	# cannot dial.
+	if [ "$CONNECTION_OWNED" = 1 ] && [ "$conn_resolve_verb" != disconnect ] && \
+	   [ "$(uci -q get "network.${CONNECTION_SECTION}.disabled" 2>/dev/null || :)" = 1 ]; then
+		CONNECTION_REASON="interface $CONNECTION_SECTION is still staged and has no APN profile yet"
+		CONNECTION_SECTION=""
+		return 4
+	fi
+
+	CONNECTION_REASON=ok
+	return 0
+}
+
 connection_cmd() {
 	conn_action="$1"
 	conn_modem="$REQUESTED_MODEM"
 	[ -n "$conn_modem" ] || die_code 2 "$conn_action requires --modem"
 	command_exists uci || die "uci is required"
 
-	# v1 acts only on sections this package owns. A user-created interface is
-	# never driven from here; see docs/provisioning-contract-v1.md.
-	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
-	[ -n "$conn_section" ] || \
-		die_code 4 "no section owned by this package is bound to modem $conn_modem"
-	case "$conn_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+	conn_status=0
+	connection_resolve_section "$conn_modem" "$conn_action" || conn_status=$?
+	[ "$conn_status" -eq 0 ] || die_code "$conn_status" "$CONNECTION_REASON"
+	conn_expected_section="$CONNECTION_SECTION"
+	conn_expected_owned="$CONNECTION_OWNED"
 
 	acquire_apn_lock
 	acquire_modem_lock "$conn_modem"
 
-	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
-	[ -n "$conn_section" ] || \
-		die_code 4 "modem $conn_modem no longer owns a project-created section"
+	# Pre-lock validation alone has a time-of-check/time-of-use race: presence,
+	# ambiguity, ownership and the bound section can all change in between.
+	conn_status=0
+	connection_resolve_section "$conn_modem" "$conn_action" || conn_status=$?
+	[ "$conn_status" -eq 0 ] || die_code "$conn_status" "$CONNECTION_REASON"
+	[ "$CONNECTION_SECTION" = "$conn_expected_section" ] || \
+		die_code 4 "modem $conn_modem changed its bound interface before $conn_action"
+	[ "$CONNECTION_OWNED" = "$conn_expected_owned" ] || \
+		die_code 4 "modem $conn_modem changed section ownership before $conn_action"
+	conn_section="$CONNECTION_SECTION"
 
 	conn_result=up
 	case "$conn_action" in
@@ -1443,6 +1535,14 @@ provision_plan_cmd() {
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "provision-plan requires --modem"
 	plan_status=0
 	provision_evaluate "$REQUESTED_MODEM" || plan_status=$?
+
+	# Bearer control is reported by the same resolver the action uses, so the
+	# rule that a control is never rendered for something that cannot work
+	# cannot drift from what the runtime would actually accept. `connect` is
+	# the strictest verb, which makes it the right question to answer here.
+	connection_status=0
+	connection_resolve_section "$REQUESTED_MODEM" connect "$PROVISION_RECORD" || connection_status=$?
+
 	printf '{'
 	json_key_string version v1; printf ','
 	json_key_string modem_id "$REQUESTED_MODEM"; printf ','
@@ -1451,7 +1551,10 @@ provision_plan_cmd() {
 	json_key_string section "$PROVISION_SECTION"; printf ','
 	json_key_string existing_section "$PROVISION_EXISTING"; printf ','
 	json_key_string protocol "$PROVISION_PROTOCOL"; printf ','
-	json_key_string device "$PROVISION_DEVICE"
+	json_key_string device "$PROVISION_DEVICE"; printf ','
+	printf '"can_control_bearer":%s,' "$([ "$connection_status" -eq 0 ] && printf true || printf false)"
+	json_key_string connection_section "$CONNECTION_SECTION"; printf ','
+	printf '"connection_owned":%s' "$([ "$CONNECTION_OWNED" = 1 ] && printf true || printf false)"
 	printf '}\n'
 	return "$plan_status"
 }
@@ -1719,9 +1822,16 @@ action_precondition() {
 			[ "$PROVISION_REASON" = ok ] || \
 				die_code "$precondition_status" "modem $precondition_modem cannot be provisioned: $PROVISION_REASON"
 		;;
-		deprovision|connect|disconnect|reconnect)
+		deprovision)
 			[ -n "$(provision_existing_section "$precondition_modem" 2>/dev/null || :)" ] || \
 				die_code 4 "no section owned by this package is bound to modem $precondition_modem"
+		;;
+		connect|disconnect|reconnect)
+			precondition_status=0
+			connection_resolve_section "$precondition_modem" "$precondition_action" || \
+				precondition_status=$?
+			[ "$precondition_status" -eq 0 ] || \
+				die_code "$precondition_status" "$CONNECTION_REASON"
 		;;
 	esac
 }

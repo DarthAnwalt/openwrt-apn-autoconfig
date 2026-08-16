@@ -1,12 +1,12 @@
 'use strict';
 
-/* Regression tests for the LuCI first-run provisioning card.
+/* Regression tests for the LuCI modem area and manual APN entry.
  *
  * These assert the safety properties the view is responsible for: a control is
- * never offered for something that cannot work, an interface the user created
- * is never offered for adoption or removal, the privileged wrapper is only ever
- * given a fixed verb and a modem identity, and a lost launch answer never
- * reports success. */
+ * never offered for something the runtime would refuse, an interface the user
+ * created is never offered for adoption or removal even though it can now be
+ * started and stopped, the privileged wrapper is only ever given a fixed verb
+ * and a modem identity, and a lost launch answer never reports success. */
 
 var assert = require('assert');
 var fs = require('fs');
@@ -177,11 +177,15 @@ function modemFixture(plan, operation) {
 	};
 }
 
+function modemArea(plan, operation, extra) {
+	var modem = Object.assign(modemFixture(plan, operation), extra || {});
+	return loadView().modemAreaNodes({ version: 'v1', modems: [ modem ] });
+}
+
 /* An unconfigured modem is the only case that offers setup. */
-var app = loadView();
-var setupNodes = app.provisioningNodes({
-	version: 'v1',
-	modems: [ modemFixture({ can_provision: true, reason: 'ok', section: 'apnmodem1', protocol: 'qmi' }) ]
+var setupNodes = modemArea({
+	can_provision: true, reason: 'ok', section: 'apnmodem1', protocol: 'qmi',
+	can_control_bearer: false, connection_section: '', connection_owned: false
 });
 assert.deepStrictEqual(buttonLabels(setupNodes), [ 'Set up this modem' ],
 	'an unconfigured modem must offer exactly one setup control');
@@ -190,13 +194,38 @@ assert.ok(collectText(setupNodes).join(' ').indexOf('SERIAL01') === -1,
 assert.ok(collectText(setupNodes).join(' ').indexOf('apnmodem1') !== -1,
 	'the view must name the interface it would create before the user agrees');
 
-/* A modem belonging to an interface the user created is never offered for
- * adoption, removal or connection control. */
-[ 'already_configured', 'ambiguous', 'conflicting_owner', 'unsupported_protocol', 'no_device' ]
+/* Bearer control no longer depends on who created the interface. An interface
+ * the user made gets connect, disconnect and reconnect - and nothing that would
+ * change its configuration. */
+var foreignNodes = modemArea(
+	{ can_provision: false, reason: 'already_configured',
+	  can_control_bearer: true, connection_section: 'wwan', connection_owned: false },
+	null,
+	{ owner_state: 'modemmanager', netifd_interface: 'wwan' });
+assert.deepStrictEqual(buttonLabels(foreignNodes), [ 'Connect', 'Reconnect', 'Disconnect' ],
+	'a user-created cellular interface must offer bearer control and nothing else');
+var foreignText = collectText(foreignNodes).join(' ');
+assert.ok(foreignText.indexOf('wwan') !== -1,
+	'the card must name the interface the modem is bound to');
+assert.ok(!/only reported here/.test(foreignText),
+	'a modem that can now be controlled must not be described as merely reported');
+
+/* A modem this package set up keeps removal in addition. */
+var ownedNodes = modemArea({
+	can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1',
+	can_control_bearer: true, connection_section: 'apnmodem1', connection_owned: true
+});
+assert.deepStrictEqual(buttonLabels(ownedNodes),
+	[ 'Connect', 'Reconnect', 'Disconnect', 'Remove setup' ],
+	'a project-owned modem must offer bearer control and removal');
+
+/* Whatever the reason, a modem the runtime would refuse gets no control and an
+ * explanation. The backend decides; the view never re-derives the rule. */
+[ 'ambiguous', 'conflicting_owner', 'unsupported_protocol', 'no_device' ]
 	.forEach(function(reason) {
-		var nodes = loadView().provisioningNodes({
-			version: 'v1',
-			modems: [ modemFixture({ can_provision: false, reason: reason }) ]
+		var nodes = modemArea({
+			can_provision: false, reason: reason,
+			can_control_bearer: false, connection_section: '', connection_owned: false
 		});
 		assert.deepStrictEqual(buttonLabels(nodes), [],
 			'a modem refused for ' + reason + ' must offer no controls at all');
@@ -204,62 +233,28 @@ assert.ok(collectText(setupNodes).join(' ').indexOf('apnmodem1') !== -1,
 			'a modem refused for ' + reason + ' must be explained instead of silently empty');
 	});
 
-/* A modem this package set up gets connection control and removal. */
-var ownedNodes = loadView().provisioningNodes({
-	version: 'v1',
-	modems: [ modemFixture({ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1' }) ]
+/* A staged project-owned section has no profile yet. The backend refuses to
+ * start it, so the page must not offer to. */
+var stagedNodes = modemArea({
+	can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1',
+	can_control_bearer: false, connection_section: '', connection_owned: true
 });
-assert.deepStrictEqual(buttonLabels(ownedNodes),
-	[ 'Connect', 'Reconnect', 'Disconnect', 'Remove setup' ],
-	'a project-owned modem must offer connection control and removal');
-
-/* The read-only inventory card looks exactly like the place controls would be,
- * so a modem this package will not drive has to say why there are none. Without
- * this the page shows a modem, no controls and no reason - which is what a real
- * browser session found. */
-var inventoryApp = loadView();
-var foreignInventory = inventoryApp.modemInventoryNodes({
-	version: 'v1',
-	modems: [ Object.assign(modemFixture({ can_provision: false, reason: 'already_configured' }),
-		{ owner_state: 'modemmanager', netifd_interface: 'wwan' }) ]
-});
-var foreignText = collectText(foreignInventory).join(' ');
-assert.ok(foreignText.indexOf('wwan') !== -1,
-	'the inventory card must name the interface that owns the modem');
-assert.ok(/only reported here/.test(foreignText),
-	'the inventory card must explain that it will not drive this modem');
-assert.deepStrictEqual(buttonLabels(foreignInventory), [],
-	'the inventory card must stay read-only');
-
-var ownedInventory = loadView().modemInventoryNodes({
-	version: 'v1',
-	modems: [ modemFixture({ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1' }) ]
-});
-assert.ok(!/only reported here/.test(collectText(ownedInventory).join(' ')),
-	'a modem this package set up must not be described as merely reported');
-
-var setupInventory = loadView().modemInventoryNodes({
-	version: 'v1',
-	modems: [ modemFixture({ can_provision: true, reason: 'ok', section: 'apnmodem1', protocol: 'qmi' }) ]
-});
-assert.ok(!/only reported here/.test(collectText(setupInventory).join(' ')),
-	'a modem that can be set up must not be described as merely reported');
+assert.deepStrictEqual(buttonLabels(stagedNodes), [ 'Remove setup' ],
+	'a staged section must not be startable from the page');
 
 /* A missing optional package explains itself rather than showing dead buttons. */
-var absentNodes = loadView().provisioningNodes({ error: 'not installed' });
+var absentNodes = loadView().modemAreaNodes({ error: 'not installed' });
 assert.deepStrictEqual(buttonLabels(absentNodes), [],
 	'an absent modem package must not render controls');
 assert.ok(collectText(absentNodes).join(' ').indexOf('apn-autoconfig-modem') !== -1,
 	'an absent modem package must be named in the explanation');
 
 /* Controls stay disabled while that modem already has an operation running. */
-var busyNodes = loadView().provisioningNodes({
-	version: 'v1',
-	modems: [ modemFixture(
-		{ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1' },
-		{ busy: true, state: 'running' }
-	) ]
-});
+var busyNodes = modemArea(
+	{ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1',
+	  can_control_bearer: true, connection_section: 'apnmodem1', connection_owned: true },
+	{ busy: true, state: 'running' }
+);
 assert.ok(actionButtons(busyNodes).every(function(button) { return button.disabled === true; }),
 	'controls must be disabled while an operation is running for that modem');
 
@@ -306,7 +301,10 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 	/* Destructive verbs must be confirmed before anything is started. */
 	var confirmApp = loadView();
 	confirmApp.modemButtons = [];
-	var owned = modemFixture({ can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1' });
+	var owned = modemFixture({
+		can_provision: false, reason: 'already_provisioned', existing_section: 'apnmodem1',
+		can_control_bearer: true, connection_section: 'apnmodem1', connection_owned: true
+	});
 	[ 'provision', 'deprovision', 'disconnect', 'reconnect' ].forEach(function(verb) {
 		confirmApp.confirmModemAction(owned, verb);
 	});
@@ -314,6 +312,26 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		'every state-changing verb must be confirmed first');
 	assert.strictEqual(confirmApp.testExecCalls.length, 0,
 		'showing a confirmation must not start anything');
+
+	/* Starting or stopping an interface is not a claim to own it, so the
+	 * confirmation has to say which interface it will act on. */
+	var namingApp = loadView();
+	namingApp.modemButtons = [];
+	var foreign = modemFixture({
+		can_provision: false, reason: 'already_configured',
+		can_control_bearer: true, connection_section: 'wwan', connection_owned: false
+	});
+	[ 'connect', 'disconnect', 'reconnect' ].forEach(function(verb) {
+		namingApp.testUi.modals.length = 0;
+		namingApp.confirmModemAction(foreign, verb);
+		assert.strictEqual(namingApp.testUi.modals.length, 1,
+			verb + ' must be confirmed before it runs');
+		var body = collectText(namingApp.testUi.modals[0].children).join(' ');
+		assert.ok(body.indexOf('wwan') !== -1,
+			verb + ' must name the interface it will act on');
+		assert.ok(/no configuration is changed/i.test(body),
+			verb + ' must say that it changes no configuration');
+	});
 
 	/* ---- manual APN entry ---- */
 
@@ -393,12 +411,40 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.strictEqual(confirmApp.testExecCalls.length, 0,
 			'showing the confirmation must not start anything');
 
-		/* Without profile-apply support the form is replaced by an explanation. */
-		var unsupported = loadView().manualApnNodes({ version: 'v2', target_capabilities: {} });
-		assert.deepStrictEqual(buttonLabels(unsupported), [],
-			'manual entry must offer no control when the target cannot apply a profile');
-		assert.ok(collectText(unsupported).join(' ').trim().length > 0,
-			'an unsupported target must be explained instead of showing an empty form');
+		/* Manual entry is the rare fallback, so it must not sit expanded on the
+		 * page asking every user to fill it in. It lives behind a control. */
+		var dialogApp = loadView();
+		dialogApp.profileApplySupported = true;
+		dialogApp.busy = false;
+		assert.strictEqual(dialogApp.manualApn, undefined,
+			'the manual APN fields must not exist before the control is activated');
+		dialogApp.openManualApn();
+		assert.strictEqual(dialogApp.testUi.modals.length, 1,
+			'the manual APN control must open a dialog');
+		assert.ok(dialogApp.manualApn && dialogApp.manualPassword,
+			'the dialog must contain the profile fields');
+		assert.strictEqual(dialogApp.testExecCalls.length, 0,
+			'opening the dialog must not start anything');
+
+		/* Cancelling writes nothing and keeps nothing. */
+		var cancelBody = dialogApp.testUi.modals[0].children;
+		var cancelButton = collectButtons(cancelBody).filter(function(button) {
+			return collectText(button.children).join('').trim() === 'Cancel';
+		})[0];
+		assert.ok(cancelButton, 'the dialog must offer a way out');
+		cancelButton.click();
+		assert.strictEqual(dialogApp.testExecCalls.length, 0,
+			'cancelling the dialog must not start anything');
+		assert.strictEqual(dialogApp.manualPassword, null,
+			'cancelling must not keep the password field around');
+
+		/* A target that cannot apply a profile never reaches the dialog. */
+		var unsupported = loadView();
+		unsupported.profileApplySupported = false;
+		unsupported.busy = false;
+		unsupported.openManualApn();
+		assert.strictEqual(unsupported.testUi.modals.length, 0,
+			'manual entry must not open for a target that cannot apply a profile');
 	}).then(function() {
 	/* ---- transport: a refusal arrives with a non-zero exit code ---- */
 
@@ -424,7 +470,6 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 			}) };
 		return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
 	});
-	planApp.provisioningBox = element('div');
 	planApp.modemBox = element('div');
 	return Promise.resolve(planApp.refreshProvisioning()).then(function() {
 		var plan = planApp.modemInventory.modems[0].plan;
@@ -433,12 +478,12 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.ok(!plan.error,
 			'a complete answer must not be turned into an error by its exit code');
 
-		var rendered = collectText(planApp.provisioningBox.children).join(' ');
+		var rendered = collectText(planApp.modemBox.children).join(' ');
 		assert.strictEqual(rendered.indexOf('can_provision'), -1,
 			'raw command output must never be rendered into the page');
 		assert.strictEqual(rendered.indexOf('SERIAL01'), -1,
 			'a refusal must not leak the unmasked modem identity');
-		assert.ok(rendered.indexOf('already belongs to an existing network interface') !== -1,
+		assert.ok(rendered.indexOf('belongs to a network interface you created') !== -1,
 			'a refused modem must get its plain-language explanation');
 
 		/* Output that is not an answer at all is still reported, without
@@ -453,10 +498,9 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 				return { code: 127, stdout: 'usb-serial:1-1.2:2c7c:0801:SERIAL01 exploded' };
 			return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
 		});
-		brokenApp.provisioningBox = element('div');
 		brokenApp.modemBox = element('div');
 		return Promise.resolve(brokenApp.refreshProvisioning()).then(function() {
-			var brokenText = collectText(brokenApp.provisioningBox.children).join(' ');
+			var brokenText = collectText(brokenApp.modemBox.children).join(' ');
 			assert.strictEqual(brokenText.indexOf('exploded'), -1,
 				'raw command output must not reach the page even when it fails');
 			assert.strictEqual(brokenText.indexOf('SERIAL01'), -1,

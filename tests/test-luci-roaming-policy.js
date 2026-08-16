@@ -199,12 +199,94 @@ async function verifyLayout() {
 	};
 	var page = await app.render([ {}, status, { state: 'idle', busy: false }, database ]);
 	var nodes = descendants(page);
-	var headings = nodes.filter(function(node) { return node.tag === 'h3'; }).map(function(node) {
-		return node.children.join('');
+	/* Four areas, one question each, reachable as tabs. */
+	var tabs = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-tab') !== -1;
 	});
-	[ 'Mobile connection', 'Current APN', 'Provider database', 'Roaming data policy', 'Actions' ].forEach(function(heading) {
-		assert.ok(headings.indexOf(heading) !== -1, 'missing grouped section: ' + heading);
+	assert.deepStrictEqual(tabs.map(function(tab) { return tab.children.join(''); }),
+		[ 'Modem', 'APN', 'SIM', 'Settings' ],
+		'the page must offer exactly the four areas, in order');
+	assert.strictEqual(app.tabPanels.length, 4, 'each area must have its own panel');
+	assert.strictEqual(tabs[0].attrs['aria-selected'], 'true',
+		'the modem area must be selected on load');
+	assert.ok(app.tabPanels.slice(1).every(function(panel) {
+		return panel.node.style.display === 'none';
+	}), 'only the selected area may be displayed');
+
+	/* The strip lives outside the tabs, so state is never hidden behind the
+	 * tab a user does not happen to be on. */
+	var strip = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-strip') !== -1;
 	});
+	assert.strictEqual(strip.length, 1, 'there must be exactly one status strip');
+	assert.ok(app.tabPanels.every(function(panel) {
+		return descendants(panel.node).indexOf(strip[0]) === -1;
+	}), 'the status strip must not live inside any tab panel');
+	var stripText = nodeText(strip[0]);
+	[ 'Target', 'wwan', 'modemmanager', 'Registration', 'Connection', 'Last result' ].forEach(function(part) {
+		assert.ok(stripText.indexOf(part) !== -1, 'the strip must show ' + part);
+	});
+
+	/* Selecting another area never removes it. */
+	app.selectTab('sim');
+	assert.strictEqual(app.tabPanels[2].node.style.display, '',
+		'selecting an area must display its panel');
+	assert.strictEqual(app.tabPanels[0].node.style.display, 'none',
+		'selecting an area must hide the others');
+	assert.ok(descendants(page).indexOf(strip[0]) !== -1,
+		'the status strip must survive a tab change');
+	app.selectTab('modem');
+
+	/* The serving network and the matched database provider are different
+	 * facts, and in roaming they differ. Neither may be labelled as the other. */
+	var labels = nodes.filter(function(node) { return node.tag === 'strong'; })
+		.map(function(node) { return node.children.join(''); });
+	assert.ok(labels.indexOf('Serving network') !== -1, 'the modem area must name the serving network');
+	assert.ok(labels.indexOf('Matched provider') !== -1, 'the APN area must name the matched provider');
+	assert.strictEqual(labels.filter(function(label) { return label === 'Operator'; }).length, 0,
+		'no field may be labelled with the ambiguous name the two facts used to share');
+
+	/* Evidence-grade fields are collapsed, closed, and still present. */
+	var disclosures = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-advanced') !== -1;
+	});
+	assert.ok(disclosures.length > 0, 'evidence fields must live behind an advanced disclosure');
+	assert.ok(disclosures.every(function(node) {
+		return node.tag === 'details' && !Object.prototype.hasOwnProperty.call(node.attrs, 'open');
+	}), 'every advanced disclosure must be closed by default');
+	var disclosedText = disclosures.map(nodeText).join(' ');
+	[ 'Implementation / validation', 'Database path', 'ICCID', 'IMSI', 'EID' ].forEach(function(field) {
+		assert.ok(disclosedText.indexOf(field) !== -1,
+			field + ' is evidence-grade and must sit behind the disclosure');
+		assert.strictEqual(nodeText(page).split(field).length - 1,
+			disclosedText.split(field).length - 1,
+			field + ' must not also be rendered outside the disclosure');
+	});
+
+	/* Help opens on activation. A hover handler would be unreachable on the
+	 * touch screens many people administer a router from. */
+	var helpToggles = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-help-toggle') !== -1;
+	});
+	assert.ok(helpToggles.length > 0, 'non-obvious fields must carry help');
+	assert.ok(helpToggles.every(function(node) {
+		return typeof node.click === 'function' &&
+			node.mouseover === undefined && node.mouseenter === undefined &&
+			!Object.prototype.hasOwnProperty.call(node.attrs, 'title-on-hover');
+	}), 'help must be bound to activation rather than to hover');
+	var helpBodies = nodes.filter(function(node) {
+		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('apn-help-body') !== -1;
+	});
+	assert.ok(helpBodies.every(function(node) { return node.children.length === 0; }),
+		'help text must be absent from the DOM until it is asked for');
+	helpToggles[0].click({ preventDefault: function() {} });
+	assert.ok(helpBodies[0].children.length > 0,
+		'activating help must add the explanation');
+	assert.strictEqual(helpToggles[0].attrs['aria-expanded'], 'true',
+		'an opened help control must report its state');
+	helpToggles[0].click({ preventDefault: function() {} });
+	assert.strictEqual(helpBodies[0].children.length, 0,
+		'closing help must remove the explanation again');
 	assert.ok(nodes.some(function(node) {
 		return node.attrs && (node.attrs['class'] || '').split(' ').indexOf('cbi-progressbar') !== -1;
 	}), 'signal quality must use the native LuCI progress bar');
@@ -227,28 +309,45 @@ async function verifyLayout() {
 	assert.ok(sensitiveDisplays.every(function(node) {
 		return node.children.join('').indexOf('89492031246010483050') === -1;
 	}), 'full identifiers must not be rendered before an explicit reveal');
-	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
+	/* Selected by what it is rather than by position: the areas may be
+	 * reordered, and the ICCID happens to carry the same digits. */
+	var simToggleIndex = sensitiveToggles.findIndex(function(node) {
+		return node.attrs['aria-label'] === 'Show full SIM identifier';
+	});
+	assert.ok(simToggleIndex !== -1, 'the reconciled SIM must have a labelled reveal control');
+	var simDisplay = sensitiveDisplays[simToggleIndex];
+	var simToggle = sensitiveToggles[simToggleIndex];
+	assert.strictEqual(simDisplay.children.join(''), '••••••••••••••••3050',
 		'masked reconciled SIM must retain its full character width and final four digits');
-	assert.strictEqual(sensitiveDisplays[3].children.join('').length, '89492031246010483050'.length,
+	assert.strictEqual(simDisplay.children.join('').length, '89492031246010483050'.length,
 		'masked and revealed identifiers must have equal character counts');
-	assert.ok((sensitiveDisplays[3].attrs.style || '').indexOf('font-family:monospace') !== -1,
+	assert.ok((simDisplay.attrs.style || '').indexOf('font-family:monospace') !== -1,
 		'sensitive identifiers must use fixed-width glyphs so the toggle does not move');
-	sensitiveToggles[3].click({ preventDefault: function() {} });
-	assert.strictEqual(sensitiveDisplays[3].children.join(''), '89492031246010483050',
+	simToggle.click({ preventDefault: function() {} });
+	assert.strictEqual(simDisplay.children.join(''), '89492031246010483050',
 		'reveal control must show the complete reconciled SIM identifier');
-	assert.strictEqual(sensitiveToggles[3].attrs['aria-label'], 'Hide SIM identifier',
+	assert.strictEqual(simToggle.attrs['aria-label'], 'Hide SIM identifier',
 		'reveal control must become an explicitly labelled hide control');
-	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'hidden',
+	assert.strictEqual(simToggle.children[0].style.visibility, 'hidden',
 		'Show label must be visually hidden after revealing');
-	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'visible',
+	assert.strictEqual(simToggle.children[1].style.visibility, 'visible',
 		'Hide label must be visible after revealing');
-	sensitiveToggles[3].click({ preventDefault: function() {} });
-	assert.strictEqual(sensitiveDisplays[3].children.join(''), '••••••••••••••••3050',
+	simToggle.click({ preventDefault: function() {} });
+	assert.strictEqual(simDisplay.children.join(''), '••••••••••••••••3050',
 		'hide control must restore masking');
-	assert.strictEqual(sensitiveToggles[3].children[0].style.visibility, 'visible',
+	assert.strictEqual(simToggle.children[0].style.visibility, 'visible',
 		'Show label must be visible after hiding again');
-	assert.strictEqual(sensitiveToggles[3].children[1].style.visibility, 'hidden',
+	assert.strictEqual(simToggle.children[1].style.visibility, 'hidden',
 		'Hide label must keep contributing width while visually hidden');
+	/* LuCI's own Save & Apply footer sits outside the view's tabs by platform
+	 * convention, and this page contains exactly one form.Map — the Settings
+	 * area — so that footer has exactly one thing to act on. Nothing in the
+	 * other three areas is saved through it; their controls act immediately
+	 * through the narrow wrappers. */
+	assert.strictEqual(app.tabPanels.filter(function(panel) {
+		return panel.name === 'settings';
+	}).length, 1, 'the settings form must live in exactly one area');
+
 	assert.strictEqual(app.databaseInstallButton.style.display, '',
 		'Install update must be visible when an update is available');
 	assert.strictEqual(app.databaseInstallButton.disabled, false,
@@ -292,8 +391,12 @@ async function verifyBackendSpecificPolicy() {
 		roaming_policy: 'default-allow'
 	};
 	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
-	assert.strictEqual((nodeText(app.connectionBox).match(/SIMon mobile/g) || []).length, 3,
+	assert.strictEqual((nodeText(app.modemBox).match(/SIMon mobile/g) || []).length, 1,
+		'the modem area must report the serving network exactly once');
+	assert.strictEqual((nodeText(app.simBox).match(/SIMon mobile/g) || []).length, 2,
 		'home registration must safely reuse the serving name for SIM provider and home-network display');
+	assert.strictEqual((nodeText(app.apnBox).match(/SIMon mobile/g) || []).length, 1,
+		'the APN area must report the matched provider it selected the profile from');
 	assert.strictEqual(app.reconcileButton.disabled, false,
 		'QMI APN support must remain enabled independently of roaming policy control');
 	assert.strictEqual(app.resetButton, null,
@@ -314,7 +417,9 @@ async function verifyBackendSpecificPolicy() {
 	status.registration_state = 'roaming';
 	status.serving_operator_name = 'Vodafone.de';
 	await roamingApp.render([ {}, status, { state: 'idle', busy: false }, {} ]);
-	assert.strictEqual((nodeText(roamingApp.connectionBox).match(/Vodafone\.de/g) || []).length, 1,
+	assert.strictEqual((nodeText(roamingApp.modemBox).match(/Vodafone\.de/g) || []).length, 1,
+		'the roaming serving network belongs to the modem area');
+	assert.strictEqual((nodeText(roamingApp.simBox).match(/Vodafone\.de/g) || []).length, 0,
 		'roaming serving network must not be presented as SIM provider or home network');
 }
 

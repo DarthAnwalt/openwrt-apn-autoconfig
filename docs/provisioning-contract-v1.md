@@ -23,7 +23,7 @@ In scope for v1:
   engine, never by writing profile fields directly;
 - connect through netifd, verify real Internet access, and only then promote the
   requested autoconnect state;
-- basic `connect` / `disconnect` / `reconnect` on a project-owned section;
+- basic `connect` / `disconnect` / `reconnect` (see *Bearer control* below);
 - exact rollback of everything provisioning created; and
 - removal of project-owned provisioning state without touching anything else.
 
@@ -62,6 +62,38 @@ the sole bearer owner. Neither package writes the other's fields.
 There is no adoption in v1. A modem already bound to any netifd interface is
 not provisionable; `provision` fails closed with `already_configured`. Adoption
 requires a recorded ownership decision and is deferred to a later milestone.
+
+### Bearer control
+
+Amended in 0.13.0 by [`frontend-contract-v1.md`](frontend-contract-v1.md).
+Operations are gated by what they actually do, not by one rule for all:
+
+| Class | Operations | Requirement |
+|---|---|---|
+| Configuration-changing | `provision`, `deprovision`, profile writes | the section carries this project's ownership markers |
+| Bearer control | `connect`, `disconnect`, `reconnect` | one unambiguous cellular section bound to the modem, whoever created it |
+
+`connect`, `disconnect` and `reconnect` resolve their section through
+`connection_resolve_section`, which requires a present, unambiguous modem whose
+`owner_state` is not `conflicting`, and a bound section whose `proto` is
+cellular. It prefers the project-owned section when one exists and otherwise
+uses the single interface inventory resolved for that modem. The resolution is
+repeated after both locks are held, and an operation whose section or ownership
+changed in between aborts rather than acting on the new one.
+
+`ifup` and `ifdown` change no configuration, netifd owns the bearer either way,
+and the APN engine already performs both on user-created interfaces during every
+reconcile — so refusing the verb while performing the action was inconsistent
+rather than safe.
+
+A **staged** project-owned section is still never started: it has no profile
+yet, and starting it is exactly the APN-less dial the staging rules prevent.
+Stopping one remains allowed, because a section that cannot dial cannot be made
+less safe by ensuring it is down.
+
+This is not adoption. Starting and stopping an interface is not a claim to own
+its profile fields or a licence to delete it, and `deprovision` still refuses
+every section without the markers.
 
 ## Section naming
 
@@ -205,6 +237,14 @@ used, and, when it cannot, a stable machine-readable reason:
 `already_configured`, `ambiguous`, `conflicting_owner`, `unsupported_protocol`,
 `not_present`, `name_unavailable`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
+
+0.13.0 adds three read-only fields to the same response, additively and without
+changing the meaning of any existing one: `can_control_bearer`,
+`connection_section` and `connection_owned`. They are produced by the same
+resolver the action itself uses, so a frontend obeying the rule that a control
+is never rendered for something that cannot work cannot drift from what the
+runtime would accept. `can_control_bearer` answers for `connect`, the strictest
+of the three verbs.
 
 The engine command is
 `apn-autoconfig apply-manual --apn <apn> [--username <u> --password-stdin]

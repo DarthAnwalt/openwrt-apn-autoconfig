@@ -190,7 +190,24 @@ Both fixes were built by the SDK and installed on the router, which then
 reported `stable` / `hardware` for the production modem with its pin, button
 setting and `wwan` untouched.
 
-## Still open
+## Signed-feed smoke
 
-The signed-feed install/removal/reinstall smoke, which is only possible after
-publication.
+Run after `v0.12.0` published. `apk update` picked the release up from the
+signed feed, and all four packages were removed and reinstalled **without
+`--allow-untrusted`** — the pinned key alone was enough, which is the property
+this project refuses to compromise on.
+
+Removal behaved as designed and as the 0.11.0 lifecycle tests assert: the
+pre-deinstall hook restored the target's original mobile profile and removed the
+cache and baseline, and each package took its own configuration with it. On a
+production router that means the tuned values — the selected interface, the
+enabled button and the pinned `reset_modem_id` — are gone after a full removal,
+so they were restored from the recovery point captured before the release work.
+Both configuration files and `network.wwan` are byte-identical to that snapshot
+again, the modem path answers, and no lock or pending UCI change was left
+behind.
+
+Worth stating plainly for the next release: a full `apk del` is not a
+configuration-preserving operation, and a router that matters should have a
+recovery point before one. An upgrade in place, which is the normal path, keeps
+everything.

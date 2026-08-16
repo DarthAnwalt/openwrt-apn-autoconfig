@@ -169,5 +169,45 @@ own DOM, which is precisely the kind of thing that breaks on a LuCI update.
 
 ## Signed-feed smoke
 
-Pending publication. It installs the released packages from the signed feed with
-no `--allow-untrusted` and confirms the page works from the installed package.
+Passed for both 0.13.0 and the 0.13.1 patch, installed from the signed feed with
+no `--allow-untrusted`. The view shipped in the published
+`luci-app-apn-autoconfig` has the same SHA-256 as the tested working tree, the
+page renders from it, and the pinned `reset_modem_id`, the selected interface and
+the button setting all survived.
+
+The 0.13.1 fix was confirmed on hardware from the published package rather than
+from a local build. During a reconcile:
+
+```text
+1s: Connect=D Reconnect=D Disconnect=D Power-cycle=D Re-detect=D Enter-APN=D
+4s: Connect=D Reconnect=D Disconnect=D Power-cycle=e Re-detect=e Enter-APN=e
+5s: Connect=e Reconnect=e Disconnect=e …
+```
+
+All controls disable together. The connection controls re-enable about a second
+after the others, because the card is refreshed on its own poll; that lag is in
+the conservative direction and is left as is.
+
+## What the smoke test nearly failed to notice
+
+The first 0.13.1 upgrade moved only two of the four packages and reported
+`OK: 103.2 MiB in 293 packages`. `apn-autoconfig` and the Huasifei integration
+stayed on 0.13.0. Re-running the same command changed nothing and reported OK
+again.
+
+The cause was **this procedure**, not the packages: the hardware gate had
+installed them from local `.apk` files, and `apk add ./file.apk` records an
+exact-version constraint in `/etc/apk/world`. The two packages that did upgrade
+had been re-added by bare name during the previous smoke, which cleared theirs.
+`apk info --depends` shows the integration depending on a plain, unversioned
+`apn-autoconfig`, and a 0.13.1 LuCI package ran against a 0.13.0 core without
+complaint, so there is no inter-package version lock — an early reading of
+`apk info -r` as one was wrong.
+
+Two consequences were recorded rather than smoothed over. A signed-feed smoke
+can report success while installing nothing, so it must verify `apk list -I`
+instead of the exit status. And a hardware gate that ends without clearing the
+constraints leaves the maintainer's own router silently unable to take suite
+upgrades — which is what had happened here, and was repaired by re-adding the
+packages by bare name. Both are now rules in
+[`development-handoff.md`](development-handoff.md).

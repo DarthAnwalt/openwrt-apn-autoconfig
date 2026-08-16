@@ -185,6 +185,42 @@ real hardware tests recorded in `testing-0.10.0.md`, rollback/recovery
 artifacts, signed-feed installation and a final installed-package smoke test.
 A green fixture suite is necessary but insufficient for a hardware claim.
 
+### The hardware gate pins packages, and the smoke test must undo it
+
+`apk add ./package.apk` records an exact-version constraint in `/etc/apk/world`,
+because installing a named file is a statement about which version the
+administrator wants. Every hardware gate installs checksum-verified local
+artifacts exactly that way, so **the gate itself leaves the router unable to
+upgrade those packages.** A later `apk upgrade` then changes nothing and still
+prints `OK: … in N packages`, because the recorded constraint is satisfied.
+
+This is not a defect in the packages. Their dependencies are unversioned, and
+mixed suite versions install and run against each other. It is a property of the
+test procedure, and it makes a signed-feed smoke capable of reporting success
+while installing nothing at all.
+
+Two rules follow, and both are part of the smoke test rather than optional
+hygiene:
+
+1. Before installing from the feed, clear the constraints the local install
+   wrote, by re-adding the packages by bare name:
+
+   ```sh
+   apk add apn-autoconfig apn-autoconfig-modem apn-autoconfig-providers \
+       luci-app-apn-autoconfig apn-autoconfig-integration-huasifei-wh3000
+   tr ' ' '\n' < /etc/apk/world | grep apn-autoconfig   # no '=' may remain
+   ```
+
+2. Confirm what actually landed instead of trusting the exit status:
+
+   ```sh
+   apk list -I | grep apn-autoconfig | sort
+   ```
+
+Leaving a pinned entry behind also degrades the router afterwards: the
+maintainer's own device silently stops receiving suite upgrades. Restore it to
+bare names before the session ends.
+
 Release tags are `v<suite-version>`. From 0.10.0, first-party code packages
 participating in a suite release use the suite version; provider data remains
 date-versioned and upstream-derived dependencies retain their upstream source

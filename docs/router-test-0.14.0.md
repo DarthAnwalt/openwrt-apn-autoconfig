@@ -85,6 +85,35 @@ one silent port, pays its five-second bound once, and succeeds on the next. A
 modem whose only responder sat at the end of the list would have paid that bound
 five times, which is why discovery does not sweep and why failures are cached.
 
+## Identity read, same window
+
+`at-identity` against the seven-port modem returned the complete v1 identity
+contract in seven seconds, cold, against a live SIM:
+
+| Field | Result |
+|---|---|
+| `iccid` / `imsi` | read successfully (values omitted from this record) |
+| `operator_id` | empty, as specified |
+| `serving_operator_id` | numeric PLMN, matching the manual census |
+| `registration_state` / `roaming` | `home` / `false`, from `AT+CEREG?` |
+| `access_technologies` | `lte,5gnr` — `<AcT>` 13 is E-UTRA-NR dual connectivity |
+| `modem_state` | `enabled` |
+| `signal_quality` | derived from `AT+CESQ` RSRP |
+| `manufacturer` / `model` / `firmware_revision` | all three present in the inventory record afterwards, with no further probe |
+
+Every value matches the manual census except the signal percentage, which had
+moved by five points between the two readings — a live radio, which is the point
+of reading it rather than caching it.
+
+The operator this SIM belongs to has 23 rows in the shipped provider database,
+so the identity-to-matching path has a real target on this hardware. Wiring the
+match itself is a later step.
+
+ModemManager was restarted afterwards. It rediscovered the internal modem and
+`wwan` returned to `up`; note that ModemManager needs a minute or so after a
+restart before it publishes anything, so an immediate check reports no modems
+and a down interface without anything being wrong.
+
 ## Observation deferred rather than fixed
 
 With ModemManager stopped, the internal modem reports `owner_state:

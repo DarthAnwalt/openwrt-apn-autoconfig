@@ -850,6 +850,214 @@ at_probe_port() {
 	return 0
 }
 
+# ---- AT identity reads ----
+#
+# The command set is fixed and read-only. Nothing below is composed from UCI,
+# the environment, the GUI or another caller. See docs/backend-contract-v1.md
+# for the field mapping and why operator_id is deliberately left empty.
+
+at_identity_cache_file() {
+	printf '%s/identity.%s\n' "$(at_cache_dir)" "$(sanitize_token "$1")"
+}
+
+at_single_line() {
+	at_line_status=0
+	run_at "$1" "$2" || at_line_status=$?
+	[ "$at_line_status" -eq 0 ] || return "$at_line_status"
+	at_line_value="$(printf '%s\n' "$AT_RESULT" | sed -n '1p')"
+	safe_single_line "$at_line_value" || return 1
+	[ "${#at_line_value}" -le 128 ] || return 1
+	printf '%s\n' "$at_line_value"
+}
+
+at_digits() {
+	# Tolerates the "+CCID: " style prefixes and the trailing F some cards use
+	# as ICCID padding. More than one candidate line is malformed, not a choice.
+	awk -v kind="$1" '
+		{
+			gsub(/\r/, "")
+			sub(/^\+[A-Za-z]+:[ \t]*/, "")
+			gsub(/[ \t]/, "")
+			if ($0 == "") next
+			if (kind == "iccid") sub(/[Ff]$/, "")
+			if ($0 !~ /^[0-9]+$/) next
+			len = length($0)
+			ok = (kind == "iccid" && len >= 10 && len <= 32) ||
+			     (kind == "imsi" && len >= 5 && len <= 18)
+			if (!ok) next
+			value = $0
+			count++
+		}
+		END { if (count != 1) exit 1; print value }
+	'
+}
+
+at_read_iccid() {
+	# The standard spelling first, then the vendor variants. Advance only on an
+	# immediate command error: a port that timed out is not going to answer a
+	# differently spelled read, and trying would only repeat the bound.
+	for at_iccid_command in 'AT+CCID' 'AT+QCCID' 'AT+ICCID'; do
+		at_iccid_status=0
+		run_at "$1" "$at_iccid_command" || at_iccid_status=$?
+		[ "$at_iccid_status" -eq 124 ] && return 1
+		[ "$at_iccid_status" -eq 0 ] || continue
+		at_iccid_value="$(printf '%s\n' "$AT_RESULT" | at_digits iccid)" || continue
+		printf '%s\n' "$at_iccid_value"
+		return 0
+	done
+	return 1
+}
+
+at_read_registration() {
+	# CEREG and CGREG are preferred over CREG, and not as a matter of taste: a
+	# device attached over LTE or 5G with no CS domain answers CREG with stat 6,
+	# "registered, SMS only". Reading CREG first would report a fully registered
+	# modem as unregistered.
+	AT_REGISTRATION=unknown
+	AT_ROAMING=unknown
+	for at_reg_command in 'AT+CEREG?' 'AT+CGREG?' 'AT+CREG?'; do
+		at_reg_status=0
+		run_at "$1" "$at_reg_command" || at_reg_status=$?
+		[ "$at_reg_status" -eq 124 ] && return 1
+		[ "$at_reg_status" -eq 0 ] || continue
+		at_reg_stat="$(printf '%s\n' "$AT_RESULT" | awk -F, '
+			/^\+C[EG]?REG:/ { gsub(/[^0-9]/, "", $2); print $2; exit }
+		')"
+		case "$at_reg_stat" in ''|*[!0-9]*) continue ;; esac
+		case "$at_reg_stat" in
+			1) AT_REGISTRATION=home; AT_ROAMING=false ;;
+			5) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
+			# 6 and 7 are registered states — SMS only, on the home and on a
+			# visited network. Treating them as absent is the classic mistake.
+			6) AT_REGISTRATION=home; AT_ROAMING=false ;;
+			7) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
+			2) AT_REGISTRATION=searching ;;
+			3) AT_REGISTRATION=denied ;;
+			0) AT_REGISTRATION=idle ;;
+			*) continue ;;
+		esac
+		return 0
+	done
+	return 0
+}
+
+at_access_technology() {
+	case "$1" in
+		0|1|3|8) printf '%s\n' gsm ;;
+		2|4|5|6) printf '%s\n' umts ;;
+		7|9|10) printf '%s\n' lte ;;
+		11|12) printf '%s\n' 5gnr ;;
+		13) printf '%s\n' 'lte,5gnr' ;;
+		*) printf '%s\n' '' ;;
+	esac
+}
+
+at_read_operator() {
+	AT_SERVING_OPERATOR=""
+	AT_ACCESS_TECH=""
+	# Numeric presentation first. The default format returns a display name
+	# whose spelling varies by firmware and cannot be matched against anything.
+	# This selects a session presentation format and stores nothing.
+	run_at "$1" 'AT+COPS=3,2' >/dev/null 2>&1 || :
+	at_cops_status=0
+	run_at "$1" 'AT+COPS?' || at_cops_status=$?
+	[ "$at_cops_status" -eq 0 ] || return 1
+	at_cops_line="$(printf '%s\n' "$AT_RESULT" | sed -n '/^+COPS:/p' | sed -n '1p')"
+	[ -n "$at_cops_line" ] || return 1
+	at_cops_id="$(printf '%s\n' "$at_cops_line" | awk -F, '{ gsub(/[^0-9]/, "", $3); print $3 }')"
+	case "${#at_cops_id}" in 5|6) AT_SERVING_OPERATOR="$at_cops_id" ;; esac
+	at_cops_act="$(printf '%s\n' "$at_cops_line" | awk -F, '{ gsub(/[^0-9]/, "", $4); print $4 }')"
+	AT_ACCESS_TECH="$(at_access_technology "$at_cops_act")"
+	return 0
+}
+
+at_scale_signal() {
+	# Linear dBm to percent with clamping, using the same endpoints the QMI
+	# adapter documents so one transport cannot make the same radio look
+	# different from another.
+	awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN {
+		p = (v - lo) * 100 / (hi - lo)
+		if (p < 0) p = 0
+		if (p > 100) p = 100
+		printf "%d\n", int(p + 0.5)
+	}'
+}
+
+at_read_signal() {
+	AT_SIGNAL=""
+	at_sig_status=0
+	run_at "$1" 'AT+CESQ' || at_sig_status=$?
+	if [ "$at_sig_status" -eq 0 ]; then
+		# +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>[,NR fields…]. A
+		# 5G-capable modem appends NR fields that are frequently 255 while the
+		# LTE ones carry real values, so requiring exactly six fields would
+		# throw away a usable reading.
+		at_rsrp="$(printf '%s\n' "$AT_RESULT" | awk -F, '
+			/^\+CESQ:/ { gsub(/[^0-9]/, "", $6); print $6; exit }
+		')"
+		case "$at_rsrp" in
+			''|*[!0-9]*|255) : ;;
+			*)
+				if [ "$at_rsrp" -le 97 ]; then
+					AT_SIGNAL="$(at_scale_signal "$((-140 + at_rsrp))" -120 -80)"
+				fi
+			;;
+		esac
+	fi
+	[ -z "$AT_SIGNAL" ] || return 0
+	at_sig_status=0
+	run_at "$1" 'AT+CSQ' || at_sig_status=$?
+	[ "$at_sig_status" -eq 0 ] || return 0
+	at_rssi="$(printf '%s\n' "$AT_RESULT" | awk -F'[:,]' '
+		/^\+CSQ:/ { gsub(/[^0-9]/, "", $2); print $2; exit }
+	')"
+	# 99 means unknown. Reporting it as zero would claim no signal on a modem
+	# that simply did not say.
+	case "$at_rssi" in ''|*[!0-9]*|99) return 0 ;; esac
+	[ "$at_rssi" -le 31 ] || return 0
+	AT_SIGNAL="$(at_scale_signal "$((-113 + 2 * at_rssi))" -110 -50)"
+	return 0
+}
+
+at_read_identity() {
+	# Every read happens under one acquisition of the port lock, not one per
+	# command: an interleaved reader would corrupt both reply streams, and
+	# releasing between reads would invite exactly that.
+	at_identity_device="$1"
+	AT_MANUFACTURER=""; AT_MODEL=""; AT_FIRMWARE=""; AT_IMEI=""
+	AT_ICCID=""; AT_IMSI=""
+	AT_REGISTRATION=unknown; AT_ROAMING=unknown
+	AT_SERVING_OPERATOR=""; AT_ACCESS_TECH=""; AT_SIGNAL=""
+
+	at_port_lock_acquire "$at_identity_device" || return 3
+	run_at "$at_identity_device" 'ATE0' >/dev/null 2>&1 || :
+
+	AT_MANUFACTURER="$(at_single_line "$at_identity_device" 'AT+CGMI' 2>/dev/null || :)"
+	AT_MODEL="$(at_single_line "$at_identity_device" 'AT+CGMM' 2>/dev/null || :)"
+	AT_FIRMWARE="$(at_single_line "$at_identity_device" 'AT+CGMR' 2>/dev/null || :)"
+	at_imei_value="$(at_single_line "$at_identity_device" 'AT+CGSN' 2>/dev/null || :)"
+	at_imei_value="$(printf '%s' "$at_imei_value" | tr -cd '0-9')"
+	valid_imei "$at_imei_value" && AT_IMEI="$at_imei_value"
+
+	AT_ICCID="$(at_read_iccid "$at_identity_device" 2>/dev/null || :)"
+	at_imsi_status=0
+	run_at "$at_identity_device" 'AT+CIMI' || at_imsi_status=$?
+	if [ "$at_imsi_status" -eq 0 ]; then
+		AT_IMSI="$(printf '%s\n' "$AT_RESULT" | at_digits imsi 2>/dev/null || :)"
+	fi
+
+	at_read_registration "$at_identity_device" || :
+	at_read_operator "$at_identity_device" >/dev/null 2>&1 || :
+	at_read_signal "$at_identity_device" || :
+
+	at_port_lock_release
+
+	# A valid ICCID is the floor. Without it there is no SIM identity to match
+	# a provider against, and a partial record would look like a working one.
+	[ -n "$AT_ICCID" ] || return 1
+	return 0
+}
+
 at_cached_port() {
 	# The already-resolved port for this modem, or nothing. Never probes, so it
 	# is safe on the discovery path.
@@ -1255,6 +1463,12 @@ print_modem_json() {
 	json_key_string data_device "$data_device"; printf ','
 	json_key_string at_device "$at_device"; printf ','
 	json_key_string protocol "$protocol"; printf ','
+	# Display and quirk-keying evidence, read over AT and cached so the record
+	# can carry it without probing. Empty whenever no AT identity was obtained.
+	record_identity="$(sed -n '1p' "$(at_identity_cache_file "$modem_id")" 2>/dev/null || :)"
+	json_key_string manufacturer "$(field "$record_identity" 1)"; printf ','
+	json_key_string model "$(field "$record_identity" 2)"; printf ','
+	json_key_string firmware_revision "$(field "$record_identity" 3)"; printf ','
 	# Maturity of this inventory implementation and the evidence behind it, kept
 	# separate exactly as in the APN backend contract. The code is the same for
 	# every record, so implementation state does not vary; the evidence does.
@@ -1887,8 +2101,13 @@ provision_plan_cmd() {
 	return "$plan_status"
 }
 
-at_port_cmd() {
-	[ -n "$REQUESTED_MODEM" ] || die_code 2 "at-port requires --modem"
+at_resolve_target_port() {
+	# Shared guards for every AT entry point. Ownership is re-read here on each
+	# call rather than trusted from an earlier scan, because a modem that was
+	# unowned when it was first seen can be claimed later — on the reference
+	# router ModemManager publishes a freshly attached modem only after it has
+	# finished probing every port, so unowned-then-owned is the normal sequence.
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "$COMMAND_NAME requires --modem"
 	line="$(find_inventory_record "$REQUESTED_MODEM")" || \
 		die_code 3 "modem $REQUESTED_MODEM is not present"
 	[ "$(field "$line" 12)" = 0 ] || \
@@ -1906,7 +2125,48 @@ at_port_cmd() {
 	command_exists "$SMS_TOOL" || die_code 3 "$SMS_TOOL is not installed"
 	at_resolve_port "$REQUESTED_MODEM" "$(field "$line" 3)" || \
 		die_code 3 "no AT control port could be resolved for modem $REQUESTED_MODEM"
+}
+
+at_port_cmd() {
+	at_resolve_target_port
 	printf '%s\n' "$AT_RESOLVED_PORT"
+}
+
+at_identity_cmd() {
+	at_resolve_target_port
+	identity_status=0
+	at_read_identity "$AT_RESOLVED_PORT" || identity_status=$?
+	[ "$identity_status" -eq 3 ] && \
+		die_code 3 "the AT port for modem $REQUESTED_MODEM is busy"
+	[ "$identity_status" -eq 0 ] || \
+		die_code 3 "no usable SIM identity was read from modem $REQUESTED_MODEM"
+
+	# Cached so inventory can display these without probing. Identity evidence,
+	# never identity: nothing here distinguishes two identical modems.
+	at_cache_write "$(at_identity_cache_file "$REQUESTED_MODEM")" \
+		"$(printf '%s\t%s\t%s\t%s' "$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE" "$AT_IMEI")" || :
+
+	# The same v1 identity TSV the QMI and MBIM adapters emit, so a consumer
+	# never has to know which transport produced it. operator_id stays empty
+	# deliberately: no standard AT command reports the SIM's home PLMN, and the
+	# matcher already falls back to the IMSI prefix when it is absent.
+	printf 'v1\n'
+	printf 'sim_index\t1\n'
+	printf 'modem_index\t%s\n' "$AT_RESOLVED_PORT"
+	printf 'iccid\t%s\n' "$AT_ICCID"
+	printf 'imsi\t%s\n' "$AT_IMSI"
+	printf 'eid\t\n'
+	printf 'operator_id\t\n'
+	printf 'operator_name\t\n'
+	printf 'gid1\t\n'
+	printf 'gid2\t\n'
+	printf 'modem_state\tenabled\n'
+	printf 'registration_state\t%s\n' "$AT_REGISTRATION"
+	printf 'roaming\t%s\n' "$AT_ROAMING"
+	printf 'serving_operator_id\t%s\n' "$AT_SERVING_OPERATOR"
+	printf 'serving_operator_name\t\n'
+	printf 'access_technologies\t%s\n' "$AT_ACCESS_TECH"
+	printf 'signal_quality\t%s\n' "$AT_SIGNAL"
 }
 
 resolve_cmd() {
@@ -2279,6 +2539,8 @@ Commands:
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
   at-port           Resolve and print the AT control port for --modem, probing
                     correlated ports by role. Refused under ModemManager
+  at-identity       Read SIM and registration identity for --modem over AT and
+                    print the v1 identity contract. Read-only
   rescan            Synchronous full read-only rescan (updates first/last seen)
   rescan-async      Debounced rescan entry point for hotplug handlers
 EOF
@@ -2327,6 +2589,7 @@ main() {
 		status-json) status_json_cmd ;;
 		resolve) resolve_cmd ;;
 		at-port) at_port_cmd ;;
+		at-identity) at_identity_cmd ;;
 		provision-plan) provision_plan_cmd ;;
 		provision) provision_cmd ;;
 		deprovision) deprovision_cmd ;;

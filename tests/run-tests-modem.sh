@@ -325,10 +325,54 @@ case "$behaviour" in
 		exit 0
 	;;
 	control|control-echo)
+		# A current modem: EPS registration answers, CESQ carries the NR
+		# extension fields, and the standard ICCID spelling works.
 		[ "$behaviour" = control-echo ] && printf '%s\r\n' "$at_command"
 		case "$at_command" in
-			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Fibocom Wireless Inc.\r\n'; printf 'OK\r\n'; exit 0 ;;
 			AT+CGMM) printf '%s\r\n' "${TEST_AT_MODEL:-FM350-GL}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf '81600.0000.00.29.21.27\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '%s\r\n' "${TEST_AT_IMEI:-016177002734885}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CIMI) printf '%s\r\n' "${TEST_AT_IMSI:-262023103971566}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CCID) printf '+CCID: %s\r\n' "${TEST_AT_ICCID:-89492031246010483050}"; printf 'OK\r\n'; exit 0 ;;
+			"AT+COPS?") printf '+COPS:0,2,"%s",%s\r\n' "${TEST_AT_PLMN:-26202}" "${TEST_AT_ACT:-13}"; printf 'OK\r\n'; exit 0 ;;
+			"AT+CEREG?") printf '+CEREG: 0,%s\r\n' "${TEST_AT_EPS_STAT:-1}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CESQ) printf '+CESQ: %s\r\n' "${TEST_AT_CESQ:-29,99,255,255,22,49,255,255,255}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 12, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	control-nosim)
+		# Resolves as a control port and answers everything except the SIM.
+		# Without this the "no readable SIM" case never gets past resolution,
+		# and the identity floor goes untested.
+		case "$at_command" in
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Fibocom Wireless Inc.\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'FM350-GL\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf '81600.0000.00.29.21.27\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '016177002734885\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+CEREG?") printf '+CEREG: 0,0\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 99, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf '+CME ERROR: SIM not inserted\r\n'; exit 1 ;;
+		esac
+	;;
+	control-legacy)
+		# The awkward one, drawn from real replies: only the CS-domain
+		# registration answers and it reports stat 6 ("registered, SMS only"),
+		# the standard ICCID spelling is rejected, and there is no CESQ.
+		case "$at_command" in
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Quectel\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'EC25-E\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf 'EC25EFAR06A11M4G\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '867556043212345\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CIMI) printf '262023103971566\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+QCCID) printf '+QCCID: 89492031246010483050\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+COPS?") printf '+COPS:0,2,"26202",7\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+CREG?") printf '+CREG: 0,6\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 12, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
 			*) printf 'ERROR\r\n'; exit 1 ;;
 		esac
 	;;
@@ -775,6 +819,93 @@ sed -i.bak 's|^/dev/ttyUSB33	control$|/dev/ttyUSB33	dead|' "$TEST_AT_PORTS"
 rm -f "$TEST_AT_PORTS.bak"
 port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'resolution did not recover from a stale cache'
 [ "$port" = /dev/ttyUSB34 ] || fail "stale cache recovery selected $port instead of /dev/ttyUSB34"
+
+printf '%s\n' 'TEST at-identity emits the v1 identity contract over AT'
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.1 0e8d 7127 '' 50
+printf '/dev/ttyUSB50\tcontrol\n' >>"$TEST_AT_PORTS"
+MODEM_ID_AT="weak-vidpid:7-1.1:0e8d:7127"
+sh "$SCRIPT" at-identity --modem "$MODEM_ID_AT" >"$STATE/at-identity" || fail 'at-identity failed'
+awk -F'\t' '
+	NR == 1 { if ($0 != "v1") { print "bad version line: " $0 > "/dev/stderr"; exit 1 } next }
+	{ seen[$1] = $2 }
+	END {
+		required = "sim_index modem_index iccid imsi eid operator_id operator_name gid1 gid2 " \
+			"modem_state registration_state roaming serving_operator_id serving_operator_name " \
+			"access_technologies signal_quality"
+		n = split(required, want, " ")
+		for (i = 1; i <= n; i++)
+			if (!(want[i] in seen)) { print "missing field: " want[i] > "/dev/stderr"; exit 1 }
+		if (seen["iccid"] != "89492031246010483050") { print "iccid: " seen["iccid"] > "/dev/stderr"; exit 1 }
+		if (seen["imsi"] != "262023103971566") { print "imsi: " seen["imsi"] > "/dev/stderr"; exit 1 }
+		if (seen["operator_id"] != "") { print "operator_id must stay empty" > "/dev/stderr"; exit 1 }
+		if (seen["serving_operator_id"] != "26202") { print "serving: " seen["serving_operator_id"] > "/dev/stderr"; exit 1 }
+		if (seen["registration_state"] != "home") { print "registration: " seen["registration_state"] > "/dev/stderr"; exit 1 }
+		if (seen["roaming"] != "false") { print "roaming: " seen["roaming"] > "/dev/stderr"; exit 1 }
+		if (seen["access_technologies"] != "lte,5gnr") { print "act: " seen["access_technologies"] > "/dev/stderr"; exit 1 }
+		if (seen["modem_state"] != "enabled") { print "modem_state: " seen["modem_state"] > "/dev/stderr"; exit 1 }
+		if (seen["signal_quality"] !~ /^[0-9]+$/) { print "signal: " seen["signal_quality"] > "/dev/stderr"; exit 1 }
+	}
+' "$STATE/at-identity" || fail 'the v1 identity contract was not satisfied'
+
+printf '%s\n' 'TEST CESQ RSRP outranks CSQ, and the NR extension fields do not break the parse'
+# 49 maps to -91 dBm on the documented -120..-80 scale, which is 73%. Reading
+# CSQ instead would have given -89 dBm on a different scale and 35%, so this
+# also proves which of the two sources won.
+signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity")"
+[ "$signal" = 73 ] || fail "signal_quality was $signal, not the CESQ-derived 73"
+
+printf '%s\n' 'TEST an unknown CESQ RSRP falls back to CSQ rather than reporting no signal'
+TEST_AT_CESQ="99,99,255,255,255,255,255,255,255" \
+	sh "$SCRIPT" at-identity --modem "$MODEM_ID_AT" >"$STATE/at-identity-csq" || fail 'fallback identity failed'
+signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity-csq")"
+[ "$signal" = 35 ] || fail "CSQ fallback produced $signal instead of 35"
+
+printf '%s\n' 'TEST registration stat 6 is a registered state, and the ICCID ladder reaches the vendor spelling'
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.2 2c7c 0125 '' 51
+printf '/dev/ttyUSB51\tcontrol-legacy\n' >>"$TEST_AT_PORTS"
+sh "$SCRIPT" at-identity --modem "weak-vidpid:7-1.2:2c7c:0125" >"$STATE/at-identity-legacy" || \
+	fail 'at-identity failed against the legacy modem'
+awk -F'\t' '
+	$1 == "registration_state" && $2 != "home" { print "stat 6 read as " $2 > "/dev/stderr"; exit 1 }
+	$1 == "roaming" && $2 != "false" { print "roaming: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "iccid" && $2 != "89492031246010483050" { print "iccid: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "access_technologies" && $2 != "lte" { print "act: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "signal_quality" && $2 != "35" { print "signal: " $2 > "/dev/stderr"; exit 1 }
+' "$STATE/at-identity-legacy" || fail 'the legacy modem was misread'
+grep -q "/dev/ttyUSB51	AT+CCID" "$TEST_AT_PROBES" || fail 'the standard ICCID spelling was not tried first'
+grep -q "/dev/ttyUSB51	AT+QCCID" "$TEST_AT_PROBES" || fail 'the ladder did not advance to the vendor spelling'
+
+printf '%s\n' 'TEST identity evidence reaches the inventory record without a further probe'
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "EC25-E", m
+assert m["firmware_revision"] == "EC25EFAR06A11M4G", m
+' "$out" || fail 'identity evidence did not reach the inventory record'
+: >"$TEST_AT_PROBES"
+sh "$SCRIPT" inventory-json >/dev/null
+[ ! -s "$TEST_AT_PROBES" ] || fail 'displaying identity evidence caused a probe'
+
+printf '%s\n' 'TEST a modem with no readable SIM fails rather than reporting a partial identity'
+# The port resolves and answers every hardware query, so the failure has to come
+# from the identity floor rather than from resolution. An earlier version of
+# this test used a port that never resolved at all, which asserted nothing about
+# the floor and passed with the floor removed.
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.3 1234 9999 '' 52
+printf '/dev/ttyUSB52\tcontrol-nosim\n' >>"$TEST_AT_PORTS"
+sh "$SCRIPT" at-port --modem "weak-vidpid:7-1.3:1234:9999" >/dev/null || \
+	fail 'the no-SIM port should still resolve as a control port'
+noiccid=0
+sh "$SCRIPT" at-identity --modem "weak-vidpid:7-1.3:1234:9999" >/dev/null 2>&1 || noiccid=$?
+[ "$noiccid" -eq 3 ] || fail "a modem with no SIM identity exited $noiccid instead of the retryable class 3"
 
 printf '%s\n' 'TEST the watchdog bounds a silent port when no external timeout exists'
 # Not an exotic-image fallback: the reference router has no timeout executable

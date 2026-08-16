@@ -76,7 +76,7 @@ modem switched into MBIM composition, not an isolated parser.
 
 ## 0.13.0 — coherent frontend
 
-Reorganize the optional LuCI package around the four things a user actually
+Released. Reorganized the optional LuCI package around the four things a user actually
 reasons about — the modem, the APN policy, the SIM and the program's own
 settings — instead of the order features were added in. A persistent status
 strip keeps the target, its registration and the last result visible while the
@@ -113,12 +113,45 @@ it without bound. The paths the exit trap removes are now assigned once at
 start-up instead of inside a function reached through a command substitution,
 where the assignment never reached the parent.
 
-## 0.14.0 — bounded generic AT framework
+## 0.14.0 — AT identity backend and bounded AT transport
 
-Add stable same-device AT-port resolution, bounded probing, normalized
-identity and a capability/quirk extension contract. No public control accepts
-free-form AT commands. Manual APN remains an APN-engine operation using the
-same baseline, verification and rollback discipline as database profiles.
+Add the third and last identity backend. A modem that answers 3GPP AT but
+exposes neither QMI nor MBIM becomes identifiable, matchable against the
+provider database and displayable. This is the precondition for the Fibocom
+work that follows rather than a capability wanted for its own sake: an FM350 in
+RNDIS composition exposes no `cdc-wdm` control node at all, so without this
+release the suite could dial it in 0.15.0 and still have no way to choose an
+APN for it.
+
+The engineering content is port ownership rather than command vocabulary. The
+release adds same-device AT-port resolution by observed role, a bounded
+executor with a watchdog for images that have no external `timeout`, and a
+mandatory AT-port lock in the shared lock protocol. Multiple AT ports inside
+one proven USB device stop being terminal ambiguity — on a single modem they
+are redundancy, resolved deterministically — while ambiguity between devices
+still fails closed. A quirk table keyed by the modem's reported manufacturer
+and model carries vendor divergence, and its default is empty: an untested
+modem gets no capability rather than a guess.
+
+`modem-reset` becomes one capability with several implementations, each chosen
+by the modem's current control owner — the board GPIO power cycle where a
+supported integration package pins the modem, ModemManager's own reset where
+ModemManager owns it, and `AT+CFUN=1,1` where the project holds direct control.
+Asking the legitimate owner to perform its own reset keeps the single-owner
+invariant intact without an exception for any configuration. The released
+Huasifei behaviour is unchanged; the operation stops being unavailable on
+modems the board GPIO cannot reach. Automatic escalation between methods is
+deliberately not part of this release.
+
+Two modems present at once move from fixture coverage to hardware coverage.
+While they do, the global APN operation lock stays system-wide, so operations
+on two modems serialize against each other; see the deferred decision recorded
+in [`architecture.md`](architecture.md).
+
+No public control accepts free-form AT commands, and no AT path writes an APN
+profile: profile fields remain UCI options applied by netifd, exactly as for
+QMI and MBIM. Manual APN remains an APN-engine operation using the same
+baseline, verification and rollback discipline as database profiles.
 
 ## 0.15.0 — Fibocom FM350 connection path
 
@@ -139,9 +172,12 @@ common LuCI package.
 ## 0.17.0 — 1.0 release-candidate hardening
 
 Complete multi-modem, hotplug/re-enumeration, ownership coexistence, fresh
-install, upgrade, removal and failure-recovery matrices. Freeze package names,
-machine APIs and migration rules only after all old CLI/LuCI/button entry
-points have safe compatibility paths.
+install, upgrade, removal and failure-recovery matrices. Revisit the two
+correctness questions deliberately deferred earlier: whether the global APN
+operation lock should gain per-target granularity, and whether `modem-reset`
+should escalate automatically from a soft method to a board power cycle. Freeze
+package names, machine APIs and migration rules only after all old
+CLI/LuCI/button entry points have safe compatibility paths.
 
 ## 1.0.0 — stable standalone mobile-connectivity suite
 

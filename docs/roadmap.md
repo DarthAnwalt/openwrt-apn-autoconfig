@@ -105,6 +105,14 @@ another entry point held the shared lock, so the page offered a control that
 could only fail and lost the double-click protection its other actions have.
 The busy state is now symmetric in both directions.
 
+## 0.13.2 — scratch-file cleanup
+
+Released. A defect-only patch with no feature or API change. Two read-only
+commands left a temporary file in `/tmp` on every run, so an open LuCI page grew
+it without bound. The paths the exit trap removes are now assigned once at
+start-up instead of inside a function reached through a command substitution,
+where the assignment never reached the parent.
+
 ## 0.14.0 — bounded generic AT framework
 
 Add stable same-device AT-port resolution, bounded probing, normalized

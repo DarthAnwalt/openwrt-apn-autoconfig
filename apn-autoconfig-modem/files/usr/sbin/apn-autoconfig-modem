@@ -44,8 +44,14 @@ MMCLI="${APN_AUTOCONFIG_MODEM_MMCLI:-mmcli}"
 COMMAND_NAME=""
 REQUESTED_MODEM=""
 REQUESTED_INTERFACE=""
-INVENTORY_FILE=""
-MM_USB_PATHS_FILE=""
+# Scratch paths are fixed here rather than inside scan_inventory, because that
+# function is often reached through a command substitution: the assignment would
+# then live only in the subshell, the parent's exit trap would see an empty
+# variable, and the file would survive the process that made it. LuCI polls two
+# such commands, so the leak grew with every page load.
+INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
+MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
+CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
 MM_DISCOVERY_UNCERTAIN=0
 
 LOCK_HELD=0
@@ -117,8 +123,11 @@ cleanup_files() {
 	# Unwind provisioning before the locks are released, so no other operation
 	# can observe a half-created staging section.
 	provisioning_rollback
-	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE"
+	# Named scratch files only, never a wildcard under a shared directory.
+	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE" "$INVENTORY_FILE.display" \
+		"$INVENTORY_FILE.merged" "$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
 	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
+	[ -z "$CANDIDATES_FILE" ] || rm -f "$CANDIDATES_FILE"
 	if [ "$LOCK_HELD" -eq 1 ] && [ -n "$LOCK_PATH" ]; then
 		lock_release "$LOCK_PATH"
 		LOCK_HELD=0
@@ -427,8 +436,6 @@ resolve_class_device_usb_path() {
 }
 
 # ---- read-only candidate discovery ----
-
-CANDIDATES_FILE=""
 
 emit_candidate() {
 	# modem_id evidence_tier usb_path vendor_id product_id control_device data_device at_device protocol mm_bound
@@ -760,9 +767,6 @@ record_seen() {
 # ---- inventory scan orchestration ----
 
 scan_inventory() {
-	INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
-	CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
-	MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
 	: >"$CANDIDATES_FILE"
 	: >"$MM_USB_PATHS_FILE"
 	mkdir -p "$STATE_DIR" 2>/dev/null || :

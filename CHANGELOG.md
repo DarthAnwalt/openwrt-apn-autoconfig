@@ -1,5 +1,32 @@
 # Changelog
 
+## apn-autoconfig 0.13.2 / apn-autoconfig-modem 0.13.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.2 (2026-08-16)
+
+A defect-only patch with no feature or API change.
+
+`apn-autoconfig-modem provision-plan` and `status-json` each left a small
+scratch file in `/tmp` every time they ran. LuCI calls both — per modem, on page
+load and on its provisioning poll — so opening the web interface grew `/tmp`
+without bound on a device whose `/tmp` is RAM. The reference router had
+accumulated 63 files over two days of ordinary use.
+
+The exit trap that removes those files was correct. The paths it removes were
+assigned inside `scan_inventory`, and both commands reach it through a command
+substitution, so the assignment lived only in the subshell: the parent's trap
+saw an empty variable and removed nothing. `inventory-json`, which scans in the
+main shell, always cleaned up correctly — which is why the leak was invisible
+from the obvious command.
+
+The scratch paths are now fixed once at start-up, so the trap has them on every
+path, and the trap also removes the derived `.display`, `.merged`, `.dupes` and
+`.weak-dupes` files by exact name rather than by wildcard.
+
+The fixtures could not have caught this: the names carry the PID, so every run
+created its own file, nothing ever collided and nothing failed. The regression
+this adds compares the exact set of scratch files before and after every
+read-only command, rather than counting them, so it is unaffected by whatever
+else shares `/tmp`.
+
 ## apn-autoconfig 0.13.1 / apn-autoconfig-modem 0.13.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.1 (2026-08-16)
 
 A defect-only patch with no feature or API change.

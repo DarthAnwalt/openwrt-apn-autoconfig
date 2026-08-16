@@ -159,6 +159,11 @@ case "${1:-}" in
 ;;
 -m)
 	[ "${2:-}" = "${MM_MODEM_INDEX:-}" ] || exit 1
+	if [ "${3:-}" = "--reset" ]; then
+		printf '%s\t%s\n' "$2" reset >>"${TEST_MM_RESETS:-/dev/null}"
+		[ "${MM_RESET_FAILS:-0}" = 1 ] && exit 1
+		exit 0
+	fi
 	printf '%s\n' \
 		"modem.generic.device : ${MM_DEVICE:---}" \
 		"modem.generic.physdev : ${MM_PHYSDEV:---}" \
@@ -343,6 +348,16 @@ case "$behaviour" in
 			*) printf 'ERROR\r\n'; exit 1 ;;
 		esac
 	;;
+	control-vanish)
+		# Answers like a control port until the reset, which takes the port away
+		# as it succeeds: no final OK, and on a real device the node disappears.
+		case "$at_command" in
+			"AT+CFUN=1,1") exit 1 ;;
+			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'FM350-GL\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
 	control-nosim)
 		# Resolves as a control port and answers everything except the SIM.
 		# Without this the "no readable SIM" case never gets past resolution,
@@ -389,6 +404,8 @@ export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
 export TEST_AT_PORT_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-at-port"
 export TEST_AT_PORTS="$STATE/at-ports"
+export TEST_MM_RESETS="$STATE/mm-resets"
+: >"$STATE/mm-resets"
 export TEST_AT_PROBES="$STATE/at-probes"
 export TEST_AT_TIMEOUT_SECONDS=1
 : >"$STATE/at-ports"
@@ -1274,6 +1291,77 @@ export TEST_MODEM_POWER_OFF_SECONDS
 grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'interrupted reset did not restart the selected interface'
 [ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 	fail 'interrupted reset left the per-modem lock behind'
+
+printf '%s\n' 'TEST the reset method is chosen by control owner, and gpio wins where it is available'
+reset_sysfs
+reset_at_ports
+reset_network_config
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0 wwan0
+add_at_port 1-1.2 80 1.5 control
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+# A resolved AT port must not displace the board power cycle: gpio is out of
+# band, needs no control channel, and is the released behaviour.
+sh "$SCRIPT" at-port --modem "$TEST_RESET_MODEM_ID" >/dev/null || fail 'the pinned modem did not resolve an AT port'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "gpio", m
+assert m["capabilities"]["reset"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved AT port displaced the board reset'
+
+printf '%s\n' 'TEST an AT-only modem gets the at method, and a soft reset that loses its port succeeds'
+reset_sysfs
+reset_at_ports
+reset_network_config
+add_at_modem 11-1.1 0e8d 7127 '' 81
+printf '/dev/ttyUSB81\tcontrol-vanish\n' >>"$TEST_AT_PORTS"
+AT_RESET_ID="weak-vidpid:11-1.1:0e8d:7127"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "none", m
+assert m["capabilities"]["reset"] is False, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an unresolved AT modem already advertised a reset method'
+sh "$SCRIPT" at-port --modem "$AT_RESET_ID" >/dev/null || fail 'the AT-only modem did not resolve'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "at", m
+assert m["capabilities"]["reset"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved AT-only modem did not offer the at reset method'
+: >"$TEST_AT_PROBES"
+sh "$SCRIPT" reset --modem "$AT_RESET_ID" || \
+	fail 'a soft reset whose port vanished without a final OK was treated as a failure'
+grep -q "AT+CFUN=1,1" "$TEST_AT_PROBES" || fail 'the soft reset never reached the modem'
+[ ! -e "${TEST_AT_PORT_LOCK_ROOT}.ttyUSB81" ] || fail 'the soft reset left the AT port locked'
+
+printf '%s\n' 'TEST a ModemManager-owned modem is reset by ModemManager, not around it'
+reset_sysfs
+reset_at_ports
+reset_network_config
+rm -f "$HARDWARE_MARKER"
+add_qmi_modem 12-1.1 2c7c 0801 MMRESET 9 wwan9
+add_at_port 12-1.1 82 1.5 control
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/12-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+MM_RESET_ID="usb-serial:12-1.1:2c7c:0801:MMRESET"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["reset_method"] == "modemmanager", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an owned modem did not select the modemmanager reset method'
+: >"$TEST_MM_RESETS"
+: >"$TEST_AT_PROBES"
+sh "$SCRIPT" reset --modem "$MM_RESET_ID" || fail 'the ModemManager reset failed'
+grep -q "	reset" "$TEST_MM_RESETS" || fail 'ModemManager was never asked to reset its own modem'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'an owned modem was reached over AT during its reset'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
 
 printf '%s\n' 'TEST reset refuses to run against a conflicting-ownership modem'
 reset_sysfs

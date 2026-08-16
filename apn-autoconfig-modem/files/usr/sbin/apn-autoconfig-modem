@@ -60,6 +60,7 @@ REQUESTED_INTERFACE=""
 # such commands, so the leak grew with every page load.
 INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
 MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
+MM_INDEX_FILE="/tmp/apn-autoconfig-modem.$$.mm-indexes"
 CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
 AT_OUTPUT_FILE="/tmp/apn-autoconfig-modem.$$.at-output"
 AT_CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.at-candidates"
@@ -143,6 +144,7 @@ cleanup_files() {
 	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE" "$INVENTORY_FILE.display" \
 		"$INVENTORY_FILE.merged" "$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
 	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
+	[ -z "$MM_INDEX_FILE" ] || rm -f "$MM_INDEX_FILE"
 	[ -z "$CANDIDATES_FILE" ] || rm -f "$CANDIDATES_FILE"
 	[ -z "$AT_OUTPUT_FILE" ] || rm -f "$AT_OUTPUT_FILE"
 	[ -z "$AT_CANDIDATES_FILE" ] || rm -f "$AT_CANDIDATES_FILE"
@@ -1100,6 +1102,62 @@ at_read_identity() {
 	return 0
 }
 
+# ---- reset methods ----
+#
+# One capability, several implementations, chosen by the record's current
+# control owner so the reset is always performed by whoever legitimately holds
+# the modem. See docs/modem-contract-v1.md.
+
+mm_index_for_usb_path() {
+	[ -s "$MM_INDEX_FILE" ] || return 1
+	mm_index_value="$(awk -F '\t' -v want="$1" '$1 == want { print $2; exit }' "$MM_INDEX_FILE")"
+	case "$mm_index_value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$mm_index_value"
+}
+
+reset_method_for_record() {
+	# Must not probe: this runs on the discovery path, where a sweep would cost
+	# the per-port bound for every silent port on every page load.
+	method_gpio_capable="$1"
+	method_owner="$2"
+	method_ambiguous="$3"
+	method_usb_path="$4"
+	[ "$method_ambiguous" = 0 ] || { printf '%s\n' none; return 0; }
+	[ "$method_owner" != conflicting ] || { printf '%s\n' none; return 0; }
+	# Board power is out of band: it needs no control channel and works
+	# whoever owns the modem, so it wins wherever it is available. This also
+	# keeps the released Huasifei behaviour exactly as it was.
+	if [ "$method_gpio_capable" = 1 ]; then printf '%s\n' gpio; return 0; fi
+	if [ "$method_owner" = modemmanager ]; then
+		if command_exists "$MMCLI" && mm_index_for_usb_path "$method_usb_path" >/dev/null 2>&1; then
+			printf '%s\n' modemmanager
+			return 0
+		fi
+		# Owned by ModemManager but unable to ask it: no other method may touch
+		# this modem, so there is no reset rather than a direct one.
+		printf '%s\n' none
+		return 0
+	fi
+	if command_exists "$SMS_TOOL" && at_cached_port "$method_usb_path" >/dev/null 2>&1; then
+		printf '%s\n' at
+		return 0
+	fi
+	printf '%s\n' none
+}
+
+at_soft_reset() {
+	# AT+CFUN=1,1 has one property nothing else in this program shares: it takes
+	# the port away as it succeeds. The modem starts resetting and re-enumerates,
+	# so the write frequently returns no final OK — and on a vanished port the
+	# transport reports a timeout. That is the expected shape of success here,
+	# not a transport failure, and the real verdict comes from re-enumeration.
+	soft_reset_device="$1"
+	at_port_lock_acquire "$soft_reset_device" || return 1
+	run_at "$soft_reset_device" 'AT+CFUN=1,1' >/dev/null 2>&1 || :
+	at_port_lock_release
+	return 0
+}
+
 at_cached_port() {
 	# The already-resolved port for this modem, or nothing. Never probes, so it
 	# is safe on the discovery path.
@@ -1215,6 +1273,9 @@ discover_modemmanager_candidates() {
 		[ -n "$usb_path" ] || [ -z "$control_device" ] || \
 			usb_path="$(resolve_class_device_usb_path "$SYSFS_ROOT/class/usbmisc/${control_device#/dev/}/device" 2>/dev/null || :)"
 		[ -z "$usb_path" ] || printf '%s\n' "$usb_path" >>"$MM_USB_PATHS_FILE"
+		# Kept beside the path list because the reset path needs the object
+		# index to ask ModemManager to reset its own modem.
+		[ -z "$usb_path" ] || printf '%s\t%s\n' "$usb_path" "$modem_index" >>"$MM_INDEX_FILE"
 
 		vendor_id=""
 		product_id=""
@@ -1467,10 +1528,13 @@ scan_inventory() {
 			capable_reset=1
 		fi
 
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		reset_method="$(reset_method_for_record "$capable_reset" "$owner_state" "$ambiguous" "$usb_path")"
+
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"$modem_id" "$tier" "$usb_path" "$control_device" "$data_device" "$at_device" \
 			"$protocol" "$owner_state" "$netifd_interface" "$first_seen" "$now" \
 			"$ambiguous" "$ambiguity_reason" "$capable_reset" "$vendor_id:$product_id" \
+			"$reset_method" \
 			>>"$INVENTORY_FILE"
 	done <"$INVENTORY_FILE.merged"
 
@@ -1495,6 +1559,8 @@ print_modem_json() {
 	ambiguity_reason="$(field "$line" 13)"
 	capable_reset="$(field "$line" 14)"
 	vendor_product="$(field "$line" 15)"
+	reset_method="$(field "$line" 16)"
+	[ -n "$reset_method" ] || reset_method=none
 	printf '{'
 	json_key_string modem_id "$modem_id"; printf ','
 	json_key_string evidence_tier "$tier"; printf ','
@@ -1544,9 +1610,15 @@ print_modem_json() {
 			;;
 		esac
 	fi
+	json_key_string reset_method "$reset_method"; printf ','
 	printf '"capabilities":{"inventory":true,'
 	json_key_boolean at_identity "$capable_at_identity"; printf ','
-	json_key_boolean reset "$capable_reset"
+	# True when some method's preconditions hold, which is not a claim that this
+	# modem's reset has ever been observed to work. reset_method names the one
+	# that would run.
+	capable_any_reset=0
+	[ "$reset_method" = none ] || capable_any_reset=1
+	json_key_boolean reset "$capable_any_reset"
 	printf '},'
 	json_key_string first_seen "$first_seen"; printf ','
 	json_key_string last_seen "$last_seen"; printf ','
@@ -2317,15 +2389,19 @@ wait_for_control_owner() {
 reset_cmd() {
 	modem_id="$REQUESTED_MODEM"
 	[ -n "$modem_id" ] || die_code 2 "reset requires --modem"
-	hardware_integration_name >/dev/null 2>&1 || die_code 4 "reset requires an installed, supported board integration"
-	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
 
 	# Reset decisions use the discovered owner, not the public
 	# action-status overlay that deliberately reports this worker as
 	# "transitioning" while a background reset is active.
 	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id is not currently present"
-	capable_reset="$(printf '%s' "$line" | awk -F '\t' '{ print $14 }')"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is not the strongly identified modem bound to the board reset GPIO"
+	reset_method="$(printf '%s' "$line" | awk -F '\t' '{ print $16 }')"
+	[ -n "$reset_method" ] && [ "$reset_method" != none ] || \
+		die_code 4 "no reset method is available for modem $modem_id"
+	if [ "$reset_method" = gpio ]; then
+		hardware_integration_name >/dev/null 2>&1 || \
+			die_code 4 "reset requires an installed, supported board integration"
+		[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+	fi
 	owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
 	case "$owner_state" in
 		conflicting) die_code 4 "modem $modem_id has a conflicting control-owner state; refusing to reset" ;;
@@ -2339,9 +2415,12 @@ reset_cmd() {
 	acquire_apn_lock
 	acquire_modem_lock "$modem_id"
 	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id disappeared before reset could start"
-	capable_reset="$(field "$line" 14)"
+	current_reset_method="$(field "$line" 16)"
 	current_owner_state="$(field "$line" 8)"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is no longer safely reset-capable"
+	[ -n "$current_reset_method" ] && [ "$current_reset_method" != none ] || \
+		die_code 4 "modem $modem_id is no longer safely reset-capable"
+	[ "$current_reset_method" = "$reset_method" ] || \
+		die_code 4 "modem $modem_id changed reset method before reset could start"
 	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $modem_id acquired a conflicting owner before reset"
 	[ "$current_owner_state" = "$expected_owner_state" ] || \
 		die_code 4 "modem $modem_id changed control owner before reset"
@@ -2358,14 +2437,41 @@ reset_cmd() {
 		log notice "modem reset requested for $modem_id (no bound netifd interface)"
 	fi
 
-	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
-	MODEM_POWER_OFF_ARMED=1
-	write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
-	sleep "$MODEM_POWER_OFF_SECONDS"
-	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
-	MODEM_POWER_OFF_ARMED=0
+	case "$reset_method" in
+		gpio)
+			log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
+			MODEM_POWER_OFF_ARMED=1
+			write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
+			sleep "$MODEM_POWER_OFF_SECONDS"
+			write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
+			MODEM_POWER_OFF_ARMED=0
+		;;
+		modemmanager)
+			# Ask the owner to reset its own modem rather than refusing or
+			# reaching around it. This is the single-owner invariant honoured,
+			# not an exception to it.
+			mm_reset_index="$(mm_index_for_usb_path "$(field "$line" 3)")" || \
+				die_code 4 "ModemManager owns modem $modem_id but no longer reports an object for it"
+			log notice "asking ModemManager to reset modem $modem_id"
+			mm_reset_output="$STATE_DIR/.mm-reset.$$"
+			mm_reset_status=0
+			run_bounded_to_file 20 "$mm_reset_output" "$MMCLI" -m "$mm_reset_index" --reset || mm_reset_status=$?
+			rm -f "$mm_reset_output"
+			[ "$mm_reset_status" -eq 0 ] || \
+				die_code 3 "ModemManager refused or failed to reset modem $modem_id"
+		;;
+		at)
+			at_reset_port="$(at_cached_port "$(field "$line" 3)" 2>/dev/null || :)"
+			[ -n "$at_reset_port" ] || \
+				die_code 4 "modem $modem_id has no resolved AT control port to reset through"
+			log notice "sending a soft reset to modem $modem_id on its AT control port"
+			at_soft_reset "$at_reset_port" || \
+				die_code 3 "the AT control port for modem $modem_id was busy"
+		;;
+		*) die_code 4 "unsupported reset method $reset_method" ;;
+	esac
 
-	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
+	log notice "reset issued via $reset_method; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
 	if ! wait_for_control_owner "$modem_id" "$expected_owner_state"; then
 		die_code 3 "modem $modem_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
 	fi

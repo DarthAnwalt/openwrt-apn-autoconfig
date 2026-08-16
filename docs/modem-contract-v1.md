@@ -153,7 +153,7 @@ still fails closed.
 
 | State | Meaning |
 |---|---|
-| `none` | No active control session observed: no netifd interface bound and no ModemManager `Modem` object for this device. |
+| `none` | No active control session observed: nothing holds this modem's data or control device and no ModemManager `Modem` object exists for it. A netifd section may still be **bound** to the modem and reported in `netifd_interface` — see below. |
 | `netifd-direct` | A netifd protocol (`qmi.sh`, `mbim.sh`, ...) holds the session directly against this modem's data/control device; no ModemManager instance manages it. |
 | `modemmanager` | ModemManager has an active `Modem` object for this device, independent of whether a netifd `mm` proto session is also up. |
 | `transitioning` | A coordinator operation (`action-start reset`) is currently running against this `modem_id`. This is a **display-time overlay**, never a persisted state: discovery stays read-only and authoritative, so `status-json`/`inventory-json` compute `none`/`netifd-direct`/`modemmanager`/`conflicting` from currently observed backend state and substitute `transitioning` only while the coordinator's own action-status for that `modem_id` reports busy. |
@@ -163,6 +163,35 @@ A bounded operation may start only from `none`, `netifd-direct` or
 `modemmanager`. It may never start while the record is `conflicting`, and the
 coordinator's own per-modem lock (see below) already prevents starting a
 second operation while one is `transitioning`.
+
+### A binding is not a session
+
+Every state above describes an **observed** control session, never configuration
+that anticipates one. The two are routinely different, and one case is common
+enough to be normative: a netifd section with `proto='modemmanager'` delegates
+the session to a daemon, so while no ModemManager `Modem` object exists for that
+device the section holds nothing and the state is `none`, not `netifd-direct`.
+`netifd-direct` names one specific mechanism — a netifd protocol handler holding
+the control device itself — and a section that never opens one cannot satisfy it.
+
+`netifd_interface` still reports the bound section in that case, because the
+binding remains true and everything else built on it depends on it: `resolve
+--interface` still maps the section to this `modem_id`, provisioning still
+refuses to create a second section with `already_configured`, and a reset still
+cycles that exact interface. Only the ownership claim is withdrawn.
+
+This distinction was cosmetic while `owner_state` was informational. Since
+0.14.0 it is not: `netifd-direct` is one of the states that permits direct AT
+port access, so naming a session that does not exist would grant access on the
+strength of a `qmi.sh` handler that was never running. Reaching the same
+permission through `none` is the honest route — nothing holds the ports, and
+nothing is claimed to.
+
+Neither state is a durable licence. Ownership is re-read under the operation's
+own locks before any AT port is opened, because a modem that is unowned when it
+is scanned can be claimed moments later — on the reference router ModemManager
+publishes a freshly attached modem only after it has finished probing every
+port, so unowned-then-owned is the ordinary sequence rather than a race.
 
 ## AT port resolution
 

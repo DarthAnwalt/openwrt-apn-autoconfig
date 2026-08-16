@@ -114,13 +114,23 @@ ModemManager was restarted afterwards. It rediscovered the internal modem and
 restart before it publishes anything, so an immediate check reports no modems
 and a down interface without anything being wrong.
 
-## Observation deferred rather than fixed
+## Observation deferred rather than fixed, then fixed
 
-With ModemManager stopped, the internal modem reports `owner_state:
+With ModemManager stopped, the internal modem reported `owner_state:
 netifd-direct` although its netifd section is `proto=modemmanager`. Nothing
-unsafe follows — with ModemManager down the ports genuinely are free, and every
-operation re-reads ownership under its locks — but the label is loose, and it
-now carries a consequence it did not have before, since `netifd-direct` permits
-AT access. This is pre-existing classification behaviour rather than something
-this release introduced, and it is recorded here instead of being changed
-mid-milestone.
+unsafe followed — with ModemManager down the ports genuinely are free, and every
+operation re-reads ownership under its locks — but the label was loose, and it
+had come to carry a consequence it did not have before, since `netifd-direct`
+permits AT access. This is pre-existing classification behaviour rather than
+something this release introduced, and it was recorded here rather than changed
+in the middle of the AT work.
+
+It has since been corrected: a section whose proto delegates the session to
+ModemManager is not evidence of a netifd-held session, so with no ModemManager
+object the state is now `none`. The record still reports `netifd_interface:
+wwan`, and resolution, provisioning refusal and reset are unchanged — see
+[A binding is not a session](modem-contract-v1.md#a-binding-is-not-a-session).
+The permission to open an AT port is the same under `none` as it was under
+`netifd-direct`, so this observation is a naming correction and not a change to
+what the release may do; the fixture regression reproduces the router's exact
+record and fails against the old classification.

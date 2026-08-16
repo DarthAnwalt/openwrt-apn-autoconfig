@@ -1183,6 +1183,52 @@ assert m["owner_state"] == "modemmanager", m
 	sh "$SCRIPT" resolve --interface wwan)" = imei:490154203237999 ] || \
 	fail 'physical-root netifd devpath did not resolve the ModemManager-owned modem'
 
+printf '%s\n' 'TEST a modemmanager section with no live ModemManager is owner_state none, not netifd-direct'
+# The same modem and the same `wwan` binding as the test above, with
+# ModemManager stopped — the state the reference router was left in while the
+# AT transport was exercised. `proto=modemmanager` delegates the session to a
+# daemon that is no longer running, so `qmi.sh` and friends hold nothing and
+# nothing owns this modem. Reporting netifd-direct here claimed a direct netifd
+# session that does not exist, and since 0.14.0 that name also carries an
+# access consequence. Everything else the binding is used for must survive.
+MM_STOPPED_MODEM=imei:490154203237999
+out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["modems"]) == 1, d
+m = d["modems"][0]
+assert m["owner_state"] == "none", m
+assert m["netifd_interface"] == "wwan", m
+' "$out" || fail 'a modemmanager section without ModemManager was reported as a direct netifd session'
+# The section is still a binding for every purpose other than ownership: it
+# still resolves, and it still blocks provisioning a second section for it.
+[ "$(UQMI_IMEI=490154203237999 sh "$SCRIPT" resolve --interface wwan)" = "$MM_STOPPED_MODEM" ] || \
+	fail 'the bound section stopped resolving once its owner state became none'
+plan_status=0
+plan_out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" provision-plan --modem "$MM_STOPPED_MODEM" 2>/dev/null)" || plan_status=$?
+[ "$plan_status" -eq 4 ] || \
+	fail "provision-plan exited $plan_status for an already-bound modem instead of the blocked class 4"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["reason"] == "already_configured", d
+assert d["can_provision"] is False, d
+' "$plan_out" || fail 'a modem bound to a stopped-ModemManager section was offered for provisioning'
+
+printf '%s\n' 'TEST a netifd section that does hold the session is still netifd-direct'
+# The rule above must not swallow the ordinary case: same modem, same binding,
+# proto=qmi instead, where netifd genuinely does hold the control device.
+reset_network_config
+add_network_section cellqmi qmi /dev/cdc-wdm0
+out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "netifd-direct", m
+assert m["netifd_interface"] == "cellqmi", m
+' "$out" || fail 'a direct netifd protocol lost its netifd-direct owner state'
+
 printf '%s\n' 'TEST ModemManager and a direct netifd protocol both claiming a modem is conflicting'
 reset_network_config
 add_network_section celldirect qmi /dev/cdc-wdm3

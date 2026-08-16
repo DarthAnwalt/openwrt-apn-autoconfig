@@ -1507,7 +1507,12 @@ scan_inventory() {
 			else
 				owner_state=modemmanager
 			fi
-		elif [ -n "$netifd_interface" ]; then
+		# A bound section is configuration, not a session, and `proto=modemmanager`
+		# delegates the session to a daemon that is not running here, so `qmi.sh`
+		# and friends hold nothing and the state is `none`. The section is still
+		# reported in netifd_interface, so provisioning still sees the modem as
+		# already configured and reset still cycles the right interface.
+		elif [ -n "$netifd_interface" ] && [ "$netifd_proto" != modemmanager ]; then
 			owner_state=netifd-direct
 		fi
 

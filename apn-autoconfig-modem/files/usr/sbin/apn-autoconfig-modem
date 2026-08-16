@@ -622,8 +622,18 @@ $usb_path
 			modem_id="usb-serial:${usb_label}:${vendor_id}:${product_id}:${serial}"
 			tier="usb-serial"
 		else
-			modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
-			tier="weak-vidpid"
+			# A modem that exposes no USB serial and no QMI/MBIM control channel
+			# can only reach a strong tier through an AT-supplied IMEI, and
+			# discovery must not probe for one. So it stays weak until an
+			# explicit identity read has happened, then upgrades from the cache.
+			cached_imei="$(at_cached_imei "$usb_path" 2>/dev/null || :)"
+			if [ -n "$cached_imei" ]; then
+				modem_id="imei:${cached_imei}"
+				tier="imei"
+			else
+				modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+				tier="weak-vidpid"
+			fi
 		fi
 		emit_candidate "$modem_id" "$tier" "$usb_path" "$vendor_id" "$product_id" \
 			"" "$data_device" "$at_device" at 0
@@ -728,12 +738,44 @@ at_cache_dir() {
 	printf '%s\n' "$STATE_DIR/at-ports"
 }
 
+at_cache_scope() {
+	# Every AT cache is keyed by physical port plus VID:PID, never by modem_id.
+	#
+	# Two reasons, and both are defects if ignored. A record's modem_id changes
+	# when AT supplies an IMEI and the tier is upgraded, so a modem_id key would
+	# orphan its own entries at exactly the moment they became useful. And a
+	# key of physical port alone would hand one modem's port verdicts to a
+	# different modem plugged into the same socket later — a stale `dead` there
+	# would make a perfectly good port permanently invisible, which is the worst
+	# kind of cache bug because nothing looks broken.
+	scope_usb_path="$1"
+	scope_label="${scope_usb_path##*/}"
+	scope_vendor="$(usb_attr "$scope_usb_path" idVendor 2>/dev/null || :)"
+	scope_product="$(usb_attr "$scope_usb_path" idProduct 2>/dev/null || :)"
+	[ -n "$scope_label" ] || return 1
+	printf '%s\n' "$(sanitize_token "${scope_label}:${scope_vendor}:${scope_product}")"
+}
+
 at_port_verdict_file() {
-	printf '%s/port.%s\n' "$(at_cache_dir)" "$(sanitize_token "$1")"
+	printf '%s/port.%s.%s\n' "$(at_cache_dir)" "$1" "$(sanitize_token "$2")"
 }
 
 at_selection_file() {
-	printf '%s/selected.%s\n' "$(at_cache_dir)" "$(sanitize_token "$1")"
+	printf '%s/selected.%s\n' "$(at_cache_dir)" "$1"
+}
+
+at_imei_file() {
+	printf '%s/imei.%s\n' "$(at_cache_dir)" "$1"
+}
+
+at_cached_imei() {
+	# Read on the discovery path, so it must never probe. An IMEI learned by an
+	# earlier explicit identity read is what lets a modem with no USB serial
+	# reach a strong evidence tier without one.
+	cached_scope="$(at_cache_scope "$1")" || return 1
+	cached_imei_value="$(sed -n '1p' "$(at_imei_file "$cached_scope")" 2>/dev/null || :)"
+	valid_imei "$cached_imei_value" || return 1
+	printf '%s\n' "$cached_imei_value"
 }
 
 at_cache_write() {
@@ -1061,9 +1103,9 @@ at_read_identity() {
 at_cached_port() {
 	# The already-resolved port for this modem, or nothing. Never probes, so it
 	# is safe on the discovery path.
-	cached_modem_id="$1"
-	cached_usb_path="$2"
-	cached_interface="$(sed -n '1p' "$(at_selection_file "$cached_modem_id")" 2>/dev/null || :)"
+	cached_usb_path="$1"
+	cached_scope="$(at_cache_scope "$cached_usb_path")" || return 1
+	cached_interface="$(sed -n '1p' "$(at_selection_file "$cached_scope")" 2>/dev/null || :)"
 	[ -n "$cached_interface" ] || return 1
 	cached_device="$(at_candidate_ports "$cached_usb_path" | \
 		awk -F '\t' -v want="$cached_interface" '$3 == want { print $2; exit }')"
@@ -1076,15 +1118,15 @@ at_resolve_port() {
 	# Discovery never does, because a sweep costs the per-port bound for every
 	# port that accepts a write and never answers — the common case, not the
 	# exception — and LuCI calls discovery on page load.
-	resolve_modem_id="$1"
-	resolve_usb_path="$2"
+	resolve_usb_path="$1"
 	AT_RESOLVED_PORT=""
 	AT_RESOLVED_MODEL=""
 	command_exists "$SMS_TOOL" || return 1
+	resolve_scope="$(at_cache_scope "$resolve_usb_path")" || return 1
 	candidates="$(at_candidate_ports "$resolve_usb_path")"
 	[ -n "$candidates" ] || return 1
 
-	selection_file="$(at_selection_file "$resolve_modem_id")"
+	selection_file="$(at_selection_file "$resolve_scope")"
 	cached_interface="$(sed -n '1p' "$selection_file" 2>/dev/null || :)"
 	if [ -n "$cached_interface" ]; then
 		cached_device="$(printf '%s\n' "$candidates" | \
@@ -1108,7 +1150,7 @@ at_resolve_port() {
 	while IFS="$(printf '\t')" read -r device interface; do
 		[ -n "$device" ] || continue
 		[ -n "$interface" ] || continue
-		verdict_file="$(at_port_verdict_file "$interface")"
+		verdict_file="$(at_port_verdict_file "$resolve_scope" "$interface")"
 		verdict="$(sed -n '1p' "$verdict_file" 2>/dev/null || :)"
 		[ "$verdict" = dead ] && continue
 		at_probe_port "$device"
@@ -1369,7 +1411,7 @@ scan_inventory() {
 			# because discovery must not probe: a sweep costs the per-port bound
 			# for every port that accepts a write and never answers, and LuCI
 			# calls discovery on page load.
-			at_device="$(at_cached_port "$modem_id" "$usb_path" 2>/dev/null || :)"
+			at_device="$(at_cached_port "$usb_path" 2>/dev/null || :)"
 		fi
 		if [ "$ambiguous" -eq 0 ] && grep -F -x -q "$modem_id" "$INVENTORY_FILE.dupes" 2>/dev/null; then
 			ambiguous=1
@@ -1465,7 +1507,10 @@ print_modem_json() {
 	json_key_string protocol "$protocol"; printf ','
 	# Display and quirk-keying evidence, read over AT and cached so the record
 	# can carry it without probing. Empty whenever no AT identity was obtained.
-	record_identity="$(sed -n '1p' "$(at_identity_cache_file "$modem_id")" 2>/dev/null || :)"
+	record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
+	record_identity=""
+	[ -z "$record_scope" ] || \
+		record_identity="$(sed -n '1p' "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
 	json_key_string manufacturer "$(field "$record_identity" 1)"; printf ','
 	json_key_string model "$(field "$record_identity" 2)"; printf ','
 	json_key_string firmware_revision "$(field "$record_identity" 3)"; printf ','
@@ -1493,7 +1538,10 @@ print_modem_json() {
 	if [ -n "$at_device" ] && [ "$ambiguous" -eq 0 ]; then
 		case "$owner_state" in
 			modemmanager|conflicting) : ;;
-			*) [ -s "$(at_selection_file "$modem_id")" ] && capable_at_identity=1 ;;
+			*)
+				[ -z "$record_scope" ] || \
+					{ [ -s "$(at_selection_file "$record_scope")" ] && capable_at_identity=1 ; }
+			;;
 		esac
 	fi
 	printf '"capabilities":{"inventory":true,'
@@ -2123,7 +2171,8 @@ at_resolve_target_port() {
 		;;
 	esac
 	command_exists "$SMS_TOOL" || die_code 3 "$SMS_TOOL is not installed"
-	at_resolve_port "$REQUESTED_MODEM" "$(field "$line" 3)" || \
+	AT_TARGET_USB_PATH="$(field "$line" 3)"
+	at_resolve_port "$AT_TARGET_USB_PATH" || \
 		die_code 3 "no AT control port could be resolved for modem $REQUESTED_MODEM"
 }
 
@@ -2143,8 +2192,15 @@ at_identity_cmd() {
 
 	# Cached so inventory can display these without probing. Identity evidence,
 	# never identity: nothing here distinguishes two identical modems.
-	at_cache_write "$(at_identity_cache_file "$REQUESTED_MODEM")" \
-		"$(printf '%s\t%s\t%s\t%s' "$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE" "$AT_IMEI")" || :
+	identity_scope="$(at_cache_scope "$AT_TARGET_USB_PATH")" || identity_scope=""
+	if [ -n "$identity_scope" ]; then
+		at_cache_write "$(at_identity_cache_file "$identity_scope")" \
+			"$(printf '%s\t%s\t%s' "$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE")" || :
+		# The IMEI is cached separately because discovery reads it to upgrade a
+		# serial-less modem from weak-vidpid to the imei tier, and discovery is
+		# not allowed to probe for it.
+		[ -z "$AT_IMEI" ] || at_cache_write "$(at_imei_file "$identity_scope")" "$AT_IMEI" || :
+	fi
 
 	# The same v1 identity TSV the QMI and MBIM adapters emit, so a consumer
 	# never has to know which transport produced it. operator_id stays empty

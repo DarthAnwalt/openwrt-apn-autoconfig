@@ -856,6 +856,32 @@ printf '%s\n' 'TEST CESQ RSRP outranks CSQ, and the NR extension fields do not b
 signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity")"
 [ "$signal" = 73 ] || fail "signal_quality was $signal, not the CESQ-derived 73"
 
+printf '%s\n' 'TEST a serial-less modem is upgraded from weak-vidpid to the imei tier'
+# The record could only ever have been weak before: this modem exposes no USB
+# serial and no QMI/MBIM control channel, so the one path to a strong tier runs
+# through an AT-supplied IMEI. Discovery still does not probe for it — the read
+# above cached it, and discovery reads the cache.
+: >"$TEST_AT_PROBES"
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["modem_id"] == "imei:016177002734885", m
+assert m["evidence_tier"] == "imei", m
+' "$out" || fail 'the modem was not upgraded to the imei tier'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the tier upgrade probed instead of reading the cache'
+MODEM_ID_AT="imei:016177002734885"
+
+printf '%s\n' 'TEST the port selection survives the identity change that renames the record'
+# The caches are keyed by physical port and VID:PID rather than by modem_id, so
+# the upgrade cannot orphan the entries it was made from.
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ID_AT")" || fail 'at-port failed after the tier upgrade'
+[ "$port" = /dev/ttyUSB50 ] || fail "at-port returned $port after the upgrade"
+if awk -F'\t' '$1 != "/dev/ttyUSB50"' "$TEST_AT_PROBES" | grep -q .; then
+	fail 'the renamed record lost its cached selection and swept again'
+fi
+
 printf '%s\n' 'TEST an unknown CESQ RSRP falls back to CSQ rather than reporting no signal'
 TEST_AT_CESQ="99,99,255,255,255,255,255,255,255" \
 	sh "$SCRIPT" at-identity --modem "$MODEM_ID_AT" >"$STATE/at-identity-csq" || fail 'fallback identity failed'
@@ -925,6 +951,28 @@ APN_AUTOCONFIG_MODEM_SLEEP="$(command -v /bin/sleep || command -v /usr/bin/sleep
 grep -q '/dev/ttyUSB35' "$TEST_AT_PROBES" || fail 'the watchdog path never reached the silent port'
 ls /tmp/apn-autoconfig-modem.*.bounded-timeout >/dev/null 2>&1 && \
 	fail 'the watchdog left its timeout marker behind'
+
+printf '%s\n' 'TEST a different modem in the same USB socket does not inherit the previous one'
+reset_sysfs
+: >"$TEST_AT_PORTS"; : >"$TEST_AT_PROBES"
+rm -rf "$TEST_MODEM_STATE_DIR/at-ports"
+add_at_modem 10-1.1 1111 1111 '' 70
+printf '/dev/ttyUSB70\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 10-1.1 71 1.3 control
+port="$(sh "$SCRIPT" at-port --modem "weak-vidpid:10-1.1:1111:1111")" || fail 'first modem did not resolve'
+[ "$port" = /dev/ttyUSB71 ] || fail "first modem resolved to $port"
+
+# Swap in another model on the same physical port, whose control channel happens
+# to sit on the interface the previous modem's dead port occupied. Keying the
+# verdict cache by port alone would make that channel permanently invisible, and
+# nothing would look broken — the modem would simply never resolve.
+reset_sysfs
+: >"$TEST_AT_PORTS"; : >"$TEST_AT_PROBES"
+add_at_modem 10-1.1 3333 4444 '' 72
+printf '/dev/ttyUSB72\tcontrol\n' >>"$TEST_AT_PORTS"
+port="$(sh "$SCRIPT" at-port --modem "weak-vidpid:10-1.1:3333:4444")" || \
+	fail 'the replacement modem inherited a dead-port verdict from its predecessor'
+[ "$port" = /dev/ttyUSB72 ] || fail "the replacement modem resolved to $port"
 
 printf '%s\n' 'TEST the resolver refuses a port the QMI adapter is holding, rather than proceeding'
 # The other half of the shared namespace, asserted from this side. A reader that

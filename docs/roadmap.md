@@ -158,7 +158,15 @@ baseline, verification and rollback discipline as database profiles.
 Add separately packaged netifd protocol support and capability modules needed
 for the practical FM350 connection lifecycle. Validate provisioning,
 connection, interruption, recovery and coexistence on hardware without moving
-bearer ownership outside netifd.
+bearer ownership outside netifd. The protocol handler binds the data-interface
+driver itself: on the measured hardware the device presents an RNDIS interface
+pair with no driver bound and therefore no network device at all.
+
+This release also brings the first netifd target an AT-managed modem has ever
+had, and with it the decision deferred from 0.14.0: whether the APN engine gets
+AT identity through an adapter of its own or by asking `apn-autoconfig-modem`.
+Both candidates and the argument between them are recorded in
+[`backend-contract-v1.md`](backend-contract-v1.md).
 
 ## 0.16.0 — eSIM lifecycle and live APN recovery
 

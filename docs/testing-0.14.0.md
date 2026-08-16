@@ -28,8 +28,9 @@ release is actually decided.
 - same-device AT port resolution by observed role, and its cache/revalidation;
 - the bounded executor, including the watchdog path for images with no external
   `timeout`;
-- the mandatory AT port lock as the innermost level of the existing order;
-- `/usr/libexec/apn-autoconfig-at`: identity only, per the backend contract;
+- the mandatory AT port lock as the innermost level of the existing order,
+  including making the QMI adapter's existing AT fallback take it;
+- AT identity in `apn-autoconfig-modem`, emitting the v1 identity TSV;
 - the quirk table mechanism, keyed by manufacturer/model, with an empty default;
 - `reset_method` selection by control owner, and `AT+CFUN=1,1` as the third
   implementation;
@@ -43,6 +44,11 @@ release is actually decided.
 - free-form AT from any public control, UCI, the environment or the GUI;
 - band selection, SIM slot switching, SMS, USSD, firmware or radio-mode control;
 - the Fibocom netifd protocol, which is 0.15.0;
+- an APN-engine-facing AT adapter. The engine only speaks about netifd targets
+  and an AT-managed modem has none until 0.15.0, so the adapter would be a
+  connector to a socket that does not exist. Which component answers the engine
+  is decided there, against a real caller; both candidates are recorded in
+  [`backend-contract-v1.md`](backend-contract-v1.md);
 - ModemManager inhibition, which is an eSIM-transport problem for 0.16.0;
 - per-target lock granularity and automatic reset escalation, both deferred to
   0.17.0 and recorded in [`architecture.md`](architecture.md);

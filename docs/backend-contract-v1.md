@@ -173,16 +173,52 @@ The backend owns the same five netifd options as QMI, but `pdptype` takes MBIM's
 `ipv4` rather than qmi.sh's canonical `ip`, and readiness is observed on the
 dynamic `${interface}_4` / `${interface}_6` interfaces `mbim.sh` publishes.
 
-## Native AT adapter
+## Native AT identity
 
-`/usr/libexec/apn-autoconfig-at`, added in 0.14.0, follows the same shape again:
-`capabilities` and `identity <device>`, the same v1 identity TSV, the same exit
-classes. Its device argument is an AT port resolved by role per
-[`modem-contract-v1.md`](modem-contract-v1.md), and it shares that document's AT
-port lock namespace so it cannot overlap the QMI adapter's AT fallback on one
-device.
+AT identity is implemented in `apn-autoconfig-modem` from 0.14.0, as
+`at-identity --modem <id>`. It resolves the port by role, holds the AT port lock
+for the whole read and emits the v1 identity TSV below, unchanged from what the
+QMI and MBIM adapters produce.
 
-It is an **identity-only backend, permanently**. Its capability map reports
+### Which component answers the APN engine is decided in 0.15.0
+
+There is deliberately **no `/usr/libexec/apn-autoconfig-at` in 0.14.0**, and this
+is a decision rather than an omission.
+
+The engine only ever asks about a configured netifd target; it has no way to
+speak about a modem that has none. An AT-managed modem gets its first netifd
+target in 0.15.0, with the Fibocom protocol. Until then the identity has exactly
+two consumers — the inventory and the LuCI page — and both reach it through the
+modem package directly. An adapter shaped for the engine would be a connector to
+a socket that does not exist yet, and the shape it should take depends on facts
+that arrive with its first caller.
+
+Two candidates are on the table, to be chosen in 0.15.0 against a real consumer:
+
+1. **A thin `/usr/libexec/apn-autoconfig-at`** with `capabilities` and
+   `identity <device>`, matching the QMI and MBIM adapters exactly. Uniform, and
+   the engine's dispatch needs no special case. But it puts a second
+   implementation of AT port resolution and reply parsing in the core package,
+   competing for the same tty as the modem package's.
+2. **The engine asks the modem package**, `at-identity --modem <id>`. One
+   implementation, one owner of the port lock, and the modem package already
+   owns hardware access — the engine already delegates the power cycle to it. It
+   costs a second dispatch shape in the engine, and a harder dependency on the
+   modem package for that target class.
+
+The second currently looks better, precisely because two components parsing AT
+replies while racing for one serial port is the failure this release exists to
+prevent. It is not chosen yet: a decision taken without its caller in front of
+us is the kind that gets discovered to be wrong during a hardware gate.
+
+One 0.14.0 obligation is **not** deferred with it: the QMI adapter's existing AT
+fallback must take the shared AT port lock, so two components of this project
+cannot write to one `ttyUSB` at the same time. That is independent of who
+eventually answers the engine.
+
+### Properties fixed now, whichever shape wins
+
+AT is an **identity-only backend, permanently**. Its capability map reports
 `identity: true` and `profile_read`, `profile_write` and `profile_apply` all
 false, and that is not a maturity statement to be revised later. An AT-managed
 modem still receives its APN the same way every other target does: the engine

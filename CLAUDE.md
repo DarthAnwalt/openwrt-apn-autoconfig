@@ -121,10 +121,17 @@ not optional style preferences.
   Never use a broad wildcard or recursive deletion for lock roots. Resolve
   exact project-owned paths and delete only regular state or provably stale
   locks. Preserve config/baseline restoration semantics across upgrades.
-- Check exact new package names against official OpenWrt indexes and public
-  package trees immediately before an RC, and inspect the actual APK produced
-  by the official supported SDK rather than inferring package contents from the
-  source tree.
+- Inspect the actual APK produced by the official supported SDK rather than
+  inferring package contents from the source tree. This is a per-release
+  requirement: it is what catches a file that reached a published package
+  without being declared.
+- Audit exact package names against official OpenWrt indexes and public package
+  trees **when a package is added or renamed**, and once before the 1.0 name
+  freeze. Not every release: an unchanged name gives the same answer every
+  time, the risk is driven by other people's publishing rather than by our
+  cadence, and a collision can appear the day after any check. Record the date
+  and result of each audit in `docs/architecture.md` so the last answer is
+  attributable.
 
 ### Tests required for architectural work
 

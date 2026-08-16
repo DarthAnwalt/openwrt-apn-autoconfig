@@ -78,9 +78,21 @@ These rules bind every component and release:
 The package namespace remains the already published `apn-autoconfig-*` family.
 The product title shown in LuCI may become **Mobile Connectivity**, but generic
 global package names such as `modem-control`, `esim-control` and
-`luci-app-mobile-connectivity` are deliberately avoided. Release preparation
-must check the supported OpenWrt package indexes and public package trees for
-new exact name collisions.
+`luci-app-mobile-connectivity` are deliberately avoided.
+
+Exact names are audited against the supported OpenWrt package indexes and public
+package trees when a package is **added or renamed**, and once before the 1.0
+name freeze. Repeating the search for unchanged names every release produced the
+same answer each time while suggesting the namespace was under continuous watch,
+which it cannot be: a collision can appear the day after any check, and it
+depends on other people's publishing rather than on this project's cadence.
+
+Audits so far:
+
+| Date | Scope | Result |
+|---|---|---|
+| 2026-08-13 | `apn-autoconfig-modem`, `-esim`, `-proto-fibocom`, `-lpac` | no exact collision |
+| 2026-08-16 | all five published names | no exact collision; every `PKG_NAME` hit belongs to this repository, and the three official trees contain none |
 
 ### First-party packages
 

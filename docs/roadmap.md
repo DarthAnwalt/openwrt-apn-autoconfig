@@ -97,6 +97,14 @@ convenience rather than the user's.
 
 No machine API changes shape or meaning in this release.
 
+## 0.13.1 — connection-control busy state
+
+Released. A defect-only patch with no feature or API change. The connection
+controls 0.13.0 introduced stayed clickable while an operation started from
+another entry point held the shared lock, so the page offered a control that
+could only fail and lost the double-click protection its other actions have.
+The busy state is now symmetric in both directions.
+
 ## 0.14.0 — bounded generic AT framework
 
 Add stable same-device AT-port resolution, bounded probing, normalized

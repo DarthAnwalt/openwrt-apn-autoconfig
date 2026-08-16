@@ -394,7 +394,11 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmModemAction(modem, verb); }
 		}, [ label ]);
-		button.disabled = !!(modem.operation && modem.operation.busy);
+		/* Either lock is enough to make this fail. The modem's own operation is
+		 * the obvious one; a busy engine — a reconcile, a power-cycle, an SSH
+		 * command or the physical button — holds the same global lock, and a
+		 * card re-rendered while that runs must come back disabled too. */
+		button.disabled = !!(modem.operation && modem.operation.busy) || !!self.busy;
 		self.modemButtons.push(button);
 		return button;
 	},
@@ -804,6 +808,11 @@ return view.extend({
 		(this.resetButtons || []).forEach(function(button) {
 			button.disabled = this.busy || !this.profileApplySupported;
 		}, this);
+		/* The modem card's controls are otherwise only refreshed when LuCI
+		 * itself started a modem action, so an operation from any other entry
+		 * point left them clickable and they failed on the lock instead. */
+		if (this.busy)
+			this.setModemButtonsBusy(true);
 		this.updatePolicyControls();
 		this.updateDatabaseControls();
 		this.refreshStrip();

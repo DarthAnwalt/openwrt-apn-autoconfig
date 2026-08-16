@@ -258,6 +258,40 @@ var busyNodes = modemArea(
 assert.ok(actionButtons(busyNodes).every(function(button) { return button.disabled === true; }),
 	'controls must be disabled while an operation is running for that modem');
 
+/* The case that let a real defect through: the modem itself is idle, but the
+ * engine is busy — a reconcile, a power-cycle, an SSH command or the physical
+ * button — and they all take the same global lock. A bearer control offered
+ * then is a control that will fail on that lock. Both the render path and the
+ * poll path have to close it, because either can be the one that runs. */
+var idlePlan = {
+	can_provision: false, reason: 'already_configured',
+	can_control_bearer: true, connection_section: 'wwan', connection_owned: false
+};
+
+var engineBusyApp = loadView();
+engineBusyApp.busy = true;
+var engineBusyNodes = engineBusyApp.modemAreaNodes({
+	version: 'v1',
+	modems: [ modemFixture(idlePlan, { busy: false, state: 'idle' }) ]
+});
+assert.ok(actionButtons(engineBusyNodes).length > 0,
+	'the fixture must actually render the controls this asserts about');
+assert.ok(actionButtons(engineBusyNodes).every(function(button) { return button.disabled === true; }),
+	'a card rendered while the engine is busy must come back disabled');
+
+var pollApp = loadView();
+pollApp.busy = false;
+pollApp.profileApplySupported = true;
+var pollNodes = pollApp.modemAreaNodes({
+	version: 'v1',
+	modems: [ modemFixture(idlePlan, { busy: false, state: 'idle' }) ]
+});
+assert.ok(actionButtons(pollNodes).every(function(button) { return button.disabled === false; }),
+	'an idle modem and an idle engine must leave the controls usable');
+pollApp.setBusy(true, { state: 'running', action: 'reconcile' });
+assert.ok(actionButtons(pollNodes).every(function(button) { return button.disabled === true; }),
+	'learning that the engine is busy must disable the already-rendered controls');
+
 /* The privileged wrapper only ever receives a fixed verb and a modem identity:
  * the view cannot name a section, device or profile field. */
 var actionApp = loadView(function(command, args) {

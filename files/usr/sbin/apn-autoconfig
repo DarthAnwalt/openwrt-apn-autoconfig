@@ -1503,7 +1503,8 @@ forget_target_cmd() {
 		return 0
 	fi
 	# Named files only: never a recursive or wildcard delete under the state root.
-	rm -f "$forget_dir/baseline.tsv" "$forget_dir/active.tsv"
+	rm -f "$forget_dir/baseline.tsv" "$forget_dir/active.tsv" \
+		"$forget_dir/last-result" "$forget_dir/last-result-code"
 	rmdir "$forget_dir" 2>/dev/null || \
 		log warning "engine state directory for network:$forget_section is not empty; left in place"
 	log notice "dropped engine state for network:$forget_section"
@@ -1651,15 +1652,20 @@ targets_json_cmd() {
 	printf '\n'
 }
 
+# The last result belongs to the target it describes. It lived in the shared
+# cache since the single-target era, so a failure on one target was reported as
+# every other target's last result. There is deliberately no fallback to the
+# legacy path: an upgraded installation cannot tell which target the old result
+# belonged to, and "no result yet" is true where attributing it would not be.
 read_last_result() {
-	if [ -r "$CACHE_DIR/last-result" ]; then
-		sed -n '1p' "$CACHE_DIR/last-result"
+	if [ -r "$TARGET_STATE_DIR/last-result" ]; then
+		sed -n '1p' "$TARGET_STATE_DIR/last-result"
 	fi
 }
 
 read_last_result_code() {
-	if [ -r "$CACHE_DIR/last-result-code" ]; then
-		sed -n '1p' "$CACHE_DIR/last-result-code"
+	if [ -r "$TARGET_STATE_DIR/last-result-code" ]; then
+		sed -n '1p' "$TARGET_STATE_DIR/last-result-code"
 	fi
 }
 
@@ -2171,9 +2177,12 @@ save_cache() {
 write_last_result() {
 	result_code="$1"
 	shift
-	mkdir -p "$CACHE_DIR" || return 0
-	printf '%s\n' "$*" >"$CACHE_DIR/last-result"
-	printf '%s\n' "$result_code" >"$CACHE_DIR/last-result-code"
+	mkdir -p "$TARGET_STATE_DIR" || return 0
+	printf '%s\n' "$*" >"$TARGET_STATE_DIR/last-result"
+	printf '%s\n' "$result_code" >"$TARGET_STATE_DIR/last-result-code"
+	# Retire the shared pair once a per-target result exists, so the file that
+	# used to answer for every target does not outlive the behaviour.
+	rm -f "$CACHE_DIR/last-result" "$CACHE_DIR/last-result-code"
 }
 
 registration_is_pending() {

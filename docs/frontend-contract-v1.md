@@ -15,9 +15,18 @@ appear together, and nothing on the page can be taken in at a glance. The fix is
 not decoration. It is deciding which question each area answers, and letting the
 layout follow the answer.
 
-**No machine API changes shape or meaning in this release.** The narrow rpcd
-surface, the capability-driven rendering rule and the identifier-masking rules
-are unchanged.
+**No existing machine API field changes shape or meaning in this release**, and
+no wrapper gains a verb. The narrow rpcd surface, the capability-driven
+rendering rule and the identifier-masking rules are unchanged.
+
+One addition is required rather than optional. The capability-driven rule says a
+control is never rendered for something that cannot work, and the bearer-control
+change below makes "can this interface be started?" a question the frontend
+cannot answer from what it already receives. `provision-plan` therefore gains
+three read-only fields — `can_control_bearer`, `connection_section` and
+`connection_owned` — produced by the same resolver the action uses. Deriving the
+answer in JavaScript instead would put a second copy of the safety rule in the
+frontend, where it would drift.
 
 ## The four areas, and the question each answers
 

@@ -1014,7 +1014,7 @@ if DATA_ADDRESS_UNAVAILABLE=1 CURL_SUCCESS_APN=mbim.internet TEST_INTERFACE=cell
 fi
 [ "$(cat "$STATE/mbim-apn")" = mbim.old ] || fail 'a bearer that never got an address was not rolled back'
 [ "$(cat "$STATE/mbim-auth")" = chap ] || fail 'a bearer that never got an address left an owned option behind'
-[ "$(cat "$CACHE/last-result-code")" = bearer-rejected ] || fail 'an unaddressed MBIM bearer was not classified as rejected'
+[ "$(cat "$PERSIST/targets/network_cellmbim/last-result-code")" = bearer-rejected ] || fail 'an unaddressed MBIM bearer was not classified as rejected'
 TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
 rm -f "$CACHE/$MBIM_ICCID.tsv"
 MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/home"
@@ -1292,7 +1292,7 @@ printf '%s\n' 'TEST reconcile is idempotent for an already verified SIM and APN'
 : >"$STATE/events"
 sh "$SCRIPT" reconcile
 [ ! -s "$STATE/events" ] || fail 'idempotent reconcile restarted the interface'
-[ "$(cat "$CACHE/last-result-code")" = success ] || fail 'idempotent connectivity verification left a stale failure result'
+[ "$(cat "$TARGET_PERSIST/last-result-code")" = success ] || fail 'idempotent connectivity verification left a stale failure result'
 
 printf '%s\n' 'TEST reconcile restores the cached APN when configuration differs'
 printf '%s\n' 'wrong.apn' >"$STATE/apn"
@@ -1372,13 +1372,13 @@ fi
 [ "$(cat "$STATE/apn")" = 'rollback.apn' ] || fail 'previous APN was not restored'
 [ "$(cat "$STATE/username")" = 'old-user' ] || fail 'previous username was not restored'
 [ "$(cat "$STATE/password")" = 'old-pass' ] || fail 'previous password was not restored'
-[ "$(cat "$CACHE/last-result-code")" = 'connectivity-failed' ] || fail 'bearer-up Internet failure was not classified'
+[ "$(cat "$TARGET_PERSIST/last-result-code")" = 'connectivity-failed' ] || fail 'bearer-up Internet failure was not classified'
 
 printf '%s\n' 'TEST profiles that never produce a bearer are classified separately'
 UBUS_UP=0
 export UBUS_UP
 if sh "$SCRIPT" apply >/dev/null 2>&1; then fail 'bearer-rejected apply unexpectedly succeeded'; fi
-[ "$(cat "$CACHE/last-result-code")" = 'bearer-rejected' ] || fail 'missing bearer was not classified'
+[ "$(cat "$TARGET_PERSIST/last-result-code")" = 'bearer-rejected' ] || fail 'missing bearer was not classified'
 unset UBUS_UP
 
 printf '%s\n' 'TEST reset after failed apply is idempotent for network state'
@@ -1444,7 +1444,7 @@ fi
 [ "$(cat "$STATE/apn")" = 'blocked.before' ] || fail 'roaming block changed the APN'
 [ "$(grep -F -c 'down wwan' "$STATE/events")" -eq 1 ] || fail 'roaming block did not stop the active interface exactly once'
 [ "$(grep -F -c 'up wwan' "$STATE/events")" -eq 0 ] || fail 'roaming block restarted the interface or cycled profiles'
-[ "$(cat "$CACHE/last-result-code")" = 'blocked-roaming-policy' ] || fail 'roaming block result was not classified'
+[ "$(cat "$TARGET_PERSIST/last-result-code")" = 'blocked-roaming-policy' ] || fail 'roaming block result was not classified'
 
 printf '%s\n' 'TEST explicit policy commands edit only the canonical network option'
 : >"$STATE/events"
@@ -1793,7 +1793,7 @@ sh "$SCRIPT" apply-manual --apn manual.example >/dev/null 2>&1 || \
 [ -s "$TARGET_PERSIST/active.tsv" ] || fail 'apply-manual did not record reconciled state'
 grep -F -q 'manual.example' "$TARGET_PERSIST/active.tsv" || \
 	fail 'reconciled state does not name the manually applied APN'
-grep -F -q 'manual' "$CACHE/last-result" || \
+grep -F -q 'manual' "$TARGET_PERSIST/last-result" || \
 	fail 'the recorded result does not identify the profile as manual'
 
 printf '%s\n' 'TEST apply-manual stores optional credentials it was given'
@@ -1886,6 +1886,42 @@ mv "$DB.hidden" "$DB"
 	fail "apply-manual needed the provider database it does not consult (exit $nodb_status)"
 [ "$(cat "$STATE/apn")" = nodb.example ] || \
 	fail 'apply-manual did not apply the profile without a database'
+
+printf '%s\n' 'TEST a failure recorded for one target is not reported as another target'\''s'
+rm -rf "$TEST_LOCK"
+mkdir -p "$PERSIST/targets/network_cellqmi"
+printf '%s\n' 'failed: something went wrong on cellqmi' >"$PERSIST/targets/network_cellqmi/last-result"
+printf '%s\n' 'connectivity-failed' >"$PERSIST/targets/network_cellqmi/last-result-code"
+rm -f "$TARGET_PERSIST/last-result" "$TARGET_PERSIST/last-result-code"
+scoped_status="$(sh "$SCRIPT" status-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["last_result"] == "", d
+' "$scoped_status" || fail "one target's recorded failure leaked into another target's status"
+scoped_status="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" status-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["last_result"] == "failed: something went wrong on cellqmi", d
+' "$scoped_status" || fail 'the target that recorded the failure did not report it'
+rm -f "$PERSIST/targets/network_cellqmi/last-result" \
+	"$PERSIST/targets/network_cellqmi/last-result-code"
+
+printf '%s\n' 'TEST a result stored by an older release is not attributed to any target'
+rm -rf "$TEST_LOCK"
+mkdir -p "$CACHE"
+printf '%s\n' 'failed: recorded before per-target results existed' >"$CACHE/last-result"
+printf '%s\n' 'connectivity-failed' >"$CACHE/last-result-code"
+rm -f "$TARGET_PERSIST/last-result" "$TARGET_PERSIST/last-result-code"
+legacy_status="$(sh "$SCRIPT" status-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["last_result"] == "", d
+assert d["result_code"] == "", d
+' "$legacy_status" || fail 'an upgraded installation attributed its old shared result to a target'
+rm -f "$CACHE/last-result" "$CACHE/last-result-code"
 
 printf '%s\n' 'TEST forget-target drops one target and leaves the shared cache alone'
 rm -rf "$TEST_LOCK"

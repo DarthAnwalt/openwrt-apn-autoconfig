@@ -1,0 +1,8 @@
+  nwerror: 0000 - unknown
+  registerstate: 0003 - home
+  registermode: 0002 - automatic
+  availabledataclasses: 80000020 - (null)
+  currentcellularclass: 0001 - gsm
+  provider_id: 20404
+  provider_name: KPN Mobile
+  roamingtext: (null)

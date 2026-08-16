@@ -7,16 +7,19 @@ stable identity, control-owner arbitration and serialized reset coordination.
 The APN engine discovers configured cellular netifd interfaces and publishes
 their runtime capabilities and validation level through a GUI-independent API.
 QMI identity
-uses `uqmi` with a same-USB-device AT fallback through `sms-tool`; profile
-application is delegated to the configured netifd `qmi.sh` target. MBIM, Fibocom and
-selected AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
+uses `uqmi` with a same-USB-device AT fallback through `sms-tool`, and MBIM
+identity uses the read-only `umbim` queries; profile application is delegated to
+the configured netifd `qmi.sh` or `mbim.sh` target. Fibocom and selected
+AT-managed protocols remain inventory-only. The engine resolves the active SIM, finds mobile profile
 candidates in a worldwide local TSV database, restarts only the selected mobile
 interface, verifies real Internet access through netifd's current layer-3 device, caches
 the successful profile by ICCID, and restores the previous profile when all candidates
 fail. It distinguishes the SIM's home operator from the serving network.
-ModemManager honors OpenWrt's canonical data-roaming policy before changing
-any APN; QMI reports observed roaming but exposes policy control as unsupported
-because no portable netifd mapping has been hardware-validated. The engine
+ModemManager and MBIM honor OpenWrt's canonical data-roaming policy before
+changing any APN — MBIM through its `allow_roaming` and `allow_partner` pair,
+whose absent default blocks roaming rather than allowing it. QMI reports
+observed roaming but exposes policy control as unsupported because no portable
+netifd mapping has been hardware-validated. The engine
 reports registration failures separately from profile failures. It includes an idempotent `reconcile` command for SIM transitions and an
 opt-in delayed boot service. A separately installed Huasifei board integration
 can power-cycle the modem through its verified exported GPIO and reconcile the
@@ -309,11 +312,11 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.11.0-r1.apk \
-  ./luci-app-apn-autoconfig-0.11.0-r1.apk
+  ./apn-autoconfig-0.12.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.12.0-r1.apk
 ```
 
-`apn-autoconfig-modem-0.11.0-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.12.0-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it in 0.10.0. It adds
 read-only modem inventory and a coordinator-based `modem-reset` path alongside
 the compatibility path. Install it when those functions are required.
@@ -863,8 +866,18 @@ packages enter an official feed.
   uses the strictly same-device AT fallback. This path is hardware-validated
   on one Huasifei WH3000 Pro + RM520N-GL; other modem/board combinations still
   require compatibility reports and should not be inferred from that evidence.
-- MBIM, Fibocom and AT-managed profile operations remain unavailable; mutating
-  commands for those targets exit 4 before changing UCI, state or interfaces.
+- MBIM profile operations ship as `stable` with `validation_state: hardware`:
+  discovery, provisioning, profile write, verified Internet access, roaming
+  policy and exact rollback passed on the Huasifei WH3000 Pro with an
+  RM520N-GL in MBIM composition, recorded in `docs/router-test-0.12.0.md`. As
+  with QMI, that is evidence for one modem and board, not for MBIM in general.
+  The board power-cycle in MBIM composition is implemented but has only
+  synthetic coverage. Fibocom and AT-managed profile operations remain
+  unavailable; mutating commands for those targets exit 4 before changing UCI,
+  state or interfaces.
+- MBIM uses `umbim` only for read-only identity. It never opens a control
+  session netifd is holding for a live bearer, and a netifd transition in
+  flight is reported as retryable rather than probed through.
 - The connectivity test uses HTTPS through netifd's effective layer-3 device. It uses
   the profile's IPv4 or IPv6 family and tries both for dual-stack profiles.
 - Boot and hardware-button automation are independently opt-in and exposed as

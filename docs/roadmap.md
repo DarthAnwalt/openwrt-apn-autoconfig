@@ -48,7 +48,7 @@ scope until this foundation is proven.
 
 ## 0.10.1 — operation-lock correctness
 
-Prepared, not released. A defect-only patch with no feature or API change. It
+Released. A defect-only patch with no feature or API change. It
 makes lock publication atomic, so a lock can no longer be observed without a
 recorded owner and deleted while it is live. That window allowed two background
 workers to be accepted for one modem and made an accepted operation report
@@ -57,12 +57,13 @@ look like a rejected launch.
 
 ## 0.11.0 — safe first-run provisioning
 
-Add a capability-driven first-run workflow for an unconfigured ModemManager or
-QMI modem. Create only a disabled, project-owned staging netifd section, provide
-automatic and manual APN paths, connect through netifd, verify Internet access
-and then promote the requested autoconnect state. Add basic
-connect/disconnect/reconnect actions, explicit adoption rules and exact
-provisioning rollback/removal tests.
+Released. Added a capability-driven first-run workflow for an unconfigured
+ModemManager or QMI modem: only a disabled, project-owned staging netifd
+section, automatic and manual APN paths, connection through netifd, Internet
+verification and only then promotion of the requested autoconnect state. Added
+basic connect/disconnect/reconnect actions, explicit adoption rules — no
+adoption of user-created sections — and exact provisioning rollback and removal
+tests.
 
 ## 0.12.0 — complete native MBIM vertical slice
 

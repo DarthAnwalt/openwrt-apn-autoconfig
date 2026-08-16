@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig
-PKG_VERSION:=0.11.0
+PKG_VERSION:=0.12.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -21,9 +21,10 @@ endef
 
 define Package/apn-autoconfig/description
  POSIX-shell cellular profile detection and testing engine for OpenWrt.
- It supports already configured ModemManager and QMI netifd targets. QMI uses
- an installed uqmi command with a same-USB-device identity fallback through
- sms-tool; the core does not install a modem manager. It matches SIM identity against a worldwide local TSV database,
+ It supports already configured ModemManager, QMI and MBIM netifd targets. QMI
+ uses an installed uqmi command with a same-USB-device identity fallback through
+ sms-tool, and MBIM uses an installed umbim; the core does not install a modem
+ manager. It matches SIM identity against a worldwide local TSV database,
  verifies real Internet access, caches successful profiles per ICCID and safely
  rolls back failures.
 endef
@@ -66,6 +67,7 @@ define Package/apn-autoconfig/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-control $(1)/usr/libexec/apn-autoconfig-control
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-database $(1)/usr/libexec/apn-autoconfig-database
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-qmi $(1)/usr/libexec/apn-autoconfig-qmi
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-mbim $(1)/usr/libexec/apn-autoconfig-mbim
 endef
 
 define Package/apn-autoconfig-integration-huasifei-wh3000/install

@@ -30,8 +30,8 @@ contract explicitly rather than silently widening it.
       "data_device": "wwan0",
       "at_device": "/dev/ttyUSB2",
       "protocol": "qmi|mbim|at|modemmanager|unknown",
-      "implementation_state": "experimental",
-      "validation_state": "synthetic",
+      "implementation_state": "stable",
+      "validation_state": "synthetic|hardware",
       "hardware_validated": false,
       "owner_state": "none|netifd-direct|modemmanager|transitioning|conflicting",
       "netifd_interface": "wwan",
@@ -61,7 +61,13 @@ as `apn-autoconfig-modem.main.reset_modem_id`. A board-wide GPIO is never
 inferred to control every QMI modem merely because several are present.
 Capability, implementation maturity and hardware-validation evidence stay
 separate exactly as in the APN backend contract; an installed classifier is
-not hardware support.
+not hardware support. Maturity describes this implementation and is therefore
+the same for every record; evidence describes the protocol that was classified,
+so QMI and MBIM report `hardware` while AT-only and unclassified devices report
+`synthetic`. As with the APN backends, that evidence comes from one modem on one
+board and does not transfer to other hardware by itself. These fields must be
+kept current: a stale `experimental` understates a validated implementation just
+as badly as an unearned `stable` overstates one.
 
 ## Discovery evidence hierarchy
 

@@ -318,6 +318,63 @@ async function verifyBackendSpecificPolicy() {
 		'roaming serving network must not be presented as SIM provider or home network');
 }
 
+async function verifyMbimPolicy() {
+	var app = loadView();
+	var status = {
+		version: 'v2',
+		interface: 'wwanmbim',
+		target_backend: 'mbim',
+		target_protocol: 'mbim',
+		target_capabilities: {
+			identity: true,
+			profile_read: true,
+			profile_write: true,
+			profile_apply: true,
+			roaming_policy_read: true,
+			roaming_policy_write: true
+		},
+		registration_state: 'home',
+		roaming_policy: 'default-block'
+	};
+	await app.render([ {}, status, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual(app.policySelect.disabled, false,
+		'an MBIM target must offer roaming policy control');
+	assert.match(nodeText(app.policyDescription), /allow_partner/,
+		'the MBIM description must name both options it edits');
+	var defaultOption = app.policySelect.options.filter(function(option) {
+		return option.value === 'default';
+	})[0];
+	assert.match(nodeText(defaultOption), /blocked/i,
+		'the MBIM default must not be described as allowed');
+
+	var customApp = loadView();
+	var customStatus = Object.assign({}, status, { roaming_policy: 'invalid' });
+	await customApp.render([ {}, customStatus, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual(customApp.policySelect.value, 'custom',
+		'a custom option pair must not be displayed as one of the three policies');
+	assert.strictEqual(customApp.policyButton.disabled, true,
+		'a custom option pair must not be normalizable by an Apply click alone');
+	customApp.confirmRoamingPolicy();
+	assert.strictEqual(customApp.testUi.modalCalls, 0,
+		'an unchanged custom pair must not reach a mutating confirmation dialog');
+	customApp.policySelect.value = 'block';
+	customApp.policySelect.change();
+	assert.strictEqual(customApp.policyButton.disabled, false,
+		'deliberately replacing a custom pair must be possible');
+
+	var legacyApp = loadView();
+	var legacyStatus = {
+		version: 'v2',
+		interface: 'wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true },
+		roaming_policy: 'default-allow'
+	};
+	await legacyApp.render([ {}, legacyStatus, { state: 'idle', busy: false }, {} ]);
+	assert.strictEqual(legacyApp.policySelect.disabled, false,
+		'an engine that predates the capability booleans must keep its ModemManager control');
+}
+
 async function verifyUnavailableConfiguredTargetGuidance() {
 	var app = loadView();
 	var targets = {
@@ -344,6 +401,7 @@ Promise.all([
 	verifyPolicy('explicit-block', 'block'),
 	verifyLayout(),
 	verifyBackendSpecificPolicy(),
+	verifyMbimPolicy(),
 	verifyUnavailableConfiguredTargetGuidance()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');

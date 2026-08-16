@@ -57,6 +57,7 @@ MODEM_POLL_SECONDS="2"
 MMCLI_TIMEOUT_SECONDS="${APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS:-8}"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 QMI_ADAPTER="${APN_AUTOCONFIG_QMI_ADAPTER:-/usr/libexec/apn-autoconfig-qmi}"
+MBIM_ADAPTER="${APN_AUTOCONFIG_MBIM_ADAPTER:-/usr/libexec/apn-autoconfig-mbim}"
 TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
 HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn-autoconfig/integrations/huasifei-wh3000}"
 
@@ -136,7 +137,8 @@ cleanup_files() {
 		BOUNDED_CHILD_PID=""
 	fi
 	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
-		"$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS" "$TARGETS_DATA"
+		"$CANDIDATES" "${CANDIDATES}.apply" "${CANDIDATES}.attempts" \
+		"$SEEN_APNS" "$TARGETS_DATA"
 	if [ "$LOCK_HELD" -eq 1 ]; then
 		lock_release "$LOCK_DIR"
 		LOCK_HELD=0
@@ -293,7 +295,9 @@ capture_owned_profile() {
 capture_old_profile() {
 	case "$TARGET_BACKEND" in
 		modemmanager) capture_owned_profile allowedauth iptype ;;
-		qmi) capture_owned_profile auth pdptype ;;
+		# MBIM shares qmi.sh's option names but not its value vocabulary; see
+		# mbim_set_profile.
+		qmi|mbim) capture_owned_profile auth pdptype ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read APN profiles" ;;
 	esac
 }
@@ -321,6 +325,10 @@ restore_old_profile() {
 		;;
 		qmi)
 			log warning "restoring previous QMI profile for interface $INTERFACE"
+			restore_owned_profile auth pdptype
+		;;
+		mbim)
+			log warning "restoring previous MBIM profile for interface $INTERFACE"
 			restore_owned_profile auth pdptype
 		;;
 		*) return 1 ;;
@@ -393,10 +401,30 @@ qmi_set_profile() {
 	set_owned_profile "$apn" "$username" "$password" auth "$auth" pdptype "$ip_type"
 }
 
+mbim_set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	# umbim accepts exactly one authentication protocol and silently drops the
+	# username and password for any other value, so a normalized pap-or-chap
+	# candidate must have been expanded by the attempt planner before it gets
+	# here. Writing it verbatim would dial unauthenticated with no error.
+	case "$auth" in -|none|pap|chap) : ;; *) return 1 ;; esac
+	# mbim.sh lowercases pdptype and passes ipv4/ipv6/ipv4v6 through to umbim;
+	# anything else means "let the modem decide". qmi.sh's canonical "ip" is
+	# exactly such an unrecognized value here.
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+	set_owned_profile "$apn" "$username" "$password" auth "$auth" pdptype "$ip_type"
+}
+
 set_profile() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_set_profile "$@" ;;
 		qmi) qmi_set_profile "$@" ;;
+		mbim) mbim_set_profile "$@" ;;
 		*) return 1 ;;
 	esac
 }
@@ -497,9 +525,17 @@ target_protocol_capabilities() {
 	TARGET_IMPLEMENTATION_STATE="unimplemented"
 	TARGET_VALIDATION_STATE="none"
 	TARGET_HARDWARE_VALIDATED=false
+	# Roaming policy is a property of the connection manager, not of the APN
+	# profile, so it is reported separately instead of being inferred from a
+	# backend name. Both are plain netifd options, so neither depends on a
+	# runtime command being installed.
+	TARGET_ROAMING_POLICY_READ=false
+	TARGET_ROAMING_POLICY_WRITE=false
 	case "$protocol" in
 		modemmanager)
 			TARGET_BACKEND="modemmanager"
+			TARGET_ROAMING_POLICY_READ=true
+			TARGET_ROAMING_POLICY_WRITE=true
 			TARGET_IMPLEMENTATION_STATE="stable"
 			TARGET_VALIDATION_STATE="hardware"
 			TARGET_HARDWARE_VALIDATED=true
@@ -530,7 +566,29 @@ target_protocol_capabilities() {
 				TARGET_REASON="backend-command-unavailable"
 			fi
 		;;
-		mbim|umbim) TARGET_BACKEND="mbim" ;;
+		mbim|umbim)
+			TARGET_BACKEND="mbim"
+			TARGET_ROAMING_POLICY_READ=true
+			TARGET_ROAMING_POLICY_WRITE=true
+			# Discovery through provisioning, profile write, verified Internet
+			# access, roaming policy and exact rollback passed on the WH3000
+			# with an RM520N-GL in MBIM composition; see
+			# docs/router-test-0.12.0.md.
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
+			if [ ! -x "$MBIM_ADAPTER" ]; then
+				TARGET_REASON="adapter-unavailable"
+			elif "$MBIM_ADAPTER" capabilities >/dev/null 2>&1; then
+				TARGET_IDENTITY=true
+				TARGET_PROFILE_READ=true
+				TARGET_PROFILE_WRITE=true
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
+			else
+				TARGET_REASON="backend-command-unavailable"
+			fi
+		;;
 		fibocom) TARGET_BACKEND="fibocom" ;;
 		atc|xmm|ncm|wwan|3g) TARGET_BACKEND="at" ;;
 		*) TARGET_BACKEND=""; TARGET_REASON="unsupported-protocol" ;;
@@ -728,6 +786,7 @@ validate_config() {
 			case "$TARGET_BACKEND" in
 				modemmanager) command_exists mmcli || die "mmcli is required" ;;
 				qmi) [ -x "$QMI_ADAPTER" ] || die "QMI identity adapter is not executable" ;;
+				mbim) [ -x "$MBIM_ADAPTER" ] || die "MBIM identity adapter is not executable" ;;
 			esac
 		;;
 	esac
@@ -840,11 +899,42 @@ resolve_sim_index() {
 	return 1
 }
 
+# OpenWrt's MBIM handler gates roaming with two options instead of one, and its
+# absent default is the opposite of ModemManager's: no options means blocked.
+mbim_read_roaming_policy() {
+	roaming_value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null || printf '%s' -)"
+	partner_value="$(uci -q get "network.${INTERFACE}.allow_partner" 2>/dev/null || printf '%s' -)"
+	case "$roaming_value:$partner_value" in
+		1:1)
+			ROAMING_POLICY="explicit-allow"
+			ROAMING_ALLOWED=true
+		;;
+		0:0)
+			ROAMING_POLICY="explicit-block"
+			ROAMING_ALLOWED=false
+		;;
+		-:-)
+			ROAMING_POLICY="default-block"
+			ROAMING_ALLOWED=false
+		;;
+		*)
+			# Somebody configured these two deliberately and this project does
+			# not own the answer, so the pair is reported, never guessed at.
+			ROAMING_POLICY="invalid"
+			ROAMING_ALLOWED=false
+		;;
+	esac
+}
+
 read_roaming_policy() {
 	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	if [ "$TARGET_BACKEND" = mbim ]; then
+		mbim_read_roaming_policy
+		return 0
+	fi
 	if [ "$TARGET_BACKEND" != modemmanager ]; then
-		# Roaming policy belongs to the connection manager. Only OpenWrt's
-		# ModemManager protocol has a tested allow_roaming contract here.
+		# Roaming policy belongs to the connection manager. QMI has no tested
+		# policy mapping, so it is reported as unsupported rather than guessed.
 		ROAMING_POLICY="unsupported"
 		ROAMING_ALLOWED=true
 		return 0
@@ -914,9 +1004,40 @@ modemmanager_refresh_modem_status() {
 	return 0
 }
 
+# Unlike QMI, MBIM can refresh registration during an operation, so the roaming
+# guards in apply_candidate_list are live for this backend. The adapter is
+# read-only and reuses netifd's open session, so re-reading mid-operation does
+# not disturb the bearer being tested.
+mbim_refresh_modem_status() {
+	MODEM_STATE="unknown"
+	REGISTRATION_STATE="unknown"
+	ROAMING_STATUS="unknown"
+	SERVING_OPERATOR_ID=""
+	SERVING_OPERATOR_NAME=""
+	ACCESS_TECHNOLOGIES=""
+	SIGNAL_QUALITY=""
+	read_roaming_policy
+
+	mbim_resolve_control_device || return 1
+	"$MBIM_ADAPTER" identity "$NETWORK_DEVICE" >"$MODEM_DATA" 2>/dev/null || return 1
+	[ "$(sed -n '1p' "$MODEM_DATA")" = "v1" ] || return 1
+
+	MODEM_STATE="$(adapter_identity_value "$MODEM_DATA" modem_state)"
+	REGISTRATION_STATE="$(adapter_identity_value "$MODEM_DATA" registration_state)"
+	ROAMING_STATUS="$(adapter_identity_value "$MODEM_DATA" roaming)"
+	SERVING_OPERATOR_ID="$(adapter_identity_value "$MODEM_DATA" serving_operator_id)"
+	SERVING_OPERATOR_NAME="$(adapter_identity_value "$MODEM_DATA" serving_operator_name)"
+	SIGNAL_QUALITY="$(adapter_identity_value "$MODEM_DATA" signal_quality)"
+	[ -n "$MODEM_STATE" ] || MODEM_STATE="unknown"
+	[ -n "$REGISTRATION_STATE" ] || REGISTRATION_STATE="unknown"
+	case "$ROAMING_STATUS" in true|false|unknown) : ;; *) ROAMING_STATUS=unknown ;; esac
+	return 0
+}
+
 refresh_modem_status() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_refresh_modem_status ;;
+		mbim) mbim_refresh_modem_status ;;
 		*) return 1 ;;
 	esac
 }
@@ -938,39 +1059,57 @@ modemmanager_read_sim() {
 	refresh_modem_status || :
 }
 
-qmi_identity_value() {
-	key="$1"
+# Both native adapters answer in the same v1 identity TSV.
+adapter_identity_value() {
+	identity_file="$1"
+	key="$2"
 	awk -F '\t' -v wanted="$key" '
 		NR == 1 { next }
 		$1 == wanted { print substr($0, length($1) + 2); exit }
-	' "$SIM_DATA"
+	' "$identity_file"
 }
 
-qmi_control_device_is_safe() {
-	device="$1"
-	case "$device" in /dev/*) : ;; *) return 1 ;; esac
-	device_name="${device#/dev/}"
-	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
-	case "$device_name" in
+qmi_identity_value() {
+	adapter_identity_value "$SIM_DATA" "$1"
+}
+
+# Every name here is prefixed because POSIX shell has no local scope and this
+# function is called from resolve_control_device's own loop variables.
+control_device_is_safe() {
+	safe_infix="$1"
+	safe_device="$2"
+	case "$safe_device" in /dev/*) : ;; *) return 1 ;; esac
+	safe_name="${safe_device#/dev/}"
+	case "$safe_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$safe_name" in
 		cdc-wdm*)
-			index="${device_name#cdc-wdm}"
-			case "$index" in ''|*[!0-9]*) return 1 ;; esac
+			safe_index="${safe_name#cdc-wdm}"
+			case "$safe_index" in ''|*[!0-9]*) return 1 ;; esac
 		;;
-		wwan*qmi*)
-			wwan_index="${device_name#wwan}"
-			wwan_index="${wwan_index%%qmi*}"
-			qmi_index="${device_name##*qmi}"
-			case "$wwan_index:$qmi_index" in *[!0-9:]*) return 1 ;; esac
-			[ -n "$wwan_index" ] && [ -n "$qmi_index" ] || return 1
-			[ "$device_name" = "wwan${wwan_index}qmi${qmi_index}" ] || return 1
+		wwan*"$safe_infix"*)
+			safe_wwan_index="${safe_name#wwan}"
+			safe_wwan_index="${safe_wwan_index%%"$safe_infix"*}"
+			safe_channel_index="${safe_name##*"$safe_infix"}"
+			case "$safe_wwan_index:$safe_channel_index" in *[!0-9:]*) return 1 ;; esac
+			[ -n "$safe_wwan_index" ] && [ -n "$safe_channel_index" ] || return 1
+			[ "$safe_name" = "wwan${safe_wwan_index}${safe_infix}${safe_channel_index}" ] || return 1
 		;;
 		*) return 1 ;;
 	esac
 }
 
-qmi_resolve_control_device() {
+qmi_control_device_is_safe() {
+	control_device_is_safe qmi "$1"
+}
+
+mbim_control_device_is_safe() {
+	control_device_is_safe mbim "$1"
+}
+
+resolve_control_device() {
+	protocol_infix="$1"
 	if [ -n "$NETWORK_DEVICE" ]; then
-		qmi_control_device_is_safe "$NETWORK_DEVICE"
+		control_device_is_safe "$protocol_infix" "$NETWORK_DEVICE"
 		return $?
 	fi
 	resolved_sysfs="$(readlink -f "$SYSFS_ROOT" 2>/dev/null)" || return 1
@@ -983,12 +1122,12 @@ qmi_resolve_control_device() {
 	for candidate in \
 		"$NETWORK_DEVPATH"/usbmisc/cdc-wdm* \
 		"$NETWORK_DEVPATH"/*/usbmisc/cdc-wdm* \
-		"$NETWORK_DEVPATH"/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]* \
-		"$NETWORK_DEVPATH"/*/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]*
+		"$NETWORK_DEVPATH"/*/wwan[0-9]*/wwan[0-9]*"$protocol_infix"[0-9]* \
+		"$NETWORK_DEVPATH"/*/*/wwan[0-9]*/wwan[0-9]*"$protocol_infix"[0-9]*
 	do
 		[ -e "$candidate" ] || continue
 		device="/dev/${candidate##*/}"
-		qmi_control_device_is_safe "$device" || continue
+		control_device_is_safe "$protocol_infix" "$device" || continue
 		[ "$device" = "$resolved" ] && continue
 		resolved="$device"
 		count=$((count + 1))
@@ -997,20 +1136,40 @@ qmi_resolve_control_device() {
 	NETWORK_DEVICE="$resolved"
 }
 
-qmi_read_sim() {
-	qmi_resolve_control_device || \
-		die_code 4 "QMI target $TARGET_ID requires a safe control device path"
+qmi_resolve_control_device() {
+	resolve_control_device qmi
+}
 
-	if "$QMI_ADAPTER" identity "$NETWORK_DEVICE" >"$SIM_DATA"; then
-		:
-	else
-		status=$?
-		case "$status" in
-			3) die_code 3 "cannot yet read QMI SIM identity for $TARGET_ID" ;;
-			*) die "QMI identity adapter returned invalid or incomplete data" ;;
-		esac
-	fi
-	[ "$(sed -n '1p' "$SIM_DATA")" = "v1" ] || die "unsupported QMI identity contract"
+mbim_resolve_control_device() {
+	resolve_control_device mbim
+}
+
+qmi_read_sim() {
+	native_read_sim QMI "$QMI_ADAPTER" qmi_resolve_control_device
+}
+
+mbim_read_sim() {
+	native_read_sim MBIM "$MBIM_ADAPTER" mbim_resolve_control_device
+}
+
+# Both native adapters answer in the same v1 identity TSV and have the same
+# failure classes, so only the adapter and its control-device resolver differ.
+native_read_sim() {
+	native_label="$1"
+	native_adapter="$2"
+	native_resolver="$3"
+
+	"$native_resolver" || \
+		die_code 4 "$native_label target $TARGET_ID requires a safe control device path"
+
+	native_status=0
+	"$native_adapter" identity "$NETWORK_DEVICE" >"$SIM_DATA" || native_status=$?
+	case "$native_status" in
+		0) : ;;
+		3) die_code 3 "cannot yet read $native_label SIM identity for $TARGET_ID" ;;
+		*) die "$native_label identity adapter returned invalid or incomplete data" ;;
+	esac
+	[ "$(sed -n '1p' "$SIM_DATA")" = "v1" ] || die "unsupported $native_label identity contract"
 
 	SIM_INDEX="$(qmi_identity_value sim_index)"
 	MODEM_INDEX="$(qmi_identity_value modem_index)"
@@ -1031,15 +1190,15 @@ qmi_read_sim() {
 	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
 	read_roaming_policy
 
-	case "$SIM_INDEX" in ''|*[!0-9]*) die "invalid QMI SIM index" ;; esac
-	case "$ICCID" in ''|*[!0-9]*) die "unexpected QMI ICCID format" ;; esac
-	case "$IMSI" in ''|*[!0-9]*) [ -z "$IMSI" ] || die "unexpected QMI IMSI format" ;; esac
-	case "$OPERATOR_ID" in ''|*[!0-9]*) [ -z "$OPERATOR_ID" ] || die "unexpected QMI operator ID format" ;; esac
-	case "$ROAMING_STATUS" in true|false|unknown) : ;; *) die "unexpected QMI roaming status" ;; esac
+	case "$SIM_INDEX" in ''|*[!0-9]*) die "invalid $native_label SIM index" ;; esac
+	case "$ICCID" in ''|*[!0-9]*) die "unexpected $native_label ICCID format" ;; esac
+	case "$IMSI" in ''|*[!0-9]*) [ -z "$IMSI" ] || die "unexpected $native_label IMSI format" ;; esac
+	case "$OPERATOR_ID" in ''|*[!0-9]*) [ -z "$OPERATOR_ID" ] || die "unexpected $native_label operator ID format" ;; esac
+	case "$ROAMING_STATUS" in true|false|unknown) : ;; *) die "unexpected $native_label roaming status" ;; esac
 	for value in "$MODEM_INDEX" "$EID" "$OPERATOR_NAME" "$GID1" "$GID2" \
 		"$MODEM_STATE" "$REGISTRATION_STATE" "$SERVING_OPERATOR_ID" \
 		"$SERVING_OPERATOR_NAME" "$ACCESS_TECHNOLOGIES" "$SIGNAL_QUALITY"; do
-		state_value_is_safe "$value" || die "unsafe value returned by QMI identity adapter"
+		state_value_is_safe "$value" || die "unsafe value returned by $native_label identity adapter"
 	done
 }
 
@@ -1047,6 +1206,7 @@ read_sim() {
 	case "$TARGET_BACKEND" in
 		modemmanager) modemmanager_read_sim ;;
 		qmi) qmi_read_sim ;;
+		mbim) mbim_read_sim ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read SIM identity" ;;
 	esac
 	for value in "$SIM_INDEX" "$MODEM_INDEX" "$ICCID" "$IMSI" "$EID" \
@@ -1233,7 +1393,7 @@ save_baseline() {
 			write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
 			write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
 		;;
-		qmi)
+		qmi|mbim)
 			write_baseline_option "$tmp" auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
 			write_baseline_option "$tmp" pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
 		;;
@@ -1267,7 +1427,7 @@ reset_cmd() {
 		baseline_backend="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
 		[ "$baseline_target" = "network:$baseline_interface" ] || die "v3 baseline target does not match its interface"
 		[ "$baseline_target" = "$TARGET_ID" ] || die "v3 baseline belongs to another target"
-		case "$baseline_backend" in modemmanager|qmi) : ;; *) die "unsupported backend in v3 baseline" ;; esac
+		case "$baseline_backend" in modemmanager|qmi|mbim) : ;; *) die "unsupported backend in v3 baseline" ;; esac
 		[ "$baseline_backend" = "$TARGET_BACKEND" ] || die "v3 baseline backend does not match the selected target"
 	fi
 
@@ -1288,6 +1448,7 @@ reset_cmd() {
 					v2::apn|v2::username|v2::password|v2::allowedauth|v2::iptype) : ;;
 					v3:modemmanager:apn|v3:modemmanager:username|v3:modemmanager:password|v3:modemmanager:allowedauth|v3:modemmanager:iptype) : ;;
 					v3:qmi:apn|v3:qmi:username|v3:qmi:password|v3:qmi:auth|v3:qmi:pdptype) : ;;
+					v3:mbim:apn|v3:mbim:username|v3:mbim:password|v3:mbim:auth|v3:mbim:pdptype) : ;;
 					*) die "invalid option in baseline" ;;
 				esac
 				case "$set_flag" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
@@ -1475,7 +1636,9 @@ targets_json_cmd() {
 		printf '"identity":%s,' "$TARGET_IDENTITY"
 		printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 		printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-		printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+		printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+		printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+		printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 		printf '},'
 		json_key_string implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 		json_key_string validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -1526,7 +1689,9 @@ status_json_cmd() {
 	printf '"identity":%s,' "$TARGET_IDENTITY"
 	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+	printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+	printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 	printf '},'
 	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -1588,7 +1753,9 @@ detect_json_cmd() {
 	printf '"identity":%s,' "$TARGET_IDENTITY"
 	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
 	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
-	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '"profile_apply":%s,' "$TARGET_PROFILE_APPLY"
+	printf '"roaming_policy_read":%s,' "$TARGET_ROAMING_POLICY_READ"
+	printf '"roaming_policy_write":%s' "$TARGET_ROAMING_POLICY_WRITE"
 	printf '},'
 	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
@@ -1832,16 +1999,23 @@ matching_database_provider() {
 	wanted_password="$3"
 	wanted_auth="$4"
 	wanted_ip_type="$5"
+	# A backend that can only use one authentication protocol caches the one
+	# that actually worked, so the row it came from still describes it.
+	expanded_auth=0
+	case "$TARGET_BACKEND:$wanted_auth" in
+		mbim:pap|mbim:chap) expanded_auth=1 ;;
+	esac
 	awk -F '\t' \
 		-v wanted_apn="$wanted_apn" \
 		-v wanted_username="$wanted_username" \
 		-v wanted_password="$wanted_password" \
 		-v wanted_auth="$wanted_auth" \
-		-v wanted_ip_type="$wanted_ip_type" '
+		-v wanted_ip_type="$wanted_ip_type" \
+		-v expanded_auth="$expanded_auth" '
 		$3 == wanted_apn &&
 		$5 == wanted_username &&
 		$6 == wanted_password &&
-		$7 == wanted_auth &&
+		($7 == wanted_auth || (expanded_auth == 1 && $7 == "pap-or-chap")) &&
 		$8 == wanted_ip_type {
 			print $4
 			exit
@@ -1919,7 +2093,10 @@ wait_for_interface() {
 	return 1
 }
 
-qmi_data_interface_is_ready() {
+# qmi.sh and mbim.sh both leave the parent section without an address and
+# publish dynamic ${interface}_4 / ${interface}_6 interfaces for the families the
+# bearer actually got. An interface that is merely "up" is not yet usable.
+data_interface_is_ready() {
 	command_exists ubus || return 1
 	for data_interface in "$INTERFACE" "${INTERFACE}_4" "${INTERFACE}_6"; do
 		status="$(ubus call "network.interface.${data_interface}" status 2>/dev/null || :)"
@@ -1929,10 +2106,10 @@ qmi_data_interface_is_ready() {
 	return 1
 }
 
-wait_for_qmi_data_interface() {
+wait_for_data_interface() {
 	remaining="$WAIT_SECONDS"
 	while [ "$remaining" -gt 0 ]; do
-		qmi_data_interface_is_ready && return 0
+		data_interface_is_ready && return 0
 		sleep 1
 		remaining=$((remaining - 1))
 	done
@@ -2135,7 +2312,7 @@ configured_profile_matches_active() {
 			configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
 			configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
 		;;
-		qmi)
+		qmi|mbim)
 			configured_allowedauth="$(uci -q get "network.${INTERFACE}.auth" 2>/dev/null || printf '%s' -)"
 			configured_iptype="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)"
 		;;
@@ -2151,9 +2328,65 @@ configured_connectivity_ip_type() {
 	case "$TARGET_BACKEND" in
 		modemmanager) value="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)" ;;
 		qmi) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' ip)" ;;
+		# An absent MBIM pdptype means "let the modem decide", not IPv4.
+		mbim) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)" ;;
 		*) value="-" ;;
 	esac
 	case "$value" in ip|ipv4) printf '%s\n' ipv4 ;; ipv6|ipv4v6) printf '%s\n' "$value" ;; *) printf '%s\n' - ;; esac
+}
+
+# Some backends cannot express one normalized candidate in a single attempt.
+# QMI and MBIM both retry a rejected dual-stack bearer once with IPv4, and MBIM
+# accepts exactly one authentication protocol per connection, so pap-or-chap
+# becomes chap and then pap. Keeping that knowledge here stops it from spreading
+# through the candidate loop as per-backend special cases, and makes the
+# effective values a caller can cache explicit.
+backend_attempt_plan() {
+	plan_ip_type="$1"
+	plan_auth="$2"
+	plan_username="$3"
+
+	plan_ip_types="$plan_ip_type"
+	case "$TARGET_BACKEND:$plan_ip_type" in
+		qmi:ipv4v6|mbim:ipv4v6) plan_ip_types="ipv4v6 ipv4" ;;
+	esac
+
+	# ipv6=0 is somebody else's decision about this interface. mbim.sh forces
+	# IPv4 and publishes no _6 interface, so an IPv6-only candidate cannot work
+	# and a dual-stack one is really an IPv4 attempt. The option is read as a
+	# constraint and never rewritten.
+	if [ "$TARGET_BACKEND" = mbim ] && \
+		[ "$(uci -q get "network.${INTERFACE}.ipv6" 2>/dev/null || :)" = 0 ]; then
+		case "$plan_ip_type" in
+			ipv6) return 0 ;;
+			ipv4v6) plan_ip_types="ipv4" ;;
+		esac
+	fi
+
+	plan_auths="$plan_auth"
+	case "$TARGET_BACKEND:$plan_auth" in
+		mbim:pap-or-chap)
+			case "$plan_username" in
+				# umbim only carries credentials together with a protocol, so
+				# without a username there is nothing to negotiate.
+				-|'') plan_auths="none" ;;
+				*) plan_auths="chap pap" ;;
+			esac
+		;;
+	esac
+
+	for plan_one_ip_type in $plan_ip_types; do
+		for plan_one_auth in $plan_auths; do
+			printf '%s\t%s\n' "$plan_one_ip_type" "$plan_one_auth"
+		done
+	done
+}
+
+# MBIM's bearer is only usable once mbim.sh has published an addressed dynamic
+# interface. QMI keeps the behavior its hardware evidence was collected with.
+backend_data_interface_ready() {
+	[ "$TARGET_BACKEND" = mbim ] || return 0
+	wait_for_data_interface
 }
 
 # The candidate loop is shared by database-driven and manual application so
@@ -2173,16 +2406,24 @@ apply_candidate_list() {
 		[ "$apn" = "<empty>" ] && apn=""
 		display_apn="${apn:-<empty>}"
 		log notice "trying APN '$display_apn' ($provider)"
-		attempt_types="$ip_type"
-		[ "$TARGET_BACKEND:$ip_type" != qmi:ipv4v6 ] || attempt_types="ipv4v6 ipv4"
+		backend_attempt_plan "$ip_type" "$auth" "$username" >"${CANDIDATES}.attempts"
+		if [ ! -s "${CANDIDATES}.attempts" ]; then
+			log notice "skipping APN '$display_apn': its IP family is incompatible with this interface"
+			continue
+		fi
 		bearer_ready=0
 		effective_ip_type="$ip_type"
-		for attempt_ip_type in $attempt_types; do
+		effective_auth="$auth"
+		while IFS="$(printf '\t')" read -r attempt_ip_type attempt_auth; do
 			effective_ip_type="$attempt_ip_type"
-			if [ "$TARGET_BACKEND:$ip_type:$attempt_ip_type" = qmi:ipv4v6:ipv4 ]; then
-				log warning "QMI dual-stack bearer was rejected; retrying APN '$display_apn' with IPv4 only"
+			effective_auth="$attempt_auth"
+			if [ "$ip_type:$attempt_ip_type" = ipv4v6:ipv4 ]; then
+				log warning "$TARGET_BACKEND dual-stack bearer was rejected; retrying APN '$display_apn' with IPv4 only"
 			fi
-			if ! set_profile "$apn" "$username" "$password" "$auth" "$attempt_ip_type"; then
+			if [ "$auth" != "$attempt_auth" ]; then
+				log notice "trying APN '$display_apn' with $attempt_auth authentication"
+			fi
+			if ! set_profile "$apn" "$username" "$password" "$attempt_auth" "$attempt_ip_type"; then
 				log err "failed to write mobile profile for APN '$display_apn'"
 				break
 			fi
@@ -2190,12 +2431,12 @@ apply_candidate_list() {
 				log warning "interface $INTERFACE did not restart for APN '$display_apn'"
 				continue
 			fi
-			if wait_for_interface; then
+			if wait_for_interface && backend_data_interface_ready; then
 				bearer_ready=1
 				break
 			fi
 			log warning "mobile data session did not become ready within ${WAIT_SECONDS}s for profile '$display_apn' ($attempt_ip_type)"
-		done
+		done <"${CANDIDATES}.attempts"
 		if [ "$bearer_ready" -ne 1 ]; then
 			refresh_modem_status || :
 			case "$REGISTRATION_STATE" in
@@ -2224,9 +2465,9 @@ apply_candidate_list() {
 			die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
 		fi
 		if test_connectivity "$effective_ip_type"; then
-			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$effective_ip_type" || \
+			save_cache "$apn" "$provider" "$username" "$password" "$effective_auth" "$effective_ip_type" || \
 				log warning "APN worked, but cache could not be written"
-			save_active_state "$apn" "$username" "$password" "$auth" "$effective_ip_type" || \
+			save_active_state "$apn" "$username" "$password" "$effective_auth" "$effective_ip_type" || \
 				log warning "APN worked, but reconciled SIM state could not be written"
 			write_last_result success "success: $display_apn ($provider)"
 			ROLLBACK_ARMED=0
@@ -2344,7 +2585,7 @@ reconcile_cmd() {
 roaming_policy_set_cmd() {
 	requested="${1:-}"
 	case "$requested" in default|allow|block) : ;; *) die "roaming policy must be default, allow or block" ;; esac
-	[ "$TARGET_BACKEND" = modemmanager ] || \
+	[ "$TARGET_ROAMING_POLICY_WRITE" = true ] || \
 		die_code 4 "roaming policy control is not implemented for backend $TARGET_BACKEND"
 	acquire_lock
 	migrate_target_state
@@ -2354,17 +2595,41 @@ roaming_policy_set_cmd() {
 	sim_available=0
 	SIM_INDEX=""
 	MODEM_INDEX=""
-	if resolve_sim_index && run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
-		mmcli -i "$SIM_INDEX" --output-keyvalue; then
-		sim_available=1
-		refresh_modem_status || :
-		was_roaming="$ROAMING_STATUS"
-	fi
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			if resolve_sim_index && run_bounded_to_file "$MMCLI_TIMEOUT_SECONDS" "$SIM_DATA" \
+				mmcli -i "$SIM_INDEX" --output-keyvalue; then
+				sim_available=1
+				refresh_modem_status || :
+				was_roaming="$ROAMING_STATUS"
+			fi
+		;;
+		*)
+			if refresh_modem_status; then
+				sim_available=1
+				was_roaming="$ROAMING_STATUS"
+			fi
+		;;
+	esac
 
-	case "$requested" in
-		default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
-		allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
-		block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
+	case "$TARGET_BACKEND:$requested" in
+		mbim:default)
+			uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || :
+			uci -q delete "network.${INTERFACE}.allow_partner" >/dev/null 2>&1 || :
+		;;
+		# mbim.sh gates a preferred-partner registration with its own option, so
+		# allowing roaming without it would still refuse a partner network.
+		mbim:allow)
+			uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming"
+			uci set "network.${INTERFACE}.allow_partner=1" >/dev/null 2>&1 || die "cannot allow partner networks"
+		;;
+		mbim:block)
+			uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming"
+			uci set "network.${INTERFACE}.allow_partner=0" >/dev/null 2>&1 || die "cannot block partner networks"
+		;;
+		*:default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
+		*:allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
+		*:block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
 	esac
 	uci commit network >/dev/null 2>&1 || die "cannot commit roaming policy"
 	read_roaming_policy
@@ -2446,7 +2711,7 @@ modem_reset_inline_cmd() {
 		# client close before handing the control device back to netifd, then
 		# wait for qmi.sh to own initialization before reconcile queries status.
 		settle_after_ifdown
-		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_qmi_data_interface; then
+		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_data_interface; then
 			INTERFACE_RESTORE_ARMED=0
 			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else
@@ -2513,7 +2778,7 @@ modem_reset_via_coordinator_cmd() {
 			return 3
 		fi
 	elif [ "$TARGET_BACKEND" = qmi ]; then
-		if wait_for_interface && wait_for_qmi_data_interface; then
+		if wait_for_interface && wait_for_data_interface; then
 			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else
 			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"

@@ -24,7 +24,10 @@ and validation state:
 - `implementation_state` is `unimplemented`, `alpha` or `stable`;
 - `validation_state` is `none`, `synthetic` or `hardware`;
 - `hardware_validated` is false until the backend completes the documented live
-  test gate.
+  test gate;
+- `roaming_policy_read` and `roaming_policy_write` describe policy support
+  separately, so a consumer never infers it from a backend name. They are an
+  additive extension: the existing `roaming_policy` string keeps its meaning.
 
 An installed parser is not hardware support. A missing runtime command such as
 `mmcli`, `uqmi` or the core dependency `sms_tool` makes the corresponding capability false without hiding the
@@ -146,6 +149,26 @@ core asks netifd to restart only the selected target. If a requested
 `ipv4v6` bearer does not become ready, QMI makes one explicit retry with IPv4
 and records IPv4 as the effective cached profile when it succeeds. Other IP
 families are not silently changed.
+
+## Native MBIM adapter
+
+`/usr/libexec/apn-autoconfig-mbim` follows the same shape: `capabilities` and
+`identity <device>`, the same v1 identity TSV, the same exit classes and the same
+per-device identity lock namespace. It issues only the read-only `umbim`
+`subscriber`, `home` and `registration` queries and never starts, stops or
+reconfigures a bearer.
+
+Three MBIM-specific rules have no QMI equivalent and are normative in
+[`mbim-contract-v1.md`](mbim-contract-v1.md): `umbim`'s exit status carries
+modem state rather than failure, so validated stdout is authoritative; the
+adapter must never close a control session netifd opened for a live bearer; and
+`umbim connect` accepts exactly one authentication protocol, so a normalized
+`pap-or-chap` profile expands into bounded `chap`-then-`pap` attempts and the
+effective value is what gets cached.
+
+The backend owns the same five netifd options as QMI, but `pdptype` takes MBIM's
+`ipv4` rather than qmi.sh's canonical `ip`, and readiness is observed on the
+dynamic `${interface}_4` / `${interface}_6` interfaces `mbim.sh` publishes.
 
 QMI does not inherit ModemManager's `allow_roaming` control. Until a portable,
 tested QMI policy mapping exists, the GUI keeps that control visible but

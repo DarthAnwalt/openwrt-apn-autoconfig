@@ -14,6 +14,12 @@ config apn_autoconfig_modem 'main'
 	option modem_poll_seconds '2'
 	option connect_wait_seconds '60'
 	option hardware_integration_file '/usr/share/apn-autoconfig/integrations/huasifei-wh3000'
+	# Route metric for sections this package creates. A provisioned modem is the
+	# least preferred route by default, so it cannot take the default route away
+	# from an uplink that already works; with no other uplink it still becomes
+	# the default one. Empty restores netifd's own default of 0. The same
+	# default is compiled in, so an upgraded installation gets it too.
+	option provision_metric '1024'
 	# Reset stays unavailable until the administrator pins the strong modem_id
 	# of the internal modem controlled by the board GPIO.
 	option reset_modem_id ''

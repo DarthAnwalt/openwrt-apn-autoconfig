@@ -1,0 +1,3 @@
+  readystate: 0002 - sim-not-inserted
+  simiccid: 
+  subscriberid: 

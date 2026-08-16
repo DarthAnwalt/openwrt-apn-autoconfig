@@ -1,0 +1,8 @@
+  nwerror: 0000 - unknown
+  registerstate: 0002 - searching
+  registermode: 0002 - automatic
+  availabledataclasses: 80000020 - (null)
+  currentcellularclass: 0001 - gsm
+  provider_id: 
+  provider_name: 
+  roamingtext: (null)

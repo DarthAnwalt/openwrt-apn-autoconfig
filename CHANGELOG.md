@@ -1,5 +1,87 @@
 # Changelog
 
+## apn-autoconfig 0.12.0 / apn-autoconfig-modem 0.12.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.12.0 (2026-08-16)
+
+Native MBIM support, from discovering the modem to verifying its connection.
+Until now a CDC-MBIM modem was recognised and then refused everywhere after
+that: provisioning called it an unsupported protocol and the APN engine had no
+backend for it.
+
+- Added `/usr/libexec/apn-autoconfig-mbim`, a strictly read-only identity
+  adapter over `umbim`'s `subscriber`, `home` and `registration` queries. It
+  never issues a command that could change a profile, the SIM, the radio or a
+  bearer. `umbim` is not a new package dependency: a missing one makes the MBIM
+  capabilities false without hiding the configured target.
+- The adapter decides from netifd's own state whether to open a control
+  session. `mbim.sh` holds one open for the life of a bearer, so an identity
+  query borrows it with a transaction id from a separate range and never closes
+  it. An interface up without a recorded session, a pending interface, two
+  sections claiming one device and an unresolvable active section are all
+  retryable and issue no command at all. A session id left behind by a killed
+  teardown is treated as stale rather than blocking identity forever.
+- `umbim` exits with the observed modem state rather than a failure for several
+  perfectly valid answers, so validated output decides: a modem registered in
+  roaming or on a partner network produces normal identity, while a truncated
+  or unparseable message is a hard failure and a SIM that is not ready is
+  retryable with its state named in the log.
+- The APN engine owns the same five netifd options as for QMI, but writes MBIM's
+  `pdptype` vocabulary — `ipv4`, not qmi.sh's canonical `ip`, which `umbim` would
+  read as "let the modem decide".
+- A normalized `pap-or-chap` profile is expanded into bounded `chap`-then-`pap`
+  attempts, because `umbim connect` accepts one protocol and **silently discards
+  the username and password** for any other value. The protocol that carried the
+  session is what gets cached and reconciled, and the provider-label refresh
+  still matches the `pap-or-chap` database row it came from.
+- A rejected dual-stack bearer gets the same single bounded IPv4 retry QMI has,
+  now expressed in a shared per-backend attempt planner. A pre-existing `ipv6=0`
+  is read as an external constraint: an IPv6-only candidate is skipped rather
+  than attempted, a dual-stack one becomes an IPv4 attempt, and the option is
+  never rewritten.
+- Connectivity verification waits for an addressed `<interface>_4` or
+  `<interface>_6` dynamic interface, which is where `mbim.sh` puts the address.
+- MBIM roaming policy is readable and writable through its real option pair:
+  `allow` sets `allow_roaming` and `allow_partner`, `block` clears both,
+  `default` deletes both. OpenWrt's absent MBIM default **blocks** roaming,
+  unlike ModemManager's, and LuCI now says so. A mixed pair is reported as a
+  custom configuration and is never normalized by opening the page or running an
+  operation.
+- Capability is reported as separate `roaming_policy_read` and
+  `roaming_policy_write` booleans, additively; the existing `roaming_policy`
+  string keeps its meaning, and LuCI drives the control from the capability
+  instead of a backend name. QMI still reports it unsupported.
+- `apn-autoconfig-modem` provisions an MBIM modem as a `proto=mbim` staging
+  section on its own control device, with the same ownership markers,
+  `disabled=1`, `auto=0` and absent `apn` as a QMI one. Inventory and
+  provisioning still never open an MBIM control channel, which the tests assert
+  from recorded invocations.
+
+Two defects that only a router with a working uplink could reveal, both found
+by the hardware run and fixed with regression tests:
+
+- **A provisioned modem no longer takes the default route.** netifd defaults a
+  section's `metric` to 0, so a freshly provisioned modem outranked the uplink
+  the router was already using and moved its own traffic onto metered cellular
+  data without asking. Sections this package creates now carry
+  `provision_metric`, defaulting to 1024, and with no other uplink the modem
+  still becomes the default route. The default is compiled in as well as
+  shipped in the config, because a new config default never reaches an existing
+  installation.
+- **The board power-cycle follows the modem, not its protocol.** The reset
+  capability required `protocol=qmi`, so the validated BTN_0 path silently
+  disappeared when the same pinned modem ran MBIM. The GPIO cuts power to the
+  slot, which is a property of the board and the physical modem. Either proven
+  native protocol now qualifies, with the explicit strong pin, board marker,
+  writable GPIO, no ambiguity and no conflicting owner all unchanged — protocol
+  alone still never implies reset. The button itself was not re-tested in MBIM
+  composition, so that combination has synthetic coverage only.
+
+MBIM ships as `implementation_state: stable` and `validation_state: hardware`.
+The live gate passed on the WH3000 with an RM520N-GL switched into MBIM
+composition: discovery, provisioning, APN selection, real Internet access over
+the MBIM bearer, roaming policy, interruption and exact rollback, followed by a
+byte-identical restore. See `docs/router-test-0.12.0.md` and
+`docs/mbim-contract-v1.md`.
+
 ## apn-autoconfig 0.11.0 / apn-autoconfig-modem 0.11.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.11.0 (2026-08-15)
 
 Safe first-run provisioning for a modem that has no network configuration yet.

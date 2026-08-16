@@ -1,0 +1,4 @@
+  readystate: 0001 - initialized
+  simiccid: 89490200002186275443
+  subscriberid: 
+  dont display subscriberID: 1

@@ -37,6 +37,7 @@ cat >"$DB" <<'EOF'
 26201	-	-	-	-	Telekom Germany	internet.telekom	20
 26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10
 21403	2140352xxxxxxxx	-	-	-	Pattern MVNO	pattern.example	10
+20404	-	-	-	-	KPN Mobile	mbim.internet	10	mbim-fixture-user	mbim-fixture-pass	pap-or-chap	ipv4v6
 EOF
 
 printf '%s\n' 'old.apn' >"$STATE/apn"
@@ -44,6 +45,11 @@ printf '%s\n' 'old-user' >"$STATE/username"
 printf '%s\n' 'old-pass' >"$STATE/password"
 printf '%s\n' 'chap' >"$STATE/allowedauth"
 printf '%s\n' 'ipv4' >"$STATE/iptype"
+printf '%s\n' 'mbim.old' >"$STATE/mbim-apn"
+printf '%s\n' 'mbim-user' >"$STATE/mbim-username"
+printf '%s\n' 'mbim-pass' >"$STATE/mbim-password"
+printf '%s\n' 'chap' >"$STATE/mbim-auth"
+printf '%s\n' 'ipv4' >"$STATE/mbim-pdptype"
 printf '%s\n' 'qmi.old' >"$STATE/qmi-apn"
 printf '%s\n' 'qmi-user' >"$STATE/qmi-username"
 printf '%s\n' 'qmi-pass' >"$STATE/qmi-password"
@@ -52,7 +58,26 @@ printf '%s\n' 'ip' >"$STATE/qmi-pdptype"
 
 cat >"$MOCKBIN/uci" <<'EOF'
 #!/bin/sh
-[ "${1:-}" = "-q" ] && shift
+state_mode=0
+while :; do
+	case "${1:-}" in
+		-q) shift ;;
+		-P) state_mode=1; shift 2 ;;
+		*) break ;;
+	esac
+done
+if [ "$state_mode" = 1 ]; then
+	# netifd runtime state, which is where mbim.sh records its open session.
+	case "$1:$2" in
+		get:network.*.tid)
+			section="${2#network.}"
+			section="${section%%.tid}"
+			cat "$TEST_STATE/mbim-tid-$section" 2>/dev/null || exit 1
+		;;
+		*) exit 1 ;;
+	esac
+	exit 0
+fi
 case "$1:$2" in
 show:network)
 	if [ "${TEST_SINGLE_TARGET:-0}" = 1 ]; then
@@ -68,10 +93,15 @@ show:network)
 			"network.cellqmi=interface" \
 			"network.cellqmi.proto='qmi'" \
 			"network.cellmbim=interface" \
-			"network.cellmbim.proto='mbim'"
+			"network.cellmbim.proto='mbim'" \
+			"network.cellat=interface" \
+			"network.cellat.proto='atc'"
 	fi
 	if [ "${TEST_STAGING_SECTION:-0}" = 1 ]; then
 		printf '%s\n' "network.apnmodem1=interface" "network.apnmodem1.proto='qmi'"
+	fi
+	if [ "${TEST_MBIM_TWIN:-0}" = 1 ]; then
+		printf '%s\n' "network.mbimtwin=interface" "network.mbimtwin.proto='mbim'"
 	fi
 	if [ "${TEST_SECOND_MM:-0}" = 1 ]; then
 		printf '%s\n' "network.wwan2=interface" "network.wwan2.proto='modemmanager'"
@@ -125,6 +155,23 @@ get:network.cellqmi.auth) cat "$TEST_STATE/qmi-auth" ;;
 get:network.cellqmi.pdptype) cat "$TEST_STATE/qmi-pdptype" ;;
 get:network.cellqmi.allow_roaming) cat "$TEST_STATE/qmi-allow_roaming" ;;
 get:network.cellmbim.proto) printf '%s\n' mbim ;;
+get:network.cellat.proto) printf '%s\n' atc ;;
+get:network.cellmbim.apn) cat "$TEST_STATE/mbim-apn" ;;
+get:network.cellmbim.username) cat "$TEST_STATE/mbim-username" ;;
+get:network.cellmbim.password) cat "$TEST_STATE/mbim-password" ;;
+get:network.cellmbim.auth) cat "$TEST_STATE/mbim-auth" ;;
+get:network.cellmbim.pdptype) cat "$TEST_STATE/mbim-pdptype" ;;
+get:network.cellmbim.ipv6) cat "$TEST_STATE/mbim-ipv6" ;;
+get:network.cellmbim.allow_roaming) cat "$TEST_STATE/mbim-allow_roaming" ;;
+get:network.cellmbim.allow_partner) cat "$TEST_STATE/mbim-allow_partner" ;;
+get:network.cellmbim.device)
+	[ "${TEST_MBIM_USE_DEVPATH:-0}" = 1 ] || printf '%s\n' "${TEST_MBIM_DEVICE:-/dev/cdc-wdm0}"
+;;
+get:network.cellmbim.devpath) [ "${TEST_MBIM_USE_DEVPATH:-0}" = 1 ] && printf '%s\n' "$TEST_MBIM_DEVPATH" ;;
+get:network.mbimtwin.proto) [ "${TEST_MBIM_TWIN:-0}" = 1 ] && printf '%s\n' mbim ;;
+get:network.mbimtwin.device)
+	[ "${TEST_MBIM_TWIN:-0}" = 1 ] && printf '%s\n' "${TEST_MBIM_TWIN_DEVICE:-/dev/cdc-wdm0}"
+;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
 get:network.wwan.username) cat "$TEST_STATE/username" ;;
@@ -148,6 +195,17 @@ set:*)
 			option="${option%%=*}"
 			case "$option" in apn|username|password|auth|pdptype) printf '%s\n' "$value" >"$TEST_STATE/qmi-$option" ;; *) exit 1 ;; esac
 		;;
+		network.cellmbim.*=*)
+			option="${2#network.cellmbim.}"
+			value="${option#*=}"
+			option="${option%%=*}"
+			case "$option" in
+				apn|username|password|auth|pdptype|allow_roaming|allow_partner)
+					printf '%s\n' "$value" >"$TEST_STATE/mbim-$option"
+				;;
+				*) exit 1 ;;
+			esac
+		;;
 		*) exit 1 ;;
 	esac
 ;;
@@ -158,6 +216,13 @@ delete:network.wwan.allowedauth) rm -f "$TEST_STATE/allowedauth" ;;
 delete:network.wwan.iptype) rm -f "$TEST_STATE/iptype" ;;
 delete:network.wwan.allow_roaming) rm -f "$TEST_STATE/allow_roaming" ;;
 delete:network.wwan2.apn) rm -f "$TEST_STATE/apn-wwan2" ;;
+delete:network.cellmbim.apn) rm -f "$TEST_STATE/mbim-apn" ;;
+delete:network.cellmbim.username) rm -f "$TEST_STATE/mbim-username" ;;
+delete:network.cellmbim.password) rm -f "$TEST_STATE/mbim-password" ;;
+delete:network.cellmbim.auth) rm -f "$TEST_STATE/mbim-auth" ;;
+delete:network.cellmbim.pdptype) rm -f "$TEST_STATE/mbim-pdptype" ;;
+delete:network.cellmbim.allow_roaming) rm -f "$TEST_STATE/mbim-allow_roaming" ;;
+delete:network.cellmbim.allow_partner) rm -f "$TEST_STATE/mbim-allow_partner" ;;
 delete:network.cellqmi.apn) rm -f "$TEST_STATE/qmi-apn" ;;
 delete:network.cellqmi.username) rm -f "$TEST_STATE/qmi-username" ;;
 delete:network.cellqmi.password) rm -f "$TEST_STATE/qmi-password" ;;
@@ -227,14 +292,26 @@ EOF
 cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
 suffix=""
+if [ -n "${UBUS_PENDING_INTERFACE:-}" ] && [ "${2:-}" = "network.interface.$UBUS_PENDING_INTERFACE" ]; then
+	printf '{ "up": false, "pending": true }\n'
+	exit 0
+fi
 [ -z "${UBUS_L3_DEVICE:-}" ] || suffix=", \"l3_device\": \"$UBUS_L3_DEVICE\""
 case "${2:-}" in
 	network.interface.*_4)
-		[ "${QMI_DATA_UNAVAILABLE:-0}" = 1 ] || suffix="${suffix}, \"ipv4-address\": [{ \"address\": \"192.0.2.2\" }]"
+		[ "${DATA_ADDRESS_UNAVAILABLE:-0}" = 1 ] || suffix="${suffix}, \"ipv4-address\": [{ \"address\": \"192.0.2.2\" }]"
 		[ "${QMI_TRACE_RESET_ORDER:-0}" != 1 ] || printf '%s\n' data >>"$TEST_STATE/qmi-reset-order"
 	;;
 esac
+mbim_auth="$(cat "$TEST_STATE/mbim-auth" 2>/dev/null || :)"
+mbim_pdptype="$(cat "$TEST_STATE/mbim-pdptype" 2>/dev/null || :)"
 if [ "${QMI_DUALSTACK_REJECT:-0}" = 1 ] && [ "$(cat "$TEST_STATE/qmi-pdptype" 2>/dev/null || :)" = ipv4v6 ]; then
+	printf '{ "up": false%s }\n' "$suffix"
+elif [ -n "${MBIM_REQUIRE_AUTH:-}" ] && [ "$mbim_auth" != "$MBIM_REQUIRE_AUTH" ]; then
+	# The network rejected the PDP activation, so umbim connect failed and
+	# mbim.sh never brought the interface up.
+	printf '{ "up": false%s }\n' "$suffix"
+elif [ "${MBIM_DUALSTACK_REJECT:-0}" = 1 ] && [ "$mbim_pdptype" = ipv4v6 ]; then
 	printf '{ "up": false%s }\n' "$suffix"
 elif [ "${UBUS_UP_AFTER_IFUP:-0}" = 1 ] && [ -e "$TEST_STATE/ifup-seen" ]; then
 	printf '{ "up": true%s }\n' "$suffix"
@@ -275,6 +352,7 @@ for argument in "$@"; do
 done
 current="$(cat "$TEST_STATE/apn" 2>/dev/null || :)"
 [ "${TEST_INTERFACE:-wwan}" != cellqmi ] || current="$(cat "$TEST_STATE/qmi-apn" 2>/dev/null || :)"
+[ "${TEST_INTERFACE:-wwan}" != cellmbim ] || current="$(cat "$TEST_STATE/mbim-apn" 2>/dev/null || :)"
 [ "$current" = "${CURL_SUCCESS_APN:-internet.telekom}" ]
 EOF
 
@@ -404,6 +482,55 @@ case "$command" in
 esac
 EOF
 
+cat >"$MOCKBIN/umbim" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$TEST_STATE/umbim-calls"
+device=
+transaction=
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-d) device="$2"; shift 2 ;;
+		-t) transaction="$2"; shift 2 ;;
+		-n|-v|-p) shift ;;
+		*) break ;;
+	esac
+done
+command="${1:-}"
+[ -n "$command" ] && [ -n "$device" ] || exit 1
+[ "$device" = "${MBIM_EXPECT_DEVICE:-/dev/cdc-wdm0}" ] || exit 1
+[ "${MBIM_HANG:-0}" != 1 ] || exec /bin/sleep 10
+case "$command" in
+	subscriber|home|registration) : ;;
+	# Anything else is a mutating or session-affecting command this project
+	# must never issue; recorded above so the test can prove it did not.
+	*) exit 2 ;;
+esac
+[ "${MBIM_FAIL_COMMAND:-}" != "$command" ] || {
+	printf 'message not long enough\n' >&2
+	exit 255
+}
+fixture="${MBIM_FIXTURE_DIR:-}/$command.txt"
+[ -f "$fixture" ] || exit 1
+cat "$fixture"
+# umbim exits with the observed state for everything except the one "good"
+# value, and 255 for a message it could not parse.
+case "$command" in
+	subscriber)
+		state="$(sed -n 's/^[[:space:]]*readystate:[[:space:]]*\([0-9A-Fa-f]*\).*/\1/p' "$fixture" | head -n 1)"
+	;;
+	registration)
+		state="$(sed -n 's/^[[:space:]]*registerstate:[[:space:]]*\([0-9A-Fa-f]*\).*/\1/p' "$fixture" | head -n 1)"
+	;;
+	*) exit 0 ;;
+esac
+[ -n "$state" ] || exit 255
+state="$(printf '%d' "0x$state" 2>/dev/null || printf '%s' 255)"
+case "$command:$state" in
+	subscriber:1|registration:3) exit 0 ;;
+esac
+exit "$state"
+EOF
+
 cat >"$MOCKBIN/readlink" <<'EOF'
 #!/bin/sh
 [ "$#" -eq 2 ] && [ "$1" = -f ] || exit 2
@@ -419,6 +546,11 @@ export APN_AUTOCONFIG_QMI_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-qmi"
 export APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/qmi-identity-lock"
 export APN_AUTOCONFIG_QMI_AT_CACHE_DIR="$TESTROOT/qmi-at-cache"
 export QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
+export APN_AUTOCONFIG_MBIM_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-mbim"
+export APN_AUTOCONFIG_MBIM_RUN_DIR="$TESTROOT/mbim-run"
+export APN_AUTOCONFIG_NETIFD_STATE_DIR="$TESTROOT/netifd-state"
+export MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/home"
+MBIM_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-mbim"
 export APN_AUTOCONFIG_HARDWARE_INTEGRATION="$HARDWARE_MARKER"
 
 cat >"$MOCKBIN/apn-autoconfig-command" <<'EOF'
@@ -456,7 +588,11 @@ file_mode() {
 
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; assert t["network:cellqmi"]["backend"] == "qmi" and all(t["network:cellqmi"]["capabilities"].values()); assert t["network:cellqmi"]["implementation_state"] == "stable" and t["network:cellqmi"]["validation_state"] == "hardware" and t["network:cellqmi"]["hardware_validated"] is True; assert t["network:cellqmi"]["unavailable_reason"] == ""; assert t["network:cellmbim"]["backend"] == "mbim" and t["network:cellmbim"]["unavailable_reason"] == "backend-not-implemented"' "$targets_json" || fail 'invalid target inventory contract'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); t={x["id"]:x for x in d["targets"]}; assert d["version"] == "v2"; assert t["network:wwan"]["backend"] == "modemmanager"; assert t["network:wwan"]["capabilities"]["profile_apply"] is True; assert t["network:wwan"]["implementation_state"] == "stable" and t["network:wwan"]["hardware_validated"] is True; q=t["network:cellqmi"]; assert q["backend"] == "qmi" and all(q["capabilities"][k] for k in ("discover","identity","profile_read","profile_write","profile_apply")); assert q["capabilities"]["roaming_policy_read"] is False and q["capabilities"]["roaming_policy_write"] is False; assert t["network:cellqmi"]["implementation_state"] == "stable" and t["network:cellqmi"]["validation_state"] == "hardware" and t["network:cellqmi"]["hardware_validated"] is True; assert t["network:cellqmi"]["unavailable_reason"] == ""; m=t["network:cellmbim"]; assert m["backend"] == "mbim" and all(m["capabilities"].values()) and m["unavailable_reason"] == ""; assert t["network:wwan"]["capabilities"]["roaming_policy_write"] is True; assert m["implementation_state"] == "stable" and m["validation_state"] == "hardware" and m["hardware_validated"] is True' "$targets_json" || fail 'invalid target inventory contract'
+mbim_unavailable_json="$(APN_AUTOCONFIG_MBIM_ADAPTER="$TESTROOT/missing-mbim-adapter" sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; m=t["network:cellmbim"]; assert m["capabilities"]["identity"] is False and m["unavailable_reason"] == "adapter-unavailable"' "$mbim_unavailable_json" || fail 'a missing MBIM adapter was reported as available'
+mbim_command_unavailable_json="$(APN_AUTOCONFIG_UMBIM="$TESTROOT/missing-umbim" sh "$SCRIPT" targets-json)"
+python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; m=t["network:cellmbim"]; assert m["capabilities"]["identity"] is False and m["unavailable_reason"] == "backend-command-unavailable"' "$mbim_command_unavailable_json" || fail 'a missing umbim command was reported as available'
 
 qmi_unavailable_json="$(APN_AUTOCONFIG_QMI_ADAPTER="$TESTROOT/missing-qmi-adapter" sh "$SCRIPT" targets-json)"
 python3 -c 'import json,sys; t={x["id"]:x for x in json.loads(sys.argv[1])["targets"]}; q=t["network:cellqmi"]; assert q["capabilities"]["identity"] is False; assert q["implementation_state"] == "stable"; assert q["validation_state"] == "hardware"; assert q["hardware_validated"] is True; assert q["unavailable_reason"] == "adapter-unavailable"' "$qmi_unavailable_json" || fail 'missing QMI adapter was reported as available'
@@ -540,7 +676,7 @@ printf '%s\n' 'TEST QMI identity is read-only and matches candidates from fixtur
 : >"$STATE/uqmi-calls"
 before="$(cat "$STATE/apn")"
 qmi_json="$(TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json)"
-python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"].values()); assert d["target_implementation_state"] == "stable" and d["target_validation_state"] == "hardware" and d["target_hardware_validated"] is True; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "qmi"; assert all(d["target_capabilities"][k] for k in ("identity","profile_read","profile_write","profile_apply")); assert d["target_capabilities"]["roaming_policy_write"] is False; assert d["target_implementation_state"] == "stable" and d["target_validation_state"] == "hardware" and d["target_hardware_validated"] is True; assert d["iccid"] == "89490200002186275443"; assert d["imsi"] == "262014740651867"; assert d["home_operator_id"] == ""; assert d["serving_operator_id"] == "26201"; assert d["registration_state"] == "home"; assert d["roaming"] is False; assert d["candidates"][0]["apn"] == "internet.telekom"' "$qmi_json" || fail 'QMI identity contract returned invalid data'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'QMI identity changed the ModemManager APN'
 [ ! -s "$STATE/events" ] || fail 'QMI identity cycled a network interface'
 [ "$(wc -l <"$STATE/uqmi-calls" | tr -d ' ')" -eq 4 ] || fail 'QMI identity issued an unexpected command count'
@@ -612,6 +748,324 @@ else
 fi
 [ ! -e "$TESTROOT/qmi-at-injection" ] || fail 'AT modem output executed shell content'
 
+mbim_identity_value() {
+	awk -F '\t' -v wanted="$2" 'NR == 1 { next } $1 == wanted { print substr($0, length($1) + 2); exit }' "$1"
+}
+
+mbim_identity() {
+	: >"$STATE/umbim-calls"
+	sh "$MBIM_ADAPTER" identity "${1:-/dev/cdc-wdm0}" >"$STATE/mbim-identity.tsv"
+}
+
+printf '%s\n' 'TEST MBIM identity opens its own session only when netifd holds none'
+UBUS_UP=0
+export UBUS_UP
+rm -f "$STATE/mbim-tid-cellmbim"
+mbim_identity || fail 'MBIM identity failed against an idle control device'
+[ "$(sed -n '1p' "$STATE/mbim-identity.tsv")" = v1 ] || fail 'MBIM identity did not emit the v1 contract'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" iccid)" = 89490200002186275443 ] || fail 'MBIM ICCID was not read from the subscriber response'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" imsi)" = 262014740651867 ] || fail 'MBIM IMSI was not read from the subscriber response'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" operator_id)" = 26201 ] || fail 'MBIM home provider was not used as the home operator'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" serving_operator_name)" = 'Telekom Test' ] || fail 'MBIM serving operator name was lost'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" registration_state)" = home ] || fail 'MBIM home registration was not normalized'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" roaming)" = false ] || fail 'MBIM home registration reported roaming'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" modem_state)" = connected ] || fail 'MBIM registered modem was not reported as connected'
+[ -z "$(mbim_identity_value "$STATE/mbim-identity.tsv" access_technologies)" ] || fail 'MBIM reported an access technology it cannot prove'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" signal_quality)" = 65 ] || fail 'MBIM did not map the RSSI index to a percentage'
+[ "$(wc -l <"$STATE/umbim-calls" | tr -d ' ')" -eq 3 ] || fail 'MBIM identity issued an unexpected command count'
+if grep -E -- '(^| )-n( |$)|(^| )-t ' "$STATE/umbim-calls" >/dev/null; then
+	fail 'MBIM identity kept a session open that netifd was not holding'
+fi
+if grep -E -- ' (connect|disconnect|attach|detach|unlock|config|radio)( |$)' "$STATE/umbim-calls" >/dev/null; then
+	fail 'MBIM identity issued a mutating umbim command'
+fi
+[ ! -e "$TESTROOT/qmi-identity-lock.cdc-wdm0" ] || fail 'MBIM identity lock remained after a successful call'
+
+printf '%s\n' 'TEST MBIM identity borrows a live netifd session instead of closing it'
+UBUS_UP=1
+export UBUS_UP
+printf '%s\n' 7 >"$STATE/mbim-tid-cellmbim"
+mbim_identity || fail 'MBIM identity failed against a live netifd session'
+[ "$(grep -c -- '-n -t ' "$STATE/umbim-calls")" -eq 3 ] || fail 'MBIM identity did not reuse the open session for every query'
+if grep -E -- '-t (2|3|4|5|6|7|8|9|1[0-9]) ' "$STATE/umbim-calls" >/dev/null; then
+	fail 'MBIM identity reused a transaction id from netifd own range'
+fi
+
+printf '%s\n' 'TEST MBIM identity refuses to guess while a netifd transition is in flight'
+rm -f "$STATE/mbim-tid-cellmbim"
+: >"$STATE/umbim-calls"
+if sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'MBIM identity ran against an interface that is up without a recorded session'
+else
+	[ "$?" -eq 3 ] || fail 'an in-flight MBIM transition was not classified as retryable'
+fi
+[ ! -s "$STATE/umbim-calls" ] || fail 'MBIM identity opened a control channel during a netifd transition'
+: >"$STATE/umbim-calls"
+if UBUS_PENDING_INTERFACE=cellmbim sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'MBIM identity ran against a pending interface'
+else
+	[ "$?" -eq 3 ] || fail 'a pending MBIM interface was not classified as retryable'
+fi
+[ ! -s "$STATE/umbim-calls" ] || fail 'MBIM identity opened a control channel on a pending interface'
+: >"$STATE/umbim-calls"
+if TEST_MBIM_TWIN=1 sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'two sections claiming one MBIM device were accepted'
+else
+	[ "$?" -eq 3 ] || fail 'duplicate MBIM device claims were not classified as retryable'
+fi
+[ ! -s "$STATE/umbim-calls" ] || fail 'MBIM identity opened a control channel for an ambiguous device claim'
+: >"$STATE/umbim-calls"
+if TEST_MBIM_TWIN=1 TEST_MBIM_TWIN_DEVICE= sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'an active MBIM section with an unresolvable binding was ignored'
+else
+	[ "$?" -eq 3 ] || fail 'an unresolvable active MBIM section was not classified as retryable'
+fi
+[ ! -s "$STATE/umbim-calls" ] || fail 'MBIM identity opened a control channel next to an unresolvable active section'
+UBUS_UP=0
+export UBUS_UP
+
+printf '%s\n' 'TEST a stale MBIM session record does not block identity forever'
+UBUS_UP=0
+export UBUS_UP
+printf '%s\n' 7 >"$STATE/mbim-tid-cellmbim"
+mbim_identity || fail 'a session record left behind by a killed teardown blocked identity'
+if grep -E -- '(^| )-n( |$)|(^| )-t ' "$STATE/umbim-calls" >/dev/null; then
+	fail 'a stale session record was treated as a live netifd session'
+fi
+rm -f "$STATE/mbim-tid-cellmbim"
+
+printf '%s\n' 'TEST MBIM registration states are answers, not failures'
+for mbim_case in roaming partner; do
+	MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/$mbim_case" mbim_identity || \
+		fail "MBIM $mbim_case registration was treated as a failure"
+	[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" registration_state)" = roaming ] || \
+		fail "MBIM $mbim_case registration was not normalized to roaming"
+	[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" roaming)" = true ] || \
+		fail "MBIM $mbim_case registration did not report roaming"
+done
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" operator_id)" = 26201 ] || fail 'MBIM partner registration overwrote the home operator'
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/roaming" mbim_identity
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" operator_id)" = 25506 ] || fail 'MBIM roaming lost the home operator'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" serving_operator_id)" = 26202 ] || fail 'MBIM roaming lost the serving operator'
+for mbim_case in searching denied; do
+	MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/$mbim_case" mbim_identity || \
+		fail "MBIM $mbim_case registration was treated as a failure"
+	[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" modem_state)" = enabled ] || \
+		fail "MBIM $mbim_case registration was reported as connected"
+done
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" registration_state)" = denied ] || fail 'MBIM denied registration was not normalized'
+
+printf '%s\n' 'TEST MBIM subscriber states that are not ready fail closed as retryable'
+for mbim_case in no-sim device-locked; do
+	if MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/$mbim_case" \
+		sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+		fail "MBIM $mbim_case returned identity"
+	else
+		[ "$?" -eq 3 ] || fail "MBIM $mbim_case was not classified as retryable"
+	fi
+done
+
+printf '%s\n' 'TEST MBIM keeps a protected subscriber id empty instead of guessing'
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/protected-imsi" mbim_identity || \
+	fail 'a protected MBIM subscriber id made valid identity unavailable'
+[ -z "$(mbim_identity_value "$STATE/mbim-identity.tsv" imsi)" ] || fail 'a protected MBIM subscriber id was published'
+[ "$(mbim_identity_value "$STATE/mbim-identity.tsv" iccid)" = 89490200002186275443 ] || fail 'a protected subscriber id lost the ICCID'
+
+printf '%s\n' 'TEST MBIM leaves an unknown signal empty rather than reporting the floor'
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/no-signal" mbim_identity || fail 'an unknown MBIM RSSI failed identity'
+[ -z "$(mbim_identity_value "$STATE/mbim-identity.tsv" signal_quality)" ] || fail 'an unknown MBIM RSSI was reported as a signal level'
+
+printf '%s\n' 'TEST malformed MBIM responses and unsafe devices fail closed'
+if MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/truncated" \
+	sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'a truncated MBIM response was accepted'
+else
+	[ "$?" -eq 1 ] || fail 'a truncated MBIM response was not reported as malformed'
+fi
+if MBIM_FAIL_COMMAND=subscriber sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'an unparseable MBIM message was accepted'
+else
+	[ "$?" -eq 1 ] || fail 'an unparseable MBIM message was not reported as malformed'
+fi
+rm -f "$TESTROOT/mbim-device-injection"
+for mbim_device in "/dev/cdc-wdm0;$TESTROOT/mbim-device-injection" /dev/cdc-wdmx /dev/ttyUSB0 /dev/wwan0mbimx cdc-wdm0; do
+	: >"$STATE/umbim-calls"
+	if sh "$MBIM_ADAPTER" identity "$mbim_device" >/dev/null 2>&1; then
+		fail "unsafe MBIM device path was accepted: $mbim_device"
+	fi
+	[ ! -s "$STATE/umbim-calls" ] || fail "unsafe MBIM device path reached umbim: $mbim_device"
+done
+[ ! -e "$TESTROOT/mbim-device-injection" ] || fail 'MBIM device path executed shell content'
+: >"$STATE/umbim-calls"
+MBIM_EXPECT_DEVICE=/dev/wwan0mbim0 TEST_MBIM_DEVICE=/dev/wwan0mbim0 \
+	sh "$MBIM_ADAPTER" identity /dev/wwan0mbim0 >/dev/null || fail 'a valid wwan MBIM control device was rejected'
+
+printf '%s\n' 'TEST MBIM identity stays bounded without an external timeout command'
+mbim_timeout_start="$(date +%s)"
+if MBIM_HANG=1 APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
+	APN_AUTOCONFIG_SLEEP=/bin/sleep APN_AUTOCONFIG_MBIM_TIMEOUT_SECONDS=1 \
+	sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'a hung umbim unexpectedly returned identity'
+else
+	[ "$?" -eq 3 ] || fail 'a hung umbim was not classified as retryable'
+fi
+[ "$(( $(date +%s) - mbim_timeout_start ))" -le 5 ] || fail 'MBIM identity exceeded its bounded timeout'
+[ ! -e "$TESTROOT/qmi-identity-lock.cdc-wdm0" ] || fail 'a bounded MBIM timeout left the identity lock behind'
+
+printf '%s\n' 'TEST MBIM and QMI identity share one per-device lock namespace'
+: >"$TESTROOT/qmi-identity-lock.cdc-wdm0"
+printf '%s\n' "$$" >"$TESTROOT/qmi-identity-lock.cdc-wdm0"
+mbim_lock_start="$(date +%s)"
+if APN_AUTOCONFIG_SLEEP=/bin/sleep sh "$MBIM_ADAPTER" identity /dev/cdc-wdm0 >/dev/null 2>&1; then
+	fail 'MBIM identity took over a live identity transaction on the same device'
+else
+	[ "$?" -eq 3 ] || fail 'a contended MBIM identity lock was not classified as retryable'
+fi
+[ "$(( $(date +%s) - mbim_lock_start ))" -ge 2 ] || fail 'MBIM identity did not wait for the contended lock'
+[ -f "$TESTROOT/qmi-identity-lock.cdc-wdm0" ] || fail 'MBIM identity deleted a lock owned by a live process'
+rm -f "$TESTROOT/qmi-identity-lock.cdc-wdm0"
+UBUS_UP=1
+export UBUS_UP
+
+printf '%s\n' 'TEST the MBIM backend reads identity through the engine'
+UBUS_UP=1
+export UBUS_UP
+printf '%s\n' 7 >"$STATE/mbim-tid-cellmbim"
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/home-auth"
+export MBIM_FIXTURE_DIR
+MBIM_ICCID=89204040000000000123
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+mbim_detect_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" detect-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["target_backend"] == "mbim"; assert all(d["target_capabilities"].values()); assert d["target_implementation_state"] == "stable" and d["target_validation_state"] == "hardware" and d["target_hardware_validated"] is True; assert d["iccid"] == "89204040000000000123"; assert d["home_operator_id"] == "20404"; assert d["registration_state"] == "home" and d["roaming"] is False; assert d["candidates"][0]["apn"] == "mbim.internet"' "$mbim_detect_json" || fail 'MBIM identity did not reach the engine intact'
+
+printf '%s\n' 'TEST MBIM applies the netifd profile with its own option vocabulary'
+: >"$STATE/events"
+mbim_before_apn="$(cat "$STATE/mbim-apn")"
+CURL_SUCCESS_APN=mbim.internet TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null
+[ "$(cat "$STATE/mbim-apn")" = mbim.internet ] || fail 'MBIM apply did not write the APN'
+[ "$(cat "$STATE/mbim-pdptype")" = ipv4v6 ] || fail 'MBIM apply did not write its own pdptype vocabulary'
+[ "$(cat "$STATE/mbim-auth")" = chap ] || fail 'MBIM apply did not expand pap-or-chap to a single protocol'
+[ "$(cat "$STATE/mbim-username")" = mbim-fixture-user ] || fail 'MBIM apply lost the username'
+grep -q '^up cellmbim$' "$STATE/events" || fail 'MBIM apply never started the interface'
+[ "$(awk -F '	' 'NR == 1 { print $7 }' "$CACHE/$MBIM_ICCID.tsv")" = chap ] || \
+	fail 'MBIM cached the normalized auth instead of the effective one'
+# The cached profile now says chap, while the database row it came from says
+# pap-or-chap. The label refresh has to recognise it anyway.
+printf 'v2\tmbim.internet\tLegacy provider label\t2026-01-01T00:00:00Z\tmbim-fixture-user\tmbim-fixture-pass\tchap\tipv4v6\n' \
+	>"$CACHE/$MBIM_ICCID.tsv"
+CURL_SUCCESS_APN=mbim.internet TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null
+grep -F -q 'KPN Mobile' "$CACHE/$MBIM_ICCID.tsv" || \
+	fail 'an effective single-protocol auth lost its pap-or-chap provider label'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+[ "$(cat "$STATE/mbim-apn")" = "$mbim_before_apn" ] || fail 'MBIM reset did not restore the APN'
+[ "$(cat "$STATE/mbim-username")" = mbim-user ] || fail 'MBIM reset did not restore the username'
+[ "$(cat "$STATE/mbim-auth")" = chap ] || fail 'MBIM reset did not restore the auth option'
+[ "$(cat "$STATE/mbim-pdptype")" = ipv4 ] || fail 'MBIM reset did not restore the pdptype option'
+
+printf '%s\n' 'TEST MBIM tries the second authentication protocol before giving up'
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+: >"$STATE/events"
+CURL_SUCCESS_APN=mbim.internet MBIM_REQUIRE_AUTH=pap TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null
+[ "$(cat "$STATE/mbim-auth")" = pap ] || fail 'MBIM did not fall back to the second authentication protocol'
+[ "$(awk -F '	' 'NR == 1 { print $7 }' "$CACHE/$MBIM_ICCID.tsv")" = pap ] || \
+	fail 'MBIM cached an authentication protocol that did not carry the session'
+[ "$(awk -F '	' 'NR == 1 { print $6 }' "$PERSIST/targets/network_cellmbim/active.tsv")" = pap ] || \
+	fail 'MBIM reconciled state did not record the effective authentication'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+
+printf '%s\n' 'TEST a manual pap-or-chap profile reaches MBIM as one protocol'
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+rm -rf "$TEST_LOCK"
+printf '%s\n' 'manual-secret' | CURL_SUCCESS_APN=manual.mbim TEST_INTERFACE=cellmbim \
+	sh "$SCRIPT" apply-manual --apn manual.mbim --username manual-user --password-stdin \
+	--auth pap-or-chap --ip-type ipv4 >/dev/null 2>&1 || \
+	fail 'a manual pap-or-chap profile failed on MBIM'
+[ "$(cat "$STATE/mbim-auth")" = chap ] || \
+	fail "a manual pap-or-chap profile reached umbim as '$(cat "$STATE/mbim-auth")', which drops the credentials"
+[ "$(cat "$STATE/mbim-password")" = manual-secret ] || fail 'the manual password did not reach the interface'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+
+printf '%s\n' 'TEST MBIM retries a rejected dual-stack bearer once with IPv4'
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+: >"$STATE/events"
+CURL_SUCCESS_APN=mbim.internet MBIM_DUALSTACK_REJECT=1 TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null
+[ "$(cat "$STATE/mbim-pdptype")" = ipv4 ] || fail 'MBIM did not retry the rejected dual-stack bearer with IPv4'
+[ "$(awk -F '	' 'NR == 1 { print $8 }' "$CACHE/$MBIM_ICCID.tsv")" = ipv4 ] || \
+	fail 'MBIM cached an IP family that did not carry the session'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+
+printf '%s\n' 'TEST an external ipv6=0 constrains MBIM candidates instead of being rewritten'
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+printf '%s\n' 0 >"$STATE/mbim-ipv6"
+: >"$STATE/events"
+CURL_SUCCESS_APN=mbim.internet MBIM_DUALSTACK_REJECT=1 TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null
+[ "$(cat "$STATE/mbim-pdptype")" = ipv4 ] || fail 'MBIM ignored the external ipv6=0 constraint'
+[ "$(cat "$STATE/mbim-ipv6")" = 0 ] || fail 'MBIM rewrote an option it does not own'
+[ "$(grep -c '^up cellmbim$' "$STATE/events")" -eq 1 ] || fail 'MBIM attempted a family the interface cannot carry'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+rm -f "$STATE/mbim-ipv6"
+
+printf '%s\n' 'TEST MBIM waits for an addressed dynamic interface before verifying'
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+: >"$STATE/events"
+if DATA_ADDRESS_UNAVAILABLE=1 CURL_SUCCESS_APN=mbim.internet TEST_INTERFACE=cellmbim \
+	sh "$SCRIPT" apply >/dev/null 2>&1; then
+	fail 'MBIM verified connectivity on a bearer with no addressed interface'
+fi
+[ "$(cat "$STATE/mbim-apn")" = mbim.old ] || fail 'a bearer that never got an address was not rolled back'
+[ "$(cat "$STATE/mbim-auth")" = chap ] || fail 'a bearer that never got an address left an owned option behind'
+[ "$(cat "$CACHE/last-result-code")" = bearer-rejected ] || fail 'an unaddressed MBIM bearer was not classified as rejected'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" reset >/dev/null
+rm -f "$CACHE/$MBIM_ICCID.tsv"
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/home"
+export MBIM_FIXTURE_DIR
+
+printf '%s\n' 'TEST MBIM roaming policy writes both options and never guesses a custom pair'
+rm -rf "$TEST_LOCK"
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "default-block" and d["roaming_allowed"] is False; assert d["target_capabilities"]["roaming_policy_read"] is True and d["target_capabilities"]["roaming_policy_write"] is True' \
+	"$mbim_policy_json" || fail 'an MBIM interface with no options was not reported as blocked by default'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set allow >/dev/null
+[ "$(cat "$STATE/mbim-allow_roaming")" = 1 ] || fail 'MBIM allow did not set allow_roaming'
+[ "$(cat "$STATE/mbim-allow_partner")" = 1 ] || fail 'MBIM allow left partner networks refused'
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "explicit-allow" and d["roaming_allowed"] is True' \
+	"$mbim_policy_json" || fail 'MBIM allow was not reported back'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set block >/dev/null
+[ "$(cat "$STATE/mbim-allow_roaming")" = 0 ] && [ "$(cat "$STATE/mbim-allow_partner")" = 0 ] || \
+	fail 'MBIM block did not clear both options'
+TEST_INTERFACE=cellmbim sh "$SCRIPT" roaming-policy-set default >/dev/null
+[ ! -e "$STATE/mbim-allow_roaming" ] && [ ! -e "$STATE/mbim-allow_partner" ] || \
+	fail 'MBIM default did not remove both options'
+printf '%s\n' 1 >"$STATE/mbim-allow_roaming"
+printf '%s\n' 0 >"$STATE/mbim-allow_partner"
+mbim_policy_json="$(TEST_INTERFACE=cellmbim sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["roaming_policy"] == "invalid" and d["roaming_allowed"] is False' \
+	"$mbim_policy_json" || fail 'a custom MBIM option pair was normalized instead of reported'
+if TEST_INTERFACE=cellmbim sh "$SCRIPT" apply >/dev/null 2>&1; then
+	fail 'an invalid MBIM roaming policy allowed profile testing'
+fi
+[ "$(cat "$STATE/mbim-allow_roaming")" = 1 ] && [ "$(cat "$STATE/mbim-allow_partner")" = 0 ] || \
+	fail 'a custom MBIM option pair was rewritten by the engine'
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+
+printf '%s\n' 'TEST MBIM roaming block stops an interface that is registered in roaming'
+rm -rf "$TEST_LOCK"
+: >"$STATE/events"
+MBIM_FIXTURE_DIR="$BASE/tests/fixtures/mbim/roaming" TEST_INTERFACE=cellmbim \
+	sh "$SCRIPT" roaming-policy-set block >/dev/null
+grep -q '^down cellmbim$' "$STATE/events" || fail 'blocking roaming left a roaming MBIM interface up'
+rm -f "$STATE/mbim-allow_roaming" "$STATE/mbim-allow_partner"
+
+printf '%s\n' 'TEST QMI still refuses roaming policy control it cannot implement'
+rm -rf "$TEST_LOCK"
+if TEST_INTERFACE=cellqmi sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1; then
+	fail 'QMI accepted a roaming policy it has no tested mapping for'
+else
+	[ "$?" -eq 4 ] || fail 'QMI roaming policy refusal did not use the target-contract exit code'
+fi
+
 printf '%s\n' 'TEST narrow integration wrappers preserve and validate target IDs'
 cat >"$MOCKBIN/apn-autoconfig-wrapper-command" <<'EOF'
 #!/bin/sh
@@ -637,8 +1091,8 @@ fi
 printf '%s\n' 'TEST unsupported backends fail before any profile or network mutation'
 : >"$STATE/events"
 before="$(cat "$STATE/apn")"
-if unsupported_target_output="$(sh "$SCRIPT" apply --target network:cellmbim 2>&1)"; then
-	fail 'MBIM target was allowed to apply a profile'
+if unsupported_target_output="$(sh "$SCRIPT" apply --target network:cellat 2>&1)"; then
+	fail 'AT-only target was allowed to apply a profile'
 else
 	unsupported_target_status=$?
 fi
@@ -646,7 +1100,7 @@ fi
 assert_contains "$unsupported_target_output" 'does not implement profile-apply'
 [ "$(cat "$STATE/apn")" = "$before" ] || fail 'unsupported target changed APN'
 [ ! -s "$STATE/events" ] || fail 'unsupported target cycled a network interface'
-[ ! -e "$PERSIST/targets/network_cellmbim" ] || fail 'unsupported target created persistent state'
+[ ! -e "$PERSIST/targets/network_cellat" ] || fail 'unsupported target created persistent state'
 
 printf '%s\n' 'TEST unsafe and ambiguous target selection fails closed'
 if sh "$SCRIPT" status-json --target 'network:../../tmp/x' >/dev/null 2>&1; then
@@ -1042,15 +1496,19 @@ if MMCLI_UNAVAILABLE=1 sh "$SCRIPT" reconcile >/dev/null 2>&1; then fail 'unavai
 printf '%s\n' 'TEST ModemManager calls remain bounded without an external timeout command'
 rm -f "$STATE/mmcli-hang-pid"
 bounded_started="$(date +%s)"
+# The watchdog budget is deliberately larger than the one second this used to
+# use: the fixture records its own pid at startup, and on a loaded machine a
+# one-second watchdog could kill it before it got that far, failing the test
+# for a reason that has nothing to do with the bound being enforced.
 if MMCLI_UNAVAILABLE=0 MMCLI_HANG=1 TEST_INTERFACE=wwan \
 	APN_AUTOCONFIG_TIMEOUT="$TESTROOT/missing-timeout" \
-	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=1 sh "$SCRIPT" status >/dev/null 2>&1; then
+	APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS=3 sh "$SCRIPT" status >/dev/null 2>&1; then
 	fail 'a hanging mmcli call unexpectedly produced status output'
 else
 	[ "$?" -eq 3 ] || fail 'a hanging mmcli call did not remain retryable'
 fi
 bounded_elapsed=$(($(date +%s) - bounded_started))
-[ "$bounded_elapsed" -le 5 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
+[ "$bounded_elapsed" -le 10 ] || fail "fallback mmcli timeout took ${bounded_elapsed}s"
 mmcli_hang_pid="$(cat "$STATE/mmcli-hang-pid" 2>/dev/null || :)"
 [ -n "$mmcli_hang_pid" ] || fail 'hanging mmcli fixture did not start'
 if kill -0 "$mmcli_hang_pid" 2>/dev/null; then
@@ -1582,7 +2040,7 @@ TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
 printf '%s\n' 'TEST QMI modem reset does not query identity before its data interface is ready'
 : >"$STATE/events"
 rm -f "$STATE/ifup-seen"
-if QMI_DATA_UNAVAILABLE=1 TEST_INTERFACE=cellqmi sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
+if DATA_ADDRESS_UNAVAILABLE=1 TEST_INTERFACE=cellqmi sh "$SCRIPT" modem-reset >/dev/null 2>&1; then
 	fail 'QMI modem reset continued without a ready data interface'
 else
 	[ "$?" -eq 3 ] || fail 'missing QMI data interface did not return retryable status'

@@ -1,0 +1,5 @@
+  provider_id: 25506
+  provider_name: Lifecell
+  cellularclass: 0001 - gsm
+  rssi: 000a
+  errorrate: 0063

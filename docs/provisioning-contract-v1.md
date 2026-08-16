@@ -48,7 +48,13 @@ create. netifd ignores unknown options, so the markers are inert at runtime.
 
 `apn-autoconfig` continues to own only the declared APN/profile fields of the
 selected target and its own baseline state. Provisioning owns the section's
-existence, `proto`, `device`/`devpath`, `disabled` and `auto`. netifd remains
+existence, `proto`, `device`/`devpath`, `disabled`, `auto` and `metric`.
+
+`metric` is owned because netifd defaults it to 0, which makes a freshly
+provisioned modem outrank an uplink that already works and moves the router's
+own traffic onto metered data without anyone asking for it. A provisioned
+section is therefore the least preferred route by default (`provision_metric`,
+1024), while still becoming the default route when there is no other uplink. netifd remains
 the sole bearer owner. Neither package writes the other's fields.
 
 ### Adoption

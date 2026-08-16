@@ -54,6 +54,7 @@ get:apn-autoconfig.main.qmi_identity_lock_root) printf '%s\n' "$TEST_QMI_IDENTIT
 get:apn-autoconfig-modem.main.action_state_dir) printf '%s\n' "$TEST_MODEM_ACTION_DIR" ;;
 get:apn-autoconfig-modem.main.hotplug_coalesce_seconds) printf '%s\n' "${TEST_HOTPLUG_COALESCE_SECONDS:-0}" ;;
 get:apn-autoconfig-modem.main.boot_delay) printf '%s\n' 0 ;;
+get:apn-autoconfig-modem.main.provision_metric) printf '%s\n' "${TEST_PROVISION_METRIC-1024}" ;;
 get:apn-autoconfig-modem.main.modem_power_path) printf '%s\n' "$TEST_GPIO" ;;
 get:apn-autoconfig-modem.main.modem_power_off_value) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
@@ -166,6 +167,14 @@ esac
 exit 1
 EOF
 
+cat >"$MOCKBIN/umbim" <<'EOF'
+#!/bin/sh
+# Recorded, never answered: nothing in inventory or provisioning may open an
+# MBIM control channel.
+printf '%s\n' "$*" >>"${TEST_UMBIM_CALLS:-/dev/null}"
+exit 1
+EOF
+
 cat >"$MOCKBIN/uqmi" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"${TEST_UQMI_CALLS:-/dev/null}"
@@ -260,6 +269,7 @@ export TEST_NETWORK_OPTIONS="$STATE/network-options"
 export TEST_UCI_WRITES="$STATE/uci-writes"
 export TEST_EVENTS="$STATE/events"
 export TEST_UQMI_CALLS="$STATE/uqmi-calls"
+export TEST_UMBIM_CALLS="$STATE/umbim-calls"
 export TEST_STATE="$STATE"
 export APN_AUTOCONFIG_MODEM_ACTION_WORKER="$ACTION_WORKER"
 export APN_AUTOCONFIG_MODEM_ACTION_COMMAND="$SCRIPT"
@@ -269,6 +279,7 @@ export APN_AUTOCONFIG_MODEM_BIN="$SCRIPT"
 : >"$TEST_NETWORK_OPTIONS"
 : >"$TEST_EVENTS"
 : >"$TEST_UQMI_CALLS"
+: >"$TEST_UMBIM_CALLS"
 
 reset_network_config() {
 	: >"$TEST_NETWORK_SECTIONS"
@@ -440,9 +451,9 @@ assert m["modem_id"].startswith("usb-serial:1-1.2:"), m
 assert m["control_device"] == "/dev/cdc-wdm0", m
 assert m["data_device"] == "wwan0", m
 assert m["protocol"] == "qmi", m
-assert m["implementation_state"] == "experimental", m
-assert m["validation_state"] == "synthetic", m
-assert m["hardware_validated"] is False, m
+assert m["implementation_state"] == "stable", m
+assert m["validation_state"] == "hardware", m
+assert m["hardware_validated"] is True, m
 assert m["owner_state"] == "none", m
 assert m["ambiguous"] is False, m
 ' "$out" || fail 'single QMI modem record is wrong'
@@ -516,7 +527,41 @@ assert by_protocol["mbim"]["data_device"] == "wwan4", by_protocol
 assert by_protocol["at"]["at_device"] == "/dev/ttyUSB8", by_protocol
 assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
+# Maturity is about this implementation, evidence about the protocol: MBIM
+# classification has a hardware record, AT-only has fixtures alone.
+assert by_protocol["mbim"]["implementation_state"] == "stable", by_protocol
+assert by_protocol["mbim"]["validation_state"] == "hardware", by_protocol
+assert by_protocol["mbim"]["hardware_validated"] is True, by_protocol
+assert by_protocol["at"]["implementation_state"] == "stable", by_protocol
+assert by_protocol["at"]["validation_state"] == "synthetic", by_protocol
+assert by_protocol["at"]["hardware_validated"] is False, by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
+
+printf '%s\n' 'TEST the board power-cycle follows the pinned modem, not its control protocol'
+# The GPIO cuts power to the slot, so the capability belongs to the board and
+# the physical modem. Gating it on QMI disabled the validated button path as
+# soon as the same modem ran MBIM.
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+TEST_RESET_MODEM_ID='usb-serial:3-1.1:2cb7:0007:MBIMSERIAL'
+export TEST_RESET_MODEM_ID
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+by_protocol = {m["protocol"]: m for m in json.loads(sys.argv[1])["modems"]}
+assert by_protocol["mbim"]["capabilities"]["reset"] is True, by_protocol
+assert by_protocol["at"]["capabilities"]["reset"] is False, by_protocol
+' "$out" || fail 'a pinned MBIM modem lost the board power-cycle capability'
+TEST_RESET_MODEM_ID='usb-serial:3-1.2:2cb7:01a2:ATSERIAL'
+export TEST_RESET_MODEM_ID
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+by_protocol = {m["protocol"]: m for m in json.loads(sys.argv[1])["modems"]}
+assert by_protocol["at"]["capabilities"]["reset"] is False, by_protocol
+assert by_protocol["mbim"]["capabilities"]["reset"] is False, by_protocol
+' "$out" || fail 'an AT-only modem advertised reset, or an unpinned MBIM modem kept it'
+TEST_RESET_MODEM_ID=''
+export TEST_RESET_MODEM_ID
 
 printf '%s\n' 'TEST a QMI modem with multiple optional AT ports keeps its proven control binding'
 reset_sysfs
@@ -1264,7 +1309,73 @@ printf '%s\n' 'TEST provisioning touches only the section it created'
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "provisioning wrote to unrelated sections: $untouched"
 
+printf '%s\n' 'TEST an MBIM modem is provisioned as an MBIM section on its control device'
+reset_sysfs
+reset_network_config
+add_mbim_modem 2-1.3 2cb7 0007 MBIMSERIAL02 4 wwan4
+rm -rf "$TEST_MODEM_STATE_DIR/provisioning"
+: >"$TEST_RECONCILE_CALLS"
+: >"$TEST_EVENTS"
+mbim_prov_modem='usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02'
+mbim_plan_out="$(sh "$SCRIPT" provision-plan --modem "$mbim_prov_modem")" || \
+	fail 'provision-plan refused a provisionable MBIM modem'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["can_provision"] is True, d
+assert d["protocol"] == "mbim", d
+assert d["device"] == "/dev/cdc-wdm4", d
+' "$mbim_plan_out" || fail 'provision-plan did not plan an MBIM section'
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'planning an MBIM modem opened a control channel'
+mbim_prov_out="$(sh "$SCRIPT" provision --modem "$mbim_prov_modem")" || \
+	fail 'provision failed on a provisionable MBIM modem'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["protocol"] == "mbim", d
+assert d["state"] == "promoted", d
+' "$mbim_prov_out" || fail 'provisioning an MBIM modem did not promote its section'
+[ "$(uci -q get network.apnmodem1.proto)" = mbim ] || fail 'the created MBIM section has the wrong protocol'
+[ "$(uci -q get network.apnmodem1.device)" = /dev/cdc-wdm4 ] || fail 'the created MBIM section has the wrong device'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_owner)" = apn-autoconfig-modem ] || \
+	fail 'the created MBIM section is not marked as project-owned'
+grep -q "section_apn=unset" "$TEST_RECONCILE_CALLS" || \
+	fail 'the MBIM section carried an apn option before the APN engine chose one'
+grep -F -q "reconcile --target network:apnmodem1" "$TEST_RECONCILE_CALLS" || \
+	fail 'provisioning did not reconcile the MBIM section it created'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" && \
+	fail 'provisioning started the MBIM section before the APN engine chose a profile'
+untouched="$(uci_touched_only_section apnmodem1)" || \
+	fail "MBIM provisioning wrote to unrelated sections: $untouched"
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'provisioning an MBIM modem opened a control channel itself'
+# A provisioned modem must not take the default route away from an uplink that
+# already works. netifd's own default is metric 0, which does exactly that.
+[ "$(uci -q get network.apnmodem1.metric)" = 1024 ] || \
+	fail 'the created MBIM section did not get the conservative route metric'
+
+printf '%s\n' 'TEST the provisioning route metric is configurable and can be switched off'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || fail 'deprovision failed before the metric test'
+TEST_PROVISION_METRIC=77
+export TEST_PROVISION_METRIC
+sh "$SCRIPT" provision --modem "$mbim_prov_modem" >/dev/null || fail 'provision failed with a configured metric'
+[ "$(uci -q get network.apnmodem1.metric)" = 77 ] || fail 'the configured route metric was ignored'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || fail 'deprovision failed after the metric test'
+TEST_PROVISION_METRIC=''
+export TEST_PROVISION_METRIC
+sh "$SCRIPT" provision --modem "$mbim_prov_modem" >/dev/null || fail 'provision failed with an empty metric'
+[ -z "$(uci -q get network.apnmodem1.metric)" ] || \
+	fail 'an empty metric still wrote one instead of leaving the netifd default'
+TEST_PROVISION_METRIC=1024
+export TEST_PROVISION_METRIC
+
+printf '%s\n' 'TEST deprovision removes an MBIM section exactly as it does a QMI one'
+sh "$SCRIPT" deprovision --modem "$mbim_prov_modem" >/dev/null || \
+	fail 'deprovision failed for an MBIM section'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'deprovision left the MBIM section behind'
+
 printf '%s\n' 'TEST provision refuses a second section for an already provisioned modem'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed on a provisionable modem'
 second_status=0
 sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || second_status=$?
 [ "$second_status" -eq 4 ] || fail "a repeated provision exited $second_status instead of the blocked class 4"
@@ -1371,6 +1482,15 @@ export RECONCILE_HANG
 # The engine must be terminated and reaped, not left running against a target
 # that is about to be deleted underneath it.
 orphan_pid="$(cat "$TEST_RECONCILE_PID" 2>/dev/null || :)"
+# The coordinator signals the engine and reaps it, but a shell sitting in a
+# foreground sleep takes a moment to actually go away, and on a loaded machine
+# that moment can outlast the coordinator. Anything still alive after a bounded
+# grace period is genuinely orphaned; anything that dies inside it is not.
+orphan_wait=0
+while [ -n "$orphan_pid" ] && [ "$orphan_wait" -lt 20 ] && kill -0 "$orphan_pid" 2>/dev/null; do
+	orphan_wait=$((orphan_wait + 1))
+	/bin/sleep 0.1
+done
 if [ -n "$orphan_pid" ] && kill -0 "$orphan_pid" 2>/dev/null; then
 	kill -TERM "$orphan_pid" 2>/dev/null || :
 	fail 'the APN engine was left running as an orphan after the interruption'
@@ -1428,6 +1548,30 @@ assert d["action"] == "connect", d
 assert d["state"] == "up", d
 ' "$conn_out" || fail 'connect did not report the interface as up'
 grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the interface'
+
+printf '%s\n' 'TEST connection control drives an MBIM section the same way'
+reset_sysfs
+reset_network_config
+add_mbim_modem 2-1.3 2cb7 0007 MBIMSERIAL02 4 wwan4
+rm -rf "$TEST_MODEM_STATE_DIR/provisioning"
+: >"$TEST_RECONCILE_CALLS"
+: >"$TEST_EVENTS"
+sh "$SCRIPT" provision --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02 >/dev/null || \
+	fail 'provision failed for the MBIM connection-control fixture'
+: >"$TEST_EVENTS"
+mbim_conn_out="$(sh "$SCRIPT" connect --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02)" || \
+	fail 'connect failed on a project-owned MBIM section'
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["state"]=="up" and d["action"]=="connect", d' \
+	"$mbim_conn_out" || fail 'connect did not report the MBIM interface as up'
+grep -F -q "up apnmodem1" "$TEST_EVENTS" || fail 'connect did not ask netifd to start the MBIM interface'
+sh "$SCRIPT" disconnect --modem usb-serial:2-1.3:2cb7:0007:MBIMSERIAL02 >/dev/null || \
+	fail 'disconnect failed on a project-owned MBIM section'
+[ ! -s "$TEST_UMBIM_CALLS" ] || fail 'connection control talked to the modem instead of netifd'
+provision_fixture
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null || fail 'provision failed'
+TEST_IFACE_UP=apnmodem1
+export TEST_IFACE_UP
+sh "$SCRIPT" connect --modem "$PROV_MODEM" >/dev/null || fail 'connect failed on an up interface'
 
 printf '%s\n' 'TEST disconnect stops the section and reconnect cycles it'
 : >"$TEST_EVENTS"

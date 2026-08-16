@@ -10,6 +10,7 @@ sh -n "$ROOT/files/usr/libexec/apn-autoconfig-query"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-control"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-database"
 sh -n "$ROOT/files/usr/libexec/apn-autoconfig-qmi"
+sh -n "$ROOT/files/usr/libexec/apn-autoconfig-mbim"
 sh -n "$ROOT/files/etc/init.d/apn-autoconfig"
 sh -n "$ROOT/files/etc/hotplug.d/button/50-apn-autoconfig"
 sh -n "$ROOT/apn-autoconfig-modem/files/usr/sbin/apn-autoconfig-modem"
@@ -117,6 +118,10 @@ grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
 grep -F -q '+jsonfilter ' "$ROOT/Makefile"
 grep -F -q '+sms-tool ' "$ROOT/Makefile"
 grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
+# Both native adapters are package payload; an unshipped adapter would make the
+# backend look implemented in the source tree and unavailable on a router.
+grep -F -q 'files/usr/libexec/apn-autoconfig-qmi $(1)/usr/libexec/apn-autoconfig-qmi' "$ROOT/Makefile"
+grep -F -q 'files/usr/libexec/apn-autoconfig-mbim $(1)/usr/libexec/apn-autoconfig-mbim' "$ROOT/Makefile"
 [ -f "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000" ]
 [ "$(sed -n '1p' "$ROOT/files/usr/share/apn-autoconfig/integrations/huasifei-wh3000")" = \
 	'huasifei-wh3000-gpio-v1' ]

@@ -131,7 +131,7 @@ inspect_package() {
 	done
 }
 
-inspect_package "$1" apn-autoconfig 13 \
+inspect_package "$1" apn-autoconfig 14 \
 	usr/sbin/apn-autoconfig \
 	usr/libexec/apn-autoconfig-boot \
 	usr/libexec/apn-autoconfig-action \
@@ -139,6 +139,7 @@ inspect_package "$1" apn-autoconfig 13 \
 	usr/libexec/apn-autoconfig-control \
 	usr/libexec/apn-autoconfig-database \
 	usr/libexec/apn-autoconfig-qmi \
+	usr/libexec/apn-autoconfig-mbim \
 	etc/config/apn-autoconfig \
 	etc/init.d/apn-autoconfig \
 	usr/share/licenses/apn-autoconfig/LICENSE \

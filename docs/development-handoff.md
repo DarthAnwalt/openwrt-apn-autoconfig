@@ -17,47 +17,34 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.11.0 is released and hardware-validated. The suite discovers a modem,
-provisions a disabled project-owned staging section, applies an APN through the
-engine, verifies real Internet access, promotes autoconnect, and offers
-connect/disconnect/reconnect, manual APN entry and the LuCI first-run card. All
-of that works for ModemManager and native QMI targets only. It does not yet
-mutate MBIM profiles or manage eSIM.
+Version 0.12.0 is released and hardware-validated. The suite discovers a modem,
+provisions it, selects and applies an APN, verifies real Internet access,
+controls the connection and manages roaming policy — over ModemManager, native
+QMI and now native MBIM, the last proven on a modem switched into MBIM
+composition and restored afterwards.
 
-The next feature release is **0.12.0**, the complete native MBIM vertical slice:
-inventory and ownership, provisioning, identity, profile capture/write/restore,
-dynamic IPv4/IPv6 readiness, connection control, roaming policy and the LuCI
-workflow.
+The next release is **0.13.0, a coherent frontend**, and it is deliberately a
+detour: the machine APIs are in good shape while the page that exposes them
+grew feature by feature until nothing on it could be taken in at a glance. Its
+accepted design is [`frontend-contract-v1.md`](frontend-contract-v1.md) and its
+plan is [`testing-0.13.0.md`](testing-0.13.0.md). The roadmap milestones after
+it shifted by one; the AT framework is now 0.14.0.
 
-**Its runtime work is implemented locally and passes `sh scripts/verify.sh`.**
-What that does *not* mean is recorded honestly in
-[`testing-0.12.0.md`](testing-0.12.0.md): the official SDK build and APK
-inspection, the package-lifecycle matrix and the hardware gate are all open, and
-the fixtures were written from the `umbim` source rather than from a modem. MBIM
-therefore reports `implementation_state: alpha` and `validation_state:
-synthetic`, and must not be relabelled until `docs/router-test-0.12.0.md`
-exists. The hardware run switches the reference RM520N-GL into MBIM composition
-and restores it afterwards, so it needs the recovery rehearsal described there.
+Three points there are easy to miss. The page is reorganized around the
+question each area answers rather than the package that supplies the data, so
+the operator name legitimately appears twice — as the serving network and as
+the matched database provider — and must be labelled accordingly. A persistent
+status strip sits outside the tabs, because tabs hide exactly the state a user
+is not looking at when it breaks. And bearer control stops depending on who
+created the interface: `connect`/`disconnect`/`reconnect` are `ifup`/`ifdown`,
+which the APN engine already performs on user-created interfaces during every
+reconcile, so refusing the control while performing the action was
+inconsistent. Configuration-changing operations stay ownership-gated and
+adoption is still refused.
 
-Its accepted design is [`mbim-contract-v1.md`](mbim-contract-v1.md) and its plan
-is [`testing-0.12.0.md`](testing-0.12.0.md). Three facts there are easy to miss
-and expensive to get wrong: `umbim`'s exit status carries modem state rather
-than failure, so a roaming modem exits non-zero from a healthy query; `-t`
-suppresses the MBIM OPEN and `-n` suppresses the CLOSE, so the wrong combination
-tears down the session netifd holds for a live bearer; and `umbim connect`
-silently discards the username and password unless the auth value is exactly
-`pap`, `chap` or `mschapv2`, so a normalized `pap-or-chap` must expand into
-bounded attempts instead of being written verbatim.
-
-Do not implement MBIM profile mutation as an isolated shortcut in the APN
-engine's older code paths. The transport is new, but the boundary is not: the
-adapter provides identity, the engine owns the five profile options and their
-rollback, `apn-autoconfig-modem` owns the section, and netifd owns the bearer.
-
-The agreed product and ownership rules are normative in `architecture.md`. In
-particular, the final suite must work both when the modem is attached after the
-software and when an internal or USB modem was already present before package
-installation. Hotplug is never the only discovery mechanism.
+The browser gate is not optional in this release. The 0.11.0 and 0.12.0 passes
+each found a defect no fixture could have caught, and 0.13.0's subject is
+precisely the thing fixtures cannot judge.
 
 ## Released package and file map
 

@@ -544,6 +544,11 @@ export TEST_GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
 export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
 export APN_AUTOCONFIG_QMI_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-qmi"
 export APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/qmi-identity-lock"
+# Shared with apn-autoconfig-modem. Without redirecting it the suite would try
+# to create real locks under /var/lock, and a failure there makes the AT
+# fallback skip every port — the tests would pass or fail for a reason that has
+# nothing to do with the code under test.
+export APN_AUTOCONFIG_AT_PORT_LOCK_ROOT="$TESTROOT/at-port-lock"
 export APN_AUTOCONFIG_QMI_AT_CACHE_DIR="$TESTROOT/qmi-at-cache"
 export QMI_FIXTURE_DIR="$BASE/tests/fixtures/qmi/home"
 export APN_AUTOCONFIG_MBIM_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-mbim"
@@ -656,6 +661,27 @@ QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/d
 if grep -F -q '/dev/ttyUSB0' "$STATE/sms-tool-calls"; then
 	fail 'cached QMI AT identity retried an earlier non-responsive port'
 fi
+
+printf '%s\n' 'TEST the QMI AT fallback leaves alone a port held on the shared modem-package lock'
+# apn-autoconfig-modem resolves and reads the same tty nodes for its inventory.
+# The per-control-device identity lock above does not exclude it: that one is
+# keyed by the QMI control node, not by the serial port. Both packages must
+# therefore contend on one port-keyed namespace, or two components of this
+# project can write to one ttyUSB at the same time.
+: >"$STATE/sms-tool-calls"
+shared_at_lock="$TESTROOT/at-port-lock.ttyUSB2"
+mkdir -p "$(dirname "$shared_at_lock")"
+printf '%s\n' "$$" >"$shared_at_lock"
+QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1 || :
+if grep -F -q '/dev/ttyUSB2' "$STATE/sms-tool-calls"; then
+	fail 'the QMI AT fallback wrote to a port another package was holding'
+fi
+rm -f "$shared_at_lock"
+: >"$STATE/sms-tool-calls"
+QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/dev/null 2>&1 || :
+grep -F -q '/dev/ttyUSB2' "$STATE/sms-tool-calls" || \
+	fail 'the QMI AT fallback did not resume once the shared lock was released'
+[ ! -e "$shared_at_lock" ] || fail 'the QMI AT fallback left the shared port lock behind'
 
 printf '%s\n' 'TEST concurrent QMI identity calls serialize access to the AT port'
 rm -f "$STATE/sms-tool-collisions"

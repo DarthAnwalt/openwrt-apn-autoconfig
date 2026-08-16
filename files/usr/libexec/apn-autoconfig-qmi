@@ -12,8 +12,16 @@ SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
 AT_TIMEOUT_SECONDS="${APN_AUTOCONFIG_AT_TIMEOUT_SECONDS:-6}"
 SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
 IDENTITY_LOCK_ROOT="${APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT:-/var/lock/apn-autoconfig-qmi-identity}"
+# Shared with apn-autoconfig-modem, which resolves and reads AT ports for the
+# inventory. The two packages probe the same tty nodes on the same modem, so
+# without one namespace they would interleave writes on a device that is
+# effectively exclusive and corrupt both reply streams. The per-control-device
+# identity lock above does not cover this: it is keyed by the QMI control node,
+# not by the serial port.
+AT_PORT_LOCK_ROOT="${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-/var/lock/apn-autoconfig-at-port}"
 AT_CACHE_DIR="${APN_AUTOCONFIG_QMI_AT_CACHE_DIR:-/var/run/apn-autoconfig-qmi}"
 IDENTITY_LOCK_DIR=
+AT_PORT_LOCK_PATH=
 
 case "$AT_TIMEOUT_SECONDS" in
 	''|*[!0-9]*) AT_TIMEOUT_SECONDS=6 ;;
@@ -119,7 +127,38 @@ release_identity_lock() {
 	IDENTITY_LOCK_DIR=
 }
 
+release_at_port_lock() {
+	[ -n "$AT_PORT_LOCK_PATH" ] || return 0
+	rm -f "$AT_PORT_LOCK_PATH" 2>/dev/null || :
+	AT_PORT_LOCK_PATH=
+}
+
+acquire_at_port_lock() {
+	# Mandatory, and a failure to acquire is a refusal to touch the port, not a
+	# licence to proceed without it. The port belongs to whoever holds this.
+	at_lock_device="${1#/dev/}"
+	case "$at_lock_device" in
+		ttyUSB[0-9]*|ttyACM[0-9]*) : ;;
+		*) return 1 ;;
+	esac
+	AT_PORT_LOCK_PATH="$AT_PORT_LOCK_ROOT.$at_lock_device"
+	mkdir -p "$(dirname "$AT_PORT_LOCK_ROOT")" 2>/dev/null || :
+	at_lock_waited=0
+	while :; do
+		lock_try_acquire_or_reclaim "$AT_PORT_LOCK_PATH"
+		at_lock_status=$?
+		[ "$at_lock_status" -eq 0 ] && return 0
+		if [ "$at_lock_status" -eq 1 ] || [ "$at_lock_waited" -ge 15 ]; then
+			AT_PORT_LOCK_PATH=
+			return 1
+		fi
+		"$SLEEP" 1
+		at_lock_waited=$((at_lock_waited + 1))
+	done
+}
+
 identity_signal() {
+	release_at_port_lock
 	release_identity_lock
 	exit 3
 }
@@ -315,18 +354,32 @@ at_identity() {
 }$at_device"
 	done
 	for at_device in $ordered_devices; do
+		# One acquisition per port, held across every read on it. Releasing
+		# between reads would let apn-autoconfig-modem's resolver interleave on
+		# the same node, and neither side would get a coherent reply stream.
+		acquire_at_port_lock "$at_device" || continue
 		iccid_status=0
 		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_status=$?
 		iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
 			# A timed-out serial port is not an AT command channel. Trying the
 			# vendor spelling there would only repeat the same bounded delay.
 			# Immediate command errors still get the Quectel-compatible fallback.
-			case "$iccid_status" in 124|137|143) continue ;; esac
+			case "$iccid_status" in 124|137|143) release_at_port_lock; continue ;; esac
 			iccid_output="$(run_at "$at_device" 'AT+QCCID')" || iccid_output=""
-			iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || continue
+			iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
+				release_at_port_lock
+				continue
+			}
 		}
-		imsi_output="$(run_at "$at_device" 'AT+CIMI')" || continue
-		imsi="$(printf '%s\n' "$imsi_output" | at_digits imsi)" || continue
+		imsi_output="$(run_at "$at_device" 'AT+CIMI')" || {
+			release_at_port_lock
+			continue
+		}
+		imsi="$(printf '%s\n' "$imsi_output" | at_digits imsi)" || {
+			release_at_port_lock
+			continue
+		}
+		release_at_port_lock
 		mkdir -p "$AT_CACHE_DIR" 2>/dev/null || :
 		if [ -d "$AT_CACHE_DIR" ]; then
 			printf '%s\n' "$at_device" >"$cache_file.$$" 2>/dev/null &&
@@ -481,6 +534,10 @@ identity() {
 	acquire_identity_lock "$1" || return 3
 	identity_status=0
 	identity_locked "$@" || identity_status=$?
+	# Innermost first. Every path inside the AT loop already releases it; this
+	# is the backstop, so an unforeseen exit cannot leave a port locked against
+	# apn-autoconfig-modem for the lifetime of a stale file.
+	release_at_port_lock
 	release_identity_lock
 	trap - HUP INT TERM
 	return "$identity_status"

@@ -926,6 +926,27 @@ grep -q '/dev/ttyUSB35' "$TEST_AT_PROBES" || fail 'the watchdog path never reach
 ls /tmp/apn-autoconfig-modem.*.bounded-timeout >/dev/null 2>&1 && \
 	fail 'the watchdog left its timeout marker behind'
 
+printf '%s\n' 'TEST the resolver refuses a port the QMI adapter is holding, rather than proceeding'
+# The other half of the shared namespace, asserted from this side. A reader that
+# waits, fails to acquire and then reads anyway would corrupt both its own reply
+# stream and the holder's, so failing to acquire has to be a refusal.
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.1 1234 5678 CONTENDED 55
+printf '/dev/ttyUSB55\tcontrol\n' >>"$TEST_AT_PORTS"
+held_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB55"
+mkdir -p "$(dirname "$held_lock")"
+printf '%s\n' "$$" >"$held_lock"
+contended=0
+sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED" >/dev/null 2>&1 || contended=$?
+[ "$contended" -ne 0 ] || fail 'the resolver used a port that another package had locked'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the resolver wrote to a locked port'
+rm -f "$held_lock"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED")" || \
+	fail 'the resolver did not recover once the shared lock was released'
+[ "$port" = /dev/ttyUSB55 ] || fail "recovery returned $port"
+[ ! -e "$held_lock" ] || fail 'the resolver left the shared port lock behind'
+
 printf '%s\n' 'TEST a probe never reaches a port belonging to another modem'
 # The target modem deliberately owns the *higher* tty index. With correlation
 # working, its own port is the only one probed; without it, the neighbour's

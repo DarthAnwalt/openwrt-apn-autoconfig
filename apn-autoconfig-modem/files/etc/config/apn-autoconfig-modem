@@ -13,6 +13,12 @@ config apn_autoconfig_modem 'main'
 	option modem_wait_seconds '90'
 	option modem_poll_seconds '2'
 	option connect_wait_seconds '60'
+	# Per-command bound for AT probes and reads. Five seconds is enough for a
+	# live control port and short enough that sweeping a modem whose other
+	# ports never answer stays tolerable. Raising it multiplies by the number
+	# of silent ports, which on some modems is most of them.
+	option at_timeout_seconds '5'
+	option at_port_lock_root '/var/lock/apn-autoconfig-at-port'
 	option hardware_integration_file '/usr/share/apn-autoconfig/integrations/huasifei-wh3000'
 	# Route metric for sections this package creates. A provisioned modem is the
 	# least preferred route by default, so it cannot take the default route away

@@ -62,6 +62,8 @@ get:apn-autoconfig-modem.main.modem_power_off_seconds) printf '%s\n' "${TEST_MOD
 get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' 3 ;;
 get:apn-autoconfig-modem.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.connect_wait_seconds) printf '%s\n' "${TEST_CONNECT_WAIT_SECONDS:-2}" ;;
+get:apn-autoconfig-modem.main.at_timeout_seconds) printf '%s\n' "${TEST_AT_TIMEOUT_SECONDS:-1}" ;;
+get:apn-autoconfig-modem.main.at_port_lock_root) printf '%s\n' "$TEST_AT_PORT_LOCK_ROOT" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
@@ -245,10 +247,93 @@ cat >"$MOCKBIN/sleep" <<'EOF'
 exit 0
 EOF
 
+# An honest bounded timeout. The previous mock exec'd its argument with no
+# bound at all, which was harmless while every mocked command returned
+# instantly, but silently disabled the very behaviour the AT transport depends
+# on. It must also return 124 on expiry, because the code under test
+# distinguishes "this port is not a command channel" from "the modem answered
+# ERROR", and both look like a nonzero status otherwise. The suite's own `sleep`
+# is a no-op, so the watchdog here uses the real one.
 cat >"$MOCKBIN/timeout" <<'EOF'
 #!/bin/sh
+realsleep() { /bin/sleep "$1" 2>/dev/null || /usr/bin/sleep "$1" 2>/dev/null || :; }
+seconds="$1"
 shift
-exec "$@"
+marker="${TEST_STATE:-/tmp}/.mock-timeout.$$"
+rm -f "$marker"
+"$@" &
+child=$!
+(
+	realsleep "$seconds"
+	: >"$marker"
+	kill -TERM "$child" 2>/dev/null || exit 0
+	realsleep 1
+	kill -9 "$child" 2>/dev/null || :
+) >/dev/null 2>&1 &
+watchdog=$!
+status=0
+wait "$child" || status=$?
+kill -TERM "$watchdog" 2>/dev/null || :
+wait "$watchdog" 2>/dev/null || :
+if [ -e "$marker" ]; then
+	rm -f "$marker"
+	exit 124
+fi
+rm -f "$marker"
+exit "$status"
+EOF
+
+# usage: sms_tool -d <device> at <command>
+# Behaviour per port comes from TEST_AT_PORTS, and every invocation is
+# journalled to TEST_AT_PROBES so a test can assert which ports were probed —
+# in particular that a modem's ports were never reached from another modem's
+# record, and that discovery probed nothing at all.
+cat >"$MOCKBIN/sms_tool" <<'EOF'
+#!/bin/sh
+realsleep() { /bin/sleep "$1" 2>/dev/null || /usr/bin/sleep "$1" 2>/dev/null || :; }
+device=""
+at_command=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-d) device="${2:-}"; shift 2 ;;
+		at) at_command="${2:-}"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+printf '%s\t%s\n' "$device" "$at_command" >>"$TEST_AT_PROBES"
+behaviour="$(awk -F'\t' -v d="$device" '$1 == d { print $2; exit }' "$TEST_AT_PORTS" 2>/dev/null)"
+[ -n "$behaviour" ] || behaviour=dead
+case "$behaviour" in
+	dead)
+		# Accepts the write and never answers. The majority case on real
+		# multi-port modems.
+		realsleep 30
+		exit 0
+	;;
+	atonly)
+		# Speaks AT without being the control channel, and rejects the model
+		# query outright.
+		case "$at_command" in
+			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	atonly-silent)
+		# The nastier variant: accepts the model query and answers OK with no
+		# model at all. A status check alone would take this for a control port.
+		printf 'OK\r\n'
+		exit 0
+	;;
+	control|control-echo)
+		[ "$behaviour" = control-echo ] && printf '%s\r\n' "$at_command"
+		case "$at_command" in
+			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf '%s\r\n' "${TEST_AT_MODEL:-FM350-GL}"; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	*) printf 'ERROR\r\n'; exit 1 ;;
+esac
 EOF
 
 chmod 0755 "$MOCKBIN"/*
@@ -258,6 +343,12 @@ export TEST_MODEM_STATE_DIR="$TESTROOT/run"
 export TEST_MODEM_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-modem"
 export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
+export TEST_AT_PORT_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-at-port"
+export TEST_AT_PORTS="$STATE/at-ports"
+export TEST_AT_PROBES="$STATE/at-probes"
+export TEST_AT_TIMEOUT_SECONDS=1
+: >"$STATE/at-ports"
+: >"$STATE/at-probes"
 export TEST_MODEM_ACTION_DIR="/tmp/apn-autoconfig-modem-action-test.$$"
 export TEST_GPIO="$GPIO"
 export TEST_HARDWARE_MARKER="$HARDWARE_MARKER"
@@ -387,6 +478,23 @@ add_at_modem() {
 	printf '%s\n' "$product" >"$usb_dir/idProduct"
 	[ -z "$serial" ] || printf '%s\n' "$serial" >"$usb_dir/serial"
 	ln -s "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+}
+
+# One tty on an existing USB device, with its own interface number, so that the
+# cache key (the USB interface path) differs per port exactly as it does on real
+# hardware. `behaviour` is consumed by the mocked sms_tool below.
+add_at_port() {
+	bus_port="$1"; tty_index="$2"; interface="$3"; behaviour="$4"
+	usb_dir="$TESTROOT/sys/devices/platform/mock-usb/$bus_port"
+	mkdir -p "$usb_dir/$bus_port:$interface" "$TESTROOT/sys/class/tty/ttyUSB$tty_index"
+	ln -s "$usb_dir/$bus_port:$interface" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+	printf '/dev/ttyUSB%s\t%s\n' "$tty_index" "$behaviour" >>"$TEST_AT_PORTS"
+}
+
+reset_at_ports() {
+	: >"$TEST_AT_PORTS"
+	: >"$TEST_AT_PROBES"
+	rm -rf "$TEST_MODEM_STATE_DIR/at-ports"
 }
 
 reset_sysfs
@@ -579,19 +687,146 @@ assert m["owner_state"] == "none", m
 assert not m["at_device"], m
 ' "$out" || fail 'optional AT ports incorrectly blocked a proven QMI control path'
 
-printf '%s\n' 'TEST an AT-only modem with multiple ports remains ambiguous without role evidence'
+printf '%s\n' 'TEST an AT-only modem with multiple ports is one unambiguous record'
+# Reverses the pre-0.14.0 rule. Several tty nodes correlated to one proven USB
+# device are one modem exposing several ports, not two candidate modems, and
+# treating them as ambiguous made every ordinary multi-port modem unusable.
 reset_sysfs
+reset_at_ports
 add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 1
 add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 2
 out="$(sh "$SCRIPT" inventory-json)"
 python3 -c '
 import json, sys
-m = json.loads(sys.argv[1])["modems"][0]
+d = json.loads(sys.argv[1])
+assert len(d["modems"]) == 1, d
+m = d["modems"][0]
 assert m["protocol"] == "at", m
-assert m["ambiguous"] is True, m
-assert m["owner_state"] == "conflicting", m
+assert m["ambiguous"] is False, m
+assert m["owner_state"] == "none", m
 assert not m["at_device"], m
-' "$out" || fail 'AT-only multi-port modem selected a port without role evidence'
+assert m["capabilities"]["at_identity"] is False, m
+' "$out" || fail 'AT-only multi-port modem was not reduced to one unambiguous record'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'discovery probed an AT port'
+
+printf '%s\n' 'TEST discovery never probes, however many ports are present'
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.1 1234 5678 SWEEPME 20
+add_at_port 4-1.1 21 1.3 dead
+add_at_port 4-1.1 22 1.4 control
+sh "$SCRIPT" inventory-json >/dev/null
+sh "$SCRIPT" status-json --modem "usb-serial:4-1.1:1234:5678:SWEEPME" >/dev/null
+[ ! -s "$TEST_AT_PROBES" ] || \
+	fail "discovery or status probed an AT port: $(cat "$TEST_AT_PROBES")"
+
+printf '%s\n' 'TEST at-port resolves by role, skipping ports that never answer'
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.2 1234 5678 ROLEPROBE 30
+printf '/dev/ttyUSB30\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 4-1.2 31 1.3 atonly
+add_at_port 4-1.2 32 1.4 atonly-silent
+add_at_port 4-1.2 33 1.5 control
+add_at_port 4-1.2 34 1.6 control
+MODEM_ROLE="usb-serial:4-1.2:1234:5678:ROLEPROBE"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'at-port failed to resolve a control port'
+[ "$port" = /dev/ttyUSB33 ] || fail "at-port selected $port instead of the lowest-indexed control port"
+grep -q "/dev/ttyUSB31	AT+CGMM" "$TEST_AT_PROBES" || \
+	fail 'the port that rejects the model query was not reached by the second phase'
+grep -q "/dev/ttyUSB32	AT+CGMM" "$TEST_AT_PROBES" || \
+	fail 'the port that answers OK without a model was not reached by the second phase'
+
+printf '%s\n' 'TEST several responding ports on one device are redundancy, not ambiguity'
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["ambiguous"] is False, m
+assert m["at_device"] == "/dev/ttyUSB33", m
+assert m["capabilities"]["at_identity"] is True, m
+' "$out" || fail 'a resolved multi-responder modem was not reported as usable'
+
+printf '%s\n' 'TEST a cached selection is revalidated and no other port is touched'
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'cached at-port failed'
+[ "$port" = /dev/ttyUSB33 ] || fail "cached resolution returned $port"
+if awk -F'\t' '$1 != "/dev/ttyUSB33"' "$TEST_AT_PROBES" | grep -q .; then
+	fail "a cached selection still swept other ports: $(cut -f1 "$TEST_AT_PROBES" | sort -u | tr '\n' ' ')"
+fi
+grep -q '/dev/ttyUSB33' "$TEST_AT_PROBES" || fail 'the cached port was not revalidated before reuse'
+
+printf '%s\n' 'TEST a port recorded as dead is skipped when the selection has to be redone'
+# Deleting only the selection forces a fresh sweep, which is the one path where
+# the negative cache does any work. Asserting it through the selection cache
+# proved nothing: that path short-circuits before a sweep can happen at all.
+rm -f "$TEST_MODEM_STATE_DIR"/at-ports/selected.*
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'resweep after losing the selection failed'
+[ "$port" = /dev/ttyUSB33 ] || fail "resweep selected $port instead of /dev/ttyUSB33"
+if grep -q '/dev/ttyUSB30' "$TEST_AT_PROBES"; then
+	fail 'a port cached as dead was swept again'
+fi
+grep -q '/dev/ttyUSB31' "$TEST_AT_PROBES" || \
+	fail 'the resweep skipped a port that had answered, which is not cached as dead'
+
+printf '%s\n' 'TEST a cached port that stopped answering is discarded and resolution runs again'
+sed -i.bak 's|^/dev/ttyUSB33	control$|/dev/ttyUSB33	dead|' "$TEST_AT_PORTS"
+rm -f "$TEST_AT_PORTS.bak"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'resolution did not recover from a stale cache'
+[ "$port" = /dev/ttyUSB34 ] || fail "stale cache recovery selected $port instead of /dev/ttyUSB34"
+
+printf '%s\n' 'TEST the watchdog bounds a silent port when no external timeout exists'
+# Not an exotic-image fallback: the reference router has no timeout executable
+# at all, so this is the branch that actually runs there. The suite's own sleep
+# is a no-op, so the watchdog needs the real one to be tested honestly.
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.3 1234 5678 WATCHDOG 35
+printf '/dev/ttyUSB35\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 4-1.3 36 1.3 control
+APN_AUTOCONFIG_MODEM_TIMEOUT="$TESTROOT/absent-timeout" \
+APN_AUTOCONFIG_MODEM_SLEEP="$(command -v /bin/sleep || command -v /usr/bin/sleep)" \
+	sh "$SCRIPT" at-port --modem "usb-serial:4-1.3:1234:5678:WATCHDOG" >"$STATE/watchdog-port" 2>&1 || \
+	fail "the watchdog path failed to resolve: $(cat "$STATE/watchdog-port")"
+[ "$(cat "$STATE/watchdog-port")" = /dev/ttyUSB36 ] || \
+	fail "watchdog path selected $(cat "$STATE/watchdog-port") instead of /dev/ttyUSB36"
+grep -q '/dev/ttyUSB35' "$TEST_AT_PROBES" || fail 'the watchdog path never reached the silent port'
+ls /tmp/apn-autoconfig-modem.*.bounded-timeout >/dev/null 2>&1 && \
+	fail 'the watchdog left its timeout marker behind'
+
+printf '%s\n' 'TEST a probe never reaches a port belonging to another modem'
+# The target modem deliberately owns the *higher* tty index. With correlation
+# working, its own port is the only one probed; without it, the neighbour's
+# lower-numbered port would be swept first and would satisfy the resolution, so
+# this ordering is what makes the assertion mean anything.
+reset_sysfs
+reset_at_ports
+add_at_modem 5-1.1 3333 4444 NEIGHBOUR 40
+printf '/dev/ttyUSB40\tcontrol\n' >>"$TEST_AT_PORTS"
+add_at_modem 5-1.2 1111 2222 FIRSTMODEM 41
+printf '/dev/ttyUSB41\tcontrol\n' >>"$TEST_AT_PORTS"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:5-1.2:1111:2222:FIRSTMODEM")" || \
+	fail 'at-port failed with two modems present'
+[ "$port" = /dev/ttyUSB41 ] || fail "at-port returned $port, which is not this modem's own port"
+if grep -q '/dev/ttyUSB40' "$TEST_AT_PROBES"; then
+	fail "a probe for one modem reached the other modem's port"
+fi
+
+printf '%s\n' 'TEST AT access is refused for a modem owned by ModemManager'
+reset_sysfs
+reset_at_ports
+add_qmi_modem 6-1.1 2c7c 0801 MMOWNED 7 wwan7
+add_at_port 6-1.1 45 1.2 control
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/6-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+mm_refused=0
+sh "$SCRIPT" at-port --modem "usb-serial:6-1.1:2c7c:0801:MMOWNED" >/dev/null 2>&1 || mm_refused=$?
+[ "$mm_refused" -eq 4 ] || fail "AT access under ModemManager exited $mm_refused instead of the blocked class 4"
+[ ! -s "$TEST_AT_PROBES" ] || fail 'a ModemManager-owned modem was probed anyway'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
 
 printf '%s\n' 'TEST two distinct physically present modems are both reported, not merged'
 reset_sysfs

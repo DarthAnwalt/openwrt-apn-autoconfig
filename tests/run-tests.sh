@@ -7,6 +7,7 @@ TEST_ACTION_STATE="/tmp/apn-autoconfig-action-test.$$"
 HARDWARE_MARKER="$TESTROOT/huasifei-wh3000-integration"
 MOCKBIN="$TESTROOT/bin"
 STATE="$TESTROOT/state"
+SCRATCH="$TESTROOT/scratch"
 DB="$TESTROOT/providers.tsv"
 PERSIST="$TESTROOT/persist"
 TARGET_PERSIST="$PERSIST/targets/network_wwan"
@@ -22,7 +23,7 @@ cleanup() {
 }
 trap cleanup 0 HUP INT TERM
 
-mkdir -p "$MOCKBIN" "$STATE" "$CACHE" "$PERSIST"
+mkdir -p "$MOCKBIN" "$STATE" "$CACHE" "$PERSIST" "$SCRATCH"
 printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
 mkdir -p "$TESTROOT/sys/class/gpio/modem_power"
 printf '%s\n' '0' >"$TESTROOT/sys/class/gpio/modem_power/value"
@@ -542,6 +543,10 @@ export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_DB="$DB" TEST_CACHE="$CACHE" TEST_STATE="$STATE" TEST_LOCK="$TESTROOT/lock" TEST_PERSIST="$PERSIST"
 export TEST_GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
 export APN_AUTOCONFIG_SYSFS_ROOT="$TESTROOT/sys"
+# The engine's scratch files live in a directory of this run's own, so the
+# assertions about what it leaves behind can compare against "empty" instead of
+# against whatever else on the machine happens to be using /tmp.
+export APN_AUTOCONFIG_TMP_DIR="$SCRATCH"
 export APN_AUTOCONFIG_QMI_ADAPTER="$BASE/files/usr/libexec/apn-autoconfig-qmi"
 export APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/qmi-identity-lock"
 export APN_AUTOCONFIG_QMI_AT_CACHE_DIR="$TESTROOT/qmi-at-cache"
@@ -585,6 +590,42 @@ assert_contains() {
 file_mode() {
 	stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
 }
+
+# The SIGPIPE regressions below need an interpreter that behaves like the
+# target's BusyBox ash, where an untrapped SIGPIPE is fatal and the exit trap
+# therefore never runs. bash does not: it reports status 141 and runs the exit
+# trap anyway, both for a failed builtin write and for an async signal. On any
+# host whose /bin/sh is bash — every macOS — a SIGPIPE test run through `sh`
+# passes against the exact code it exists to reject, which is worse than not
+# having it. So the interpreter is chosen by probing for the behavior instead of
+# by trusting a name, and a host with no such shell is told, not quietly passed.
+cat >"$TESTROOT/pipe-probe.sh" <<'EOF'
+trap 'printf %s reached-exit-trap >&2' 0
+kill -PIPE $$
+printf %s survived-the-signal >&2
+EOF
+PIPE_SHELL=""
+for candidate_shell in sh dash 'busybox sh' ash; do
+	command -v "${candidate_shell%% *}" >/dev/null 2>&1 || continue
+	probe_output="$($candidate_shell "$TESTROOT/pipe-probe.sh" 2>&1 >/dev/null || :)"
+	[ -z "$probe_output" ] || continue
+	PIPE_SHELL="$candidate_shell"
+	break
+done
+if [ -z "$PIPE_SHELL" ]; then
+	if [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
+		printf '%s\n' 'No shell on this host treats an untrapped SIGPIPE as fatal; the SIGPIPE regressions cannot run.' >&2
+		exit 1
+	fi
+	{
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+		printf '%s\n' '!! WARNING: the SIGPIPE regressions did NOT run. No shell on this host'
+		printf '%s\n' '!! treats an untrapped SIGPIPE as fatal, so they would pass whether or'
+		printf '%s\n' '!! not the engine cleans up after one. Install dash or busybox to close'
+		printf '%s\n' '!! the gap; CI is the authoritative run for them here.'
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+	} >&2
+fi
 
 printf '%s\n' 'TEST target inventory reports exact backend capabilities'
 targets_json="$(sh "$SCRIPT" targets-json)"
@@ -1222,6 +1263,46 @@ kill -TERM "$(cat "$STATE/qmi-settle-pid")" 2>/dev/null || :
 [ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'SIGTERM did not restore QMI PDP type'
 [ "$(tail -n 1 "$STATE/events")" = 'up cellqmi' ] || fail 'SIGTERM rollback left the QMI interface down'
 TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+
+printf '%s\n' 'TEST SIGPIPE during QMI apply restores the exact profile, interface and lock'
+# The same destructive window as the SIGTERM case above, interrupted by the one
+# signal the engine used to die from with no cleanup at all: an operation whose
+# output is piped somewhere ("reconcile 2>&1 | tee", a reader that stops early,
+# an SSH session that dies mid-command) skipped its rollback, left the interface
+# down and left the operation lock behind for the next caller to reclaim.
+if [ -z "$PIPE_SHELL" ]; then
+	printf 'SKIP: no shell on this host treats an untrapped SIGPIPE as fatal\n'
+else
+	rm -rf "$PERSIST/targets/network_cellqmi" "$CACHE"
+	mkdir -p "$CACHE"
+	printf 'v2\tinternet.telekom\tQMI signal fixture\t2026-01-01T00:00:00Z\tfixture-user\tfixture-pass\tpap-or-chap\tipv4v6\n' \
+		>"$CACHE/89490200002186275443.tsv"
+	rm -f "$STATE/qmi-settle-seen" "$STATE/qmi-settle-pid" "$STATE/ifup-seen"
+	: >"$STATE/events"
+	BLOCK_QMI_SETTLE=1 TEST_INTERFACE=cellqmi $PIPE_SHELL "$SCRIPT" apply >/dev/null 2>&1 &
+	pipe_engine_pid=$!
+	signal_wait=50
+	while [ ! -e "$STATE/qmi-settle-seen" ] && [ "$signal_wait" -gt 0 ]; do
+		/bin/sleep 0.1
+		signal_wait=$((signal_wait - 1))
+	done
+	[ -e "$STATE/qmi-settle-seen" ] || fail 'QMI SIGPIPE test did not reach the teardown quiet period'
+	kill -PIPE "$pipe_engine_pid"
+	pipe_engine_status=0
+	wait "$pipe_engine_pid" || pipe_engine_status=$?
+	[ "$pipe_engine_status" -ne 0 ] || fail 'a QMI apply interrupted by SIGPIPE returned success'
+	[ "$pipe_engine_status" -eq 141 ] || \
+		fail "a QMI apply interrupted by SIGPIPE exited $pipe_engine_status instead of 141"
+	kill -TERM "$(cat "$STATE/qmi-settle-pid")" 2>/dev/null || :
+	[ "$(cat "$STATE/qmi-apn")" = qmi.old ] || fail 'SIGPIPE did not restore QMI APN'
+	[ "$(cat "$STATE/qmi-username")" = qmi-user ] || fail 'SIGPIPE did not restore QMI username'
+	[ "$(cat "$STATE/qmi-password")" = qmi-pass ] || fail 'SIGPIPE did not restore QMI password'
+	[ "$(cat "$STATE/qmi-auth")" = chap ] || fail 'SIGPIPE did not restore QMI auth'
+	[ "$(cat "$STATE/qmi-pdptype")" = ip ] || fail 'SIGPIPE did not restore QMI PDP type'
+	[ "$(tail -n 1 "$STATE/events")" = 'up cellqmi' ] || fail 'SIGPIPE rollback left the QMI interface down'
+	[ ! -e "$TEST_LOCK" ] || fail 'SIGPIPE left the APN operation lock behind'
+	TEST_INTERFACE=cellqmi sh "$SCRIPT" reset >/dev/null 2>&1
+fi
 
 printf '%s\n' 'TEST connectivity URL rejects non-HTTP schemes'
 if invalid_url_output="$(TEST_CONFIG_URL=file:///etc/passwd sh "$SCRIPT" status 2>&1)"; then
@@ -2231,5 +2312,90 @@ TEST_SECOND_MM=1 sh "$SCRIPT" reset-all >/dev/null 2>&1
 [ "$(cat "$STATE/apn-wwan2")" = restored-two ] || fail 'reset-all did not restore the second target'
 [ ! -e "$PERSIST/targets/network_wwan/baseline.tsv" ] || fail 'reset-all left the first baseline'
 [ ! -e "$PERSIST/targets/network_wwan2/baseline.tsv" ] || fail 'reset-all left the second baseline'
+
+printf '%s\n' 'TEST a reader that stopped early leaves no scratch file behind'
+# Every read-only command gathers its data into scratch files before it writes
+# the first byte of its answer, so a reader that has already gone away kills the
+# engine at the point where there is the most to clean up. `true` has long
+# exited by then, which makes the closed pipe deterministic rather than a race.
+#
+# The exit status is asserted as well, for two reasons: 141 is what a caller saw
+# before this was fixed and must keep seeing, and a command that stopped writing
+# to stdout altogether would otherwise make this test pass without ever
+# reproducing the defect.
+if [ -z "$PIPE_SHELL" ]; then
+	printf 'SKIP: no shell on this host treats an untrapped SIGPIPE as fatal\n'
+else
+	rm -rf "$SCRATCH"/*
+	for pipe_cmd in targets-json status-json detect-json; do
+		{
+			pipe_cmd_status=0
+			$PIPE_SHELL "$SCRIPT" "$pipe_cmd" 2>/dev/null || pipe_cmd_status=$?
+			printf '%s\n' "$pipe_cmd_status" >"$STATE/pipe-cmd-status"
+		} | true
+		[ "$(cat "$STATE/pipe-cmd-status")" = 141 ] || \
+			fail "$pipe_cmd did not reach a closed reader; the leak case was not exercised"
+		pipe_leaked="$(ls "$SCRATCH" 2>/dev/null || :)"
+		[ -z "$pipe_leaked" ] || {
+			printf 'left behind by %s:\n%s\n' "$pipe_cmd" "$pipe_leaked" >&2
+			fail "$pipe_cmd leaked its scratch files when the reader went away"
+		}
+	done
+fi
+
+printf '%s\n' 'TEST the next run removes only a provably dead run scratch files'
+# No trap can cover SIGKILL — rpcd sends it to a LuCI helper that outruns its
+# exec timeout — so the guarantee cannot be "the engine always cleans up after
+# itself". It has to be "the next engine cleans up after a predecessor that
+# provably cannot". Everything else in this shared directory has to survive
+# that, including a live sibling's files and this project's own documented
+# /tmp/apn-autoconfig.pem download.
+sh -c 'exit 0' &
+sweep_dead_pid=$!
+wait "$sweep_dead_pid" 2>/dev/null || :
+/bin/sleep 30 &
+sweep_live_pid=$!
+if kill -0 "$sweep_dead_pid" 2>/dev/null; then
+	printf 'SKIP: PID %s did not stay dead on this host\n' "$sweep_dead_pid"
+else
+	rm -rf "$SCRATCH"/*
+	for sweep_suffix in sim modem modems candidates candidates.apply \
+		candidates.attempts seen targets; do
+		printf 'stale\n' >"$SCRATCH/apn-autoconfig.$sweep_dead_pid.$sweep_suffix"
+	done
+	printf 'live\n' >"$SCRATCH/apn-autoconfig.$sweep_live_pid.sim"
+	printf 'key\n' >"$SCRATCH/apn-autoconfig.pem"
+	printf 'other package\n' >"$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.inventory"
+	printf 'not a pid\n' >"$SCRATCH/apn-autoconfig.notapid.sim"
+	printf 'not our suffix\n' >"$SCRATCH/apn-autoconfig.$sweep_dead_pid.journal"
+	mkdir -p "$SCRATCH/apn-autoconfig.999998.seen"
+	printf 'must survive\n' >"$STATE/symlink-target"
+	ln -s "$STATE/symlink-target" "$SCRATCH/apn-autoconfig.999997.sim"
+	sh "$SCRIPT" targets-json >/dev/null || fail 'targets-json failed while sweeping'
+	for sweep_suffix in sim modem modems candidates candidates.apply \
+		candidates.attempts seen targets; do
+		[ ! -e "$SCRATCH/apn-autoconfig.$sweep_dead_pid.$sweep_suffix" ] || \
+			fail "a dead run's .$sweep_suffix scratch file survived the next run"
+	done
+	[ -e "$SCRATCH/apn-autoconfig.$sweep_live_pid.sim" ] || \
+		fail 'the sweep deleted a scratch file belonging to a live process'
+	[ -e "$SCRATCH/apn-autoconfig.pem" ] || \
+		fail 'the sweep deleted an unrelated file sharing the project prefix'
+	[ -e "$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.inventory" ] || \
+		fail 'the sweep deleted a scratch file belonging to the modem package'
+	[ -e "$SCRATCH/apn-autoconfig.notapid.sim" ] || \
+		fail 'the sweep deleted a file whose PID field is not a PID'
+	[ -e "$SCRATCH/apn-autoconfig.$sweep_dead_pid.journal" ] || \
+		fail 'the sweep deleted a file with a suffix the engine never creates'
+	[ -d "$SCRATCH/apn-autoconfig.999998.seen" ] || \
+		fail 'the sweep removed a directory planted under a scratch name'
+	[ -L "$SCRATCH/apn-autoconfig.999997.sim" ] || \
+		fail 'the sweep removed a symlink planted under a scratch name'
+	[ -e "$STATE/symlink-target" ] || \
+		fail 'the sweep followed a symlink out of the scratch directory'
+fi
+kill -TERM "$sweep_live_pid" 2>/dev/null || :
+wait "$sweep_live_pid" 2>/dev/null || :
+rm -rf "$SCRATCH"/*
 
 printf '%s\n' 'All tests passed.'

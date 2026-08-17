@@ -2484,10 +2484,13 @@ wait_for_control_owner() {
 }
 
 reset_cmd() {
-	# Deliberately not called `modem_id`: scan_inventory reassigns that name,
-	# and wait_for_control_owner below calls it in this shell rather than in a
-	# subshell, so the target would silently become whichever record was
-	# scanned last.
+	# Every local below is deliberately prefixed. scan_inventory assigns
+	# modem_id, owner_state, netifd_interface and reset_method as it walks the
+	# records, and both waits call it in this shell rather than in a subshell,
+	# so an unprefixed name here silently becomes whichever record was scanned
+	# last. That produced a reset that named the wrong modem, then one that
+	# named the wrong method, and — worst of the three — an ifup of whatever
+	# interface the scan happened to end on.
 	reset_target_id="$REQUESTED_MODEM"
 	[ -n "$reset_target_id" ] || die_code 2 "reset requires --modem"
 
@@ -2495,20 +2498,20 @@ reset_cmd() {
 	# action-status overlay that deliberately reports this worker as
 	# "transitioning" while a background reset is active.
 	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $reset_target_id is not currently present"
-	reset_method="$(printf '%s' "$line" | awk -F '\t' '{ print $16 }')"
-	[ -n "$reset_method" ] && [ "$reset_method" != none ] || \
+	reset_chosen_method="$(printf '%s' "$line" | awk -F '\t' '{ print $16 }')"
+	[ -n "$reset_chosen_method" ] && [ "$reset_chosen_method" != none ] || \
 		die_code 4 "no reset method is available for modem $reset_target_id"
-	if [ "$reset_method" = gpio ]; then
+	if [ "$reset_chosen_method" = gpio ]; then
 		hardware_integration_name >/dev/null 2>&1 || \
 			die_code 4 "reset requires an installed, supported board integration"
 		[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
 	fi
-	owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
-	case "$owner_state" in
+	reset_owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
+	case "$reset_owner_state" in
 		conflicting) die_code 4 "modem $reset_target_id has a conflicting control-owner state; refusing to reset" ;;
 	esac
-	expected_owner_state="$owner_state"
-	netifd_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
+	expected_owner_state="$reset_owner_state"
+	reset_bound_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
 
 	# Every composite operation uses one global order: APN lock, then the
 	# selected modem lock. A compatibility caller may borrow its already-held
@@ -2520,25 +2523,25 @@ reset_cmd() {
 	current_owner_state="$(field "$line" 8)"
 	[ -n "$current_reset_method" ] && [ "$current_reset_method" != none ] || \
 		die_code 4 "modem $reset_target_id is no longer safely reset-capable"
-	[ "$current_reset_method" = "$reset_method" ] || \
+	[ "$current_reset_method" = "$reset_chosen_method" ] || \
 		die_code 4 "modem $reset_target_id changed reset method before reset could start"
 	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $reset_target_id acquired a conflicting owner before reset"
 	[ "$current_owner_state" = "$expected_owner_state" ] || \
 		die_code 4 "modem $reset_target_id changed control owner before reset"
-	netifd_interface="$(field "$line" 9)"
+	reset_bound_interface="$(field "$line" 9)"
 
 	restore_armed=0
-	if [ -n "$netifd_interface" ]; then
-		log notice "modem reset requested for $reset_target_id; stopping interface $netifd_interface"
+	if [ -n "$reset_bound_interface" ]; then
+		log notice "modem reset requested for $reset_target_id; stopping interface $reset_bound_interface"
 		restore_armed=1
-		RESET_INTERFACE="$netifd_interface"
+		RESET_INTERFACE="$reset_bound_interface"
 		RESET_INTERFACE_RESTORE_ARMED=1
-		ifdown "$netifd_interface" >/dev/null 2>&1 || :
+		ifdown "$reset_bound_interface" >/dev/null 2>&1 || :
 	else
 		log notice "modem reset requested for $reset_target_id (no bound netifd interface)"
 	fi
 
-	case "$reset_method" in
+	case "$reset_chosen_method" in
 		gpio)
 			log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
 			MODEM_POWER_OFF_ARMED=1
@@ -2569,28 +2572,28 @@ reset_cmd() {
 			at_soft_reset "$at_reset_port" || \
 				die_code 3 "the AT control port for modem $reset_target_id was busy"
 		;;
-		*) die_code 4 "unsupported reset method $reset_method" ;;
+		*) die_code 4 "unsupported reset method $reset_chosen_method" ;;
 	esac
 
 	# An in-band reset leaves the modem enumerated for a moment after the
 	# command returns, so its departure has to be observed before its return
 	# can mean anything. Board power has already removed it by this point.
-	case "$reset_method" in
+	case "$reset_chosen_method" in
 		at|modemmanager)
-			log notice "reset issued via $reset_method; waiting up to ${MODEM_DEPART_SECONDS}s for modem $reset_target_id to leave the bus"
+			log notice "reset issued via $reset_chosen_method; waiting up to ${MODEM_DEPART_SECONDS}s for modem $reset_target_id to leave the bus"
 			if ! wait_for_modem_departure "$reset_target_id"; then
-				die_code 3 "modem $reset_target_id never left the bus after the $reset_method reset; treating it as ineffective"
+				die_code 3 "modem $reset_target_id never left the bus after the $reset_chosen_method reset; treating it as ineffective"
 			fi
 		;;
 	esac
 
-	log notice "reset issued via $reset_method; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
+	log notice "reset issued via $reset_chosen_method; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
 	if ! wait_for_control_owner "$reset_target_id" "$expected_owner_state"; then
 		die_code 3 "modem $reset_target_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
 	fi
 
 	if [ "$restore_armed" -eq 1 ]; then
-		ifup "$netifd_interface" >/dev/null 2>&1 || die "failed to restart interface $netifd_interface after modem reset"
+		ifup "$reset_bound_interface" >/dev/null 2>&1 || die "failed to restart interface $reset_bound_interface after modem reset"
 		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
 	release_modem_lock

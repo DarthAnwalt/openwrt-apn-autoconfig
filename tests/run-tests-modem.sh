@@ -1312,6 +1312,37 @@ grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'reset did not restore the bou
 [ ! -d "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] \
 	|| fail 'per-modem lock was not released after reset'
 
+printf '%s\n' 'TEST reset restarts its own modem interface, not whichever one the scan ended on'
+# The third and worst instance of the same clobbering: reset_cmd held the bound
+# interface in `netifd_interface`, a name scan_inventory reassigns per record,
+# and both waits call that scan in this shell. With one modem the clobbered
+# value equals the target and nothing looks wrong; with two, the reset can bring
+# up somebody else's interface.
+reset_sysfs
+reset_at_ports
+reset_network_config
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+add_qmi_modem 14-1.1 2c7c 0801 IFTARGET 4 wwan4
+add_qmi_modem 14-1.2 2c7c 0801 ZIFOTHER 5 wwan5
+add_network_section celltarget qmi /dev/cdc-wdm4
+add_network_section zcellother qmi /dev/cdc-wdm5
+TEST_RESET_MODEM_ID='usb-serial:14-1.1:2c7c:0801:IFTARGET'
+export TEST_RESET_MODEM_ID
+: >"$TEST_EVENTS"
+sh "$SCRIPT" reset --modem "$TEST_RESET_MODEM_ID" >/dev/null 2>&1 || \
+	fail 'the two-modem GPIO reset failed'
+grep -F -x -q 'down celltarget' "$TEST_EVENTS" || fail 'reset stopped the wrong interface'
+grep -F -x -q 'up celltarget' "$TEST_EVENTS" || fail 'reset did not restore its own interface'
+if grep -F -x -q 'up zcellother' "$TEST_EVENTS" || grep -F -x -q 'down zcellother' "$TEST_EVENTS"; then
+	fail 'reset touched a neighbouring modem interface'
+fi
+reset_network_config
+reset_sysfs
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0 wwan0
+add_network_section cellqmi qmi /dev/cdc-wdm0
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+
 printf '%s\n' 'TEST reset waits for the original ModemManager owner before restoring netifd'
 : >"$TEST_EVENTS"
 rm -f "$STATE/ifdown-seen" "$STATE/mm-owner-scan-count" "$STATE/mm-owner-ready" "$STATE/up-before-owner"

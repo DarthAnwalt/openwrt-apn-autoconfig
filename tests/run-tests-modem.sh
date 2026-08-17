@@ -1463,6 +1463,41 @@ grep -q "	reset" "$TEST_MM_RESETS" || fail 'ModemManager was never asked to rese
 unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
 printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
 
+printf '%s\n' 'TEST a second idle modem cannot satisfy the wait for the one being reset'
+# Found on the reference router, not by fixtures. wait_for_control_owner passed
+# its target to awk as "$modem_id" — the same name scan_inventory reassigns once
+# per discovered record — so the comparison ran against whichever record was
+# scanned last. A neighbouring idle modem matched immediately and the reset was
+# reported complete seconds after it was issued, for a device that had not
+# cycled. With one modem present the clobbered value equals the target, which is
+# why this needs two.
+reset_sysfs
+reset_at_ports
+reset_network_config
+# The neighbour sorts last, so it is what the clobbered variable would hold.
+add_qmi_modem 13-1.1 2c7c 0801 RESETTARGET 6
+add_qmi_modem 13-1.2 2c7c 0801 ZNEIGHBOUR 7
+cat >"$STATE/wait-probe" <<'PROBE'
+#!/bin/sh
+target="$1"; owner="$2"
+set --
+. "$WAIT_SCRIPT" >/dev/null 2>&1 || :
+load_config
+SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
+MODEM_WAIT_SECONDS=2
+MODEM_POLL_SECONDS=1
+if wait_for_control_owner "$target" "$owner"; then printf 'matched\n'; else printf 'timeout\n'; fi
+PROBE
+# The named modem is not present at all, while the neighbour is present and
+# idle. A wait that compares against its own target must time out.
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.9:2c7c:0801:ABSENT' none)"
+[ "$verdict" = timeout ] || \
+	fail 'an idle neighbouring modem satisfied the wait for a modem that is not present'
+# Positive control, so the assertion above cannot pass by the wait being broken
+# in the other direction.
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.1:2c7c:0801:RESETTARGET' none)"
+[ "$verdict" = matched ] || fail 'the wait did not match its own target when that target was present'
+
 printf '%s\n' 'TEST reset refuses to run against a conflicting-ownership modem'
 reset_sysfs
 reset_network_config

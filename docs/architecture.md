@@ -114,8 +114,8 @@ both exit 141 and leave `.inventory`, `.inventory.display` and `.mm-indexes`. It
 carries the same two-part fix. One detail of that leftover set is worth recording,
 because it is evidence about a branch rather than about the released code:
 `.mm-indexes` is created only by the AT-framework build, so the router was running
-a 0.14.0 pre-release, and the four scratch paths that branch adds
-(`.mm-indexes`, `.at-output`, `.at-candidates`, `.bounded-timeout`) have to join
+a 0.14.0 pre-release, and the five scratch paths that branch adds (`.mm-indexes`,
+`.mm-identity`, `.at-output`, `.at-candidates`, `.bounded-timeout`) have to join
 `TMP_SUFFIXES` when it lands. `tests/run-tests-modem.sh` asserts that mapping
 structurally — it reads the scratch paths back out of the script and requires the
 list to name every one — because that is the one failure a behavioral test cannot

@@ -3,9 +3,9 @@
 Status: complete. Evidence is recorded in
 [`router-test-0.14.0.md`](router-test-0.14.0.md).
 
-Original status: planned. No implementation had started. The hardware first-contact
-census was performed on 2026-08-16 before implementation and is recorded below;
-three of its findings changed the contracts, which is why it was done first.
+The hardware first-contact census was performed on 2026-08-16 **before any code
+was written**, and three of its findings changed the contracts — which is the
+argument for doing it in that order.
 
 0.14.0 adds the third and last identity backend, the bounded AT transport it
 needs, and the reset-method contract, against

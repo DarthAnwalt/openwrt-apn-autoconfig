@@ -79,11 +79,14 @@ These rules bind every component and release:
 
 ## Scratch files, signals and the start-up sweep
 
-Every scratch path the APN engine creates is `/tmp/apn-autoconfig.<pid>.<suffix>`
-and every suffix it may use is listed once, in `TMP_SUFFIXES`, because two
-different mechanisms have to agree on that list: the exit trap removes them by
-exact name, and the start-up sweep recognizes a dead predecessor's files by the
-same names. A suffix added to only one of the two leaks.
+Every scratch path either binary creates is `/tmp/<prog>.<pid>.<suffix>` —
+`apn-autoconfig.<pid>.<suffix>` for the APN engine,
+`apn-autoconfig-modem.<pid>.<suffix>` for the coordinator — and every suffix each
+may use is listed once, in that script's `TMP_SUFFIXES`, because two different
+mechanisms have to agree on that list: the exit trap removes them by exact name,
+and the start-up sweep recognizes a dead predecessor's files by the same names. A
+suffix added to only one of the two leaks. The lists are per script and the
+prefixes do not overlap, so neither sweep can reach the other's files.
 
 Three things can leave such a file behind, and they need different answers.
 
@@ -104,6 +107,26 @@ the command that produced it. The engine now traps PIPE and exits 141, the statu
 a caller already saw, so only the leak goes away. The same trap closes a worse
 case than a scratch file: a mutation interrupted this way skipped its rollback,
 its modem power-on and its lock release.
+
+`apn-autoconfig-modem` had the identical omission and was confirmed the same day
+on the same router: `inventory-json | true` and `status-json --modem <id> | true`
+both exit 141 and leave `.inventory`, `.inventory.display` and `.mm-indexes`. It
+carries the same two-part fix. One detail of that leftover set is worth recording,
+because it is evidence about a branch rather than about the released code:
+`.mm-indexes` is created only by the AT-framework build, so the router was running
+a 0.14.0 pre-release, and the four scratch paths that branch adds
+(`.mm-indexes`, `.at-output`, `.at-candidates`, `.bounded-timeout`) have to join
+`TMP_SUFFIXES` when it lands. `tests/run-tests-modem.sh` asserts that mapping
+structurally — it reads the scratch paths back out of the script and requires the
+list to name every one — because that is the one failure a behavioral test cannot
+reach: a suffix missing from the list is still removed by the caller's own exit
+trap and only leaks in the SIGKILL case.
+
+A rollback logs its way out, so the exit trap ignores PIPE for its own duration in
+both scripts. Otherwise the reader that went away — it may have been reading
+stderr too, which `2>&1 | tee` makes ordinary — delivers a second SIGPIPE on the
+rollback's first log line and kills the cleanup halfway, leaving behind the
+staging section, the locks and the scratch files it had just started to remove.
 
 **SIGKILL, which no trap can cover.** rpcd's `file exec` — the transport under
 every LuCI `fs.exec` call — kills the process it started when it exceeds rpcd's
@@ -128,14 +151,17 @@ removal there is what this project already forbids for its lock and state roots.
 The sweep runs on every entry point rather than at service start, because LuCI is
 the caller that never reaches one.
 
-Two things are deliberately not covered. `apn-autoconfig-modem` has the identical
-SIGPIPE exposure — confirmed on the router the same day, leaving `.inventory`,
-`.inventory.display` and `.mm-indexes` — and is left for a patch that does not
-collide with the AT framework's rewrite of that file. And the regression for this
-can only run under a shell where an untrapped SIGPIPE is fatal: bash reports
-status 141 and runs the exit trap anyway, so on a host whose `/bin/sh` is bash the
-test would pass against the code it exists to reject. `tests/run-tests.sh` probes
-for a suitable interpreter, and says so loudly when the host has none.
+One thing is deliberately not covered: bounding the LuCI-facing read callers below
+rpcd's timeout, which is a behavioral change to a released surface rather than a
+leak fix.
+
+The regressions for all of this can only run under a shell where an untrapped
+SIGPIPE is fatal. bash reports status 141 and runs the exit trap anyway, so on a
+host whose `/bin/sh` is bash — every macOS — the tests would pass against the code
+they exist to reject, which is worse than not having them. `tests/run-tests.sh`
+and `tests/run-tests-modem.sh` each probe for a suitable interpreter by behavior
+rather than by name, skip the affected tests loudly when the host has none, and
+fail outright under `CI` or a release build.
 
 ## Package namespace and boundaries
 

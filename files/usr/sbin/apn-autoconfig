@@ -1594,7 +1594,9 @@ json_escape() {
 	{
 		if (NR > 1) printf "\\n"
 		gsub(/\\/, "\\\\")
-		gsub(/\"/, "\\\"")
+		# A plain " needs no escape inside an awk regex, and gawk warns
+		# about it loudly enough to bury real diagnostics in CI logs.
+		gsub(/"/, "\\\"")
 		gsub(/\t/, "\\t")
 		gsub(/\r/, "\\r")
 		printf "%s", $0

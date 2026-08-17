@@ -389,7 +389,9 @@ json_escape() {
 	{
 		if (NR > 1) printf "\\n"
 		gsub(/\\/, "\\\\")
-		gsub(/\"/, "\\\"")
+		# A plain " needs no escape inside an awk regex, and gawk warns
+		# about it loudly enough to bury real diagnostics in CI logs.
+		gsub(/"/, "\\\"")
 		gsub(/\t/, "\\t")
 		gsub(/\r/, "\\r")
 		printf "%s", $0
@@ -677,7 +679,11 @@ run_bounded_to_file() {
 	) >/dev/null 2>&1 &
 	BOUNDED_WATCHDOG_PID=$!
 	bounded_status=0
-	wait "$BOUNDED_CHILD_PID" || bounded_status=$?
+	# The shell announces a killed background job on its own stderr when it is
+	# reaped. On a timeout that is expected, not news, and it would otherwise
+	# reach the system log — and any caller that merged stderr into stdout would
+	# read "Terminated" as part of the result.
+	wait "$BOUNDED_CHILD_PID" 2>/dev/null || bounded_status=$?
 	BOUNDED_CHILD_PID=""
 	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :

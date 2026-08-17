@@ -959,12 +959,20 @@ reset_at_ports
 add_at_modem 4-1.3 1234 5678 WATCHDOG 35
 printf '/dev/ttyUSB35\tdead\n' >>"$TEST_AT_PORTS"
 add_at_port 4-1.3 36 1.3 control
+# stdout and stderr are kept apart. Merging them made this assertion depend on
+# whether the shell announces the killed probe as "Terminated" — which some do
+# and some do not, so the test passed on the author's machine and failed in CI
+# on a result that was in fact correct. The requirement is that the *result*
+# channel carries the port and nothing else; stderr is only reported here,
+# because suppressing a shell's job-control notice is not portable enough to
+# gate a release on.
 APN_AUTOCONFIG_MODEM_TIMEOUT="$TESTROOT/absent-timeout" \
 APN_AUTOCONFIG_MODEM_SLEEP="$(command -v /bin/sleep || command -v /usr/bin/sleep)" \
-	sh "$SCRIPT" at-port --modem "usb-serial:4-1.3:1234:5678:WATCHDOG" >"$STATE/watchdog-port" 2>&1 || \
-	fail "the watchdog path failed to resolve: $(cat "$STATE/watchdog-port")"
+	sh "$SCRIPT" at-port --modem "usb-serial:4-1.3:1234:5678:WATCHDOG" \
+	>"$STATE/watchdog-port" 2>"$STATE/watchdog-err" || \
+	fail "the watchdog path failed to resolve: $(cat "$STATE/watchdog-err")"
 [ "$(cat "$STATE/watchdog-port")" = /dev/ttyUSB36 ] || \
-	fail "watchdog path selected $(cat "$STATE/watchdog-port") instead of /dev/ttyUSB36"
+	fail "watchdog path selected '$(cat "$STATE/watchdog-port")' instead of /dev/ttyUSB36 (stderr: $(cat "$STATE/watchdog-err"))"
 grep -q '/dev/ttyUSB35' "$TEST_AT_PROBES" || fail 'the watchdog path never reached the silent port'
 ls /tmp/apn-autoconfig-modem.*.bounded-timeout >/dev/null 2>&1 && \
 	fail 'the watchdog left its timeout marker behind'

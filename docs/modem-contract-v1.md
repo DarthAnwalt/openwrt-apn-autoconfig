@@ -81,9 +81,8 @@ Capability, implementation maturity and hardware-validation evidence stay
 separate exactly as in the APN backend contract; an installed classifier is
 not hardware support. Maturity describes this implementation and is therefore
 the same for every record; evidence describes the protocol that was classified,
-so QMI and MBIM report `hardware`, AT reports `hardware` only once the 0.14.0
-gate records it and `synthetic` until then, and unclassified devices always
-report `synthetic`. As with the APN backends, that evidence comes from one modem on one
+so QMI, MBIM and AT all report `hardware` — the last of them since the 0.14.0
+gate — while unclassified devices report `synthetic`. As with the APN backends, that evidence comes from one modem on one
 board and does not transfer to other hardware by itself. These fields must be
 kept current: a stale `experimental` understates a validated implementation just
 as badly as an unearned `stable` overstates one.

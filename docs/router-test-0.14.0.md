@@ -1,10 +1,16 @@
 # 0.14.0 WH3000 AT transport and port-resolution validation
 
 Date: 2026-08-16
-Status: in progress. Everything below was run against **installed 0.14.0
-packages** built by the official SDK, unless a section says otherwise. The
-remaining gate items are the package lifecycle matrix with hardware attached
-and the browser pass.
+Status: complete for the runtime gate. Everything below was run against
+**installed 0.14.0 packages** built by the official SDK, unless a section says
+otherwise.
+
+One qualification on the browser gate, recorded rather than glossed: the first
+pass was performed by the maintainer and found two defects — every modem shown
+as "Unidentified", and a reset button naming the wrong action. Both were fixed
+and the resulting card contents were then verified from the machine API on
+hardware rather than by a second pass in the browser. The release was cut on
+that basis, at the maintainer's decision.
 
 ## Environment
 

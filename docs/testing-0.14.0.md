@@ -1,6 +1,9 @@
 # 0.14.0 AT test and release plan
 
-Status: planned. No implementation has started. The hardware first-contact
+Status: complete. Evidence is recorded in
+[`router-test-0.14.0.md`](router-test-0.14.0.md).
+
+Original status: planned. No implementation had started. The hardware first-contact
 census was performed on 2026-08-16 before implementation and is recorded below;
 three of its findings changed the contracts, which is why it was done first.
 

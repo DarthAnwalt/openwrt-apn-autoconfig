@@ -1669,14 +1669,17 @@ print_modem_json() {
 	# Maturity of this inventory implementation and the evidence behind it, kept
 	# separate exactly as in the APN backend contract. The code is the same for
 	# every record, so implementation state does not vary; the evidence does.
-	# QMI and MBIM classification have both been validated on real hardware,
-	# while AT-only and unclassified devices have fixture coverage alone. As
-	# with the APN backends, that evidence is one modem on one board and does
-	# not transfer to other hardware by itself.
+	# QMI, MBIM and — since the 0.14.0 gate — AT classification have all been
+	# validated on real hardware; unclassified devices still have fixture
+	# coverage alone. The AT evidence is a seven-port Fibocom FM350-GL on the
+	# reference board: port resolution by role, the identity contract against a
+	# live SIM, and a soft reset observed leaving the bus and returning. As with
+	# the APN backends, that is one modem on one board and does not transfer to
+	# other hardware by itself.
 	record_validation=synthetic
 	record_hardware_validated=false
 	case "$protocol" in
-		qmi|mbim) record_validation=hardware; record_hardware_validated=true ;;
+		qmi|mbim|at) record_validation=hardware; record_hardware_validated=true ;;
 	esac
 	json_key_string implementation_state stable; printf ','
 	json_key_string validation_state "$record_validation"; printf ','

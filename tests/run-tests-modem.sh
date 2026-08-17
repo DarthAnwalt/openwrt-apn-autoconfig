@@ -708,15 +708,38 @@ assert by_protocol["mbim"]["data_device"] == "wwan4", by_protocol
 assert by_protocol["at"]["at_device"] == "/dev/ttyUSB8", by_protocol
 assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
-# Maturity is about this implementation, evidence about the protocol: MBIM
-# classification has a hardware record, AT-only has fixtures alone.
+# Maturity is about this implementation, evidence about the protocol. AT joined
+# MBIM as hardware-validated when the 0.14.0 gate ran it on a seven-port
+# FM350-GL; an unclassified device still carries fixtures alone, which is what
+# keeps this assertion from being a rubber stamp.
 assert by_protocol["mbim"]["implementation_state"] == "stable", by_protocol
 assert by_protocol["mbim"]["validation_state"] == "hardware", by_protocol
 assert by_protocol["mbim"]["hardware_validated"] is True, by_protocol
 assert by_protocol["at"]["implementation_state"] == "stable", by_protocol
-assert by_protocol["at"]["validation_state"] == "synthetic", by_protocol
-assert by_protocol["at"]["hardware_validated"] is False, by_protocol
+assert by_protocol["at"]["validation_state"] == "hardware", by_protocol
+assert by_protocol["at"]["hardware_validated"] is True, by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
+
+printf '%s\n' 'TEST an unclassified device still reports synthetic evidence'
+# Without this, promoting AT to hardware would have left nothing asserting the
+# separation at all, and "validation_state" could quietly become a constant.
+reset_sysfs
+add_qmi_modem 16-1.1 1111 2222 UNCLASSIFIED 6
+rm -f "$TESTROOT/sys/class/usbmisc/cdc-wdm6/../../devices/platform/mock-usb/16-1.1/16-1.1:1.4/driver" 2>/dev/null || :
+rm -f "$TESTROOT/sys/devices/platform/mock-usb/16-1.1/16-1.1:1.4/driver"
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["protocol"] == "unknown", m
+assert m["validation_state"] == "synthetic", m
+assert m["hardware_validated"] is False, m
+' "$out" || fail 'an unclassified device claimed hardware validation'
+# Put back the pair the next test inherits, rather than leaving it to discover
+# that this one moved the ground under it.
+reset_sysfs
+add_mbim_modem 3-1.1 2cb7 0007 MBIMSERIAL 4 wwan4
+add_at_modem 3-1.2 2cb7 01a2 ATSERIAL 8
 
 printf '%s\n' 'TEST the board power-cycle follows the pinned modem, not its control protocol'
 # The GPIO cuts power to the slot, so the capability belongs to the board and

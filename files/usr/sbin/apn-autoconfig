@@ -64,13 +64,19 @@ HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
 ACTION_STATE_DIR="/tmp/apn-autoconfig-action"
 ACTION_WORKER="${APN_AUTOCONFIG_ACTION_WORKER:-/usr/libexec/apn-autoconfig-action}"
-TMP_BASE="/tmp/apn-autoconfig.$$"
+TMP_DIR="${APN_AUTOCONFIG_TMP_DIR:-/tmp}"
+TMP_BASE="$TMP_DIR/$PROG.$$"
 SIM_DATA="${TMP_BASE}.sim"
 MODEM_DATA="${TMP_BASE}.modem"
 MODEM_LIST="${TMP_BASE}.modems"
 CANDIDATES="${TMP_BASE}.candidates"
 SEEN_APNS="${TMP_BASE}.seen"
 TARGETS_DATA="${TMP_BASE}.targets"
+# Every scratch suffix this process can create, in one list, because two
+# separate things have to agree on it: the exit trap removes them by exact name,
+# and sweep_dead_scratch_files identifies a dead predecessor's files by the same
+# names. A suffix added to only one of the two would leak again.
+TMP_SUFFIXES="sim modem modems candidates candidates.apply candidates.attempts seen targets"
 
 ROLLBACK_ARMED=0
 OLD_APN_SET=0
@@ -136,13 +142,57 @@ cleanup_files() {
 		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
 		BOUNDED_CHILD_PID=""
 	fi
-	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
-		"$CANDIDATES" "${CANDIDATES}.apply" "${CANDIDATES}.attempts" \
-		"$SEEN_APNS" "$TARGETS_DATA"
+	for tmp_suffix in $TMP_SUFFIXES; do
+		rm -f "$TMP_BASE.$tmp_suffix"
+	done
 	if [ "$LOCK_HELD" -eq 1 ]; then
 		lock_release "$LOCK_DIR"
 		LOCK_HELD=0
 	fi
+}
+
+# No trap can cover SIGKILL, so a scratch file can always outlive the process
+# that created it: rpcd SIGKILLs a LuCI helper that exceeds its exec timeout
+# (30s by default), and the OOM killer asks nobody either. /tmp is RAM on the
+# target, so the next run removes what a provably dead predecessor left instead
+# of leaving it there until the next reboot.
+#
+# The glob only finds candidates. Every path this removes is one the function
+# rebuilt itself from a validated PID and a known suffix, because /tmp is shared
+# with the rest of the system and a wildcard removal there is exactly what this
+# project forbids for its lock and state roots. A file whose PID is still alive
+# is left alone: it belongs either to a concurrent apn-autoconfig or to an
+# unrelated process that was given the same number, and neither is ours to
+# delete.
+sweep_dead_scratch_files() {
+	# Deletion is the half that has to be careful, so an unusable scratch
+	# directory sweeps nothing rather than resolving names against the working
+	# directory.
+	case "$TMP_DIR" in /*) : ;; *) return 0 ;; esac
+	[ -d "$TMP_DIR" ] || return 0
+	sweep_count=0
+	for sweep_suffix in $TMP_SUFFIXES; do
+		for sweep_path in "$TMP_DIR/$PROG."[0-9]*".$sweep_suffix"; do
+			[ -e "$sweep_path" ] || continue
+			sweep_pid="${sweep_path##*/}"
+			sweep_pid="${sweep_pid#"$PROG."}"
+			sweep_pid="${sweep_pid%".$sweep_suffix"}"
+			case "$sweep_pid" in ''|*[!0-9]*) continue ;; esac
+			# Our own PID can appear here after the number was reused, and those
+			# files are stale by definition: nothing has been written yet.
+			if [ "$sweep_pid" != "$$" ] && kill -0 "$sweep_pid" 2>/dev/null; then
+				continue
+			fi
+			# /tmp is world-writable, so a symlink or a directory can be planted
+			# under one of these names. Neither is a scratch file of ours.
+			[ -L "$sweep_path" ] && continue
+			[ -f "$sweep_path" ] || continue
+			rm -f "$TMP_DIR/$PROG.$sweep_pid.$sweep_suffix" || continue
+			sweep_count=$((sweep_count + 1))
+		done
+	done
+	[ "$sweep_count" -eq 0 ] || \
+		log notice "removed $sweep_count scratch file(s) left by an interrupted earlier run"
 }
 
 # ---- lock primitives ----
@@ -432,6 +482,10 @@ set_profile() {
 on_exit() {
 	on_exit_status=$?
 	trap - 0 HUP INT TERM
+	# PIPE is ignored rather than restored for the duration of the cleanup: the
+	# reader that went away may have been reading stderr too, and a rollback
+	# that logs its progress must not be killed halfway by a second SIGPIPE.
+	trap '' PIPE
 	if [ -n "$SETTLE_SLEEP_PID" ]; then
 		kill -TERM "$SETTLE_SLEEP_PID" 2>/dev/null || :
 		wait "$SETTLE_SLEEP_PID" 2>/dev/null || :
@@ -456,8 +510,24 @@ on_signal() {
 	exit 143
 }
 
+# Death by an untrapped signal never runs the exit trap, and SIGPIPE was the one
+# left out: every command gathers all of its data into scratch files before it
+# writes the first byte of its answer, so a reader that has already gone away
+# kills the engine at exactly the moment when there is the most to clean up.
+# `status-json | head -1`, a captured pipeline whose reader exits early or an SSH
+# session that dies mid-command each left the whole scratch set behind, and a
+# mutation interrupted this way skipped its rollback, its modem power-on and its
+# lock release as well.
+#
+# 141 is the status the process already reported when the default action killed
+# it, so no caller sees a new one; what changes is that the exit trap now runs.
+on_pipe() {
+	exit 141
+}
+
 trap on_exit 0
 trap on_signal HUP INT TERM
+trap on_pipe PIPE
 
 command_exists() {
 	command -v "$1" >/dev/null 2>&1
@@ -2840,6 +2910,10 @@ EOF
 }
 
 main() {
+	# Before anything of ours exists under these names, and on every entry point,
+	# because the interrupted run that left them may have been started from any
+	# of them and LuCI is the one that never reaches a service restart.
+	sweep_dead_scratch_files
 	COMMAND_NAME="${1:-}"
 	case "$COMMAND_NAME" in -h|--help|help|'') usage; return 0 ;; esac
 	shift

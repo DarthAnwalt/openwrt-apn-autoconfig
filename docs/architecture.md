@@ -72,6 +72,70 @@ These rules bind every component and release:
 12. **Hardware claims require hardware evidence.** Fixtures and SDK builds are
     required but cannot promote a capability to hardware-validated by
     themselves.
+13. **Cleanup may not depend on the process that made the mess.** An exit trap
+    covers the exits a shell controls, and SIGKILL is not one of them. Every
+    temporary path carries its owning PID and must be removable by a successor
+    that can prove the owner is gone.
+
+## Scratch files, signals and the start-up sweep
+
+Every scratch path the APN engine creates is `/tmp/apn-autoconfig.<pid>.<suffix>`
+and every suffix it may use is listed once, in `TMP_SUFFIXES`, because two
+different mechanisms have to agree on that list: the exit trap removes them by
+exact name, and the start-up sweep recognizes a dead predecessor's files by the
+same names. A suffix added to only one of the two leaks.
+
+Three things can leave such a file behind, and they need different answers.
+
+**A subshell assignment the parent never sees.** This was 0.13.2, in
+`apn-autoconfig-modem`: the paths were assigned inside a function reached through
+a command substitution, so the parent's trap removed an empty variable. Fixed by
+assigning the paths once at start-up.
+
+**An untrapped signal.** `trap … HUP INT TERM` left out PIPE, and death by an
+untrapped signal never runs the exit trap. Every read-only command gathers all of
+its data into scratch files before it writes the first byte of its answer, so a
+reader that has already stopped kills the engine at the point where there is the
+most to clean up. Reproduced on the reference router on 2026-08-17: `targets-json`
+into a closed reader left exactly a `.targets` file, `status-json` left the
+`.sim`/`.modem`/`.modems` set and `detect-json` added `.candidates` — the same
+file sets that had accumulated there, which is also how each leftover set names
+the command that produced it. The engine now traps PIPE and exits 141, the status
+a caller already saw, so only the leak goes away. The same trap closes a worse
+case than a scratch file: a mutation interrupted this way skipped its rollback,
+its modem power-on and its lock release.
+
+**SIGKILL, which no trap can cover.** rpcd's `file exec` — the transport under
+every LuCI `fs.exec` call — kills the process it started when it exceeds rpcd's
+configured timeout, 30 seconds by default in `/etc/config/rpcd`. Verified on the
+router on 2026-08-17 with a probe script: after 30 seconds the exit trap had not
+run, the scratch file survived and the probe's own child was still running,
+orphaned. The engine's read path is also capable of reaching that budget on its
+own — `resolve_sim_index` spends up to `APN_AUTOCONFIG_MMCLI_TIMEOUT_SECONDS`
+(8s) on `mmcli -L` plus 8s per listed modem, then the SIM read and the status
+refresh take 8s each,
+so a wedged ModemManager costs 32 seconds with one modem present and 40 with two.
+Bounding those callers below rpcd's budget is a separate change with its own
+behavioral consequences; it is not what keeps `/tmp` bounded.
+
+What keeps `/tmp` bounded is that the next run removes what a provably dead
+predecessor left. `sweep_dead_scratch_files` globs only to find candidates: every
+path it removes is one it rebuilt itself from a PID that is all digits and a
+suffix from the list, it skips anything that is not a regular file, and it leaves
+a live PID's files alone — they belong either to a concurrent engine or to an
+unrelated process that was given that number. `/tmp` is shared, and a wildcard
+removal there is what this project already forbids for its lock and state roots.
+The sweep runs on every entry point rather than at service start, because LuCI is
+the caller that never reaches one.
+
+Two things are deliberately not covered. `apn-autoconfig-modem` has the identical
+SIGPIPE exposure — confirmed on the router the same day, leaving `.inventory`,
+`.inventory.display` and `.mm-indexes` — and is left for a patch that does not
+collide with the AT framework's rewrite of that file. And the regression for this
+can only run under a shell where an untrapped SIGPIPE is fatal: bash reports
+status 141 and runs the exit trap anyway, so on a host whose `/bin/sh` is bash the
+test would pass against the code it exists to reject. `tests/run-tests.sh` probes
+for a suitable interpreter, and says so loudly when the host has none.
 
 ## Package namespace and boundaries
 

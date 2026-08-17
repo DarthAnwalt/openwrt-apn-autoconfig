@@ -16,8 +16,10 @@ and the browser pass.
   not be swapped out, and running both turned out to be the more useful shape;
 - the router's primary uplink is WiFi and the modem is the backup path, so an
   administrative session surviving is never by itself evidence;
-- the script under test was run from a scratch directory, not installed; no
-  package was upgraded and no configuration was written;
+- the first-contact census and the first resolver trial ran from a scratch
+  directory; everything after them ran against installed packages upgraded from
+  0.13.2. The reset pin was cleared briefly to exercise one method and restored
+  immediately, and is the only configuration this gate wrote;
 - modem and SIM identifiers intentionally omitted from this record.
 
 ## First contact
@@ -187,6 +189,18 @@ returns 32 seconds later.** The runtime had been refusing three consecutive
 resets that in fact worked. Departing is slower than returning on this device,
 which is the opposite of what the sequence suggests — hence the measurement
 rather than an estimate. The default is now 90 seconds.
+
+## Package lifecycle with both modems attached
+
+| Step | Result |
+|---|---|
+| Upgrade 0.13.2 → 0.14.0 | clean. The config conffile is kept and the new options land in `.apk-new`, so the compiled defaults apply — which is the real upgrade path and the one every test above ran on |
+| Removal | state directory gone including the new AT port cache, quirk table and config removed, **no lock erased** (none were live), the core package still answers, and `wwan` stayed up throughout |
+| Reinstall | both modems rediscovered and unambiguous; the USB modem correctly returns to `weak-vidpid`, since its cached IMEI went with the cache |
+
+The AT port cache needed a postrm fix found while preparing the release: it was
+not in the removal list, so the package's run directory could never be emptied
+and cached resolutions outlived the package.
 
 ## Unrelated observation, not part of this release
 

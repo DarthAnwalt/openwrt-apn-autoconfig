@@ -1338,6 +1338,52 @@ grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'interrupted reset did not res
 [ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 	fail 'interrupted reset left the per-modem lock behind'
 
+printf '%s\n' 'TEST the quirk table answers only what it was told, and the shipped one is empty'
+# Exercised by sourcing rather than through a command, because 0.14.0 has no
+# vendor-specific capability to hang on it. Adding a public verb with no caller
+# is the same mistake the engine-facing AT adapter was deferred to avoid.
+quirk_fixture="$STATE/quirks"
+cat >"$quirk_fixture" <<'QUIRKS'
+# comment lines are ignored
+Fibocom Wireless Inc.	FM350-GL	*	example_capability	general
+Fibocom Wireless Inc.	FM350-GL	81600.0000.00.29.21.27	example_capability	firmware-specific
+Quectel	EC25-E	*	example_capability	quectel
+Fibocom Wireless Inc.	FM350-GL	*	truncated_capability
+QUIRKS
+# `.` inherits the caller's positional parameters and the script ends in
+# `main "$@"`, so the probe has to clear them before sourcing or it would
+# dispatch a command instead of just defining functions. Arguments are held in
+# named variables rather than re-split, because one of them contains spaces.
+cat >"$STATE/quirk-probe" <<'PROBE'
+#!/bin/sh
+probe_table="$1"; probe_mfr="$2"; probe_model="$3"; probe_fw="$4"; probe_key="$5"
+set --
+. "$QUIRK_SCRIPT" >/dev/null 2>&1 || :
+QUIRK_TABLE="$probe_table"
+quirk_value "$probe_mfr" "$probe_model" "$probe_fw" "$probe_key" 2>/dev/null ||
+	printf '%s\n' '<none>'
+PROBE
+quirk_probe() {
+	QUIRK_SCRIPT="$SCRIPT" sh "$STATE/quirk-probe" "$@"
+}
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL 'some-other-firmware' example_capability)" = general ] || \
+	fail 'a wildcard firmware entry did not match'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '81600.0000.00.29.21.27' example_capability)" = firmware-specific ] || \
+	fail 'a firmware-specific entry did not win over the wildcard'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '*' unknown_capability)" = '<none>' ] || \
+	fail 'an unknown key returned something'
+[ "$(quirk_probe "$quirk_fixture" 'Some Vendor' 'Some Model' '*' example_capability)" = '<none>' ] || \
+	fail 'an untested modem inherited another modem quirk'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '*' truncated_capability)" = '<none>' ] || \
+	fail 'a row with no value produced one'
+# The NF and comment guards in the lookup are deliberate but redundant: a short
+# row already fails the field comparison and an empty value already fails the
+# emptiness check. They are kept as intent, not asserted as behaviour, because a
+# test that cannot fail is worse than no test.
+[ "$(quirk_probe "$BASE/apn-autoconfig-modem/files/usr/share/apn-autoconfig-modem/quirks" \
+	'Fibocom Wireless Inc.' FM350-GL '*' example_capability)" = '<none>' ] || \
+	fail 'the shipped quirk table is not empty'
+
 printf '%s\n' 'TEST the reset method is chosen by control owner, and gpio wins where it is available'
 reset_sysfs
 reset_at_ports

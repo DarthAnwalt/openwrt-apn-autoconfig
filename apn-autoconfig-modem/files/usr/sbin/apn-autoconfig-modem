@@ -35,6 +35,7 @@ CONNECT_WAIT_SECONDS="60"
 # that netifd default for anyone who wants it.
 PROVISION_METRIC="1024"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
+QUIRK_TABLE="/usr/share/apn-autoconfig-modem/quirks"
 RESET_MODEM_ID=""
 
 UQMI="${APN_AUTOCONFIG_MODEM_UQMI:-uqmi}"
@@ -199,6 +200,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.at_timeout_seconds")" && [ -n "$value" ] && AT_TIMEOUT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.at_port_lock_root")" && [ -n "$value" ] && AT_PORT_LOCK_ROOT="$value"
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
+	value="$(uci -q get "${CONFIG}.main.quirk_table")" && [ -n "$value" ] && QUIRK_TABLE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
 	value="$(uci -q get "${CONFIG}.main.provision_metric")" && PROVISION_METRIC="$value"
 }
@@ -218,6 +220,7 @@ validate_config() {
 	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
 	case "$QMI_IDENTITY_LOCK_ROOT" in /|*/../*|*/..) die "unsafe QMI identity lock root" ;; /*) : ;; *) die "QMI identity lock root must be absolute" ;; esac
 	case "$HARDWARE_INTEGRATION_FILE" in /|*/../*|*/..) die "unsafe hardware_integration_file" ;; /*) : ;; *) die "hardware_integration_file must be absolute" ;; esac
+	case "$QUIRK_TABLE" in /|*/../*|*/..) die "unsafe quirk_table" ;; /*) : ;; *) die "quirk_table must be absolute" ;; esac
 	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
 	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
 	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
@@ -1100,6 +1103,42 @@ at_read_identity() {
 	# a provider against, and a partial record would look like a working one.
 	[ -n "$AT_ICCID" ] || return 1
 	return 0
+}
+
+quirk_value() {
+	# Capabilities that are not portable across modems, keyed by what the modem
+	# reports about itself. An absent entry is "not tested here", never
+	# "probably like the others" — so this returns nothing and the caller offers
+	# nothing, rather than guessing a control that fails at the worst moment.
+	#
+	# Identity deliberately does not come from here: the 3GPP core reads are
+	# uniform, and the one divergent read is handled by an ordered attempt list
+	# that works without knowing the vendor at all.
+	[ -r "$QUIRK_TABLE" ] || return 1
+	quirk_manufacturer="$1"
+	quirk_model="$2"
+	quirk_firmware="$3"
+	quirk_key="$4"
+	[ -n "$quirk_manufacturer" ] && [ -n "$quirk_model" ] && [ -n "$quirk_key" ] || return 1
+	quirk_result="$(awk -F '\t' \
+		-v mfr="$quirk_manufacturer" -v model="$quirk_model" \
+		-v fw="$quirk_firmware" -v key="$quirk_key" '
+		/^[ \t]*#/ { next }
+		NF < 5 { next }
+		$1 != mfr || $2 != model || $4 != key { next }
+		# A firmware-specific entry wins over a wildcard one, so a general rule
+		# can be narrowed later without rewriting it.
+		$3 == fw { exact = $5; next }
+		$3 == "*" { general = $5 }
+		END {
+			if (exact != "") { print exact; exit 0 }
+			if (general != "") { print general; exit 0 }
+			exit 1
+		}
+	' "$QUIRK_TABLE" 2>/dev/null)" || return 1
+	[ -n "$quirk_result" ] || return 1
+	safe_single_line "$quirk_result" || return 1
+	printf '%s\n' "$quirk_result"
 }
 
 # ---- reset methods ----

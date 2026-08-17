@@ -77,7 +77,7 @@ to `up` and no lock or scratch file was left behind.
 | Second resolve | same port, **1 s** |
 | Negative cache | the silent port recorded `dead`, the working one `ok`, keyed by USB interface path |
 | Inventory after resolution | `at_device` populated from cache, `at_identity: true` |
-| Internal modem, ModemManager stopped | `owner_state: netifd-direct`, `at_identity: false`, `reset: true` |
+| Internal modem, ModemManager stopped | `owner_state: netifd-direct` as observed that day, `at_identity: false`, `reset: true`. That state has since been corrected to `none` — see the last section |
 | Scratch files in `/tmp` afterwards | none |
 
 The six seconds are the arithmetic the census predicted: ascending order reaches

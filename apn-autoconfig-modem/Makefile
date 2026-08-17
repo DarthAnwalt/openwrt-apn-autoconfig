@@ -52,6 +52,8 @@ define Package/apn-autoconfig-modem/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-action $(1)/usr/libexec/apn-autoconfig-modem-action
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-query $(1)/usr/libexec/apn-autoconfig-modem-query
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-control $(1)/usr/libexec/apn-autoconfig-modem-control
+	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig-modem
+	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig-modem/quirks $(1)/usr/share/apn-autoconfig-modem/quirks
 endef
 
 # A live installation must discover hardware that was already present before

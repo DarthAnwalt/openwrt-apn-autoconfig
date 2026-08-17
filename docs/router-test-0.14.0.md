@@ -1,10 +1,10 @@
 # 0.14.0 WH3000 AT transport and port-resolution validation
 
 Date: 2026-08-16
-Status: in progress. The hardware first-contact census and the first trial of
-the port resolver are complete and recorded here. Identity reads, the quirk
-table, the reset methods and the LuCI rows are not implemented yet, so the
-release gate has not started.
+Status: in progress. Everything below was run against **installed 0.14.0
+packages** built by the official SDK, unless a section says otherwise. The
+remaining gate items are the package lifecycle matrix with hardware attached
+and the browser pass.
 
 ## Environment
 
@@ -134,3 +134,65 @@ The permission to open an AT port is the same under `none` as it was under
 `netifd-direct`, so this observation is a naming correction and not a change to
 what the release may do; the fixture regression reproduces the router's exact
 record and fails against the old classification.
+
+## Reset methods, all three exercised
+
+Installed packages, both modems attached. The two in-band methods were timed
+after the departure rule was added; see the defects below for why that rule
+exists.
+
+| Method | Modem | Result |
+|---|---|---|
+| `gpio` | internal, pinned | 51 s. Stopped and restarted **its own** interface, left the second modem untouched, and correctly skipped the departure wait — board power has already removed the device. Released behaviour unchanged. |
+| `at` | USB-attached, unowned | 70 s. Departure observed, then return with the same `imei:` identity and a re-resolved control port. |
+| `modemmanager` | internal, reset pin temporarily cleared so the method would be selected | 52 s. Departure and return both observed. The pin was restored afterwards and the interface came back up. |
+
+The `modemmanager` method also has its refusal path from hardware: asked to
+reset the USB modem, which ModemManager holds as "model unknown", it answered
+`Unsupported: Operation not supported`. The runtime reported a retryable failure
+and did **not** reach around the owner to reset it another way, which is the
+behaviour the single-owner rule requires.
+
+## Defects this gate found, none of which fixtures could have
+
+### A neighbouring modem satisfied another modem's reset wait
+
+The first soft reset reported success in three seconds and named the *other*
+modem in its completion message. `wait_for_control_owner` passed its target to
+awk as `$modem_id` — the same name `scan_inventory` reassigns per record — so
+the comparison ran against whichever record was scanned last, and any idle modem
+matched at once.
+
+Latent since 0.10.0 and therefore present in released versions: with one modem
+the clobbered value equals the target. Auditing the whole function against the
+scan's variable names then turned up two more, the worst being the bound
+interface used for `ifup` — on a two-modem router a reset could have restarted
+somebody else's interface.
+
+### An in-band reset was counted as done before the modem moved
+
+With the naming fixed, the reset still reported success in three seconds.
+`AT+CFUN=1,1` returns while the modem is still fully enumerated, so waiting for
+"present with the expected owner" was satisfied by a modem that had not started
+resetting. Board power does not have this problem, having removed the device
+synchronously.
+
+The departure is now observed first, and never seeing one is a failure.
+
+### The departure bound was three times too small
+
+The first bound was 20 seconds, chosen because it sounded generous. Timing the
+cycle by hand: **the device leaves the bus 36 seconds after the command and
+returns 32 seconds later.** The runtime had been refusing three consecutive
+resets that in fact worked. Departing is slower than returning on this device,
+which is the opposite of what the sequence suggests — hence the measurement
+rather than an estimate. The default is now 90 seconds.
+
+## Unrelated observation, not part of this release
+
+`/tmp` holds scratch files from the **core** package across four PIDs and
+several hours — the same class of leak 0.13.2 fixed in the modem package, which
+itself now leaves nothing. The core's paths are assigned at start-up and its
+exit trap removes them, so the likely cause is processes being killed rather
+than exiting. Tracked separately; it predates this release and is not a
+regression from it.

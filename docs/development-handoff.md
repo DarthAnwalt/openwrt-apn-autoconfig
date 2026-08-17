@@ -220,8 +220,17 @@ hygiene:
    ```sh
    apk add apn-autoconfig apn-autoconfig-modem apn-autoconfig-providers \
        luci-app-apn-autoconfig apn-autoconfig-integration-huasifei-wh3000
-   tr ' ' '\n' < /etc/apk/world | grep apn-autoconfig   # no '=' may remain
+   tr ' ' '\n' < /etc/apk/world | grep apn-autoconfig | grep -v '^[a-z0-9-]*$'
    ```
+
+   That second line must print nothing: every entry has to be a bare name.
+   Checking for `=` specifically is not enough, and this is a correction rather
+   than a refinement. Observed on the reference router on 2026-08-17 and again
+   on 2026-08-18, the recorded constraints take the form
+   `apn-autoconfig><Q1ufVq…=` — a checksum constraint written by the installed
+   apk-tools, with no `=` in the operator at all. The old check reported clean
+   against a router that was still fully pinned, which is precisely the false
+   pass this step exists to prevent.
 
 2. Confirm what actually landed instead of trusting the exit status:
 

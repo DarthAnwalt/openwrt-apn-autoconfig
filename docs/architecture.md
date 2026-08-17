@@ -114,13 +114,19 @@ both exit 141 and leave `.inventory`, `.inventory.display` and `.mm-indexes`. It
 carries the same two-part fix. One detail of that leftover set is worth recording,
 because it is evidence about a branch rather than about the released code:
 `.mm-indexes` is created only by the AT-framework build, so the router was running
-a 0.14.0 pre-release, and the five scratch paths that branch adds (`.mm-indexes`,
-`.mm-identity`, `.at-output`, `.at-candidates`, `.bounded-timeout`) have to join
-`TMP_SUFFIXES` when it lands. `tests/run-tests-modem.sh` asserts that mapping
-structurally — it reads the scratch paths back out of the script and requires the
-list to name every one — because that is the one failure a behavioral test cannot
-reach: a suffix missing from the list is still removed by the caller's own exit
-trap and only leaks in the SIGKILL case.
+a 0.14.0 pre-release. 0.14.0 has since shipped, and the five scratch paths it adds
+(`.mm-indexes`, `.mm-identity`, `.at-output`, `.at-candidates`, `.bounded-timeout`)
+are in `TMP_SUFFIXES`: twelve suffixes over eight base paths, the four extra being
+the ones derived from `INVENTORY_FILE`. `tests/run-tests-modem.sh` asserts that
+mapping structurally — it reads the scratch paths back out of the script and
+requires the list to name every one — because that is the one failure a behavioral
+test cannot reach: a suffix missing from the list is still removed by the caller's
+own exit trap and only leaks in the SIGKILL case.
+
+That assertion has already paid for itself once. This fix was written against a
+pre-0.14.0 branch, where the list named seven suffixes and was correct; rebasing it
+onto the released 0.14.0 silently made it wrong, and the structural test is what
+failed rather than a reviewer noticing five missing names.
 
 A rollback logs its way out, so the exit trap ignores PIPE for its own duration in
 both scripts. Otherwise the reader that went away — it may have been reading

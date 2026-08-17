@@ -24,10 +24,16 @@ MODEM_POWER_OFF_VALUE="1"
 MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
-# How long an in-band reset has to actually take the modem off the bus before
-# we call it ineffective. Separate from the return wait: departing is fast,
-# coming back is not.
-MODEM_DEPART_SECONDS="20"
+# How long an in-band reset has to actually take the modem off the bus before we
+# call it ineffective. This is not a guess: on the measured FM350-GL,
+# AT+CFUN=1,1 drops the USB device 36 seconds after the command and brings it
+# back 32 seconds later. The first value chosen here was 20, which failed a
+# perfectly good reset three times before the cycle was actually timed.
+#
+# One modem, one firmware, so the default carries roughly 2.5x margin and is
+# configurable. Departing is *slower* than returning on this device, which is
+# the opposite of what the sequence suggests.
+MODEM_DEPART_SECONDS="90"
 MODEM_POLL_SECONDS="2"
 CONNECT_WAIT_SECONDS="60"
 # Route metric written onto a section this package creates. The default lives

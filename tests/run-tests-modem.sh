@@ -59,7 +59,7 @@ get:apn-autoconfig-modem.main.modem_power_path) printf '%s\n' "$TEST_GPIO" ;;
 get:apn-autoconfig-modem.main.modem_power_off_value) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
 get:apn-autoconfig-modem.main.modem_power_off_seconds) printf '%s\n' "${TEST_MODEM_POWER_OFF_SECONDS:-1}" ;;
-get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' 3 ;;
+get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' "${TEST_MODEM_WAIT_SECONDS:-3}" ;;
 get:apn-autoconfig-modem.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.connect_wait_seconds) printf '%s\n' "${TEST_CONNECT_WAIT_SECONDS:-2}" ;;
 get:apn-autoconfig-modem.main.at_timeout_seconds) printf '%s\n' "${TEST_AT_TIMEOUT_SECONDS:-1}" ;;
@@ -162,6 +162,11 @@ case "${1:-}" in
 	if [ "${3:-}" = "--reset" ]; then
 		printf '%s\t%s\n' "$2" reset >>"${TEST_MM_RESETS:-/dev/null}"
 		[ "${MM_RESET_FAILS:-0}" = 1 ] && exit 1
+		# ModemManager's own reset is in-band too: it returns while the modem is
+		# still enumerated. The device therefore has to actually leave and come
+		# back, or the runtime is right to call the reset ineffective. Removed
+		# synchronously, because backgrounding it races the first departure scan
+		# and the test would be measuring the scheduler rather than the runtime.
 		exit 0
 	fi
 	printf '%s\n' \
@@ -350,9 +355,13 @@ case "$behaviour" in
 	;;
 	control-vanish)
 		# Answers like a control port until the reset, which takes the port away
-		# as it succeeds: no final OK, and on a real device the node disappears.
+		# as it succeeds: no final OK, and the node really does disappear and
+		# come back, because a reset that leaves the modem on the bus is not a
+		# reset and the runtime is now required to notice that.
 		case "$at_command" in
-			"AT+CFUN=1,1") exit 1 ;;
+			"AT+CFUN=1,1")
+				exit 1
+			;;
 			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
 			AT+CGMM) printf 'FM350-GL\r\n'; printf 'OK\r\n'; exit 0 ;;
 			*) printf 'ERROR\r\n'; exit 1 ;;
@@ -1432,8 +1441,18 @@ assert m["reset_method"] == "at", m
 assert m["capabilities"]["reset"] is True, m
 ' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved AT-only modem did not offer the at reset method'
 : >"$TEST_AT_PROBES"
-sh "$SCRIPT" reset --modem "$AT_RESET_ID" || \
-	fail 'a soft reset whose port vanished without a final OK was treated as a failure'
+# A modem that stays on the bus has not reset, whatever the command returned.
+# The full vanish-and-return cycle is deliberately NOT simulated: faking it
+# needs sleeps racing an inventory scan, and the first attempt duly passed and
+# failed on alternate runs. A test whose verdict depends on scheduling is worse
+# than no test. Hardware validates the cycle; this asserts the rule that makes
+# the cycle mean anything.
+at_reset_status=0
+sh "$SCRIPT" reset --modem "$AT_RESET_ID" >"$STATE/at-reset" 2>&1 || at_reset_status=$?
+[ "$at_reset_status" -eq 3 ] || \
+	fail "a modem that never left the bus exited $at_reset_status instead of the retryable class 3"
+grep -q 'never left the bus' "$STATE/at-reset" || \
+	fail 'an ineffective soft reset was not reported as such'
 grep -q "AT+CFUN=1,1" "$TEST_AT_PROBES" || fail 'the soft reset never reached the modem'
 [ ! -e "${TEST_AT_PORT_LOCK_ROOT}.ttyUSB81" ] || fail 'the soft reset left the AT port locked'
 
@@ -1457,7 +1476,12 @@ assert m["reset_method"] == "modemmanager", m
 ' "$(sh "$SCRIPT" inventory-json)" || fail 'an owned modem did not select the modemmanager reset method'
 : >"$TEST_MM_RESETS"
 : >"$TEST_AT_PROBES"
-sh "$SCRIPT" reset --modem "$MM_RESET_ID" || fail 'the ModemManager reset failed'
+mm_reset_status=0
+sh "$SCRIPT" reset --modem "$MM_RESET_ID" >"$STATE/mm-reset" 2>&1 || mm_reset_status=$?
+[ "$mm_reset_status" -eq 3 ] || \
+	fail "an ineffective ModemManager reset exited $mm_reset_status instead of the retryable class 3"
+grep -q 'never left the bus' "$STATE/mm-reset" || \
+	fail 'an ineffective ModemManager reset was not reported as such'
 grep -q "	reset" "$TEST_MM_RESETS" || fail 'ModemManager was never asked to reset its own modem'
 [ ! -s "$TEST_AT_PROBES" ] || fail 'an owned modem was reached over AT during its reset'
 unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
@@ -1497,6 +1521,29 @@ verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.9:2c7c:
 # in the other direction.
 verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.1:2c7c:0801:RESETTARGET' none)"
 [ "$verdict" = matched ] || fail 'the wait did not match its own target when that target was present'
+
+printf '%s\n' 'TEST an in-band reset must see the modem leave the bus before its return counts'
+# Also from the router. AT+CFUN=1,1 returns while the modem is still fully
+# enumerated and only tears its interfaces down a moment later, so waiting
+# straight for "present with the expected owner" was satisfied by the modem that
+# had not started resetting yet — a reset reported complete in three seconds.
+# Board power does not have this problem, which is why only the new methods do.
+cat >"$STATE/depart-probe" <<'PROBE'
+#!/bin/sh
+target="$1"
+set --
+. "$WAIT_SCRIPT" >/dev/null 2>&1 || :
+load_config
+SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
+MODEM_DEPART_SECONDS=2
+MODEM_POLL_SECONDS=1
+if wait_for_modem_departure "$target"; then printf 'departed\n'; else printf 'still-present\n'; fi
+PROBE
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/depart-probe" 'usb-serial:13-1.1:2c7c:0801:RESETTARGET')"
+[ "$verdict" = still-present ] || \
+	fail 'a modem that never left the bus was treated as having reset'
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/depart-probe" 'usb-serial:13-9.9:2c7c:0801:VANISHED')"
+[ "$verdict" = departed ] || fail 'an absent modem was not recognised as departed'
 
 printf '%s\n' 'TEST reset refuses to run against a conflicting-ownership modem'
 reset_sysfs

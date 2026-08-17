@@ -24,6 +24,10 @@ MODEM_POWER_OFF_VALUE="1"
 MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
+# How long an in-band reset has to actually take the modem off the bus before
+# we call it ineffective. Separate from the return wait: departing is fast,
+# coming back is not.
+MODEM_DEPART_SECONDS="20"
 MODEM_POLL_SECONDS="2"
 CONNECT_WAIT_SECONDS="60"
 # Route metric written onto a section this package creates. The default lives
@@ -195,6 +199,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_depart_seconds")" && [ -n "$value" ] && MODEM_DEPART_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.at_timeout_seconds")" && [ -n "$value" ] && AT_TIMEOUT_SECONDS="$value"
@@ -2412,6 +2417,40 @@ write_modem_power() {
 	printf '%s\n' "$1" >"$MODEM_POWER_PATH" 2>/dev/null
 }
 
+wait_for_modem_departure() {
+	# Only an out-of-band reset makes the modem vanish before the caller can
+	# look. Board power is cut synchronously, so by the time the return-wait
+	# starts the device is already gone from sysfs. An in-band reset — AT+CFUN
+	# or a request to ModemManager — returns while the modem is still fully
+	# enumerated and only tears its interfaces down a moment later, so waiting
+	# for "present with the expected owner" is satisfied instantly by the modem
+	# that has not started resetting yet. Observing the departure first is what
+	# makes the return mean anything.
+	#
+	# Never observing it is a failure, not a success: it means the command was
+	# accepted and had no effect, and reporting that as a completed reset is
+	# exactly the false success this exists to prevent.
+	depart_target_id="$1"
+	depart_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		scan_inventory
+		if awk -F '\t' -v id="$depart_target_id" \
+			'$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' \
+			"$INVENTORY_FILE" 2>/dev/null; then
+			:
+		else
+			rm -f "$INVENTORY_FILE"
+			return 0
+		fi
+		rm -f "$INVENTORY_FILE"
+		depart_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		depart_elapsed=$((depart_now - depart_started))
+		[ "$depart_elapsed" -ge 0 ] || depart_elapsed="$MODEM_DEPART_SECONDS"
+		[ "$depart_elapsed" -lt "$MODEM_DEPART_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
 wait_for_control_owner() {
 	# The target is held in a name scan_inventory does not touch. It used to be
 	# `modem_id`, which that scan reassigns once per discovered record: by the
@@ -2531,6 +2570,18 @@ reset_cmd() {
 				die_code 3 "the AT control port for modem $reset_target_id was busy"
 		;;
 		*) die_code 4 "unsupported reset method $reset_method" ;;
+	esac
+
+	# An in-band reset leaves the modem enumerated for a moment after the
+	# command returns, so its departure has to be observed before its return
+	# can mean anything. Board power has already removed it by this point.
+	case "$reset_method" in
+		at|modemmanager)
+			log notice "reset issued via $reset_method; waiting up to ${MODEM_DEPART_SECONDS}s for modem $reset_target_id to leave the bus"
+			if ! wait_for_modem_departure "$reset_target_id"; then
+				die_code 3 "modem $reset_target_id never left the bus after the $reset_method reset; treating it as ineffective"
+			fi
+		;;
 	esac
 
 	log notice "reset issued via $reset_method; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"

@@ -231,6 +231,45 @@ never disabled. Hardware promotion requires information, list, download,
 enable, disable, delete, notification, timeout/interruption and post-switch APN
 recovery evidence.
 
+## Deferred decisions
+
+Some correctness questions are answered conservatively for now and revisited at
+a named release. They are recorded here rather than in a maintainer's notes
+because each one has an **observable consequence** a user or tester can hit, and
+an undocumented conservative choice is indistinguishable from a defect.
+
+### Global operation lock granularity
+
+Recorded 2026-08-16, deferred to 0.17.0.
+
+The APN operation lock is system-wide, not per target. Two modems present at
+once therefore serialize against each other: an operation on one makes the other
+report busy, and LuCI greys out the controls of both. This is safe and it is not
+a defect — it is a deliberate choice not to change lock granularity in the same
+release that introduces a third lock namespace (the AT port), because
+`CLAUDE.md` requires one global lock order to be settled before a composite
+operation is implemented, not renegotiated alongside it.
+
+Revisit once multi-modem hardware evidence exists. Per-target granularity would
+have to preserve the existing global-to-specific acquisition order and prove
+that no CLI, LuCI, boot, hotplug, provisioning, eSIM or button path can acquire
+the pair in the opposite direction.
+
+### Automatic escalation between reset methods
+
+Recorded 2026-08-16, deferred to 0.17.0.
+
+`modem-reset` selects one implementation from the modem's current control owner
+and reports its outcome. A soft reset that leaves the modem wedged does not
+automatically escalate to a board power cycle, so recovering from that state is
+an explicit second request.
+
+Escalation is attractive but turns a single bounded operation into a two-stage
+state machine with its own interruption window, partial-failure classes and
+rollback obligations. It needs its own design and hardware evidence rather than
+being folded into the release that first gives the operation more than one
+implementation.
+
 ## Required lifecycle matrix
 
 Every stable release that changes inventory, ownership or provisioning must

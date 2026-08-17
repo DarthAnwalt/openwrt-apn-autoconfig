@@ -199,12 +199,13 @@ inspect_package "$4" apn-autoconfig-integration-huasifei-wh3000 4 \
 	exit 1
 }
 
-inspect_package "$5" apn-autoconfig-modem 12 \
+inspect_package "$5" apn-autoconfig-modem 13 \
 	usr/sbin/apn-autoconfig-modem \
 	usr/libexec/apn-autoconfig-modem-boot \
 	usr/libexec/apn-autoconfig-modem-action \
 	usr/libexec/apn-autoconfig-modem-query \
 	usr/libexec/apn-autoconfig-modem-control \
+	usr/share/apn-autoconfig-modem/quirks \
 	etc/config/apn-autoconfig-modem \
 	etc/init.d/apn-autoconfig-modem \
 	etc/hotplug.d/usb/50-apn-autoconfig-modem \

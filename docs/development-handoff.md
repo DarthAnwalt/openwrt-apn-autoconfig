@@ -5,7 +5,7 @@ with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-co
 [`modem-contract-v1.md`](modem-contract-v1.md),
 [`provisioning-contract-v1.md`](provisioning-contract-v1.md),
 [`mbim-contract-v1.md`](mbim-contract-v1.md), the latest version-specific test
-plan — currently [`testing-0.12.0.md`](testing-0.12.0.md) — and
+plan — currently [`testing-0.14.0.md`](testing-0.14.0.md) — and
 [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
@@ -17,34 +17,46 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.12.0 is released and hardware-validated. The suite discovers a modem,
-provisions it, selects and applies an APN, verifies real Internet access,
-controls the connection and manages roaming policy — over ModemManager, native
-QMI and now native MBIM, the last proven on a modem switched into MBIM
-composition and restored afterwards.
+Version 0.13.2 is released. The suite discovers a modem, provisions it, selects
+and applies an APN, verifies real Internet access, controls the connection and
+manages roaming policy — over ModemManager, native QMI and native MBIM — and
+presents all of it through the reorganized frontend that 0.13.0 delivered.
 
-The next release is **0.13.0, a coherent frontend**, and it is deliberately a
-detour: the machine APIs are in good shape while the page that exposes them
-grew feature by feature until nothing on it could be taken in at a glance. Its
-accepted design is [`frontend-contract-v1.md`](frontend-contract-v1.md) and its
-plan is [`testing-0.13.0.md`](testing-0.13.0.md). The roadmap milestones after
-it shifted by one; the AT framework is now 0.14.0.
+The next release is **0.14.0, the AT identity backend and bounded AT
+transport**. Its plan is [`testing-0.14.0.md`](testing-0.14.0.md), and the
+contract deltas are already written into
+[`modem-contract-v1.md`](modem-contract-v1.md) and
+[`backend-contract-v1.md`](backend-contract-v1.md).
 
-Three points there are easy to miss. The page is reorganized around the
-question each area answers rather than the package that supplies the data, so
-the operator name legitimately appears twice — as the serving network and as
-the matched database provider — and must be labelled accordingly. A persistent
-status strip sits outside the tabs, because tabs hide exactly the state a user
-is not looking at when it breaks. And bearer control stops depending on who
-created the interface: `connect`/`disconnect`/`reconnect` are `ifup`/`ifdown`,
-which the APN engine already performs on user-created interfaces during every
-reconcile, so refusing the control while performing the action was
-inconsistent. Configuration-changing operations stay ownership-gated and
-adoption is still refused.
+Four points there are easy to get wrong.
 
-The browser gate is not optional in this release. The 0.11.0 and 0.12.0 passes
-each found a defect no fixture could have caught, and 0.13.0's subject is
-precisely the thing fixtures cannot judge.
+It is a **dependency, not a feature wanted for its own sake.** An FM350 in RNDIS
+composition exposes no `cdc-wdm` node, so neither the QMI nor the MBIM adapter
+can read its SIM. Without AT identity, 0.15.0 could dial that modem and still
+have no way to choose an APN for it.
+
+**The command vocabulary is the easy part.** The 3GPP core reads are uniform
+across vendors, and the bootstrap that learns which modem this is uses no vendor
+knowledge at all — `AT+CGMI`/`AT+CGMM` are the *output* of the probe, not a
+precondition for it. The work is port ownership: resolving a port by observed
+role, bounding every call on images without an external `timeout`, and holding a
+mandatory lock rather than an opportunistic one.
+
+**One earlier rule is reversed.** Multiple AT ports on one proven USB device
+were terminal ambiguity, which made an ordinary seven-port modem permanently
+unusable rather than safe. Ports on one device are redundancy; ambiguity between
+devices still fails closed.
+
+**Reset becomes one capability with three implementations** chosen by control
+owner. Under ModemManager the answer is to ask ModemManager to reset, not to
+refuse: refusing would encode one deployment's shape into the contract and leave
+a ModemManager user with no reset at all on a board without GPIO.
+
+The hardware gate is where this release is decided, and it needs two modems
+attached at once. Fixtures cannot reproduce a port that accepts a write and
+never answers, a port that answers `OK` while being a debug channel, a reset
+that removes its own port mid-command, or a re-enumeration that renumbers a
+neighbouring modem's tty nodes — and those are the failures that matter.
 
 ## Released package and file map
 

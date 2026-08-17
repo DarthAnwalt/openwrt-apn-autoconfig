@@ -353,9 +353,33 @@ return view.extend({
 		}
 	},
 
+	/* The modem's own name for itself, read over AT. It is display evidence, not
+	 * identity — two identical modems say exactly the same thing — so it never
+	 * replaces the identifier under the advanced disclosure. Falls back to the
+	 * USB ids, which are all that is known before an identity read has run. */
+	modemModelLabel: function(modem) {
+		if (modem.manufacturer && modem.model)
+			return '%s %s'.format(modem.manufacturer, modem.model);
+		if (modem.model)
+			return modem.model;
+		if (modem.vendor_id && modem.product_id)
+			return _('Unidentified (%s:%s)').format(modem.vendor_id, modem.product_id);
+		return _('Unidentified');
+	},
+
+	modemResetMethodLabel: function(method) {
+		switch (method) {
+		case 'gpio': return _('Board power cycle');
+		case 'modemmanager': return _('Through ModemManager');
+		case 'at': return _('Command over the control port');
+		case 'none': return _('Not available');
+		}
+		return text(method);
+	},
+
 	/* Why a modem cannot be set up, in the user's terms. A missing control is
 	 * always explained; the view never shows a button that is going to fail. */
-	provisionReasonText: function(reason) {
+	provisionReasonText: function(reason, modem) {
 		switch (reason) {
 		case 'already_configured':
 			return _('This modem belongs to a network interface you created, so its configuration is left alone. It can still be connected and disconnected from here.');
@@ -364,6 +388,12 @@ return view.extend({
 		case 'ambiguous':
 			return _('This modem could not be told apart from another one, so nothing will be changed automatically.');
 		case 'unsupported_protocol':
+			/* An AT-managed modem is recognised and its SIM can be read, but
+			 * nothing installed can dial it yet. Saying so is more useful than
+			 * the generic protocol message, because the missing piece is a
+			 * package rather than anything about this device. */
+			if (modem && modem.protocol === 'at')
+				return _('This modem is recognised and its SIM can be read, but no connection support for it is installed yet, so it cannot be set up here.');
 			return _('Setting up this modem automatically is not supported yet for its control protocol.');
 		case 'conflicting_owner':
 			return _('Another component is claiming control of this modem, so it is left alone.');
@@ -448,6 +478,7 @@ return view.extend({
 		var explanation = '';
 
 		var rows = [
+			row(_('Model'), self.modemModelLabel(modem)),
 			row(_('Protocol'), modem.protocol),
 			row(_('Control owner'), self.modemOwnerStateLabel(modem.owner_state),
 				_('Which component is allowed to talk to this modem. Two components claiming it at once stops every operation rather than racing them.')),
@@ -473,13 +504,18 @@ return view.extend({
 				buttons.push(self.modemActionButton(modem, 'provision', _('Set up this modem'), 'cbi-button-action important'));
 			}
 			else {
-				explanation = self.provisionReasonText(plan.reason);
+				explanation = self.provisionReasonText(plan.reason, modem);
 				if (plan.reason === 'already_provisioned')
 					buttons.push(self.modemActionButton(modem, 'deprovision', _('Remove setup'), 'cbi-button-remove'));
 			}
 		}
 
-		if (self.hardwareIntegration && modem.capabilities && modem.capabilities.reset === true)
+		/* Reset stopped being a board-integration feature: the backend picks a
+		 * method from whoever owns the modem, so the control is offered
+		 * whenever it says one applies. Gating on the board package as well
+		 * would hide a working reset on every modem the board GPIO cannot
+		 * reach — which is exactly the case the new methods exist for. */
+		if (modem.capabilities && modem.capabilities.reset === true)
 			buttons.push(self.resetButtonFor(modem));
 
 		var nodes = [ table(rows), E('p', {}, [ explanation ]) ];
@@ -492,9 +528,13 @@ return view.extend({
 		nodes.push(advanced([
 			row(_('Modem identity'), sensitiveIdentifier(modem.modem_id, _('modem identity'))),
 			row(_('Evidence'), modem.evidence_tier),
+			row(_('Firmware'), modem.firmware_revision),
+			row(_('Reset method'), self.modemResetMethodLabel(modem.reset_method),
+				_('How this modem would be reset. Board power is used wherever the hardware supports it; otherwise the component that owns the modem is asked to reset it, or a reset command is sent over the modem\'s own control port.')),
 			row(_('Implementation'), modem.implementation_state),
 			row(_('Validation'), modem.hardware_validated ? _('hardware') : modem.validation_state),
 			row(_('USB path'), modem.usb_path),
+			row(_('AT control port'), modem.at_device),
 			row(_('Vendor / product'), modem.vendor_id && modem.product_id
 				? '%s:%s'.format(modem.vendor_id, modem.product_id) : ''),
 			row(_('Control device'), modem.control_device),
@@ -508,13 +548,20 @@ return view.extend({
 	/* The power-cycle keeps running through the engine command the hardware
 	 * button already uses, so the validated reset-then-reconcile behaviour is
 	 * unchanged; only where the control lives has moved. */
-	resetButtonFor: function() {
+	resetButtonFor: function(modem) {
 		var self = this;
+		/* The label names what will actually happen, because the three methods
+		 * are not interchangeable to a user watching the device: cutting board
+		 * power and asking the modem to restart itself look different and take
+		 * different amounts of time. */
+		var label = _('Restart modem');
+		if (modem && modem.reset_method === 'gpio')
+			label = _('Power-cycle modem');
 		var button = E('button', {
 			'class': 'btn cbi-button cbi-button-negative',
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
-		}, [ _('Power-cycle modem') ]);
+		}, [ label ]);
 		button.disabled = !!self.busy;
 		/* Tracked as a list because a board could pin more than one modem, and
 		 * disabling only the most recently rendered one would leave a live

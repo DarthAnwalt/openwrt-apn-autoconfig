@@ -24,6 +24,16 @@ MODEM_POWER_OFF_VALUE="1"
 MODEM_POWER_ON_VALUE="0"
 MODEM_POWER_OFF_SECONDS="5"
 MODEM_WAIT_SECONDS="90"
+# How long an in-band reset has to actually take the modem off the bus before we
+# call it ineffective. This is not a guess: on the measured FM350-GL,
+# AT+CFUN=1,1 drops the USB device 36 seconds after the command and brings it
+# back 32 seconds later. The first value chosen here was 20, which failed a
+# perfectly good reset three times before the cycle was actually timed.
+#
+# One modem, one firmware, so the default carries roughly 2.5x margin and is
+# configurable. Departing is *slower* than returning on this device, which is
+# the opposite of what the sequence suggests.
+MODEM_DEPART_SECONDS="90"
 MODEM_POLL_SECONDS="2"
 CONNECT_WAIT_SECONDS="60"
 # Route metric written onto a section this package creates. The default lives
@@ -35,11 +45,21 @@ CONNECT_WAIT_SECONDS="60"
 # that netifd default for anyone who wants it.
 PROVISION_METRIC="1024"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
+QUIRK_TABLE="/usr/share/apn-autoconfig-modem/quirks"
 RESET_MODEM_ID=""
 
 UQMI="${APN_AUTOCONFIG_MODEM_UQMI:-uqmi}"
 TIMEOUT="${APN_AUTOCONFIG_MODEM_TIMEOUT:-timeout}"
 MMCLI="${APN_AUTOCONFIG_MODEM_MMCLI:-mmcli}"
+SMS_TOOL="${APN_AUTOCONFIG_MODEM_SMS_TOOL:-sms_tool}"
+# Only the bounded watchdog uses this, and only so the fixtures can give that
+# one path a real sleep while the rest of the suite keeps an instant mock.
+# apn-autoconfig-qmi carries the same override for the same reason.
+SLEEP="${APN_AUTOCONFIG_MODEM_SLEEP:-sleep}"
+
+AT_PORT_LOCK_ROOT="/var/lock/apn-autoconfig-at-port"
+AT_TIMEOUT_SECONDS="5"
+AT_LOCK_WAIT_SECONDS="15"
 
 COMMAND_NAME=""
 REQUESTED_MODEM=""
@@ -51,7 +71,12 @@ REQUESTED_INTERFACE=""
 # such commands, so the leak grew with every page load.
 INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
 MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
+MM_INDEX_FILE="/tmp/apn-autoconfig-modem.$$.mm-indexes"
+MM_IDENTITY_FILE="/tmp/apn-autoconfig-modem.$$.mm-identity"
 CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
+AT_OUTPUT_FILE="/tmp/apn-autoconfig-modem.$$.at-output"
+AT_CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.at-candidates"
+BOUNDED_TIMEOUT_MARKER="/tmp/apn-autoconfig-modem.$$.bounded-timeout"
 MM_DISCOVERY_UNCERTAIN=0
 
 LOCK_HELD=0
@@ -68,6 +93,10 @@ PROVISION_CHILD_PID=""
 REQUESTED_AUTOCONNECT=1
 BOUNDED_CHILD_PID=""
 BOUNDED_WATCHDOG_PID=""
+BOUNDED_TIMED_OUT=0
+AT_RESULT=""
+AT_PORT_LOCK_HELD=0
+AT_PORT_LOCK_PATH=""
 
 log() {
 	level="$1"
@@ -127,7 +156,18 @@ cleanup_files() {
 	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE" "$INVENTORY_FILE.display" \
 		"$INVENTORY_FILE.merged" "$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
 	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
+	[ -z "$MM_INDEX_FILE" ] || rm -f "$MM_INDEX_FILE"
+	[ -z "$MM_IDENTITY_FILE" ] || rm -f "$MM_IDENTITY_FILE"
 	[ -z "$CANDIDATES_FILE" ] || rm -f "$CANDIDATES_FILE"
+	[ -z "$AT_OUTPUT_FILE" ] || rm -f "$AT_OUTPUT_FILE"
+	[ -z "$AT_CANDIDATES_FILE" ] || rm -f "$AT_CANDIDATES_FILE"
+	[ -z "$BOUNDED_TIMEOUT_MARKER" ] || rm -f "$BOUNDED_TIMEOUT_MARKER"
+	# The AT port lock is the innermost level, so it is released before the
+	# per-modem and global locks below.
+	if [ "$AT_PORT_LOCK_HELD" -eq 1 ] && [ -n "$AT_PORT_LOCK_PATH" ]; then
+		lock_release "$AT_PORT_LOCK_PATH"
+		AT_PORT_LOCK_HELD=0
+	fi
 	if [ "$LOCK_HELD" -eq 1 ] && [ -n "$LOCK_PATH" ]; then
 		lock_release "$LOCK_PATH"
 		LOCK_HELD=0
@@ -167,9 +207,13 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_depart_seconds")" && [ -n "$value" ] && MODEM_DEPART_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.at_timeout_seconds")" && [ -n "$value" ] && AT_TIMEOUT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.at_port_lock_root")" && [ -n "$value" ] && AT_PORT_LOCK_ROOT="$value"
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
+	value="$(uci -q get "${CONFIG}.main.quirk_table")" && [ -n "$value" ] && QUIRK_TABLE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
 	value="$(uci -q get "${CONFIG}.main.provision_metric")" && PROVISION_METRIC="$value"
 }
@@ -189,6 +233,7 @@ validate_config() {
 	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
 	case "$QMI_IDENTITY_LOCK_ROOT" in /|*/../*|*/..) die "unsafe QMI identity lock root" ;; /*) : ;; *) die "QMI identity lock root must be absolute" ;; esac
 	case "$HARDWARE_INTEGRATION_FILE" in /|*/../*|*/..) die "unsafe hardware_integration_file" ;; /*) : ;; *) die "hardware_integration_file must be absolute" ;; esac
+	case "$QUIRK_TABLE" in /|*/../*|*/..) die "unsafe quirk_table" ;; /*) : ;; *) die "quirk_table must be absolute" ;; esac
 	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
 	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
 	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
@@ -198,6 +243,9 @@ validate_config() {
 	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
 	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
 	case "$CONNECT_WAIT_SECONDS" in ''|*[!0-9]*) die "connect_wait_seconds must be numeric" ;; esac
+	case "$AT_TIMEOUT_SECONDS" in ''|*[!0-9]*) die "at_timeout_seconds must be numeric" ;; esac
+	[ "$AT_TIMEOUT_SECONDS" -gt 0 ] || die "at_timeout_seconds must be greater than zero"
+	case "$AT_PORT_LOCK_ROOT" in /|*/../*|*/..) die "unsafe at_port_lock_root" ;; /*) : ;; *) die "at_port_lock_root must be absolute" ;; esac
 	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
@@ -354,7 +402,9 @@ json_escape() {
 	{
 		if (NR > 1) printf "\\n"
 		gsub(/\\/, "\\\\")
-		gsub(/\"/, "\\\"")
+		# A plain " needs no escape inside an awk regex, and gawk warns
+		# about it loudly enough to bury real diagnostics in CI logs.
+		gsub(/"/, "\\\"")
 		gsub(/\t/, "\\t")
 		gsub(/\r/, "\\r")
 		printf "%s", $0
@@ -565,9 +615,22 @@ discover_direct_candidates() {
 }
 
 discover_at_candidates() {
+	# One candidate per USB device, not per tty node. Emitting a record per node
+	# gave a seven-port modem seven identical records, which then collapsed into
+	# a permanent duplicate-identity conflict — the modem was reported as an
+	# ambiguous pile of itself.
+	seen_usb_paths="
+"
 	for class_device in "$SYSFS_ROOT"/class/tty/ttyUSB*/device "$SYSFS_ROOT"/class/tty/ttyACM*/device; do
 		[ -e "$class_device" ] || continue
 		usb_path="$(resolve_class_device_usb_path "$class_device")" || continue
+		case "$seen_usb_paths" in
+			*"
+$usb_path
+"*) continue ;;
+		esac
+		seen_usb_paths="${seen_usb_paths}${usb_path}
+"
 		vendor_id="$(usb_attr "$usb_path" idVendor 2>/dev/null || :)"
 		product_id="$(usb_attr "$usb_path" idProduct 2>/dev/null || :)"
 		serial="$(usb_attr "$usb_path" serial 2>/dev/null || :)"
@@ -579,8 +642,18 @@ discover_at_candidates() {
 			modem_id="usb-serial:${usb_label}:${vendor_id}:${product_id}:${serial}"
 			tier="usb-serial"
 		else
-			modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
-			tier="weak-vidpid"
+			# A modem that exposes no USB serial and no QMI/MBIM control channel
+			# can only reach a strong tier through an AT-supplied IMEI, and
+			# discovery must not probe for one. So it stays weak until an
+			# explicit identity read has happened, then upgrades from the cache.
+			cached_imei="$(at_cached_imei "$usb_path" 2>/dev/null || :)"
+			if [ -n "$cached_imei" ]; then
+				modem_id="imei:${cached_imei}"
+				tier="imei"
+			else
+				modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+				tier="weak-vidpid"
+			fi
 		fi
 		emit_candidate "$modem_id" "$tier" "$usb_path" "$vendor_id" "$product_id" \
 			"" "$data_device" "$at_device" at 0
@@ -591,26 +664,630 @@ run_bounded_to_file() {
 	seconds="$1"
 	output_file="$2"
 	shift 2
+	BOUNDED_TIMED_OUT=0
 	if command_exists "$TIMEOUT"; then
-		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null
-		return
+		bounded_status=0
+		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null || bounded_status=$?
+		[ "$bounded_status" -ne 124 ] || BOUNDED_TIMED_OUT=1
+		return "$bounded_status"
 	fi
+	# This branch is not a fallback for exotic minimal images. The reference
+	# router has no `timeout` executable at all, so it is the branch that
+	# actually runs there — including for the QMI adapter's AT fallback that is
+	# already marked hardware-validated. It gets the same care as the other one.
+	#
+	# The timeout is carried by a marker file rather than by the child's exit
+	# status, because a child killed by the watchdog reports 143 exactly like a
+	# child killed by an external TERM. Callers that must tell "this port is not
+	# a command channel" from "the modem answered ERROR" cannot work from 143.
+	rm -f "$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
 	"$@" >"$output_file" 2>/dev/null &
 	BOUNDED_CHILD_PID=$!
 	(
-		sleep "$seconds"
+		"$SLEEP" "$seconds"
+		: >"$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
 		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
-		sleep 1
+		"$SLEEP" 1
 		kill -9 "$BOUNDED_CHILD_PID" 2>/dev/null || :
 	) >/dev/null 2>&1 &
 	BOUNDED_WATCHDOG_PID=$!
 	bounded_status=0
-	wait "$BOUNDED_CHILD_PID" || bounded_status=$?
+	# The shell announces a killed background job on its own stderr when it is
+	# reaped. On a timeout that is expected, not news, and it would otherwise
+	# reach the system log — and any caller that merged stderr into stdout would
+	# read "Terminated" as part of the result.
+	wait "$BOUNDED_CHILD_PID" 2>/dev/null || bounded_status=$?
 	BOUNDED_CHILD_PID=""
 	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 	BOUNDED_WATCHDOG_PID=""
+	if [ -e "$BOUNDED_TIMEOUT_MARKER" ]; then
+		rm -f "$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
+		BOUNDED_TIMED_OUT=1
+		return 124
+	fi
 	return "$bounded_status"
+}
+
+# ---- bounded AT transport and same-device port resolution ----
+#
+# See docs/modem-contract-v1.md. Nothing here accepts a command from UCI, the
+# environment, the GUI or another caller: every AT string is a literal below.
+
+usb_interface_path() {
+	# The USB interface directory name (…/2-1.3:1.2) a class device belongs to.
+	# This is the cache key. Unlike ttyUSB<n> it stays valid exactly as long as
+	# a port verdict does — that is, while the modem stays in the same physical
+	# port — so a re-enumeration invalidates precisely the entries that changed.
+	interface_path="$1"
+	while [ "$interface_path" != "$SYSFS_ROOT" ] && [ "$interface_path" != / ] && [ -n "$interface_path" ]; do
+		interface_name="${interface_path##*/}"
+		case "$interface_name" in
+			*:1.*) printf '%s\n' "$interface_name"; return 0 ;;
+		esac
+		interface_path="${interface_path%/*}"
+	done
+	return 1
+}
+
+valid_at_device_name() {
+	case "$1" in
+		ttyUSB[0-9]*|ttyACM[0-9]*) : ;;
+		*) return 1 ;;
+	esac
+	case "${1#tty???}" in ''|*[!0-9]*) return 1 ;; esac
+	return 0
+}
+
+at_candidate_ports() {
+	# Every tty correlated to this exact USB device, ascending by index. The
+	# correlation happens before any probe, which is what keeps two modems
+	# present at once apart: a probe can never reach the other modem's port
+	# regardless of how the kernel numbered them.
+	wanted_usb_path="$1"
+	for class_device in "$SYSFS_ROOT"/class/tty/ttyUSB*/device "$SYSFS_ROOT"/class/tty/ttyACM*/device; do
+		[ -e "$class_device" ] || continue
+		candidate_usb="$(resolve_class_device_usb_path "$class_device")" || continue
+		[ "$candidate_usb" = "$wanted_usb_path" ] || continue
+		device_name="${class_device%/device}"
+		device_name="${device_name##*/}"
+		valid_at_device_name "$device_name" || continue
+		resolved="$(readlink -f "$class_device" 2>/dev/null)" || continue
+		interface="$(usb_interface_path "$resolved")" || continue
+		printf '%s\t/dev/%s\t%s\n' "${device_name#tty???}" "$device_name" "$interface"
+	done | sort -n -k1,1
+}
+
+at_cache_dir() {
+	printf '%s\n' "$STATE_DIR/at-ports"
+}
+
+at_cache_scope() {
+	# Every AT cache is keyed by physical port plus VID:PID, never by modem_id.
+	#
+	# Two reasons, and both are defects if ignored. A record's modem_id changes
+	# when AT supplies an IMEI and the tier is upgraded, so a modem_id key would
+	# orphan its own entries at exactly the moment they became useful. And a
+	# key of physical port alone would hand one modem's port verdicts to a
+	# different modem plugged into the same socket later — a stale `dead` there
+	# would make a perfectly good port permanently invisible, which is the worst
+	# kind of cache bug because nothing looks broken.
+	scope_usb_path="$1"
+	scope_label="${scope_usb_path##*/}"
+	scope_vendor="$(usb_attr "$scope_usb_path" idVendor 2>/dev/null || :)"
+	scope_product="$(usb_attr "$scope_usb_path" idProduct 2>/dev/null || :)"
+	[ -n "$scope_label" ] || return 1
+	printf '%s\n' "$(sanitize_token "${scope_label}:${scope_vendor}:${scope_product}")"
+}
+
+at_port_verdict_file() {
+	printf '%s/port.%s.%s\n' "$(at_cache_dir)" "$1" "$(sanitize_token "$2")"
+}
+
+at_selection_file() {
+	printf '%s/selected.%s\n' "$(at_cache_dir)" "$1"
+}
+
+at_imei_file() {
+	printf '%s/imei.%s\n' "$(at_cache_dir)" "$1"
+}
+
+at_cached_imei() {
+	# Read on the discovery path, so it must never probe. An IMEI learned by an
+	# earlier explicit identity read is what lets a modem with no USB serial
+	# reach a strong evidence tier without one.
+	cached_scope="$(at_cache_scope "$1")" || return 1
+	cached_imei_value="$(sed -n '1p' "$(at_imei_file "$cached_scope")" 2>/dev/null || :)"
+	valid_imei "$cached_imei_value" || return 1
+	printf '%s\n' "$cached_imei_value"
+}
+
+at_cache_write() {
+	cache_file="$1"
+	cache_value="$2"
+	mkdir -p "$(at_cache_dir)" 2>/dev/null || return 1
+	printf '%s\n' "$cache_value" >"$cache_file.$$" 2>/dev/null || return 1
+	mv -f "$cache_file.$$" "$cache_file" 2>/dev/null || {
+		rm -f "$cache_file.$$" 2>/dev/null || :
+		return 1
+	}
+}
+
+at_clean_reply() {
+	# Strips CR, the final result code, and the echo of the command itself that
+	# a port whose echo is still on returns before ATE0 takes effect. Echo is a
+	# per-port property, not a per-modem one: one modem can present an echoing
+	# port and a silent port at the same moment, so it cannot be decided once
+	# for the device and then assumed.
+	awk -v sent="$1" '
+		{
+			gsub(/\r/, "")
+			sub(/^[ \t]+/, "")
+			sub(/[ \t]+$/, "")
+			if ($0 == "" || $0 == sent || $0 == "OK" || $0 == "ERROR") next
+			lines[n++] = $0
+		}
+		END { for (i = 0; i < n; i++) print lines[i] }
+	'
+}
+
+run_at() {
+	# 0 with AT_RESULT set, 124 on timeout, otherwise the command's own status.
+	at_device="$1"
+	at_command="$2"
+	AT_RESULT=""
+	command_exists "$SMS_TOOL" || return 3
+	at_status=0
+	run_bounded_to_file "$AT_TIMEOUT_SECONDS" "$AT_OUTPUT_FILE" \
+		"$SMS_TOOL" -d "$at_device" at "$at_command" || at_status=$?
+	if [ "$BOUNDED_TIMED_OUT" -eq 1 ]; then
+		rm -f "$AT_OUTPUT_FILE" 2>/dev/null || :
+		return 124
+	fi
+	AT_RESULT="$(at_clean_reply "$at_command" <"$AT_OUTPUT_FILE" 2>/dev/null || :)"
+	rm -f "$AT_OUTPUT_FILE" 2>/dev/null || :
+	return "$at_status"
+}
+
+at_port_lock_acquire() {
+	# Mandatory, including for a read. A tty is effectively exclusive: a reader
+	# that waits, fails and proceeds anyway corrupts both its own reply stream
+	# and the holder's. Failing to acquire is a refusal, never a licence.
+	lock_device_name="${1#/dev/}"
+	valid_at_device_name "$lock_device_name" || return 1
+	AT_PORT_LOCK_PATH="${AT_PORT_LOCK_ROOT}.${lock_device_name}"
+	mkdir -p "$(dirname "$AT_PORT_LOCK_ROOT")" 2>/dev/null || return 1
+	at_lock_waited=0
+	while :; do
+		lock_try_acquire_or_reclaim "$AT_PORT_LOCK_PATH"
+		at_lock_status=$?
+		if [ "$at_lock_status" -eq 0 ]; then
+			AT_PORT_LOCK_HELD=1
+			return 0
+		fi
+		[ "$at_lock_status" -eq 2 ] || { AT_PORT_LOCK_PATH=""; return 1; }
+		[ "$at_lock_waited" -lt "$AT_LOCK_WAIT_SECONDS" ] || { AT_PORT_LOCK_PATH=""; return 1; }
+		sleep 1
+		at_lock_waited=$((at_lock_waited + 1))
+	done
+}
+
+at_port_lock_release() {
+	[ "$AT_PORT_LOCK_HELD" -eq 1 ] || return 0
+	lock_release "$AT_PORT_LOCK_PATH"
+	AT_PORT_LOCK_HELD=0
+	AT_PORT_LOCK_PATH=""
+}
+
+at_probe_port() {
+	# Two phases, under the port lock. Phase 1 proves the node is a command
+	# channel at all; phase 2 proves it is the modem's control channel rather
+	# than a GNSS, debug or diagnostic port that also speaks AT.
+	probe_device="$1"
+	at_port_lock_acquire "$probe_device" || return 1
+	probe_status=0
+	run_at "$probe_device" 'ATE0' || probe_status=$?
+	if [ "$probe_status" -eq 124 ]; then
+		at_port_lock_release
+		return 2
+	fi
+	probe_status=0
+	run_at "$probe_device" 'AT' || probe_status=$?
+	if [ "$probe_status" -eq 124 ]; then
+		at_port_lock_release
+		return 2
+	fi
+	if [ "$probe_status" -ne 0 ]; then
+		at_port_lock_release
+		return 1
+	fi
+	probe_status=0
+	run_at "$probe_device" 'AT+CGMM' || probe_status=$?
+	at_port_lock_release
+	[ "$probe_status" -eq 124 ] && return 2
+	[ "$probe_status" -eq 0 ] || return 1
+	AT_PROBE_MODEL="$(printf '%s\n' "$AT_RESULT" | sed -n '1p')"
+	# A port that answers OK to bare AT but returns nothing resembling a model
+	# is a channel that speaks AT without being the control channel.
+	safe_single_line "$AT_PROBE_MODEL" || return 1
+	[ -n "$AT_PROBE_MODEL" ] || return 1
+	[ "${#AT_PROBE_MODEL}" -le 64 ] || return 1
+	case "$AT_PROBE_MODEL" in *[A-Za-z0-9]*) : ;; *) return 1 ;; esac
+	return 0
+}
+
+# ---- AT identity reads ----
+#
+# The command set is fixed and read-only. Nothing below is composed from UCI,
+# the environment, the GUI or another caller. See docs/backend-contract-v1.md
+# for the field mapping and why operator_id is deliberately left empty.
+
+at_identity_cache_file() {
+	printf '%s/identity.%s\n' "$(at_cache_dir)" "$(sanitize_token "$1")"
+}
+
+at_single_line() {
+	at_line_status=0
+	run_at "$1" "$2" || at_line_status=$?
+	[ "$at_line_status" -eq 0 ] || return "$at_line_status"
+	at_line_value="$(printf '%s\n' "$AT_RESULT" | sed -n '1p')"
+	safe_single_line "$at_line_value" || return 1
+	[ "${#at_line_value}" -le 128 ] || return 1
+	printf '%s\n' "$at_line_value"
+}
+
+at_digits() {
+	# Tolerates the "+CCID: " style prefixes and the trailing F some cards use
+	# as ICCID padding. More than one candidate line is malformed, not a choice.
+	awk -v kind="$1" '
+		{
+			gsub(/\r/, "")
+			sub(/^\+[A-Za-z]+:[ \t]*/, "")
+			gsub(/[ \t]/, "")
+			if ($0 == "") next
+			if (kind == "iccid") sub(/[Ff]$/, "")
+			if ($0 !~ /^[0-9]+$/) next
+			len = length($0)
+			ok = (kind == "iccid" && len >= 10 && len <= 32) ||
+			     (kind == "imsi" && len >= 5 && len <= 18)
+			if (!ok) next
+			value = $0
+			count++
+		}
+		END { if (count != 1) exit 1; print value }
+	'
+}
+
+at_read_iccid() {
+	# The standard spelling first, then the vendor variants. Advance only on an
+	# immediate command error: a port that timed out is not going to answer a
+	# differently spelled read, and trying would only repeat the bound.
+	for at_iccid_command in 'AT+CCID' 'AT+QCCID' 'AT+ICCID'; do
+		at_iccid_status=0
+		run_at "$1" "$at_iccid_command" || at_iccid_status=$?
+		[ "$at_iccid_status" -eq 124 ] && return 1
+		[ "$at_iccid_status" -eq 0 ] || continue
+		at_iccid_value="$(printf '%s\n' "$AT_RESULT" | at_digits iccid)" || continue
+		printf '%s\n' "$at_iccid_value"
+		return 0
+	done
+	return 1
+}
+
+at_read_registration() {
+	# CEREG and CGREG are preferred over CREG, and not as a matter of taste: a
+	# device attached over LTE or 5G with no CS domain answers CREG with stat 6,
+	# "registered, SMS only". Reading CREG first would report a fully registered
+	# modem as unregistered.
+	AT_REGISTRATION=unknown
+	AT_ROAMING=unknown
+	for at_reg_command in 'AT+CEREG?' 'AT+CGREG?' 'AT+CREG?'; do
+		at_reg_status=0
+		run_at "$1" "$at_reg_command" || at_reg_status=$?
+		[ "$at_reg_status" -eq 124 ] && return 1
+		[ "$at_reg_status" -eq 0 ] || continue
+		at_reg_stat="$(printf '%s\n' "$AT_RESULT" | awk -F, '
+			/^\+C[EG]?REG:/ { gsub(/[^0-9]/, "", $2); print $2; exit }
+		')"
+		case "$at_reg_stat" in ''|*[!0-9]*) continue ;; esac
+		case "$at_reg_stat" in
+			1) AT_REGISTRATION=home; AT_ROAMING=false ;;
+			5) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
+			# 6 and 7 are registered states — SMS only, on the home and on a
+			# visited network. Treating them as absent is the classic mistake.
+			6) AT_REGISTRATION=home; AT_ROAMING=false ;;
+			7) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
+			2) AT_REGISTRATION=searching ;;
+			3) AT_REGISTRATION=denied ;;
+			0) AT_REGISTRATION=idle ;;
+			*) continue ;;
+		esac
+		return 0
+	done
+	return 0
+}
+
+at_access_technology() {
+	case "$1" in
+		0|1|3|8) printf '%s\n' gsm ;;
+		2|4|5|6) printf '%s\n' umts ;;
+		7|9|10) printf '%s\n' lte ;;
+		11|12) printf '%s\n' 5gnr ;;
+		13) printf '%s\n' 'lte,5gnr' ;;
+		*) printf '%s\n' '' ;;
+	esac
+}
+
+at_read_operator() {
+	AT_SERVING_OPERATOR=""
+	AT_ACCESS_TECH=""
+	# Numeric presentation first. The default format returns a display name
+	# whose spelling varies by firmware and cannot be matched against anything.
+	# This selects a session presentation format and stores nothing.
+	run_at "$1" 'AT+COPS=3,2' >/dev/null 2>&1 || :
+	at_cops_status=0
+	run_at "$1" 'AT+COPS?' || at_cops_status=$?
+	[ "$at_cops_status" -eq 0 ] || return 1
+	at_cops_line="$(printf '%s\n' "$AT_RESULT" | sed -n '/^+COPS:/p' | sed -n '1p')"
+	[ -n "$at_cops_line" ] || return 1
+	at_cops_id="$(printf '%s\n' "$at_cops_line" | awk -F, '{ gsub(/[^0-9]/, "", $3); print $3 }')"
+	case "${#at_cops_id}" in 5|6) AT_SERVING_OPERATOR="$at_cops_id" ;; esac
+	at_cops_act="$(printf '%s\n' "$at_cops_line" | awk -F, '{ gsub(/[^0-9]/, "", $4); print $4 }')"
+	AT_ACCESS_TECH="$(at_access_technology "$at_cops_act")"
+	return 0
+}
+
+at_scale_signal() {
+	# Linear dBm to percent with clamping, using the same endpoints the QMI
+	# adapter documents so one transport cannot make the same radio look
+	# different from another.
+	awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN {
+		p = (v - lo) * 100 / (hi - lo)
+		if (p < 0) p = 0
+		if (p > 100) p = 100
+		printf "%d\n", int(p + 0.5)
+	}'
+}
+
+at_read_signal() {
+	AT_SIGNAL=""
+	at_sig_status=0
+	run_at "$1" 'AT+CESQ' || at_sig_status=$?
+	if [ "$at_sig_status" -eq 0 ]; then
+		# +CESQ: <rxlev>,<ber>,<rscp>,<ecno>,<rsrq>,<rsrp>[,NR fields…]. A
+		# 5G-capable modem appends NR fields that are frequently 255 while the
+		# LTE ones carry real values, so requiring exactly six fields would
+		# throw away a usable reading.
+		at_rsrp="$(printf '%s\n' "$AT_RESULT" | awk -F, '
+			/^\+CESQ:/ { gsub(/[^0-9]/, "", $6); print $6; exit }
+		')"
+		case "$at_rsrp" in
+			''|*[!0-9]*|255) : ;;
+			*)
+				if [ "$at_rsrp" -le 97 ]; then
+					AT_SIGNAL="$(at_scale_signal "$((-140 + at_rsrp))" -120 -80)"
+				fi
+			;;
+		esac
+	fi
+	[ -z "$AT_SIGNAL" ] || return 0
+	at_sig_status=0
+	run_at "$1" 'AT+CSQ' || at_sig_status=$?
+	[ "$at_sig_status" -eq 0 ] || return 0
+	at_rssi="$(printf '%s\n' "$AT_RESULT" | awk -F'[:,]' '
+		/^\+CSQ:/ { gsub(/[^0-9]/, "", $2); print $2; exit }
+	')"
+	# 99 means unknown. Reporting it as zero would claim no signal on a modem
+	# that simply did not say.
+	case "$at_rssi" in ''|*[!0-9]*|99) return 0 ;; esac
+	[ "$at_rssi" -le 31 ] || return 0
+	AT_SIGNAL="$(at_scale_signal "$((-113 + 2 * at_rssi))" -110 -50)"
+	return 0
+}
+
+at_read_identity() {
+	# Every read happens under one acquisition of the port lock, not one per
+	# command: an interleaved reader would corrupt both reply streams, and
+	# releasing between reads would invite exactly that.
+	at_identity_device="$1"
+	AT_MANUFACTURER=""; AT_MODEL=""; AT_FIRMWARE=""; AT_IMEI=""
+	AT_ICCID=""; AT_IMSI=""
+	AT_REGISTRATION=unknown; AT_ROAMING=unknown
+	AT_SERVING_OPERATOR=""; AT_ACCESS_TECH=""; AT_SIGNAL=""
+
+	at_port_lock_acquire "$at_identity_device" || return 3
+	run_at "$at_identity_device" 'ATE0' >/dev/null 2>&1 || :
+
+	AT_MANUFACTURER="$(at_single_line "$at_identity_device" 'AT+CGMI' 2>/dev/null || :)"
+	AT_MODEL="$(at_single_line "$at_identity_device" 'AT+CGMM' 2>/dev/null || :)"
+	AT_FIRMWARE="$(at_single_line "$at_identity_device" 'AT+CGMR' 2>/dev/null || :)"
+	at_imei_value="$(at_single_line "$at_identity_device" 'AT+CGSN' 2>/dev/null || :)"
+	at_imei_value="$(printf '%s' "$at_imei_value" | tr -cd '0-9')"
+	valid_imei "$at_imei_value" && AT_IMEI="$at_imei_value"
+
+	AT_ICCID="$(at_read_iccid "$at_identity_device" 2>/dev/null || :)"
+	at_imsi_status=0
+	run_at "$at_identity_device" 'AT+CIMI' || at_imsi_status=$?
+	if [ "$at_imsi_status" -eq 0 ]; then
+		AT_IMSI="$(printf '%s\n' "$AT_RESULT" | at_digits imsi 2>/dev/null || :)"
+	fi
+
+	at_read_registration "$at_identity_device" || :
+	at_read_operator "$at_identity_device" >/dev/null 2>&1 || :
+	at_read_signal "$at_identity_device" || :
+
+	at_port_lock_release
+
+	# A valid ICCID is the floor. Without it there is no SIM identity to match
+	# a provider against, and a partial record would look like a working one.
+	[ -n "$AT_ICCID" ] || return 1
+	return 0
+}
+
+quirk_value() {
+	# Capabilities that are not portable across modems, keyed by what the modem
+	# reports about itself. An absent entry is "not tested here", never
+	# "probably like the others" — so this returns nothing and the caller offers
+	# nothing, rather than guessing a control that fails at the worst moment.
+	#
+	# Identity deliberately does not come from here: the 3GPP core reads are
+	# uniform, and the one divergent read is handled by an ordered attempt list
+	# that works without knowing the vendor at all.
+	[ -r "$QUIRK_TABLE" ] || return 1
+	quirk_manufacturer="$1"
+	quirk_model="$2"
+	quirk_firmware="$3"
+	quirk_key="$4"
+	[ -n "$quirk_manufacturer" ] && [ -n "$quirk_model" ] && [ -n "$quirk_key" ] || return 1
+	quirk_result="$(awk -F '\t' \
+		-v mfr="$quirk_manufacturer" -v model="$quirk_model" \
+		-v fw="$quirk_firmware" -v key="$quirk_key" '
+		/^[ \t]*#/ { next }
+		NF < 5 { next }
+		$1 != mfr || $2 != model || $4 != key { next }
+		# A firmware-specific entry wins over a wildcard one, so a general rule
+		# can be narrowed later without rewriting it.
+		$3 == fw { exact = $5; next }
+		$3 == "*" { general = $5 }
+		END {
+			if (exact != "") { print exact; exit 0 }
+			if (general != "") { print general; exit 0 }
+			exit 1
+		}
+	' "$QUIRK_TABLE" 2>/dev/null)" || return 1
+	[ -n "$quirk_result" ] || return 1
+	safe_single_line "$quirk_result" || return 1
+	printf '%s\n' "$quirk_result"
+}
+
+# ---- reset methods ----
+#
+# One capability, several implementations, chosen by the record's current
+# control owner so the reset is always performed by whoever legitimately holds
+# the modem. See docs/modem-contract-v1.md.
+
+mm_index_for_usb_path() {
+	[ -s "$MM_INDEX_FILE" ] || return 1
+	mm_index_value="$(awk -F '\t' -v want="$1" '$1 == want { print $2; exit }' "$MM_INDEX_FILE")"
+	case "$mm_index_value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$mm_index_value"
+}
+
+reset_method_for_record() {
+	# Must not probe: this runs on the discovery path, where a sweep would cost
+	# the per-port bound for every silent port on every page load.
+	method_gpio_capable="$1"
+	method_owner="$2"
+	method_ambiguous="$3"
+	method_usb_path="$4"
+	[ "$method_ambiguous" = 0 ] || { printf '%s\n' none; return 0; }
+	[ "$method_owner" != conflicting ] || { printf '%s\n' none; return 0; }
+	# Board power is out of band: it needs no control channel and works
+	# whoever owns the modem, so it wins wherever it is available. This also
+	# keeps the released Huasifei behaviour exactly as it was.
+	if [ "$method_gpio_capable" = 1 ]; then printf '%s\n' gpio; return 0; fi
+	if [ "$method_owner" = modemmanager ]; then
+		if command_exists "$MMCLI" && mm_index_for_usb_path "$method_usb_path" >/dev/null 2>&1; then
+			printf '%s\n' modemmanager
+			return 0
+		fi
+		# Owned by ModemManager but unable to ask it: no other method may touch
+		# this modem, so there is no reset rather than a direct one.
+		printf '%s\n' none
+		return 0
+	fi
+	if command_exists "$SMS_TOOL" && at_cached_port "$method_usb_path" >/dev/null 2>&1; then
+		printf '%s\n' at
+		return 0
+	fi
+	printf '%s\n' none
+}
+
+at_soft_reset() {
+	# AT+CFUN=1,1 has one property nothing else in this program shares: it takes
+	# the port away as it succeeds. The modem starts resetting and re-enumerates,
+	# so the write frequently returns no final OK — and on a vanished port the
+	# transport reports a timeout. That is the expected shape of success here,
+	# not a transport failure, and the real verdict comes from re-enumeration.
+	soft_reset_device="$1"
+	at_port_lock_acquire "$soft_reset_device" || return 1
+	run_at "$soft_reset_device" 'AT+CFUN=1,1' >/dev/null 2>&1 || :
+	at_port_lock_release
+	return 0
+}
+
+at_cached_port() {
+	# The already-resolved port for this modem, or nothing. Never probes, so it
+	# is safe on the discovery path.
+	cached_usb_path="$1"
+	cached_scope="$(at_cache_scope "$cached_usb_path")" || return 1
+	cached_interface="$(sed -n '1p' "$(at_selection_file "$cached_scope")" 2>/dev/null || :)"
+	[ -n "$cached_interface" ] || return 1
+	cached_device="$(at_candidate_ports "$cached_usb_path" | \
+		awk -F '\t' -v want="$cached_interface" '$3 == want { print $2; exit }')"
+	[ -n "$cached_device" ] || return 1
+	printf '%s\n' "$cached_device"
+}
+
+at_resolve_port() {
+	# Lazy by contract: only a request that needs AT identity reaches this.
+	# Discovery never does, because a sweep costs the per-port bound for every
+	# port that accepts a write and never answers — the common case, not the
+	# exception — and LuCI calls discovery on page load.
+	resolve_usb_path="$1"
+	AT_RESOLVED_PORT=""
+	AT_RESOLVED_MODEL=""
+	command_exists "$SMS_TOOL" || return 1
+	resolve_scope="$(at_cache_scope "$resolve_usb_path")" || return 1
+	candidates="$(at_candidate_ports "$resolve_usb_path")"
+	[ -n "$candidates" ] || return 1
+
+	selection_file="$(at_selection_file "$resolve_scope")"
+	cached_interface="$(sed -n '1p' "$selection_file" 2>/dev/null || :)"
+	if [ -n "$cached_interface" ]; then
+		cached_device="$(printf '%s\n' "$candidates" | \
+			awk -F '\t' -v want="$cached_interface" '$3 == want { print $2; exit }')"
+		if [ -n "$cached_device" ] && at_probe_port "$cached_device"; then
+			AT_RESOLVED_PORT="$cached_device"
+			AT_RESOLVED_MODEL="$AT_PROBE_MODEL"
+			return 0
+		fi
+		# Absent, moved to another device, or no longer answering: the verdict
+		# is stale rather than merely unlucky, so it goes rather than being
+		# retried on every later call.
+		rm -f "$selection_file" 2>/dev/null || :
+	fi
+
+	# Written to a file rather than piped, so the loop below runs in this shell
+	# and its results survive it.
+	printf '%s\n' "$candidates" | cut -f2,3 >"$AT_CANDIDATES_FILE" 2>/dev/null || return 1
+
+	resolve_result=1
+	while IFS="$(printf '\t')" read -r device interface; do
+		[ -n "$device" ] || continue
+		[ -n "$interface" ] || continue
+		verdict_file="$(at_port_verdict_file "$resolve_scope" "$interface")"
+		verdict="$(sed -n '1p' "$verdict_file" 2>/dev/null || :)"
+		[ "$verdict" = dead ] && continue
+		at_probe_port "$device"
+		probe_result=$?
+		if [ "$probe_result" -eq 0 ]; then
+			at_cache_write "$verdict_file" ok || :
+			at_cache_write "$selection_file" "$interface" || :
+			AT_RESOLVED_PORT="$device"
+			AT_RESOLVED_MODEL="$AT_PROBE_MODEL"
+			resolve_result=0
+			break
+		fi
+		# Only a timeout is cached as dead. A port that answered with an error
+		# is a live channel whose verdict may change once the modem finishes
+		# booting, and caching that would make a transient state permanent.
+		if [ "$probe_result" -eq 2 ]; then
+			at_cache_write "$verdict_file" dead || :
+		fi
+	done <"$AT_CANDIDATES_FILE"
+	rm -f "$AT_CANDIDATES_FILE" 2>/dev/null || :
+	return "$resolve_result"
 }
 
 discover_modemmanager_candidates() {
@@ -638,6 +1315,15 @@ discover_modemmanager_candidates() {
 		device_field="$(kv_value_from "$mm_data" 'modem.generic.device')"
 		physdev_field="$(kv_value_from "$mm_data" 'modem.generic.physdev')"
 		imei="$(kv_value_from "$mm_data" 'modem.generic.equipment-identifier')"
+		# ModemManager already knows what it is holding, so a modem it owns has
+		# no reason to be displayed as unidentified merely because AT is refused
+		# to us. "--" is its placeholder for unknown, not a value.
+		mm_manufacturer="$(kv_value_from "$mm_data" 'modem.generic.manufacturer')"
+		mm_model="$(kv_value_from "$mm_data" 'modem.generic.model')"
+		mm_revision="$(kv_value_from "$mm_data" 'modem.generic.revision')"
+		[ "$mm_manufacturer" != '--' ] || mm_manufacturer=""
+		[ "$mm_model" != '--' ] || mm_model=""
+		[ "$mm_revision" != '--' ] || mm_revision=""
 		rm -f "$mm_data"
 
 		control_device=""
@@ -654,6 +1340,15 @@ discover_modemmanager_candidates() {
 		[ -n "$usb_path" ] || [ -z "$control_device" ] || \
 			usb_path="$(resolve_class_device_usb_path "$SYSFS_ROOT/class/usbmisc/${control_device#/dev/}/device" 2>/dev/null || :)"
 		[ -z "$usb_path" ] || printf '%s\n' "$usb_path" >>"$MM_USB_PATHS_FILE"
+		# Kept beside the path list because the reset path needs the object
+		# index to ask ModemManager to reset its own modem.
+		[ -z "$usb_path" ] || printf '%s\t%s\n' "$usb_path" "$modem_index" >>"$MM_INDEX_FILE"
+		# Scratch, not the persistent cache: discovery stays free of side
+		# effects, and these values are re-read every scan anyway.
+		if [ -n "$usb_path" ] && { [ -n "$mm_manufacturer" ] || [ -n "$mm_model" ]; }; then
+			printf '%s\t%s\t%s\t%s\n' "$usb_path" "$mm_manufacturer" "$mm_model" "$mm_revision" \
+				>>"$MM_IDENTITY_FILE"
+		fi
 
 		vendor_id=""
 		product_id=""
@@ -839,16 +1534,18 @@ scan_inventory() {
 			ambiguity_reason="multiple data devices claim the same physical modem"
 		fi
 		if [ "$at_device" = '!ambiguous' ]; then
-			at_device=""
-			# Composite USB modems normally expose several ttyUSB ports. That is
-			# terminal ambiguity only when AT is the sole control transport. A
-			# proven QMI/MBIM control path may remain inventory/reset-capable, but
-			# it advertises no AT device until a future AT backend identifies one
-			# by role instead of enumeration order.
-			if [ -z "$control_device" ] || [ "$protocol" = at ]; then
-				ambiguous=1
-				ambiguity_reason="multiple AT ports claim the same physical modem"
-			fi
+			# Composite USB modems normally expose several ttyUSB ports. Until
+			# 0.14.0 that was treated as terminal ambiguity whenever AT was the
+			# sole transport, which made an ordinary seven-port modem
+			# permanently unusable rather than safe: several nodes correlated to
+			# one proven USB device are one modem, not two candidates.
+			#
+			# The record is no longer ambiguous for that reason. It advertises a
+			# port only if one has already been resolved by role and cached,
+			# because discovery must not probe: a sweep costs the per-port bound
+			# for every port that accepts a write and never answers, and LuCI
+			# calls discovery on page load.
+			at_device="$(at_cached_port "$usb_path" 2>/dev/null || :)"
 		fi
 		if [ "$ambiguous" -eq 0 ] && grep -F -x -q "$modem_id" "$INVENTORY_FILE.dupes" 2>/dev/null; then
 			ambiguous=1
@@ -883,7 +1580,12 @@ scan_inventory() {
 			else
 				owner_state=modemmanager
 			fi
-		elif [ -n "$netifd_interface" ]; then
+		# A bound section is configuration, not a session, and `proto=modemmanager`
+		# delegates the session to a daemon that is not running here, so `qmi.sh`
+		# and friends hold nothing and the state is `none`. The section is still
+		# reported in netifd_interface, so provisioning still sees the modem as
+		# already configured and reset still cycles the right interface.
+		elif [ -n "$netifd_interface" ] && [ "$netifd_proto" != modemmanager ]; then
 			owner_state=netifd-direct
 		fi
 
@@ -904,10 +1606,13 @@ scan_inventory() {
 			capable_reset=1
 		fi
 
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		reset_method="$(reset_method_for_record "$capable_reset" "$owner_state" "$ambiguous" "$usb_path")"
+
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
 			"$modem_id" "$tier" "$usb_path" "$control_device" "$data_device" "$at_device" \
 			"$protocol" "$owner_state" "$netifd_interface" "$first_seen" "$now" \
 			"$ambiguous" "$ambiguity_reason" "$capable_reset" "$vendor_id:$product_id" \
+			"$reset_method" \
 			>>"$INVENTORY_FILE"
 	done <"$INVENTORY_FILE.merged"
 
@@ -932,6 +1637,8 @@ print_modem_json() {
 	ambiguity_reason="$(field "$line" 13)"
 	capable_reset="$(field "$line" 14)"
 	vendor_product="$(field "$line" 15)"
+	reset_method="$(field "$line" 16)"
+	[ -n "$reset_method" ] || reset_method=none
 	printf '{'
 	json_key_string modem_id "$modem_id"; printf ','
 	json_key_string evidence_tier "$tier"; printf ','
@@ -942,25 +1649,65 @@ print_modem_json() {
 	json_key_string data_device "$data_device"; printf ','
 	json_key_string at_device "$at_device"; printf ','
 	json_key_string protocol "$protocol"; printf ','
+	# Display and quirk-keying evidence, read over AT and cached so the record
+	# can carry it without probing. Empty whenever no AT identity was obtained.
+	# ModemManager's own answer first, because it is live and available for
+	# modems whose AT port we are not allowed to touch; the AT cache is the
+	# fallback for everything else.
+	record_identity="$(awk -F '\t' -v path="$usb_path" \
+		'$1 == path { printf "%s\t%s\t%s", $2, $3, $4; exit }' "$MM_IDENTITY_FILE" 2>/dev/null || :)"
+	if [ -z "$record_identity" ]; then
+		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
+		[ -z "$record_scope" ] || \
+			record_identity="$(sed -n '1p' "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
+	else
+		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
+	fi
+	json_key_string manufacturer "$(field "$record_identity" 1)"; printf ','
+	json_key_string model "$(field "$record_identity" 2)"; printf ','
+	json_key_string firmware_revision "$(field "$record_identity" 3)"; printf ','
 	# Maturity of this inventory implementation and the evidence behind it, kept
 	# separate exactly as in the APN backend contract. The code is the same for
 	# every record, so implementation state does not vary; the evidence does.
-	# QMI and MBIM classification have both been validated on real hardware,
-	# while AT-only and unclassified devices have fixture coverage alone. As
-	# with the APN backends, that evidence is one modem on one board and does
-	# not transfer to other hardware by itself.
+	# QMI, MBIM and — since the 0.14.0 gate — AT classification have all been
+	# validated on real hardware; unclassified devices still have fixture
+	# coverage alone. The AT evidence is a seven-port Fibocom FM350-GL on the
+	# reference board: port resolution by role, the identity contract against a
+	# live SIM, and a soft reset observed leaving the bus and returning. As with
+	# the APN backends, that is one modem on one board and does not transfer to
+	# other hardware by itself.
 	record_validation=synthetic
 	record_hardware_validated=false
 	case "$protocol" in
-		qmi|mbim) record_validation=hardware; record_hardware_validated=true ;;
+		qmi|mbim|at) record_validation=hardware; record_hardware_validated=true ;;
 	esac
 	json_key_string implementation_state stable; printf ','
 	json_key_string validation_state "$record_validation"; printf ','
 	json_key_boolean hardware_validated "$record_hardware_validated"; printf ','
 	json_key_string owner_state "$owner_state"; printf ','
 	json_key_string netifd_interface "$netifd_interface"; printf ','
+	# True only once a port has actually been resolved by role and the current
+	# owner permits the project to use it. A correlated tty node is not the
+	# capability: it is a node that may well never answer.
+	capable_at_identity=0
+	if [ -n "$at_device" ] && [ "$ambiguous" -eq 0 ]; then
+		case "$owner_state" in
+			modemmanager|conflicting) : ;;
+			*)
+				[ -z "$record_scope" ] || \
+					{ [ -s "$(at_selection_file "$record_scope")" ] && capable_at_identity=1 ; }
+			;;
+		esac
+	fi
+	json_key_string reset_method "$reset_method"; printf ','
 	printf '"capabilities":{"inventory":true,'
-	json_key_boolean reset "$capable_reset"
+	json_key_boolean at_identity "$capable_at_identity"; printf ','
+	# True when some method's preconditions hold, which is not a claim that this
+	# modem's reset has ever been observed to work. reset_method names the one
+	# that would run.
+	capable_any_reset=0
+	[ "$reset_method" = none ] || capable_any_reset=1
+	json_key_boolean reset "$capable_any_reset"
 	printf '},'
 	json_key_string first_seen "$first_seen"; printf ','
 	json_key_string last_seen "$last_seen"; printf ','
@@ -1563,6 +2310,82 @@ provision_plan_cmd() {
 	return "$plan_status"
 }
 
+at_resolve_target_port() {
+	# Shared guards for every AT entry point. Ownership is re-read here on each
+	# call rather than trusted from an earlier scan, because a modem that was
+	# unowned when it was first seen can be claimed later — on the reference
+	# router ModemManager publishes a freshly attached modem only after it has
+	# finished probing every port, so unowned-then-owned is the normal sequence.
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "$COMMAND_NAME requires --modem"
+	line="$(find_inventory_record "$REQUESTED_MODEM")" || \
+		die_code 3 "modem $REQUESTED_MODEM is not present"
+	[ "$(field "$line" 12)" = 0 ] || \
+		die_code 4 "modem $REQUESTED_MODEM is ambiguous; no AT operation may target it"
+	record_owner="$(field "$line" 8)"
+	case "$record_owner" in
+		modemmanager|conflicting)
+			# Deliberate restraint, not inability: a modem under ModemManager
+			# typically leaves a second AT port apparently free, and probing it
+			# usually appears to work. Ownership is of the modem, not of one
+			# node. See docs/modem-contract-v1.md.
+			die_code 4 "modem $REQUESTED_MODEM is owned by $record_owner; AT access is refused"
+		;;
+	esac
+	command_exists "$SMS_TOOL" || die_code 3 "$SMS_TOOL is not installed"
+	AT_TARGET_USB_PATH="$(field "$line" 3)"
+	at_resolve_port "$AT_TARGET_USB_PATH" || \
+		die_code 3 "no AT control port could be resolved for modem $REQUESTED_MODEM"
+}
+
+at_port_cmd() {
+	at_resolve_target_port
+	printf '%s\n' "$AT_RESOLVED_PORT"
+}
+
+at_identity_cmd() {
+	at_resolve_target_port
+	identity_status=0
+	at_read_identity "$AT_RESOLVED_PORT" || identity_status=$?
+	[ "$identity_status" -eq 3 ] && \
+		die_code 3 "the AT port for modem $REQUESTED_MODEM is busy"
+	[ "$identity_status" -eq 0 ] || \
+		die_code 3 "no usable SIM identity was read from modem $REQUESTED_MODEM"
+
+	# Cached so inventory can display these without probing. Identity evidence,
+	# never identity: nothing here distinguishes two identical modems.
+	identity_scope="$(at_cache_scope "$AT_TARGET_USB_PATH")" || identity_scope=""
+	if [ -n "$identity_scope" ]; then
+		at_cache_write "$(at_identity_cache_file "$identity_scope")" \
+			"$(printf '%s\t%s\t%s' "$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE")" || :
+		# The IMEI is cached separately because discovery reads it to upgrade a
+		# serial-less modem from weak-vidpid to the imei tier, and discovery is
+		# not allowed to probe for it.
+		[ -z "$AT_IMEI" ] || at_cache_write "$(at_imei_file "$identity_scope")" "$AT_IMEI" || :
+	fi
+
+	# The same v1 identity TSV the QMI and MBIM adapters emit, so a consumer
+	# never has to know which transport produced it. operator_id stays empty
+	# deliberately: no standard AT command reports the SIM's home PLMN, and the
+	# matcher already falls back to the IMSI prefix when it is absent.
+	printf 'v1\n'
+	printf 'sim_index\t1\n'
+	printf 'modem_index\t%s\n' "$AT_RESOLVED_PORT"
+	printf 'iccid\t%s\n' "$AT_ICCID"
+	printf 'imsi\t%s\n' "$AT_IMSI"
+	printf 'eid\t\n'
+	printf 'operator_id\t\n'
+	printf 'operator_name\t\n'
+	printf 'gid1\t\n'
+	printf 'gid2\t\n'
+	printf 'modem_state\tenabled\n'
+	printf 'registration_state\t%s\n' "$AT_REGISTRATION"
+	printf 'roaming\t%s\n' "$AT_ROAMING"
+	printf 'serving_operator_id\t%s\n' "$AT_SERVING_OPERATOR"
+	printf 'serving_operator_name\t\n'
+	printf 'access_technologies\t%s\n' "$AT_ACCESS_TECH"
+	printf 'signal_quality\t%s\n' "$AT_SIGNAL"
+}
+
 resolve_cmd() {
 	[ -n "$REQUESTED_INTERFACE" ] || die_code 2 "resolve requires --interface"
 	case "$REQUESTED_INTERFACE" in ''|*[!A-Za-z0-9_]*) die_code 2 "invalid interface name" ;; esac
@@ -1628,8 +2451,50 @@ write_modem_power() {
 	printf '%s\n' "$1" >"$MODEM_POWER_PATH" 2>/dev/null
 }
 
+wait_for_modem_departure() {
+	# Only an out-of-band reset makes the modem vanish before the caller can
+	# look. Board power is cut synchronously, so by the time the return-wait
+	# starts the device is already gone from sysfs. An in-band reset — AT+CFUN
+	# or a request to ModemManager — returns while the modem is still fully
+	# enumerated and only tears its interfaces down a moment later, so waiting
+	# for "present with the expected owner" is satisfied instantly by the modem
+	# that has not started resetting yet. Observing the departure first is what
+	# makes the return mean anything.
+	#
+	# Never observing it is a failure, not a success: it means the command was
+	# accepted and had no effect, and reporting that as a completed reset is
+	# exactly the false success this exists to prevent.
+	depart_target_id="$1"
+	depart_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		scan_inventory
+		if awk -F '\t' -v id="$depart_target_id" \
+			'$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' \
+			"$INVENTORY_FILE" 2>/dev/null; then
+			:
+		else
+			rm -f "$INVENTORY_FILE"
+			return 0
+		fi
+		rm -f "$INVENTORY_FILE"
+		depart_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		depart_elapsed=$((depart_now - depart_started))
+		[ "$depart_elapsed" -ge 0 ] || depart_elapsed="$MODEM_DEPART_SECONDS"
+		[ "$depart_elapsed" -lt "$MODEM_DEPART_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
 wait_for_control_owner() {
-	modem_id="$1"
+	# The target is held in a name scan_inventory does not touch. It used to be
+	# `modem_id`, which that scan reassigns once per discovered record: by the
+	# time the awk below was given "$modem_id" it held the *last record scanned*,
+	# so the wait could be satisfied by a different modem that happened to be
+	# idle — reporting a reset complete seconds after it was issued, for a device
+	# that never cycled. With one modem present the clobbered value equals the
+	# target and nothing looks wrong, which is why only a two-modem router
+	# exposed it.
+	wait_target_id="$1"
 	expected_owner="$2"
 	# Bound the wall clock, not the iteration count. Each pass runs a full
 	# inventory scan whose ModemManager reads have their own multi-second
@@ -1638,7 +2503,7 @@ wait_for_control_owner() {
 	wait_started="$(date +%s 2>/dev/null || printf '%s' 0)"
 	while :; do
 		scan_inventory
-		if awk -F '\t' -v id="$modem_id" -v owner="$expected_owner" \
+		if awk -F '\t' -v id="$wait_target_id" -v owner="$expected_owner" \
 			'$1 == id && $8 == owner && $12 == 0 { found=1; exit } END { exit(found ? 0 : 1) }' \
 			"$INVENTORY_FILE" 2>/dev/null; then
 			return 0
@@ -1653,67 +2518,120 @@ wait_for_control_owner() {
 }
 
 reset_cmd() {
-	modem_id="$REQUESTED_MODEM"
-	[ -n "$modem_id" ] || die_code 2 "reset requires --modem"
-	hardware_integration_name >/dev/null 2>&1 || die_code 4 "reset requires an installed, supported board integration"
-	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+	# Every local below is deliberately prefixed. scan_inventory assigns
+	# modem_id, owner_state, netifd_interface and reset_method as it walks the
+	# records, and both waits call it in this shell rather than in a subshell,
+	# so an unprefixed name here silently becomes whichever record was scanned
+	# last. That produced a reset that named the wrong modem, then one that
+	# named the wrong method, and — worst of the three — an ifup of whatever
+	# interface the scan happened to end on.
+	reset_target_id="$REQUESTED_MODEM"
+	[ -n "$reset_target_id" ] || die_code 2 "reset requires --modem"
 
 	# Reset decisions use the discovered owner, not the public
 	# action-status overlay that deliberately reports this worker as
 	# "transitioning" while a background reset is active.
-	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id is not currently present"
-	capable_reset="$(printf '%s' "$line" | awk -F '\t' '{ print $14 }')"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is not the strongly identified modem bound to the board reset GPIO"
-	owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
-	case "$owner_state" in
-		conflicting) die_code 4 "modem $modem_id has a conflicting control-owner state; refusing to reset" ;;
+	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $reset_target_id is not currently present"
+	reset_chosen_method="$(printf '%s' "$line" | awk -F '\t' '{ print $16 }')"
+	[ -n "$reset_chosen_method" ] && [ "$reset_chosen_method" != none ] || \
+		die_code 4 "no reset method is available for modem $reset_target_id"
+	if [ "$reset_chosen_method" = gpio ]; then
+		hardware_integration_name >/dev/null 2>&1 || \
+			die_code 4 "reset requires an installed, supported board integration"
+		[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+	fi
+	reset_owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
+	case "$reset_owner_state" in
+		conflicting) die_code 4 "modem $reset_target_id has a conflicting control-owner state; refusing to reset" ;;
 	esac
-	expected_owner_state="$owner_state"
-	netifd_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
+	expected_owner_state="$reset_owner_state"
+	reset_bound_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
 
 	# Every composite operation uses one global order: APN lock, then the
 	# selected modem lock. A compatibility caller may borrow its already-held
 	# APN lock only after proving the owner PID above.
 	acquire_apn_lock
-	acquire_modem_lock "$modem_id"
-	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id disappeared before reset could start"
-	capable_reset="$(field "$line" 14)"
+	acquire_modem_lock "$reset_target_id"
+	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $reset_target_id disappeared before reset could start"
+	current_reset_method="$(field "$line" 16)"
 	current_owner_state="$(field "$line" 8)"
-	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is no longer safely reset-capable"
-	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $modem_id acquired a conflicting owner before reset"
+	[ -n "$current_reset_method" ] && [ "$current_reset_method" != none ] || \
+		die_code 4 "modem $reset_target_id is no longer safely reset-capable"
+	[ "$current_reset_method" = "$reset_chosen_method" ] || \
+		die_code 4 "modem $reset_target_id changed reset method before reset could start"
+	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $reset_target_id acquired a conflicting owner before reset"
 	[ "$current_owner_state" = "$expected_owner_state" ] || \
-		die_code 4 "modem $modem_id changed control owner before reset"
-	netifd_interface="$(field "$line" 9)"
+		die_code 4 "modem $reset_target_id changed control owner before reset"
+	reset_bound_interface="$(field "$line" 9)"
 
 	restore_armed=0
-	if [ -n "$netifd_interface" ]; then
-		log notice "modem reset requested for $modem_id; stopping interface $netifd_interface"
+	if [ -n "$reset_bound_interface" ]; then
+		log notice "modem reset requested for $reset_target_id; stopping interface $reset_bound_interface"
 		restore_armed=1
-		RESET_INTERFACE="$netifd_interface"
+		RESET_INTERFACE="$reset_bound_interface"
 		RESET_INTERFACE_RESTORE_ARMED=1
-		ifdown "$netifd_interface" >/dev/null 2>&1 || :
+		ifdown "$reset_bound_interface" >/dev/null 2>&1 || :
 	else
-		log notice "modem reset requested for $modem_id (no bound netifd interface)"
+		log notice "modem reset requested for $reset_target_id (no bound netifd interface)"
 	fi
 
-	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
-	MODEM_POWER_OFF_ARMED=1
-	write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
-	sleep "$MODEM_POWER_OFF_SECONDS"
-	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
-	MODEM_POWER_OFF_ARMED=0
+	case "$reset_chosen_method" in
+		gpio)
+			log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
+			MODEM_POWER_OFF_ARMED=1
+			write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
+			sleep "$MODEM_POWER_OFF_SECONDS"
+			write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
+			MODEM_POWER_OFF_ARMED=0
+		;;
+		modemmanager)
+			# Ask the owner to reset its own modem rather than refusing or
+			# reaching around it. This is the single-owner invariant honoured,
+			# not an exception to it.
+			mm_reset_index="$(mm_index_for_usb_path "$(field "$line" 3)")" || \
+				die_code 4 "ModemManager owns modem $reset_target_id but no longer reports an object for it"
+			log notice "asking ModemManager to reset modem $reset_target_id"
+			mm_reset_output="$STATE_DIR/.mm-reset.$$"
+			mm_reset_status=0
+			run_bounded_to_file 20 "$mm_reset_output" "$MMCLI" -m "$mm_reset_index" --reset || mm_reset_status=$?
+			rm -f "$mm_reset_output"
+			[ "$mm_reset_status" -eq 0 ] || \
+				die_code 3 "ModemManager refused or failed to reset modem $reset_target_id"
+		;;
+		at)
+			at_reset_port="$(at_cached_port "$(field "$line" 3)" 2>/dev/null || :)"
+			[ -n "$at_reset_port" ] || \
+				die_code 4 "modem $reset_target_id has no resolved AT control port to reset through"
+			log notice "sending a soft reset to modem $reset_target_id on its AT control port"
+			at_soft_reset "$at_reset_port" || \
+				die_code 3 "the AT control port for modem $reset_target_id was busy"
+		;;
+		*) die_code 4 "unsupported reset method $reset_chosen_method" ;;
+	esac
 
-	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
-	if ! wait_for_control_owner "$modem_id" "$expected_owner_state"; then
-		die_code 3 "modem $modem_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
+	# An in-band reset leaves the modem enumerated for a moment after the
+	# command returns, so its departure has to be observed before its return
+	# can mean anything. Board power has already removed it by this point.
+	case "$reset_chosen_method" in
+		at|modemmanager)
+			log notice "reset issued via $reset_chosen_method; waiting up to ${MODEM_DEPART_SECONDS}s for modem $reset_target_id to leave the bus"
+			if ! wait_for_modem_departure "$reset_target_id"; then
+				die_code 3 "modem $reset_target_id never left the bus after the $reset_chosen_method reset; treating it as ineffective"
+			fi
+		;;
+	esac
+
+	log notice "reset issued via $reset_chosen_method; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
+	if ! wait_for_control_owner "$reset_target_id" "$expected_owner_state"; then
+		die_code 3 "modem $reset_target_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
 	fi
 
 	if [ "$restore_armed" -eq 1 ]; then
-		ifup "$netifd_interface" >/dev/null 2>&1 || die "failed to restart interface $netifd_interface after modem reset"
+		ifup "$reset_bound_interface" >/dev/null 2>&1 || die "failed to restart interface $reset_bound_interface after modem reset"
 		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
 	release_modem_lock
-	log notice "modem $modem_id reset completed; stable identity and control owner are available again"
+	log notice "modem $reset_target_id reset completed; stable identity and control owner are available again"
 }
 
 action_state_dir_for() {
@@ -1931,6 +2849,10 @@ Commands:
   action-start reset  Start a bounded power-cycle in background; requires --modem
   action-status     Show background/external reset operation state; requires --modem
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
+  at-port           Resolve and print the AT control port for --modem, probing
+                    correlated ports by role. Refused under ModemManager
+  at-identity       Read SIM and registration identity for --modem over AT and
+                    print the v1 identity contract. Read-only
   rescan            Synchronous full read-only rescan (updates first/last seen)
   rescan-async      Debounced rescan entry point for hotplug handlers
 EOF
@@ -1978,6 +2900,8 @@ main() {
 		inventory-json) inventory_json_cmd ;;
 		status-json) status_json_cmd ;;
 		resolve) resolve_cmd ;;
+		at-port) at_port_cmd ;;
+		at-identity) at_identity_cmd ;;
 		provision-plan) provision_plan_cmd ;;
 		provision) provision_cmd ;;
 		deprovision) deprovision_cmd ;;

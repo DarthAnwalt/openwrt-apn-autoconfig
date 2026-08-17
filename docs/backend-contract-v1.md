@@ -1,10 +1,13 @@
 # Backend contract v1
 
-This is the released APN-backend contract through 0.9.2. The accepted target
-architecture adds a lower-level modem-control boundary without weakening this
-profile safety contract; see [`architecture.md`](architecture.md). Any 0.10.0
-compatibility mapping or successor API must be documented explicitly rather
-than silently changing the v1 meanings below.
+This is the APN-backend contract. Its v1 meanings were released in 0.9.2 and
+have not changed since; later releases added backends that conform to it —
+native MBIM in 0.12.0, native AT in 0.14.0 — rather than altering it. The
+accepted target architecture adds a lower-level modem-control boundary without
+weakening this profile safety contract; see
+[`architecture.md`](architecture.md). Any compatibility mapping or successor API
+must be documented explicitly rather than silently changing the v1 meanings
+below.
 
 This document defines the boundary between the APN decision engine and a modem
 backend. The contract is intentionally smaller than a modem-management API.
@@ -169,6 +172,119 @@ effective value is what gets cached.
 The backend owns the same five netifd options as QMI, but `pdptype` takes MBIM's
 `ipv4` rather than qmi.sh's canonical `ip`, and readiness is observed on the
 dynamic `${interface}_4` / `${interface}_6` interfaces `mbim.sh` publishes.
+
+## Native AT identity
+
+AT identity is implemented in `apn-autoconfig-modem` from 0.14.0, as
+`at-identity --modem <id>`. It resolves the port by role, holds the AT port lock
+for the whole read and emits the v1 identity TSV below, unchanged from what the
+QMI and MBIM adapters produce.
+
+### Which component answers the APN engine is decided in 0.15.0
+
+There is deliberately **no `/usr/libexec/apn-autoconfig-at` in 0.14.0**, and this
+is a decision rather than an omission.
+
+The engine only ever asks about a configured netifd target; it has no way to
+speak about a modem that has none. An AT-managed modem gets its first netifd
+target in 0.15.0, with the Fibocom protocol. Until then the identity has exactly
+two consumers — the inventory and the LuCI page — and both reach it through the
+modem package directly. An adapter shaped for the engine would be a connector to
+a socket that does not exist yet, and the shape it should take depends on facts
+that arrive with its first caller.
+
+Two candidates are on the table, to be chosen in 0.15.0 against a real consumer:
+
+1. **A thin `/usr/libexec/apn-autoconfig-at`** with `capabilities` and
+   `identity <device>`, matching the QMI and MBIM adapters exactly. Uniform, and
+   the engine's dispatch needs no special case. But it puts a second
+   implementation of AT port resolution and reply parsing in the core package,
+   competing for the same tty as the modem package's.
+2. **The engine asks the modem package**, `at-identity --modem <id>`. One
+   implementation, one owner of the port lock, and the modem package already
+   owns hardware access — the engine already delegates the power cycle to it. It
+   costs a second dispatch shape in the engine, and a harder dependency on the
+   modem package for that target class.
+
+The second currently looks better, precisely because two components parsing AT
+replies while racing for one serial port is the failure this release exists to
+prevent. It is not chosen yet: a decision taken without its caller in front of
+us is the kind that gets discovered to be wrong during a hardware gate.
+
+One 0.14.0 obligation is **not** deferred with it: the QMI adapter's existing AT
+fallback must take the shared AT port lock, so two components of this project
+cannot write to one `ttyUSB` at the same time. That is independent of who
+eventually answers the engine.
+
+### Properties fixed now, whichever shape wins
+
+AT is an **identity-only backend, permanently**. Its capability map reports
+`identity: true` and `profile_read`, `profile_write` and `profile_apply` all
+false, and that is not a maturity statement to be revised later. An AT-managed
+modem still receives its APN the same way every other target does: the engine
+writes the netifd options the target's protocol declares, and the protocol
+handler applies them. There is no AT profile-write path to implement, because
+the profile does not belong to the transport.
+
+`AT+CGDCONT?` is read for diagnostic display only — it shows what the modem
+currently holds, which is exactly the thing worth seeing when it disagrees with
+UCI. It must not be reported as `profile_read`: that capability means the
+backend can read the profile fields **it owns**, and this backend owns none.
+
+The read-only command allowlist is fixed, and nothing outside it is accepted
+from UCI, the environment, the GUI or another caller:
+
+```text
+AT            ATE0          AT+CGMI       AT+CGMM       AT+CGMR
+AT+CGSN       AT+CIMI       AT+CCID       AT+QCCID      AT+ICCID
+AT+COPS?      AT+COPS=3,2   AT+CEREG?     AT+CGREG?     AT+CREG?
+AT+CGDCONT?   AT+CSQ        AT+CESQ
+```
+
+`AT+COPS=3,2` is the one entry that writes: it selects the numeric PLMN
+presentation format for the session, because `AT+COPS?` otherwise returns a
+display name whose spelling varies by firmware and cannot be matched. It changes
+no stored modem setting.
+
+Field mapping follows the QMI adapter wherever a choice already exists, so that
+the matcher and the GUI see one shape regardless of transport:
+
+- `operator_id` is left **empty**. No standard AT command reports the SIM's home
+  PLMN, and the IMSI cannot be split into MCC/MNC without knowing the MNC length
+  for that MCC. The matcher already handles this: it tests the database row's
+  MCC-MNC as an IMSI prefix when `operator_id` is empty, so the row supplies the
+  length and both five- and six-digit rows are evaluated. A roaming serving PLMN
+  is never presented as the home operator.
+- `serving_operator_id` comes from the numeric `AT+COPS?` reply and
+  `access_technologies` from its `<AcT>` field.
+- `registration_state` and `roaming` come from the first of `AT+CEREG?`,
+  `AT+CGREG?`, `AT+CREG?` that answers, mapping `<stat>` 1 to home, 5 to
+  roaming, 2 to searching, 3 to denied and 0 to idle. A denied registration is
+  permanent and must not be reported as retryable.
+
+  `<stat>` **6 and 7 also mean registered** — SMS-only on the home and visited
+  network respectively — and map to home and roaming. This is not a
+  specification curiosity: a device attached over LTE or 5G with no CS domain
+  reports exactly this from `AT+CREG?`, and the first modem measured for this
+  contract did. Omitting 6 and 7 would report a fully registered modem as
+  unregistered whenever `CREG` is the source that answers, which is also why
+  `CEREG` and `CGREG` are preferred over it rather than merely listed first.
+- `signal_quality` uses `AT+CESQ` RSRP through the same -120 dBm to -80 dBm
+  mapping the QMI adapter documents, falling back to `AT+CSQ` RSSI through the
+  same -110 dBm to -50 dBm scale. `AT+CSQ` value 99 means unknown and leaves the
+  field empty rather than reporting zero signal, and `AT+CESQ` uses 255 for the
+  same purpose per field. The parser must accept **more than the six standard
+  `CESQ` fields**: a 5G-capable modem appends NR fields, which are frequently
+  255 while the LTE fields carry real values, so a strict six-field match would
+  discard a usable reading.
+
+ICCID uses an ordered attempt list — the standard spelling first, then the
+vendor variants — advancing only on an immediate command error. A timeout stops
+the sequence for that port, because a port that did not answer the first read is
+not going to answer a differently spelled one.
+
+As everywhere else, unknown values are empty rather than guessed, and a missing
+optional field never invalidates otherwise valid SIM identity.
 
 QMI does not inherit ModemManager's `allow_roaming` control. Until a portable,
 tested QMI policy mapping exists, the GUI keeps that control visible but

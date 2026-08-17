@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig-modem
-PKG_VERSION:=0.13.2
+PKG_VERSION:=0.14.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -15,7 +15,7 @@ define Package/apn-autoconfig-modem
   CATEGORY:=Network
   SUBMENU:=WWAN
   TITLE:=Modem inventory, identity and control-owner arbitration
-  DEPENDS:=+ubus +uci +jsonfilter
+  DEPENDS:=+ubus +uci +jsonfilter +sms-tool
   PKGARCH:=all
 endef
 
@@ -52,6 +52,8 @@ define Package/apn-autoconfig-modem/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-action $(1)/usr/libexec/apn-autoconfig-modem-action
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-query $(1)/usr/libexec/apn-autoconfig-modem-query
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-control $(1)/usr/libexec/apn-autoconfig-modem-control
+	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig-modem
+	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig-modem/quirks $(1)/usr/share/apn-autoconfig-modem/quirks
 endef
 
 # A live installation must discover hardware that was already present before
@@ -92,8 +94,19 @@ done
 for state_file in /var/run/apn-autoconfig-modem/provisioning/*.tsv; do
 	[ -f "$${state_file}" ] && rm -f "$${state_file}"
 done
+# AT port resolution cache. Regular state owned solely by this package, so it
+# goes by exact prefix; the AT port *locks* deliberately do not, because that
+# namespace is shared with apn-autoconfig-qmi and a stale one is already
+# reclaimed by its live-owner check at the next attempt.
+for state_file in /var/run/apn-autoconfig-modem/at-ports/port.* \
+	/var/run/apn-autoconfig-modem/at-ports/selected.* \
+	/var/run/apn-autoconfig-modem/at-ports/identity.* \
+	/var/run/apn-autoconfig-modem/at-ports/imei.*; do
+	[ -f "$${state_file}" ] && rm -f "$${state_file}"
+done
 rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/provisioning 2>/dev/null || :
+rmdir /var/run/apn-autoconfig-modem/at-ports 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem 2>/dev/null || :
 for lock_path in /var/lock/apn-autoconfig-modem.*; do
 	[ -e "$${lock_path}" ] || continue

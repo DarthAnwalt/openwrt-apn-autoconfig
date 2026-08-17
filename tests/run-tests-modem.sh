@@ -59,9 +59,11 @@ get:apn-autoconfig-modem.main.modem_power_path) printf '%s\n' "$TEST_GPIO" ;;
 get:apn-autoconfig-modem.main.modem_power_off_value) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.modem_power_on_value) printf '%s\n' 0 ;;
 get:apn-autoconfig-modem.main.modem_power_off_seconds) printf '%s\n' "${TEST_MODEM_POWER_OFF_SECONDS:-1}" ;;
-get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' 3 ;;
+get:apn-autoconfig-modem.main.modem_wait_seconds) printf '%s\n' "${TEST_MODEM_WAIT_SECONDS:-3}" ;;
 get:apn-autoconfig-modem.main.modem_poll_seconds) printf '%s\n' 1 ;;
 get:apn-autoconfig-modem.main.connect_wait_seconds) printf '%s\n' "${TEST_CONNECT_WAIT_SECONDS:-2}" ;;
+get:apn-autoconfig-modem.main.at_timeout_seconds) printf '%s\n' "${TEST_AT_TIMEOUT_SECONDS:-1}" ;;
+get:apn-autoconfig-modem.main.at_port_lock_root) printf '%s\n' "$TEST_AT_PORT_LOCK_ROOT" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
@@ -157,10 +159,23 @@ case "${1:-}" in
 ;;
 -m)
 	[ "${2:-}" = "${MM_MODEM_INDEX:-}" ] || exit 1
+	if [ "${3:-}" = "--reset" ]; then
+		printf '%s\t%s\n' "$2" reset >>"${TEST_MM_RESETS:-/dev/null}"
+		[ "${MM_RESET_FAILS:-0}" = 1 ] && exit 1
+		# ModemManager's own reset is in-band too: it returns while the modem is
+		# still enumerated. The device therefore has to actually leave and come
+		# back, or the runtime is right to call the reset ineffective. Removed
+		# synchronously, because backgrounding it races the first departure scan
+		# and the test would be measuring the scheduler rather than the runtime.
+		exit 0
+	fi
 	printf '%s\n' \
 		"modem.generic.device : ${MM_DEVICE:---}" \
 		"modem.generic.physdev : ${MM_PHYSDEV:---}" \
-		"modem.generic.equipment-identifier : ${MM_IMEI:---}"
+		"modem.generic.equipment-identifier : ${MM_IMEI:---}" \
+		"modem.generic.manufacturer : ${MM_MANUFACTURER:---}" \
+		"modem.generic.model : ${MM_MODEL:---}" \
+		"modem.generic.revision : ${MM_REVISION:---}"
 	exit 0
 ;;
 esac
@@ -245,10 +260,151 @@ cat >"$MOCKBIN/sleep" <<'EOF'
 exit 0
 EOF
 
+# An honest bounded timeout. The previous mock exec'd its argument with no
+# bound at all, which was harmless while every mocked command returned
+# instantly, but silently disabled the very behaviour the AT transport depends
+# on. It must also return 124 on expiry, because the code under test
+# distinguishes "this port is not a command channel" from "the modem answered
+# ERROR", and both look like a nonzero status otherwise. The suite's own `sleep`
+# is a no-op, so the watchdog here uses the real one.
 cat >"$MOCKBIN/timeout" <<'EOF'
 #!/bin/sh
+realsleep() { /bin/sleep "$1" 2>/dev/null || /usr/bin/sleep "$1" 2>/dev/null || :; }
+seconds="$1"
 shift
-exec "$@"
+marker="${TEST_STATE:-/tmp}/.mock-timeout.$$"
+rm -f "$marker"
+"$@" &
+child=$!
+(
+	realsleep "$seconds"
+	: >"$marker"
+	kill -TERM "$child" 2>/dev/null || exit 0
+	realsleep 1
+	kill -9 "$child" 2>/dev/null || :
+) >/dev/null 2>&1 &
+watchdog=$!
+status=0
+wait "$child" || status=$?
+kill -TERM "$watchdog" 2>/dev/null || :
+wait "$watchdog" 2>/dev/null || :
+if [ -e "$marker" ]; then
+	rm -f "$marker"
+	exit 124
+fi
+rm -f "$marker"
+exit "$status"
+EOF
+
+# usage: sms_tool -d <device> at <command>
+# Behaviour per port comes from TEST_AT_PORTS, and every invocation is
+# journalled to TEST_AT_PROBES so a test can assert which ports were probed —
+# in particular that a modem's ports were never reached from another modem's
+# record, and that discovery probed nothing at all.
+cat >"$MOCKBIN/sms_tool" <<'EOF'
+#!/bin/sh
+realsleep() { /bin/sleep "$1" 2>/dev/null || /usr/bin/sleep "$1" 2>/dev/null || :; }
+device=""
+at_command=""
+while [ "$#" -gt 0 ]; do
+	case "$1" in
+		-d) device="${2:-}"; shift 2 ;;
+		at) at_command="${2:-}"; shift 2 ;;
+		*) shift ;;
+	esac
+done
+printf '%s\t%s\n' "$device" "$at_command" >>"$TEST_AT_PROBES"
+behaviour="$(awk -F'\t' -v d="$device" '$1 == d { print $2; exit }' "$TEST_AT_PORTS" 2>/dev/null)"
+[ -n "$behaviour" ] || behaviour=dead
+case "$behaviour" in
+	dead)
+		# Accepts the write and never answers. The majority case on real
+		# multi-port modems.
+		realsleep 30
+		exit 0
+	;;
+	atonly)
+		# Speaks AT without being the control channel, and rejects the model
+		# query outright.
+		case "$at_command" in
+			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	atonly-silent)
+		# The nastier variant: accepts the model query and answers OK with no
+		# model at all. A status check alone would take this for a control port.
+		printf 'OK\r\n'
+		exit 0
+	;;
+	control|control-echo)
+		# A current modem: EPS registration answers, CESQ carries the NR
+		# extension fields, and the standard ICCID spelling works.
+		[ "$behaviour" = control-echo ] && printf '%s\r\n' "$at_command"
+		case "$at_command" in
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Fibocom Wireless Inc.\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf '%s\r\n' "${TEST_AT_MODEL:-FM350-GL}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf '81600.0000.00.29.21.27\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '%s\r\n' "${TEST_AT_IMEI:-016177002734885}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CIMI) printf '%s\r\n' "${TEST_AT_IMSI:-262023103971566}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CCID) printf '+CCID: %s\r\n' "${TEST_AT_ICCID:-89492031246010483050}"; printf 'OK\r\n'; exit 0 ;;
+			"AT+COPS?") printf '+COPS:0,2,"%s",%s\r\n' "${TEST_AT_PLMN:-26202}" "${TEST_AT_ACT:-13}"; printf 'OK\r\n'; exit 0 ;;
+			"AT+CEREG?") printf '+CEREG: 0,%s\r\n' "${TEST_AT_EPS_STAT:-1}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CESQ) printf '+CESQ: %s\r\n' "${TEST_AT_CESQ:-29,99,255,255,22,49,255,255,255}"; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 12, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	control-vanish)
+		# Answers like a control port until the reset, which takes the port away
+		# as it succeeds: no final OK, and the node really does disappear and
+		# come back, because a reset that leaves the modem on the bus is not a
+		# reset and the runtime is now required to notice that.
+		case "$at_command" in
+			"AT+CFUN=1,1")
+				exit 1
+			;;
+			ATE0|AT) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'FM350-GL\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	control-nosim)
+		# Resolves as a control port and answers everything except the SIM.
+		# Without this the "no readable SIM" case never gets past resolution,
+		# and the identity floor goes untested.
+		case "$at_command" in
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Fibocom Wireless Inc.\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'FM350-GL\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf '81600.0000.00.29.21.27\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '016177002734885\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+CEREG?") printf '+CEREG: 0,0\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 99, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf '+CME ERROR: SIM not inserted\r\n'; exit 1 ;;
+		esac
+	;;
+	control-legacy)
+		# The awkward one, drawn from real replies: only the CS-domain
+		# registration answers and it reports stat 6 ("registered, SMS only"),
+		# the standard ICCID spelling is rejected, and there is no CESQ.
+		case "$at_command" in
+			ATE0|AT|AT+COPS=3,2) printf 'OK\r\n'; exit 0 ;;
+			AT+CGMI) printf 'Quectel\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMM) printf 'EC25-E\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGMR) printf 'EC25EFAR06A11M4G\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CGSN) printf '867556043212345\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CIMI) printf '262023103971566\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+QCCID) printf '+QCCID: 89492031246010483050\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+COPS?") printf '+COPS:0,2,"26202",7\r\n'; printf 'OK\r\n'; exit 0 ;;
+			"AT+CREG?") printf '+CREG: 0,6\r\n'; printf 'OK\r\n'; exit 0 ;;
+			AT+CSQ) printf '+CSQ: 12, 99\r\n'; printf 'OK\r\n'; exit 0 ;;
+			*) printf 'ERROR\r\n'; exit 1 ;;
+		esac
+	;;
+	*) printf 'ERROR\r\n'; exit 1 ;;
+esac
 EOF
 
 chmod 0755 "$MOCKBIN"/*
@@ -258,6 +414,14 @@ export TEST_MODEM_STATE_DIR="$TESTROOT/run"
 export TEST_MODEM_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-modem"
 export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
+export TEST_AT_PORT_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-at-port"
+export TEST_AT_PORTS="$STATE/at-ports"
+export TEST_MM_RESETS="$STATE/mm-resets"
+: >"$STATE/mm-resets"
+export TEST_AT_PROBES="$STATE/at-probes"
+export TEST_AT_TIMEOUT_SECONDS=1
+: >"$STATE/at-ports"
+: >"$STATE/at-probes"
 export TEST_MODEM_ACTION_DIR="/tmp/apn-autoconfig-modem-action-test.$$"
 export TEST_GPIO="$GPIO"
 export TEST_HARDWARE_MARKER="$HARDWARE_MARKER"
@@ -387,6 +551,23 @@ add_at_modem() {
 	printf '%s\n' "$product" >"$usb_dir/idProduct"
 	[ -z "$serial" ] || printf '%s\n' "$serial" >"$usb_dir/serial"
 	ln -s "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+}
+
+# One tty on an existing USB device, with its own interface number, so that the
+# cache key (the USB interface path) differs per port exactly as it does on real
+# hardware. `behaviour` is consumed by the mocked sms_tool below.
+add_at_port() {
+	bus_port="$1"; tty_index="$2"; interface="$3"; behaviour="$4"
+	usb_dir="$TESTROOT/sys/devices/platform/mock-usb/$bus_port"
+	mkdir -p "$usb_dir/$bus_port:$interface" "$TESTROOT/sys/class/tty/ttyUSB$tty_index"
+	ln -s "$usb_dir/$bus_port:$interface" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+	printf '/dev/ttyUSB%s\t%s\n' "$tty_index" "$behaviour" >>"$TEST_AT_PORTS"
+}
+
+reset_at_ports() {
+	: >"$TEST_AT_PORTS"
+	: >"$TEST_AT_PROBES"
+	rm -rf "$TEST_MODEM_STATE_DIR/at-ports"
 }
 
 reset_sysfs
@@ -527,15 +708,38 @@ assert by_protocol["mbim"]["data_device"] == "wwan4", by_protocol
 assert by_protocol["at"]["at_device"] == "/dev/ttyUSB8", by_protocol
 assert not by_protocol["mbim"]["capabilities"]["reset"], by_protocol
 assert not by_protocol["at"]["capabilities"]["reset"], by_protocol
-# Maturity is about this implementation, evidence about the protocol: MBIM
-# classification has a hardware record, AT-only has fixtures alone.
+# Maturity is about this implementation, evidence about the protocol. AT joined
+# MBIM as hardware-validated when the 0.14.0 gate ran it on a seven-port
+# FM350-GL; an unclassified device still carries fixtures alone, which is what
+# keeps this assertion from being a rubber stamp.
 assert by_protocol["mbim"]["implementation_state"] == "stable", by_protocol
 assert by_protocol["mbim"]["validation_state"] == "hardware", by_protocol
 assert by_protocol["mbim"]["hardware_validated"] is True, by_protocol
 assert by_protocol["at"]["implementation_state"] == "stable", by_protocol
-assert by_protocol["at"]["validation_state"] == "synthetic", by_protocol
-assert by_protocol["at"]["hardware_validated"] is False, by_protocol
+assert by_protocol["at"]["validation_state"] == "hardware", by_protocol
+assert by_protocol["at"]["hardware_validated"] is True, by_protocol
 ' "$out" || fail 'inventory-only MBIM/AT classification is wrong'
+
+printf '%s\n' 'TEST an unclassified device still reports synthetic evidence'
+# Without this, promoting AT to hardware would have left nothing asserting the
+# separation at all, and "validation_state" could quietly become a constant.
+reset_sysfs
+add_qmi_modem 16-1.1 1111 2222 UNCLASSIFIED 6
+rm -f "$TESTROOT/sys/class/usbmisc/cdc-wdm6/../../devices/platform/mock-usb/16-1.1/16-1.1:1.4/driver" 2>/dev/null || :
+rm -f "$TESTROOT/sys/devices/platform/mock-usb/16-1.1/16-1.1:1.4/driver"
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["protocol"] == "unknown", m
+assert m["validation_state"] == "synthetic", m
+assert m["hardware_validated"] is False, m
+' "$out" || fail 'an unclassified device claimed hardware validation'
+# Put back the pair the next test inherits, rather than leaving it to discover
+# that this one moved the ground under it.
+reset_sysfs
+add_mbim_modem 3-1.1 2cb7 0007 MBIMSERIAL 4 wwan4
+add_at_modem 3-1.2 2cb7 01a2 ATSERIAL 8
 
 printf '%s\n' 'TEST the board power-cycle follows the pinned modem, not its control protocol'
 # The GPIO cuts power to the slot, so the capability belongs to the board and
@@ -579,19 +783,332 @@ assert m["owner_state"] == "none", m
 assert not m["at_device"], m
 ' "$out" || fail 'optional AT ports incorrectly blocked a proven QMI control path'
 
-printf '%s\n' 'TEST an AT-only modem with multiple ports remains ambiguous without role evidence'
+printf '%s\n' 'TEST an AT-only modem with multiple ports is one unambiguous record'
+# Reverses the pre-0.14.0 rule. Several tty nodes correlated to one proven USB
+# device are one modem exposing several ports, not two candidate modems, and
+# treating them as ambiguous made every ordinary multi-port modem unusable.
 reset_sysfs
+reset_at_ports
 add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 1
 add_at_modem 3-1.4 2c7c 0801 ATMULTIPORT 2
 out="$(sh "$SCRIPT" inventory-json)"
 python3 -c '
 import json, sys
-m = json.loads(sys.argv[1])["modems"][0]
+d = json.loads(sys.argv[1])
+assert len(d["modems"]) == 1, d
+m = d["modems"][0]
 assert m["protocol"] == "at", m
-assert m["ambiguous"] is True, m
-assert m["owner_state"] == "conflicting", m
+assert m["ambiguous"] is False, m
+assert m["owner_state"] == "none", m
 assert not m["at_device"], m
-' "$out" || fail 'AT-only multi-port modem selected a port without role evidence'
+assert m["capabilities"]["at_identity"] is False, m
+' "$out" || fail 'AT-only multi-port modem was not reduced to one unambiguous record'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'discovery probed an AT port'
+
+printf '%s\n' 'TEST discovery never probes, however many ports are present'
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.1 1234 5678 SWEEPME 20
+add_at_port 4-1.1 21 1.3 dead
+add_at_port 4-1.1 22 1.4 control
+sh "$SCRIPT" inventory-json >/dev/null
+sh "$SCRIPT" status-json --modem "usb-serial:4-1.1:1234:5678:SWEEPME" >/dev/null
+[ ! -s "$TEST_AT_PROBES" ] || \
+	fail "discovery or status probed an AT port: $(cat "$TEST_AT_PROBES")"
+
+printf '%s\n' 'TEST at-port resolves by role, skipping ports that never answer'
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.2 1234 5678 ROLEPROBE 30
+printf '/dev/ttyUSB30\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 4-1.2 31 1.3 atonly
+add_at_port 4-1.2 32 1.4 atonly-silent
+add_at_port 4-1.2 33 1.5 control
+add_at_port 4-1.2 34 1.6 control
+MODEM_ROLE="usb-serial:4-1.2:1234:5678:ROLEPROBE"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'at-port failed to resolve a control port'
+[ "$port" = /dev/ttyUSB33 ] || fail "at-port selected $port instead of the lowest-indexed control port"
+grep -q "/dev/ttyUSB31	AT+CGMM" "$TEST_AT_PROBES" || \
+	fail 'the port that rejects the model query was not reached by the second phase'
+grep -q "/dev/ttyUSB32	AT+CGMM" "$TEST_AT_PROBES" || \
+	fail 'the port that answers OK without a model was not reached by the second phase'
+
+printf '%s\n' 'TEST several responding ports on one device are redundancy, not ambiguity'
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["ambiguous"] is False, m
+assert m["at_device"] == "/dev/ttyUSB33", m
+assert m["capabilities"]["at_identity"] is True, m
+' "$out" || fail 'a resolved multi-responder modem was not reported as usable'
+
+printf '%s\n' 'TEST a cached selection is revalidated and no other port is touched'
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'cached at-port failed'
+[ "$port" = /dev/ttyUSB33 ] || fail "cached resolution returned $port"
+if awk -F'\t' '$1 != "/dev/ttyUSB33"' "$TEST_AT_PROBES" | grep -q .; then
+	fail "a cached selection still swept other ports: $(cut -f1 "$TEST_AT_PROBES" | sort -u | tr '\n' ' ')"
+fi
+grep -q '/dev/ttyUSB33' "$TEST_AT_PROBES" || fail 'the cached port was not revalidated before reuse'
+
+printf '%s\n' 'TEST a port recorded as dead is skipped when the selection has to be redone'
+# Deleting only the selection forces a fresh sweep, which is the one path where
+# the negative cache does any work. Asserting it through the selection cache
+# proved nothing: that path short-circuits before a sweep can happen at all.
+rm -f "$TEST_MODEM_STATE_DIR"/at-ports/selected.*
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'resweep after losing the selection failed'
+[ "$port" = /dev/ttyUSB33 ] || fail "resweep selected $port instead of /dev/ttyUSB33"
+if grep -q '/dev/ttyUSB30' "$TEST_AT_PROBES"; then
+	fail 'a port cached as dead was swept again'
+fi
+grep -q '/dev/ttyUSB31' "$TEST_AT_PROBES" || \
+	fail 'the resweep skipped a port that had answered, which is not cached as dead'
+
+printf '%s\n' 'TEST a cached port that stopped answering is discarded and resolution runs again'
+sed -i.bak 's|^/dev/ttyUSB33	control$|/dev/ttyUSB33	dead|' "$TEST_AT_PORTS"
+rm -f "$TEST_AT_PORTS.bak"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ROLE")" || fail 'resolution did not recover from a stale cache'
+[ "$port" = /dev/ttyUSB34 ] || fail "stale cache recovery selected $port instead of /dev/ttyUSB34"
+
+printf '%s\n' 'TEST at-identity emits the v1 identity contract over AT'
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.1 0e8d 7127 '' 50
+printf '/dev/ttyUSB50\tcontrol\n' >>"$TEST_AT_PORTS"
+MODEM_ID_AT="weak-vidpid:7-1.1:0e8d:7127"
+sh "$SCRIPT" at-identity --modem "$MODEM_ID_AT" >"$STATE/at-identity" || fail 'at-identity failed'
+awk -F'\t' '
+	NR == 1 { if ($0 != "v1") { print "bad version line: " $0 > "/dev/stderr"; exit 1 } next }
+	{ seen[$1] = $2 }
+	END {
+		required = "sim_index modem_index iccid imsi eid operator_id operator_name gid1 gid2 " \
+			"modem_state registration_state roaming serving_operator_id serving_operator_name " \
+			"access_technologies signal_quality"
+		n = split(required, want, " ")
+		for (i = 1; i <= n; i++)
+			if (!(want[i] in seen)) { print "missing field: " want[i] > "/dev/stderr"; exit 1 }
+		if (seen["iccid"] != "89492031246010483050") { print "iccid: " seen["iccid"] > "/dev/stderr"; exit 1 }
+		if (seen["imsi"] != "262023103971566") { print "imsi: " seen["imsi"] > "/dev/stderr"; exit 1 }
+		if (seen["operator_id"] != "") { print "operator_id must stay empty" > "/dev/stderr"; exit 1 }
+		if (seen["serving_operator_id"] != "26202") { print "serving: " seen["serving_operator_id"] > "/dev/stderr"; exit 1 }
+		if (seen["registration_state"] != "home") { print "registration: " seen["registration_state"] > "/dev/stderr"; exit 1 }
+		if (seen["roaming"] != "false") { print "roaming: " seen["roaming"] > "/dev/stderr"; exit 1 }
+		if (seen["access_technologies"] != "lte,5gnr") { print "act: " seen["access_technologies"] > "/dev/stderr"; exit 1 }
+		if (seen["modem_state"] != "enabled") { print "modem_state: " seen["modem_state"] > "/dev/stderr"; exit 1 }
+		if (seen["signal_quality"] !~ /^[0-9]+$/) { print "signal: " seen["signal_quality"] > "/dev/stderr"; exit 1 }
+	}
+' "$STATE/at-identity" || fail 'the v1 identity contract was not satisfied'
+
+printf '%s\n' 'TEST CESQ RSRP outranks CSQ, and the NR extension fields do not break the parse'
+# 49 maps to -91 dBm on the documented -120..-80 scale, which is 73%. Reading
+# CSQ instead would have given -89 dBm on a different scale and 35%, so this
+# also proves which of the two sources won.
+signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity")"
+[ "$signal" = 73 ] || fail "signal_quality was $signal, not the CESQ-derived 73"
+
+printf '%s\n' 'TEST a serial-less modem is upgraded from weak-vidpid to the imei tier'
+# The record could only ever have been weak before: this modem exposes no USB
+# serial and no QMI/MBIM control channel, so the one path to a strong tier runs
+# through an AT-supplied IMEI. Discovery still does not probe for it — the read
+# above cached it, and discovery reads the cache.
+: >"$TEST_AT_PROBES"
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["modem_id"] == "imei:016177002734885", m
+assert m["evidence_tier"] == "imei", m
+' "$out" || fail 'the modem was not upgraded to the imei tier'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the tier upgrade probed instead of reading the cache'
+MODEM_ID_AT="imei:016177002734885"
+
+printf '%s\n' 'TEST the port selection survives the identity change that renames the record'
+# The caches are keyed by physical port and VID:PID rather than by modem_id, so
+# the upgrade cannot orphan the entries it was made from.
+: >"$TEST_AT_PROBES"
+port="$(sh "$SCRIPT" at-port --modem "$MODEM_ID_AT")" || fail 'at-port failed after the tier upgrade'
+[ "$port" = /dev/ttyUSB50 ] || fail "at-port returned $port after the upgrade"
+if awk -F'\t' '$1 != "/dev/ttyUSB50"' "$TEST_AT_PROBES" | grep -q .; then
+	fail 'the renamed record lost its cached selection and swept again'
+fi
+
+printf '%s\n' 'TEST an unknown CESQ RSRP falls back to CSQ rather than reporting no signal'
+TEST_AT_CESQ="99,99,255,255,255,255,255,255,255" \
+	sh "$SCRIPT" at-identity --modem "$MODEM_ID_AT" >"$STATE/at-identity-csq" || fail 'fallback identity failed'
+signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity-csq")"
+[ "$signal" = 35 ] || fail "CSQ fallback produced $signal instead of 35"
+
+printf '%s\n' 'TEST registration stat 6 is a registered state, and the ICCID ladder reaches the vendor spelling'
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.2 2c7c 0125 '' 51
+printf '/dev/ttyUSB51\tcontrol-legacy\n' >>"$TEST_AT_PORTS"
+sh "$SCRIPT" at-identity --modem "weak-vidpid:7-1.2:2c7c:0125" >"$STATE/at-identity-legacy" || \
+	fail 'at-identity failed against the legacy modem'
+awk -F'\t' '
+	$1 == "registration_state" && $2 != "home" { print "stat 6 read as " $2 > "/dev/stderr"; exit 1 }
+	$1 == "roaming" && $2 != "false" { print "roaming: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "iccid" && $2 != "89492031246010483050" { print "iccid: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "access_technologies" && $2 != "lte" { print "act: " $2 > "/dev/stderr"; exit 1 }
+	$1 == "signal_quality" && $2 != "35" { print "signal: " $2 > "/dev/stderr"; exit 1 }
+' "$STATE/at-identity-legacy" || fail 'the legacy modem was misread'
+grep -q "/dev/ttyUSB51	AT+CCID" "$TEST_AT_PROBES" || fail 'the standard ICCID spelling was not tried first'
+grep -q "/dev/ttyUSB51	AT+QCCID" "$TEST_AT_PROBES" || fail 'the ladder did not advance to the vendor spelling'
+
+printf '%s\n' 'TEST identity evidence reaches the inventory record without a further probe'
+out="$(sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "EC25-E", m
+assert m["firmware_revision"] == "EC25EFAR06A11M4G", m
+' "$out" || fail 'identity evidence did not reach the inventory record'
+: >"$TEST_AT_PROBES"
+sh "$SCRIPT" inventory-json >/dev/null
+[ ! -s "$TEST_AT_PROBES" ] || fail 'displaying identity evidence caused a probe'
+
+printf '%s\n' 'TEST a modem with no readable SIM fails rather than reporting a partial identity'
+# The port resolves and answers every hardware query, so the failure has to come
+# from the identity floor rather than from resolution. An earlier version of
+# this test used a port that never resolved at all, which asserted nothing about
+# the floor and passed with the floor removed.
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.3 1234 9999 '' 52
+printf '/dev/ttyUSB52\tcontrol-nosim\n' >>"$TEST_AT_PORTS"
+sh "$SCRIPT" at-port --modem "weak-vidpid:7-1.3:1234:9999" >/dev/null || \
+	fail 'the no-SIM port should still resolve as a control port'
+noiccid=0
+sh "$SCRIPT" at-identity --modem "weak-vidpid:7-1.3:1234:9999" >/dev/null 2>&1 || noiccid=$?
+[ "$noiccid" -eq 3 ] || fail "a modem with no SIM identity exited $noiccid instead of the retryable class 3"
+
+printf '%s\n' 'TEST the watchdog bounds a silent port when no external timeout exists'
+# Not an exotic-image fallback: the reference router has no timeout executable
+# at all, so this is the branch that actually runs there. The suite's own sleep
+# is a no-op, so the watchdog needs the real one to be tested honestly.
+reset_sysfs
+reset_at_ports
+add_at_modem 4-1.3 1234 5678 WATCHDOG 35
+printf '/dev/ttyUSB35\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 4-1.3 36 1.3 control
+# stdout and stderr are kept apart. Merging them made this assertion depend on
+# whether the shell announces the killed probe as "Terminated" — which some do
+# and some do not, so the test passed on the author's machine and failed in CI
+# on a result that was in fact correct. The requirement is that the *result*
+# channel carries the port and nothing else; stderr is only reported here,
+# because suppressing a shell's job-control notice is not portable enough to
+# gate a release on.
+APN_AUTOCONFIG_MODEM_TIMEOUT="$TESTROOT/absent-timeout" \
+APN_AUTOCONFIG_MODEM_SLEEP="$(command -v /bin/sleep || command -v /usr/bin/sleep)" \
+	sh "$SCRIPT" at-port --modem "usb-serial:4-1.3:1234:5678:WATCHDOG" \
+	>"$STATE/watchdog-port" 2>"$STATE/watchdog-err" || \
+	fail "the watchdog path failed to resolve: $(cat "$STATE/watchdog-err")"
+[ "$(cat "$STATE/watchdog-port")" = /dev/ttyUSB36 ] || \
+	fail "watchdog path selected '$(cat "$STATE/watchdog-port")' instead of /dev/ttyUSB36 (stderr: $(cat "$STATE/watchdog-err"))"
+grep -q '/dev/ttyUSB35' "$TEST_AT_PROBES" || fail 'the watchdog path never reached the silent port'
+ls /tmp/apn-autoconfig-modem.*.bounded-timeout >/dev/null 2>&1 && \
+	fail 'the watchdog left its timeout marker behind'
+
+printf '%s\n' 'TEST a different modem in the same USB socket does not inherit the previous one'
+reset_sysfs
+: >"$TEST_AT_PORTS"; : >"$TEST_AT_PROBES"
+rm -rf "$TEST_MODEM_STATE_DIR/at-ports"
+add_at_modem 10-1.1 1111 1111 '' 70
+printf '/dev/ttyUSB70\tdead\n' >>"$TEST_AT_PORTS"
+add_at_port 10-1.1 71 1.3 control
+port="$(sh "$SCRIPT" at-port --modem "weak-vidpid:10-1.1:1111:1111")" || fail 'first modem did not resolve'
+[ "$port" = /dev/ttyUSB71 ] || fail "first modem resolved to $port"
+
+# Swap in another model on the same physical port, whose control channel happens
+# to sit on the interface the previous modem's dead port occupied. Keying the
+# verdict cache by port alone would make that channel permanently invisible, and
+# nothing would look broken — the modem would simply never resolve.
+reset_sysfs
+: >"$TEST_AT_PORTS"; : >"$TEST_AT_PROBES"
+add_at_modem 10-1.1 3333 4444 '' 72
+printf '/dev/ttyUSB72\tcontrol\n' >>"$TEST_AT_PORTS"
+port="$(sh "$SCRIPT" at-port --modem "weak-vidpid:10-1.1:3333:4444")" || \
+	fail 'the replacement modem inherited a dead-port verdict from its predecessor'
+[ "$port" = /dev/ttyUSB72 ] || fail "the replacement modem resolved to $port"
+
+printf '%s\n' 'TEST the resolver refuses a port the QMI adapter is holding, rather than proceeding'
+# The other half of the shared namespace, asserted from this side. A reader that
+# waits, fails to acquire and then reads anyway would corrupt both its own reply
+# stream and the holder's, so failing to acquire has to be a refusal.
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.1 1234 5678 CONTENDED 55
+printf '/dev/ttyUSB55\tcontrol\n' >>"$TEST_AT_PORTS"
+held_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB55"
+mkdir -p "$(dirname "$held_lock")"
+printf '%s\n' "$$" >"$held_lock"
+contended=0
+sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED" >/dev/null 2>&1 || contended=$?
+[ "$contended" -ne 0 ] || fail 'the resolver used a port that another package had locked'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the resolver wrote to a locked port'
+rm -f "$held_lock"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED")" || \
+	fail 'the resolver did not recover once the shared lock was released'
+[ "$port" = /dev/ttyUSB55 ] || fail "recovery returned $port"
+[ ! -e "$held_lock" ] || fail 'the resolver left the shared port lock behind'
+
+printf '%s\n' 'TEST a probe never reaches a port belonging to another modem'
+# The target modem deliberately owns the *higher* tty index. With correlation
+# working, its own port is the only one probed; without it, the neighbour's
+# lower-numbered port would be swept first and would satisfy the resolution, so
+# this ordering is what makes the assertion mean anything.
+reset_sysfs
+reset_at_ports
+add_at_modem 5-1.1 3333 4444 NEIGHBOUR 40
+printf '/dev/ttyUSB40\tcontrol\n' >>"$TEST_AT_PORTS"
+add_at_modem 5-1.2 1111 2222 FIRSTMODEM 41
+printf '/dev/ttyUSB41\tcontrol\n' >>"$TEST_AT_PORTS"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:5-1.2:1111:2222:FIRSTMODEM")" || \
+	fail 'at-port failed with two modems present'
+[ "$port" = /dev/ttyUSB41 ] || fail "at-port returned $port, which is not this modem's own port"
+if grep -q '/dev/ttyUSB40' "$TEST_AT_PROBES"; then
+	fail "a probe for one modem reached the other modem's port"
+fi
+
+printf '%s\n' 'TEST a port cached while unowned grants nothing once ModemManager claims the modem'
+# The reference router publishes a freshly attached modem in ModemManager only
+# after it has finished probing every port, so a scan at attach time sees the
+# modem unowned and a later one sees it owned. That makes unowned-then-owned the
+# normal sequence rather than a race, and a selection cached in the first window
+# must not survive as a licence into the second.
+reset_sysfs
+reset_at_ports
+add_qmi_modem 6-1.1 2c7c 0801 MMOWNED 7 wwan7
+add_at_port 6-1.1 45 1.2 control
+MM_OWNED="usb-serial:6-1.1:2c7c:0801:MMOWNED"
+port="$(sh "$SCRIPT" at-port --modem "$MM_OWNED")" || fail 'at-port failed while the modem was unowned'
+[ "$port" = /dev/ttyUSB45 ] || fail "unowned resolution returned $port"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["capabilities"]["at_identity"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved unowned modem did not report at_identity'
+
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/6-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+: >"$TEST_AT_PROBES"
+mm_refused=0
+sh "$SCRIPT" at-port --modem "$MM_OWNED" >/dev/null 2>&1 || mm_refused=$?
+[ "$mm_refused" -eq 4 ] || fail "AT access under ModemManager exited $mm_refused instead of the blocked class 4"
+[ ! -s "$TEST_AT_PROBES" ] || fail 'a ModemManager-owned modem was probed anyway'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["capabilities"]["at_identity"] is False, m
+' "$(sh "$SCRIPT" inventory-json)" || \
+	fail 'a cached selection kept at_identity true after ModemManager took the modem'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
 
 printf '%s\n' 'TEST two distinct physically present modems are both reported, not merged'
 reset_sysfs
@@ -709,6 +1226,52 @@ assert m["owner_state"] == "modemmanager", m
 	sh "$SCRIPT" resolve --interface wwan)" = imei:490154203237999 ] || \
 	fail 'physical-root netifd devpath did not resolve the ModemManager-owned modem'
 
+printf '%s\n' 'TEST a modemmanager section with no live ModemManager is owner_state none, not netifd-direct'
+# The same modem and the same `wwan` binding as the test above, with
+# ModemManager stopped — the state the reference router was left in while the
+# AT transport was exercised. `proto=modemmanager` delegates the session to a
+# daemon that is no longer running, so `qmi.sh` and friends hold nothing and
+# nothing owns this modem. Reporting netifd-direct here claimed a direct netifd
+# session that does not exist, and since 0.14.0 that name also carries an
+# access consequence. Everything else the binding is used for must survive.
+MM_STOPPED_MODEM=imei:490154203237999
+out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert len(d["modems"]) == 1, d
+m = d["modems"][0]
+assert m["owner_state"] == "none", m
+assert m["netifd_interface"] == "wwan", m
+' "$out" || fail 'a modemmanager section without ModemManager was reported as a direct netifd session'
+# The section is still a binding for every purpose other than ownership: it
+# still resolves, and it still blocks provisioning a second section for it.
+[ "$(UQMI_IMEI=490154203237999 sh "$SCRIPT" resolve --interface wwan)" = "$MM_STOPPED_MODEM" ] || \
+	fail 'the bound section stopped resolving once its owner state became none'
+plan_status=0
+plan_out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" provision-plan --modem "$MM_STOPPED_MODEM" 2>/dev/null)" || plan_status=$?
+[ "$plan_status" -eq 4 ] || \
+	fail "provision-plan exited $plan_status for an already-bound modem instead of the blocked class 4"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["reason"] == "already_configured", d
+assert d["can_provision"] is False, d
+' "$plan_out" || fail 'a modem bound to a stopped-ModemManager section was offered for provisioning'
+
+printf '%s\n' 'TEST a netifd section that does hold the session is still netifd-direct'
+# The rule above must not swallow the ordinary case: same modem, same binding,
+# proto=qmi instead, where netifd genuinely does hold the control device.
+reset_network_config
+add_network_section cellqmi qmi /dev/cdc-wdm0
+out="$(UQMI_IMEI=490154203237999 sh "$SCRIPT" inventory-json)"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "netifd-direct", m
+assert m["netifd_interface"] == "cellqmi", m
+' "$out" || fail 'a direct netifd protocol lost its netifd-direct owner state'
+
 printf '%s\n' 'TEST ModemManager and a direct netifd protocol both claiming a modem is conflicting'
 reset_network_config
 add_network_section celldirect qmi /dev/cdc-wdm3
@@ -775,6 +1338,37 @@ grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'reset did not restore the bou
 [ ! -d "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] \
 	|| fail 'per-modem lock was not released after reset'
 
+printf '%s\n' 'TEST reset restarts its own modem interface, not whichever one the scan ended on'
+# The third and worst instance of the same clobbering: reset_cmd held the bound
+# interface in `netifd_interface`, a name scan_inventory reassigns per record,
+# and both waits call that scan in this shell. With one modem the clobbered
+# value equals the target and nothing looks wrong; with two, the reset can bring
+# up somebody else's interface.
+reset_sysfs
+reset_at_ports
+reset_network_config
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+add_qmi_modem 14-1.1 2c7c 0801 IFTARGET 4 wwan4
+add_qmi_modem 14-1.2 2c7c 0801 ZIFOTHER 5 wwan5
+add_network_section celltarget qmi /dev/cdc-wdm4
+add_network_section zcellother qmi /dev/cdc-wdm5
+TEST_RESET_MODEM_ID='usb-serial:14-1.1:2c7c:0801:IFTARGET'
+export TEST_RESET_MODEM_ID
+: >"$TEST_EVENTS"
+sh "$SCRIPT" reset --modem "$TEST_RESET_MODEM_ID" >/dev/null 2>&1 || \
+	fail 'the two-modem GPIO reset failed'
+grep -F -x -q 'down celltarget' "$TEST_EVENTS" || fail 'reset stopped the wrong interface'
+grep -F -x -q 'up celltarget' "$TEST_EVENTS" || fail 'reset did not restore its own interface'
+if grep -F -x -q 'up zcellother' "$TEST_EVENTS" || grep -F -x -q 'down zcellother' "$TEST_EVENTS"; then
+	fail 'reset touched a neighbouring modem interface'
+fi
+reset_network_config
+reset_sysfs
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0 wwan0
+add_network_section cellqmi qmi /dev/cdc-wdm0
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+
 printf '%s\n' 'TEST reset waits for the original ModemManager owner before restoring netifd'
 : >"$TEST_EVENTS"
 rm -f "$STATE/ifdown-seen" "$STATE/mm-owner-scan-count" "$STATE/mm-owner-ready" "$STATE/up-before-owner"
@@ -817,6 +1411,236 @@ export TEST_MODEM_POWER_OFF_SECONDS
 grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'interrupted reset did not restart the selected interface'
 [ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 	fail 'interrupted reset left the per-modem lock behind'
+
+printf '%s\n' 'TEST a ModemManager-owned modem shows the model ModemManager knows, without any AT'
+# The page put the model at the top of the card and it read "Unidentified" for a
+# perfectly ordinary modem, because those fields were only ever filled by an AT
+# identity read — which is refused on a modem ModemManager owns. The daemon
+# already knows what it is holding, so the record uses its answer.
+reset_sysfs
+reset_at_ports
+reset_network_config
+add_qmi_modem 15-1.1 2c7c 0801 MMKNOWN 3 wwan3
+add_at_port 15-1.1 90 1.5 control
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/15-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+MM_MANUFACTURER="Quectel"
+MM_MODEL="RM520N-GL"
+MM_REVISION="RM520NGLAAR03A01M4G"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV MM_MANUFACTURER MM_MODEL MM_REVISION
+: >"$TEST_AT_PROBES"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "RM520N-GL", m
+assert m["firmware_revision"] == "RM520NGLAAR03A01M4G", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an owned modem did not show the model ModemManager reports'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the record was filled by probing a modem ModemManager owns'
+
+printf '%s\n' 'TEST ModemManager placeholders are not shown as if they were values'
+# mmcli prints "--" for what it does not know, which is not a model name.
+MM_MODEL='--' MM_REVISION='--' python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "", m
+assert m["firmware_revision"] == "", m
+' "$(MM_MODEL='--' MM_REVISION='--' sh "$SCRIPT" inventory-json)" || \
+	fail 'a ModemManager placeholder was presented as a model'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV MM_MANUFACTURER MM_MODEL MM_REVISION
+
+printf '%s\n' 'TEST the quirk table answers only what it was told, and the shipped one is empty'
+# Exercised by sourcing rather than through a command, because 0.14.0 has no
+# vendor-specific capability to hang on it. Adding a public verb with no caller
+# is the same mistake the engine-facing AT adapter was deferred to avoid.
+quirk_fixture="$STATE/quirks"
+cat >"$quirk_fixture" <<'QUIRKS'
+# comment lines are ignored
+Fibocom Wireless Inc.	FM350-GL	*	example_capability	general
+Fibocom Wireless Inc.	FM350-GL	81600.0000.00.29.21.27	example_capability	firmware-specific
+Quectel	EC25-E	*	example_capability	quectel
+Fibocom Wireless Inc.	FM350-GL	*	truncated_capability
+QUIRKS
+# `.` inherits the caller's positional parameters and the script ends in
+# `main "$@"`, so the probe has to clear them before sourcing or it would
+# dispatch a command instead of just defining functions. Arguments are held in
+# named variables rather than re-split, because one of them contains spaces.
+cat >"$STATE/quirk-probe" <<'PROBE'
+#!/bin/sh
+probe_table="$1"; probe_mfr="$2"; probe_model="$3"; probe_fw="$4"; probe_key="$5"
+set --
+. "$QUIRK_SCRIPT" >/dev/null 2>&1 || :
+QUIRK_TABLE="$probe_table"
+quirk_value "$probe_mfr" "$probe_model" "$probe_fw" "$probe_key" 2>/dev/null ||
+	printf '%s\n' '<none>'
+PROBE
+quirk_probe() {
+	QUIRK_SCRIPT="$SCRIPT" sh "$STATE/quirk-probe" "$@"
+}
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL 'some-other-firmware' example_capability)" = general ] || \
+	fail 'a wildcard firmware entry did not match'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '81600.0000.00.29.21.27' example_capability)" = firmware-specific ] || \
+	fail 'a firmware-specific entry did not win over the wildcard'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '*' unknown_capability)" = '<none>' ] || \
+	fail 'an unknown key returned something'
+[ "$(quirk_probe "$quirk_fixture" 'Some Vendor' 'Some Model' '*' example_capability)" = '<none>' ] || \
+	fail 'an untested modem inherited another modem quirk'
+[ "$(quirk_probe "$quirk_fixture" 'Fibocom Wireless Inc.' FM350-GL '*' truncated_capability)" = '<none>' ] || \
+	fail 'a row with no value produced one'
+# The NF and comment guards in the lookup are deliberate but redundant: a short
+# row already fails the field comparison and an empty value already fails the
+# emptiness check. They are kept as intent, not asserted as behaviour, because a
+# test that cannot fail is worse than no test.
+[ "$(quirk_probe "$BASE/apn-autoconfig-modem/files/usr/share/apn-autoconfig-modem/quirks" \
+	'Fibocom Wireless Inc.' FM350-GL '*' example_capability)" = '<none>' ] || \
+	fail 'the shipped quirk table is not empty'
+
+printf '%s\n' 'TEST the reset method is chosen by control owner, and gpio wins where it is available'
+reset_sysfs
+reset_at_ports
+reset_network_config
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+add_qmi_modem 1-1.2 2c7c 0801 RM520SERIAL01 0 wwan0
+add_at_port 1-1.2 80 1.5 control
+TEST_RESET_MODEM_ID='usb-serial:1-1.2:2c7c:0801:RM520SERIAL01'
+export TEST_RESET_MODEM_ID
+# A resolved AT port must not displace the board power cycle: gpio is out of
+# band, needs no control channel, and is the released behaviour.
+sh "$SCRIPT" at-port --modem "$TEST_RESET_MODEM_ID" >/dev/null || fail 'the pinned modem did not resolve an AT port'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "gpio", m
+assert m["capabilities"]["reset"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved AT port displaced the board reset'
+
+printf '%s\n' 'TEST an AT-only modem gets the at method, and a soft reset that loses its port succeeds'
+reset_sysfs
+reset_at_ports
+reset_network_config
+add_at_modem 11-1.1 0e8d 7127 '' 81
+printf '/dev/ttyUSB81\tcontrol-vanish\n' >>"$TEST_AT_PORTS"
+AT_RESET_ID="weak-vidpid:11-1.1:0e8d:7127"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "none", m
+assert m["capabilities"]["reset"] is False, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an unresolved AT modem already advertised a reset method'
+sh "$SCRIPT" at-port --modem "$AT_RESET_ID" >/dev/null || fail 'the AT-only modem did not resolve'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["reset_method"] == "at", m
+assert m["capabilities"]["reset"] is True, m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a resolved AT-only modem did not offer the at reset method'
+: >"$TEST_AT_PROBES"
+# A modem that stays on the bus has not reset, whatever the command returned.
+# The full vanish-and-return cycle is deliberately NOT simulated: faking it
+# needs sleeps racing an inventory scan, and the first attempt duly passed and
+# failed on alternate runs. A test whose verdict depends on scheduling is worse
+# than no test. Hardware validates the cycle; this asserts the rule that makes
+# the cycle mean anything.
+at_reset_status=0
+sh "$SCRIPT" reset --modem "$AT_RESET_ID" >"$STATE/at-reset" 2>&1 || at_reset_status=$?
+[ "$at_reset_status" -eq 3 ] || \
+	fail "a modem that never left the bus exited $at_reset_status instead of the retryable class 3"
+grep -q 'never left the bus' "$STATE/at-reset" || \
+	fail 'an ineffective soft reset was not reported as such'
+grep -q "AT+CFUN=1,1" "$TEST_AT_PROBES" || fail 'the soft reset never reached the modem'
+[ ! -e "${TEST_AT_PORT_LOCK_ROOT}.ttyUSB81" ] || fail 'the soft reset left the AT port locked'
+
+printf '%s\n' 'TEST a ModemManager-owned modem is reset by ModemManager, not around it'
+reset_sysfs
+reset_at_ports
+reset_network_config
+rm -f "$HARDWARE_MARKER"
+add_qmi_modem 12-1.1 2c7c 0801 MMRESET 9 wwan9
+add_at_port 12-1.1 82 1.5 control
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/12-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+MM_RESET_ID="usb-serial:12-1.1:2c7c:0801:MMRESET"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["reset_method"] == "modemmanager", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an owned modem did not select the modemmanager reset method'
+: >"$TEST_MM_RESETS"
+: >"$TEST_AT_PROBES"
+mm_reset_status=0
+sh "$SCRIPT" reset --modem "$MM_RESET_ID" >"$STATE/mm-reset" 2>&1 || mm_reset_status=$?
+[ "$mm_reset_status" -eq 3 ] || \
+	fail "an ineffective ModemManager reset exited $mm_reset_status instead of the retryable class 3"
+grep -q 'never left the bus' "$STATE/mm-reset" || \
+	fail 'an ineffective ModemManager reset was not reported as such'
+grep -q "	reset" "$TEST_MM_RESETS" || fail 'ModemManager was never asked to reset its own modem'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'an owned modem was reached over AT during its reset'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV
+printf '%s\n' 'huasifei-wh3000-gpio-v1' >"$HARDWARE_MARKER"
+
+printf '%s\n' 'TEST a second idle modem cannot satisfy the wait for the one being reset'
+# Found on the reference router, not by fixtures. wait_for_control_owner passed
+# its target to awk as "$modem_id" — the same name scan_inventory reassigns once
+# per discovered record — so the comparison ran against whichever record was
+# scanned last. A neighbouring idle modem matched immediately and the reset was
+# reported complete seconds after it was issued, for a device that had not
+# cycled. With one modem present the clobbered value equals the target, which is
+# why this needs two.
+reset_sysfs
+reset_at_ports
+reset_network_config
+# The neighbour sorts last, so it is what the clobbered variable would hold.
+add_qmi_modem 13-1.1 2c7c 0801 RESETTARGET 6
+add_qmi_modem 13-1.2 2c7c 0801 ZNEIGHBOUR 7
+cat >"$STATE/wait-probe" <<'PROBE'
+#!/bin/sh
+target="$1"; owner="$2"
+set --
+. "$WAIT_SCRIPT" >/dev/null 2>&1 || :
+load_config
+SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
+MODEM_WAIT_SECONDS=2
+MODEM_POLL_SECONDS=1
+if wait_for_control_owner "$target" "$owner"; then printf 'matched\n'; else printf 'timeout\n'; fi
+PROBE
+# The named modem is not present at all, while the neighbour is present and
+# idle. A wait that compares against its own target must time out.
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.9:2c7c:0801:ABSENT' none)"
+[ "$verdict" = timeout ] || \
+	fail 'an idle neighbouring modem satisfied the wait for a modem that is not present'
+# Positive control, so the assertion above cannot pass by the wait being broken
+# in the other direction.
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/wait-probe" 'usb-serial:13-1.1:2c7c:0801:RESETTARGET' none)"
+[ "$verdict" = matched ] || fail 'the wait did not match its own target when that target was present'
+
+printf '%s\n' 'TEST an in-band reset must see the modem leave the bus before its return counts'
+# Also from the router. AT+CFUN=1,1 returns while the modem is still fully
+# enumerated and only tears its interfaces down a moment later, so waiting
+# straight for "present with the expected owner" was satisfied by the modem that
+# had not started resetting yet — a reset reported complete in three seconds.
+# Board power does not have this problem, which is why only the new methods do.
+cat >"$STATE/depart-probe" <<'PROBE'
+#!/bin/sh
+target="$1"
+set --
+. "$WAIT_SCRIPT" >/dev/null 2>&1 || :
+load_config
+SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
+MODEM_DEPART_SECONDS=2
+MODEM_POLL_SECONDS=1
+if wait_for_modem_departure "$target"; then printf 'departed\n'; else printf 'still-present\n'; fi
+PROBE
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/depart-probe" 'usb-serial:13-1.1:2c7c:0801:RESETTARGET')"
+[ "$verdict" = still-present ] || \
+	fail 'a modem that never left the bus was treated as having reset'
+verdict="$(WAIT_SCRIPT="$SCRIPT" sh "$STATE/depart-probe" 'usb-serial:13-9.9:2c7c:0801:VANISHED')"
+[ "$verdict" = departed ] || fail 'an absent modem was not recognised as departed'
 
 printf '%s\n' 'TEST reset refuses to run against a conflicting-ownership modem'
 reset_sysfs

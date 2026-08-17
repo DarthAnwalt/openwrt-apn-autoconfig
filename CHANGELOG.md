@@ -1,5 +1,81 @@
 # Changelog
 
+## apn-autoconfig 0.14.0 / apn-autoconfig-modem 0.14.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.14.0 (2026-08-17)
+
+The third and last identity backend. A modem that answers 3GPP AT but exposes
+neither QMI nor MBIM is now identified, matched against the provider database
+and displayed honestly.
+
+This is a dependency rather than a capability wanted for its own sake. A modem
+in an RNDIS composition exposes no `cdc-wdm` control node at all, so without an
+AT identity path the suite could dial such a device in a later release and still
+have no way to choose an APN for it.
+
+### What the release actually contains
+
+The command vocabulary turned out to be the easy part: the 3GPP core reads are
+uniform across vendors, and the bootstrap that learns *which* modem this is uses
+no vendor knowledge, because `AT+CGMI` and `AT+CGMM` are its output rather than
+its precondition. The work is port ownership.
+
+- **Ports are resolved by observed role**, not by enumeration order: a liveness
+  check, then a model query, so a node that speaks AT without being the control
+  channel is rejected. On the modem this was measured against, five of seven
+  ports accept a write and never answer.
+- **One earlier rule is reversed.** Several tty nodes correlated to one proven
+  USB device used to be terminal ambiguity, which made an ordinary seven-port
+  modem permanently unusable rather than safe. They are one modem exposing
+  several ports; ambiguity *between* devices still fails closed.
+- **Resolution is lazy and its cache is negative as well as positive.**
+  Discovery never sweeps, because a sweep costs the per-port bound for every
+  silent port and the web interface loads inventory on every visit. Verdicts are
+  keyed by physical port plus VID:PID, so a replacement modem never inherits its
+  predecessor's dead-port verdicts.
+- **The AT port lock is mandatory and shared** between `apn-autoconfig-modem`
+  and `apn-autoconfig-qmi`, whose ICCID/IMSI fallback probes the same nodes. The
+  existing per-control-device lock did not exclude them: it is keyed by the QMI
+  control node, not by the serial port.
+- **Identity** emits the same v1 contract the QMI and MBIM adapters do.
+  `operator_id` stays empty deliberately — no standard AT command reports the
+  SIM's home PLMN, and the matcher already falls back to the IMSI prefix, which
+  lets the database row supply the MNC length.
+- **A serial-less modem upgrades from `weak-vidpid` to the `imei` tier** once an
+  identity read has supplied an IMEI.
+- **`modem-reset` becomes one capability with three implementations**, chosen by
+  the modem's current control owner: the board power cycle where a supported
+  integration pins the modem, ModemManager's own reset where it owns the modem,
+  and `AT+CFUN=1,1` otherwise. Asking the legitimate owner to reset its own
+  modem keeps the single-owner rule intact with no exception for any
+  configuration, and the operation stops being unavailable on modems the board
+  GPIO cannot reach. The released Huasifei behaviour is unchanged: board power
+  wins wherever it applies.
+- **A quirk table** keyed by reported manufacturer and model ships empty, and
+  that is the finding rather than an oversight — nothing in this release needs a
+  vendor-specific capability.
+
+`AT+CFUN=1,1` gets one rule nothing else here needs: it takes the port away as
+it succeeds, so a missing final `OK` is the expected shape of success and the
+verdict comes from re-enumeration instead.
+
+### Not in this release
+
+No public control accepts free-form AT, and no AT path writes an APN profile:
+profile fields remain UCI options applied by netifd, exactly as for QMI and
+MBIM. There is no engine-facing AT adapter either — the engine only speaks about
+netifd targets, and an AT-managed modem has none until the Fibocom protocol
+lands, so which component answers it is decided there against a real caller.
+
+### Findings from the reference hardware that changed the design
+
+The hardware census was run before any code was written, and three of its
+results contradicted the plan. The router has no `timeout` executable, so the
+watchdog is not a fallback for minimal images but the only bounded path that has
+ever run there — including for a QMI fallback already marked hardware-validated.
+`AT+CREG?` reports `<stat>` 6, "registered, SMS only", which the planned mapping
+did not cover and would have read as unregistered. And `AT+CESQ` returns more
+than six fields on a 5G-capable modem, so a strict parse would have discarded a
+usable reading.
+
 ## apn-autoconfig 0.13.2 / apn-autoconfig-modem 0.13.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.13.2 (2026-08-16)
 
 A defect-only patch with no feature or API change.

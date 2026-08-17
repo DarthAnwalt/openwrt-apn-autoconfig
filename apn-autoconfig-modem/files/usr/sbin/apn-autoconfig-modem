@@ -72,6 +72,7 @@ REQUESTED_INTERFACE=""
 INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
 MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
 MM_INDEX_FILE="/tmp/apn-autoconfig-modem.$$.mm-indexes"
+MM_IDENTITY_FILE="/tmp/apn-autoconfig-modem.$$.mm-identity"
 CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
 AT_OUTPUT_FILE="/tmp/apn-autoconfig-modem.$$.at-output"
 AT_CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.at-candidates"
@@ -156,6 +157,7 @@ cleanup_files() {
 		"$INVENTORY_FILE.merged" "$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
 	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
 	[ -z "$MM_INDEX_FILE" ] || rm -f "$MM_INDEX_FILE"
+	[ -z "$MM_IDENTITY_FILE" ] || rm -f "$MM_IDENTITY_FILE"
 	[ -z "$CANDIDATES_FILE" ] || rm -f "$CANDIDATES_FILE"
 	[ -z "$AT_OUTPUT_FILE" ] || rm -f "$AT_OUTPUT_FILE"
 	[ -z "$AT_CANDIDATES_FILE" ] || rm -f "$AT_CANDIDATES_FILE"
@@ -1313,6 +1315,15 @@ discover_modemmanager_candidates() {
 		device_field="$(kv_value_from "$mm_data" 'modem.generic.device')"
 		physdev_field="$(kv_value_from "$mm_data" 'modem.generic.physdev')"
 		imei="$(kv_value_from "$mm_data" 'modem.generic.equipment-identifier')"
+		# ModemManager already knows what it is holding, so a modem it owns has
+		# no reason to be displayed as unidentified merely because AT is refused
+		# to us. "--" is its placeholder for unknown, not a value.
+		mm_manufacturer="$(kv_value_from "$mm_data" 'modem.generic.manufacturer')"
+		mm_model="$(kv_value_from "$mm_data" 'modem.generic.model')"
+		mm_revision="$(kv_value_from "$mm_data" 'modem.generic.revision')"
+		[ "$mm_manufacturer" != '--' ] || mm_manufacturer=""
+		[ "$mm_model" != '--' ] || mm_model=""
+		[ "$mm_revision" != '--' ] || mm_revision=""
 		rm -f "$mm_data"
 
 		control_device=""
@@ -1332,6 +1343,12 @@ discover_modemmanager_candidates() {
 		# Kept beside the path list because the reset path needs the object
 		# index to ask ModemManager to reset its own modem.
 		[ -z "$usb_path" ] || printf '%s\t%s\n' "$usb_path" "$modem_index" >>"$MM_INDEX_FILE"
+		# Scratch, not the persistent cache: discovery stays free of side
+		# effects, and these values are re-read every scan anyway.
+		if [ -n "$usb_path" ] && { [ -n "$mm_manufacturer" ] || [ -n "$mm_model" ]; }; then
+			printf '%s\t%s\t%s\t%s\n' "$usb_path" "$mm_manufacturer" "$mm_model" "$mm_revision" \
+				>>"$MM_IDENTITY_FILE"
+		fi
 
 		vendor_id=""
 		product_id=""
@@ -1634,10 +1651,18 @@ print_modem_json() {
 	json_key_string protocol "$protocol"; printf ','
 	# Display and quirk-keying evidence, read over AT and cached so the record
 	# can carry it without probing. Empty whenever no AT identity was obtained.
-	record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
-	record_identity=""
-	[ -z "$record_scope" ] || \
-		record_identity="$(sed -n '1p' "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
+	# ModemManager's own answer first, because it is live and available for
+	# modems whose AT port we are not allowed to touch; the AT cache is the
+	# fallback for everything else.
+	record_identity="$(awk -F '\t' -v path="$usb_path" \
+		'$1 == path { printf "%s\t%s\t%s", $2, $3, $4; exit }' "$MM_IDENTITY_FILE" 2>/dev/null || :)"
+	if [ -z "$record_identity" ]; then
+		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
+		[ -z "$record_scope" ] || \
+			record_identity="$(sed -n '1p' "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
+	else
+		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
+	fi
 	json_key_string manufacturer "$(field "$record_identity" 1)"; printf ','
 	json_key_string model "$(field "$record_identity" 2)"; printf ','
 	json_key_string firmware_revision "$(field "$record_identity" 3)"; printf ','

@@ -172,7 +172,10 @@ case "${1:-}" in
 	printf '%s\n' \
 		"modem.generic.device : ${MM_DEVICE:---}" \
 		"modem.generic.physdev : ${MM_PHYSDEV:---}" \
-		"modem.generic.equipment-identifier : ${MM_IMEI:---}"
+		"modem.generic.equipment-identifier : ${MM_IMEI:---}" \
+		"modem.generic.manufacturer : ${MM_MANUFACTURER:---}" \
+		"modem.generic.model : ${MM_MODEL:---}" \
+		"modem.generic.revision : ${MM_REVISION:---}"
 	exit 0
 ;;
 esac
@@ -1385,6 +1388,46 @@ export TEST_MODEM_POWER_OFF_SECONDS
 grep -F -x -q 'up cellqmi' "$TEST_EVENTS" || fail 'interrupted reset did not restart the selected interface'
 [ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 	fail 'interrupted reset left the per-modem lock behind'
+
+printf '%s\n' 'TEST a ModemManager-owned modem shows the model ModemManager knows, without any AT'
+# The page put the model at the top of the card and it read "Unidentified" for a
+# perfectly ordinary modem, because those fields were only ever filled by an AT
+# identity read — which is refused on a modem ModemManager owns. The daemon
+# already knows what it is holding, so the record uses its answer.
+reset_sysfs
+reset_at_ports
+reset_network_config
+add_qmi_modem 15-1.1 2c7c 0801 MMKNOWN 3 wwan3
+add_at_port 15-1.1 90 1.5 control
+MM_MODEM_INDEX=0
+MM_DEVICE="$TESTROOT/sys/devices/platform/mock-usb/15-1.1"
+MM_PHYSDEV="$MM_DEVICE"
+MM_MANUFACTURER="Quectel"
+MM_MODEL="RM520N-GL"
+MM_REVISION="RM520NGLAAR03A01M4G"
+export MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV MM_MANUFACTURER MM_MODEL MM_REVISION
+: >"$TEST_AT_PROBES"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["owner_state"] == "modemmanager", m
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "RM520N-GL", m
+assert m["firmware_revision"] == "RM520NGLAAR03A01M4G", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'an owned modem did not show the model ModemManager reports'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'the record was filled by probing a modem ModemManager owns'
+
+printf '%s\n' 'TEST ModemManager placeholders are not shown as if they were values'
+# mmcli prints "--" for what it does not know, which is not a model name.
+MM_MODEL='--' MM_REVISION='--' python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["manufacturer"] == "Quectel", m
+assert m["model"] == "", m
+assert m["firmware_revision"] == "", m
+' "$(MM_MODEL='--' MM_REVISION='--' sh "$SCRIPT" inventory-json)" || \
+	fail 'a ModemManager placeholder was presented as a model'
+unset MM_MODEM_INDEX MM_DEVICE MM_PHYSDEV MM_MANUFACTURER MM_MODEL MM_REVISION
 
 printf '%s\n' 'TEST the quirk table answers only what it was told, and the shipped one is empty'
 # Exercised by sourcing rather than through a command, because 0.14.0 has no

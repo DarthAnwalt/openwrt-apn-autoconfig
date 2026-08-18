@@ -27,9 +27,56 @@ In scope for v1:
 - exact rollback of everything provisioning created; and
 - removal of project-owned provisioning state without touching anything else.
 
-Out of scope for v1: adoption of user-created sections, MBIM profile mutation,
-eSIM, Fibocom dial protocol, multi-bearer policy, and any mutation of `mwan3`,
-Travelmate, firewall or routing configuration.
+Also in scope, from 0.15.0: **placing the provisioned interface in the firewall
+zone the working uplink already uses**, so that the router's *clients* reach the
+Internet over the modem.
+
+Out of scope: adoption of user-created sections, eSIM, multi-bearer policy, and
+any mutation of `mwan3`, Travelmate or routing configuration. MBIM profile
+mutation arrived in 0.12.0 and the AT-dial protocol in 0.15.0; both conform to
+the rules below rather than altering them.
+
+### Why firewall zone membership had to come into scope
+
+v1 excluded firewall configuration entirely, on the instinct that a tool should
+not touch a user's security policy. The 0.15.0 hardware gate showed what that
+instinct costs: a fully provisioned modem, dialled and verified, gave Internet
+access to the **router** and to nothing behind it. Locally-originated traffic
+passes; forwarding and NAT for LAN clients do not happen, and the operator's IPv6
+prefix never arrives.
+
+That is not a partial success, it is the wrong outcome. Nobody buys a router to
+give the router Internet access. And documenting it as a step the administrator
+must perform afterwards does not rescue the release: if they have to configure
+the firewall by hand, they could have configured the connection by hand too, and
+the automation has delivered nothing. Commercial firmware treats a modem as
+plug-in-and-it-works; this project exists because OpenWrt does not, so stopping
+one step short of a working uplink misses the point of it.
+
+So provisioning places the interface in a zone, under rules as narrow as the rest
+of this contract:
+
+1. **The zone is resolved, never created.** The target is the zone that already
+   contains the interface currently carrying a default route — the working
+   uplink's own zone, so the modem is treated exactly as the uplink beside it
+   already is. On a router with no uplink at all, a zone named `wan` is used if
+   one exists, which is the stock OpenWrt arrangement.
+2. **Zero or several candidates fail closed**, like every other resolution here.
+   "The only masquerading zone" is deliberately *not* the rule: a router with a
+   VPN commonly has two, and the reference router does.
+3. **Only the zone's `network` list is touched**, by appending one entry. No zone
+   is created or deleted, no policy, rule, redirect or `masq` flag is changed,
+   and an interface already listed is left alone rather than duplicated.
+4. **What was done is recorded on the section** as
+   `apn_autoconfig_firewall_zone`, so removal takes out exactly the entry
+   provisioning added and nothing else — and so a zone the administrator added
+   the interface to themselves is never removed by this project.
+5. **The firewall is reloaded, not restarted**, and the network is not touched at
+   all: `fw4 reload` re-applies rules without dropping an interface.
+
+`mwan3` remains out of scope. Multi-WAN *policy* is a decision about preference
+between uplinks, which is the administrator's; zone membership is what makes the
+interface usable at all.
 
 ## Ownership
 
@@ -40,6 +87,13 @@ A section created by this package carries three markers in `network.<section>`:
 | `apn_autoconfig_owner` | `apn-autoconfig-modem` |
 | `apn_autoconfig_modem_id` | the stable `modem_id` it was provisioned for |
 | `apn_autoconfig_provisioned` | UTC ISO-8601 timestamp of creation |
+| `apn_autoconfig_mm_uid` | the ModemManager device uid, on AT-dial sections only |
+
+`apn_autoconfig_mm_uid` is recorded so the ModemManager inhibition can be held
+while the modem is **absent**. That is not an optimisation: an inhibition
+registered before the modem's ports appear is what stops ModemManager claiming
+it at the next hotplug, and resolving the uid only when the device is present
+means racing ModemManager on every re-enumeration instead of pre-empting it.
 
 These are the authoritative ownership record. A section without all three is
 **not** project-owned and is never modified, promoted, disabled or deleted by
@@ -115,8 +169,9 @@ held:
 1. exactly one inventory record matches `--modem`, and it is present;
 2. `ambiguous` is false and `owner_state` is not `conflicting`;
 3. `netifd_interface` is empty — the modem is not already bound;
-4. the modem's protocol has an implemented provisioning path (`qmi` or
-   `modemmanager` in v1; `mbim` and `at` are recognised but refused);
+4. the modem's protocol has an implemented provisioning path — `qmi`,
+   `modemmanager`, `mbim`, or `at` when the AT-dial protocol package is
+   installed **and** registered with netifd;
 5. the required control/data attributes for that protocol are resolved and
    unambiguous; and
 6. the chosen section name is free.
@@ -124,6 +179,74 @@ held:
 Any failure is terminal and performs no mutation. Uncertainty is not permission:
 a failed or unparseable owner discovery blocks provisioning exactly as it blocks
 a reset.
+
+### An AT modem needs its protocol registered, not merely installed
+
+Added in 0.15.0. An observed protocol of `at` provisions to `proto=apn_atdial`,
+bound by stable USB path, and that mapping has a precondition the other
+protocols do not have.
+
+netifd reads `/lib/netifd/proto/*.sh` **only when it starts**. Neither
+`/etc/init.d/network reload` nor `ubus call network reload` re-reads them —
+`reload` re-reads `/etc/config/network` and nothing else. So a protocol handler
+installed into a running system is present on disk and unknown to netifd, and a
+section using it is inert, reporting `available: false` and an unsupported
+protocol type.
+
+The asymmetry that follows is worth stating plainly, because it decides where
+the restart belongs:
+
+- **Installing the package for the first time needs a netifd restart**, because
+  registration lives in netifd's memory.
+- **Updating the handler's logic does not**, because netifd spawns the script
+  from disk for every setup and teardown. New dial logic is picked up by the
+  next bring-up on its own.
+- **Adding or renaming an interface option does**, because the option schema
+  comes from the handler's `dump` output and is cached alongside the
+  registration. An option netifd has not seen is not accepted from the config.
+
+The middle case is the common one, which is why an update is not treated as a
+restart trigger. The third is a release-planning constraint rather than a
+runtime one: an option added mid-life reaches users at their next reboot, so it
+must be introduced with a default that behaves exactly as its absence did.
+
+`provision-plan` therefore reports `netifd_restart_required`, computed from
+`ubus call network get_proto_handlers`, alongside `reason: netifd_unregistered`
+and the protocol it *would* use. `provision` refuses in that state and creates
+nothing.
+
+Registering is its own command, `apn-autoconfig-modem register-proto`. It
+restarts the network, says so first, and reports whether a restart was actually
+needed — running it against an already-registered protocol changes nothing.
+
+**The restart is never performed from a package script.** A `postinst` that
+restarts the network reaches routers whose administrator is not present, is not
+expecting an interruption, and may be reachable only through the interfaces
+being restarted; the project whose implementation informed this release took a
+remote router off the network twice doing exactly that, once during an update
+that had nothing to do with modems.
+
+**Provisioning is not automatically the opposite situation, and an earlier
+version of this contract was wrong to say it was.** It claimed the restart is
+safe there because the user is "at the console, waiting for it". The 0.15.0
+hardware gate disproved that on the first attempt: `/etc/init.d/network restart`
+restarts *every* interface, including the overlay the router is administered
+over. On the reference router it dropped ZeroTier and made travelmate
+re-associate the WiFi uplink to a different network, which changed the router's
+address and left it reachable only by ICMP from outside — alive, serving its own
+clients, and impossible to log into. Being at the console is not the same as
+being on the LAN, and the interfaces this restart takes down include the ones
+that carry administration.
+
+So provisioning **must not restart the network implicitly**. When a protocol is
+installed but unregistered, `provision` fails closed with `netifd_unregistered`
+and says what to do; registering it is a separate action the administrator takes
+deliberately, having been told that every interface — including any VPN or
+overlay they are connected over — will go down and may come back differently.
+
+A reboot is the other honest answer and is often the better one: it restores
+overlays and uplinks through their normal start-up path rather than leaving
+whichever of them happens to reconnect first.
 
 ## States
 
@@ -228,6 +351,7 @@ apn-autoconfig-modem provision-plan --modem <id>
 apn-autoconfig-modem provision --modem <id> [--autoconnect 0|1] [--apn <name> ...]
 apn-autoconfig-modem deprovision --modem <id>
 apn-autoconfig-modem connect|disconnect|reconnect --modem <id>
+apn-autoconfig-modem inhibit-targets
 apn-autoconfig-modem action-start provision --modem <id>
 ```
 
@@ -235,8 +359,22 @@ apn-autoconfig-modem action-start provision --modem <id>
 provisioned, the section name that would be created, the protocol that would be
 used, and, when it cannot, a stable machine-readable reason:
 `already_configured`, `ambiguous`, `conflicting_owner`, `unsupported_protocol`,
-`not_present`, `name_unavailable`. It never writes UCI, never creates state and
+`not_present`, `name_unavailable`, `netifd_unregistered`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
+
+`inhibit-targets` is read-only and lists the ModemManager inhibitions this
+package owns, one `<device-uid><TAB><modem_id>` line each. The service's init
+script turns each line into one supervised holder, so the set of held
+inhibitions is derived from configuration on every start and reload rather than
+from runtime state — it survives a reboot, and a removed section stops being
+declared. Provisioning and deprovisioning ask for a reload and procd reconciles
+the difference.
+
+0.15.0 adds `netifd_restart_required` to the same response, additively. It is
+true only for a protocol this project ships whose handler netifd has not
+registered, and it tells a frontend that the provisioning it is about to start
+will briefly restart the network — which is a thing a user is entitled to be
+told before it happens rather than after.
 
 0.13.0 adds three read-only fields to the same response, additively and without
 changing the meaning of any existing one: `can_control_bearer`,

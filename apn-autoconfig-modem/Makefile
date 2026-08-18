@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig-modem
-PKG_VERSION:=0.14.1
+PKG_VERSION:=0.15.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -52,6 +52,7 @@ define Package/apn-autoconfig-modem/install
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-action $(1)/usr/libexec/apn-autoconfig-modem-action
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-query $(1)/usr/libexec/apn-autoconfig-modem-query
 	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-control $(1)/usr/libexec/apn-autoconfig-modem-control
+	$(INSTALL_BIN) ./files/usr/libexec/apn-autoconfig-modem-inhibit $(1)/usr/libexec/apn-autoconfig-modem-inhibit
 	$(INSTALL_DIR) $(1)/usr/share/apn-autoconfig-modem
 	$(INSTALL_DATA) ./files/usr/share/apn-autoconfig-modem/quirks $(1)/usr/share/apn-autoconfig-modem/quirks
 endef

@@ -138,3 +138,24 @@ not imply otherwise.
 - confirmation before every state-changing verb;
 - polling behavior for running operations, including the rule that a lost launch
   answer keeps polling rather than inventing a result.
+
+## The provisioning verdict travels with the inventory (0.15.0)
+
+`inventory-json` records carry `can_provision`, `provision_reason`,
+`provision_section`, `provision_existing_section`, `provision_protocol`,
+`netifd_restart_required`, `can_control_bearer`, `connection_section` and
+`connection_owned`. The names and meanings are those `provision-plan` already
+returned; nothing existing changes shape, so this is an additive v1 extension.
+
+It exists to remove a cost rather than to add a capability. The page needed the
+inventory plus, per modem, whether it could be provisioned and whether its
+bearer could be controlled — and asking separately meant one helper process per
+modem, each repeating the full hardware scan. A page load therefore paid that
+scan 1+N times, measured at roughly four seconds of backend critical path with
+none of it spent waiting on hardware. A second modem made it worse.
+
+`provision-plan` keeps working and keeps its contract. A frontend that reads
+the verdict from the record must treat a **missing** verdict as a check that did
+not run, never as a refusal and never as permission: an older backend and a
+modem that cannot be provisioned are different situations, and only one of them
+should silence the controls.

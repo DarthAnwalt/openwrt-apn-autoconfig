@@ -153,20 +153,48 @@ profile: profile fields remain UCI options applied by netifd, exactly as for
 QMI and MBIM. Manual APN remains an APN-engine operation using the same
 baseline, verification and rollback discipline as database profiles.
 
-## 0.15.0 — Fibocom FM350 connection path
+## 0.15.0 — AT-dialed connection path
 
-Add separately packaged netifd protocol support and capability modules needed
-for the practical FM350 connection lifecycle. Validate provisioning,
-connection, interruption, recovery and coexistence on hardware without moving
-bearer ownership outside netifd. The protocol handler binds the data-interface
-driver itself: on the measured hardware the device presents an RNDIS interface
-pair with no driver bound and therefore no network device at all.
+Add `apn-autoconfig-proto-atdial`, a netifd protocol (`apn_atdial`) for modems
+that expose no control channel at all. Their data path is an ordinary usbnet
+interface, so the host must define and activate the PDP context over AT and then
+configure the address the modem reports; nothing else will, because the modem
+serves no DHCP. This is the first netifd target an AT-managed modem has ever had
+in this project, and the reason 0.14.0 existed.
 
-This release also brings the first netifd target an AT-managed modem has ever
-had, and with it the decision deferred from 0.14.0: whether the APN engine gets
-AT identity through an adapter of its own or by asking `apn-autoconfig-modem`.
-Both candidates and the argument between them are recorded in
-[`backend-contract-v1.md`](backend-contract-v1.md).
+The handler binds the data-interface driver itself. On the measured hardware the
+device presents an RNDIS interface pair with no driver bound and therefore no
+network device whatsoever, so a protocol that waited for one would wait forever.
+
+Two devices are addressed, and their evidence is deliberately not equal. The
+Fibocom FM350-GL is validated on hardware. The Intel XMM devices — Fibocom L850
+and L860 — need a genuinely different tail after the same 3GPP dial: the data
+channel must be bound explicitly, DNS comes from a vendor query, and the link
+does not answer ARP, so leaving it on produces an address that carries no
+traffic. That tail is implemented and ships `alpha`/`synthetic`, because no such
+device has been driven here. It is carried by the quirk table introduced empty
+in 0.14.0, keyed by reported manufacturer and model — which distinguishes the
+L850 from the L860 where the USB id cannot, since both enumerate identically.
+
+The release resolves the decision deferred from 0.14.0. The APN engine gets AT
+identity by asking `apn-autoconfig-modem` rather than through an adapter of its
+own, because the protocol handler now holds the AT port for a whole dial and a
+third component parsing replies on the same tty is the failure 0.14.0 was built
+to prevent.
+
+Two ownership questions are answered rather than worked around. A modem
+ModemManager has claimed but cannot drive is released with ModemManager's own
+`--inhibit-device`, held by a supervised process for exactly as long as the
+provisioning that requested it, and ModemManager is never restarted. And a
+protocol handler is registered with netifd only when a user provisions a modem
+and is waiting for it — never from a package script, where a network restart
+reaches administrators who are not present.
+
+The release also closes two items carried from earlier cycles: LuCI page-load
+time, measured at roughly four seconds of backend critical path and caused by
+rescanning the inventory once per modem rather than by any hardware wait, and
+per-modem presentation, which the eSIM release needs a place to hang SIM slots
+from.
 
 ## 0.16.0 — eSIM lifecycle and live APN recovery
 

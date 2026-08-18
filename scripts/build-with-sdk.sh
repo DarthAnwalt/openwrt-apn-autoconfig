@@ -47,6 +47,8 @@ rm -rf "$SDK_DIR/package/luci-app-apn-autoconfig"
 cp -R "$ROOT/luci-app-apn-autoconfig" "$SDK_DIR/package/luci-app-apn-autoconfig"
 rm -rf "$SDK_DIR/package/apn-autoconfig-modem"
 cp -R "$ROOT/apn-autoconfig-modem" "$SDK_DIR/package/apn-autoconfig-modem"
+rm -rf "$SDK_DIR/package/apn-autoconfig-proto-atdial"
+cp -R "$ROOT/apn-autoconfig-proto-atdial" "$SDK_DIR/package/apn-autoconfig-proto-atdial"
 
 (
 	cd "$SDK_DIR"
@@ -55,6 +57,7 @@ cp -R "$ROOT/apn-autoconfig-modem" "$SDK_DIR/package/apn-autoconfig-modem"
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-providers=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_luci-app-apn-autoconfig=m' >>.config
 	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-modem=m' >>.config
+	printf '%s\n' 'CONFIG_PACKAGE_apn-autoconfig-proto-atdial=m' >>.config
 	make defconfig
 	make package/apn-autoconfig-providers/clean
 	make package/apn-autoconfig-providers/compile V=s
@@ -64,24 +67,29 @@ cp -R "$ROOT/apn-autoconfig-modem" "$SDK_DIR/package/apn-autoconfig-modem"
 	make package/luci-app-apn-autoconfig/compile V=s
 	make package/apn-autoconfig-modem/clean
 	make package/apn-autoconfig-modem/compile V=s
+	make package/apn-autoconfig-proto-atdial/clean
+	make package/apn-autoconfig-proto-atdial/compile V=s
 )
 
 rm -f "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
 	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
 	"$OUTPUT"/luci-app-apn-autoconfig-*.apk \
-	"$OUTPUT"/apn-autoconfig-modem-*.apk
+	"$OUTPUT"/apn-autoconfig-modem-*.apk \
+	"$OUTPUT"/apn-autoconfig-proto-atdial-*.apk
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-[0-9]*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-integration-huasifei-wh3000-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-providers-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'luci-app-apn-autoconfig-*.apk' -exec cp {} "$OUTPUT/" \;
 find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-modem-*.apk' -exec cp {} "$OUTPUT/" \;
+find "$SDK_DIR/bin" -type f -name 'apn-autoconfig-proto-atdial-*.apk' -exec cp {} "$OUTPUT/" \;
 set -- "$OUTPUT"/apn-autoconfig-[0-9]*.apk \
 	"$OUTPUT"/apn-autoconfig-providers-*.apk \
 	"$OUTPUT"/luci-app-apn-autoconfig-*.apk \
 	"$OUTPUT"/apn-autoconfig-integration-huasifei-wh3000-*.apk \
-	"$OUTPUT"/apn-autoconfig-modem-*.apk
-[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] && [ -f "$4" ] && [ -f "$5" ] || {
+	"$OUTPUT"/apn-autoconfig-modem-*.apk \
+	"$OUTPUT"/apn-autoconfig-proto-atdial-*.apk
+[ -f "$1" ] && [ -f "$2" ] && [ -f "$3" ] && [ -f "$4" ] && [ -f "$5" ] && [ -f "$6" ] || {
 	printf '%s\n' 'One or more APKs were not produced' >&2
 	exit 1
 }
@@ -199,12 +207,13 @@ inspect_package "$4" apn-autoconfig-integration-huasifei-wh3000 4 \
 	exit 1
 }
 
-inspect_package "$5" apn-autoconfig-modem 13 \
+inspect_package "$5" apn-autoconfig-modem 14 \
 	usr/sbin/apn-autoconfig-modem \
 	usr/libexec/apn-autoconfig-modem-boot \
 	usr/libexec/apn-autoconfig-modem-action \
 	usr/libexec/apn-autoconfig-modem-query \
 	usr/libexec/apn-autoconfig-modem-control \
+	usr/libexec/apn-autoconfig-modem-inhibit \
 	usr/share/apn-autoconfig-modem/quirks \
 	etc/config/apn-autoconfig-modem \
 	etc/init.d/apn-autoconfig-modem \
@@ -213,6 +222,13 @@ inspect_package "$5" apn-autoconfig-modem 13 \
 	lib/apk/packages/apn-autoconfig-modem.list \
 	lib/apk/packages/apn-autoconfig-modem.conffiles \
 	lib/apk/packages/apn-autoconfig-modem.conffiles_static
+
+inspect_package "$6" apn-autoconfig-proto-atdial 5 \
+	lib/netifd/proto/apn_atdial.sh \
+	usr/share/apn-autoconfig-proto-atdial/atdial.sh \
+	usr/share/apn-autoconfig-proto-atdial/quirks \
+	usr/share/licenses/apn-autoconfig-proto-atdial/LICENSE \
+	lib/apk/packages/apn-autoconfig-proto-atdial.list
 
 for forbidden_dependency in modemmanager uqmi umbim kmod-button-hotplug; do
 	if grep -F -q '"'"$forbidden_dependency"'"' "$BUILD_ROOT/apn-autoconfig-modem-adbdump.json"; then
@@ -228,6 +244,7 @@ for executable in \
 	usr/libexec/apn-autoconfig-modem-query \
 	usr/libexec/apn-autoconfig-modem-control \
 	etc/init.d/apn-autoconfig-modem \
+	usr/libexec/apn-autoconfig-modem-inhibit \
 	etc/hotplug.d/usb/50-apn-autoconfig-modem
 do
 	[ -x "$BUILD_ROOT/inspect-apn-autoconfig-modem/$executable" ] || {
@@ -236,11 +253,19 @@ do
 	}
 done
 
+# netifd spawns the protocol handler as a program, so one that shipped without
+# the execute bit would fail at the first bring-up and nowhere earlier.
+[ -x "$BUILD_ROOT/inspect-apn-autoconfig-proto-atdial/lib/netifd/proto/apn_atdial.sh" ] || {
+	printf '%s\n' 'Package file is not executable: /lib/netifd/proto/apn_atdial.sh' >&2
+	exit 1
+}
+
 (cd "$OUTPUT" && sha256sum \
 	apn-autoconfig-[0-9]*.apk \
 	apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	apn-autoconfig-providers-*.apk \
 	luci-app-apn-autoconfig-*.apk \
-	apn-autoconfig-modem-*.apk >SHA256SUMS)
+	apn-autoconfig-modem-*.apk \
+	apn-autoconfig-proto-atdial-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print

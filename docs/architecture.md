@@ -189,6 +189,22 @@ Audits so far:
 |---|---|---|
 | 2026-08-13 | `apn-autoconfig-modem`, `-esim`, `-proto-fibocom`, `-lpac` | no exact collision |
 | 2026-08-16 | all five published names | no exact collision; every `PKG_NAME` hit belongs to this repository, and the three official trees contain none |
+| 2026-08-18 | `apn-autoconfig-proto-atdial`, added this release in place of the planned `-proto-fibocom`, plus the `apn_atdial` netifd protocol name and its handler path | no exact collision: zero public hits for either token, and `openwrt/packages`, `openwrt/luci` and `openwrt/openwrt` contain neither |
+
+The 2026-08-18 audit also covered a namespace the earlier ones had no reason to:
+**netifd protocol names are global and shared with every other package on the
+router**, and unlike package names a collision there is a silently overwritten
+file rather than a refused install. `luci-app-5gmodem` already installs
+`/lib/netifd/proto/fibocom.sh`, which is why the planned name was retired before
+a line of it was written. Protocol names this project ships are prefixed like
+its packages, for the same reason its packages are.
+
+One constraint is not about naming taste at all. netifd composes handler
+function names as `proto_<name>_setup`, so a protocol name becomes part of a
+shell function name and must be a valid identifier: `dash` rejects
+`proto_apn-atdial_init_config() { … }` with `Bad function name`. Hyphens are
+therefore unavailable to any protocol this project ships, underscores are fine,
+and `3g` shows a leading digit is too.
 
 ### First-party packages
 
@@ -200,8 +216,10 @@ Audits so far:
   declared profile fields, verifies connectivity and rolls back exactly.
 - `apn-autoconfig-providers`: independently updated normalized provider data;
   it retains date-based data versions.
-- `apn-autoconfig-proto-fibocom`: optional netifd protocol support for selected
-  Fibocom/AT-managed devices not handled by a stock OpenWrt protocol.
+- `apn-autoconfig-proto-atdial`: optional netifd protocol support (`apn_atdial`)
+  for AT-dialed RNDIS/ECM/NCM devices that expose no control channel and that no
+  stock OpenWrt protocol can drive. Named for the method rather than for a
+  vendor, because the same 3GPP dial covers several.
 - `apn-autoconfig-esim`: eSIM orchestration, profile lifecycle and the combined
   profile-switch, identity-refresh, APN-reconcile and connectivity workflow.
 - `apn-autoconfig-lpac`: a private, upstream-tracking lpac build if upstream
@@ -350,6 +368,22 @@ Revisit once multi-modem hardware evidence exists. Per-target granularity would
 have to preserve the existing global-to-specific acquisition order and prove
 that no CLI, LuCI, boot, hotplug, provisioning, eSIM or button path can acquire
 the pair in the opposite direction.
+
+### Roaming refusal has no hardware evidence
+
+Recorded 2026-08-18, owed by the next release, major or patch.
+
+The AT-dial handler refuses to dial on a roaming registration unless
+`allow_roaming` is set, and every registration state that decision depends on is
+covered by fixtures. None of it has run against a modem actually registered on a
+visited network: the SIM on the bench cannot be made to roam on demand, and a
+roaming one arrives 2026-08-19.
+
+0.15.0 was not held for it. A finished release waiting on the availability of a
+test SIM is a real delay bought for a test that runs just as well against the
+shipped code afterwards. What must not happen is the gap closing quietly, so
+until a roaming SIM has exercised it the refusal path is fixture evidence only,
+and this entry is what says so.
 
 ### Automatic escalation between reset methods
 

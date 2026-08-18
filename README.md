@@ -312,14 +312,46 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.14.1-r1.apk \
-  ./luci-app-apn-autoconfig-0.14.1-r1.apk
+  ./apn-autoconfig-0.15.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.15.0-r1.apk
 ```
 
-`apn-autoconfig-modem-0.14.1-r1.apk` is optional and not part of this
-transaction: `apn-autoconfig` does not depend on it in 0.10.0. It adds
-read-only modem inventory and a coordinator-based `modem-reset` path alongside
-the compatibility path. Install it when those functions are required.
+`apn-autoconfig-modem-0.15.0-r1.apk` is optional and not part of this
+transaction: `apn-autoconfig` does not depend on it. It adds read-only modem
+inventory, stable identity, control-owner arbitration and a coordinator-based
+`modem-reset` path alongside the compatibility path. Install it when those
+functions are required.
+
+`apn-autoconfig-proto-atdial-0.15.0-r1.apk` is also optional, and only useful
+for a modem that exposes no control channel at all — a Fibocom FM350-GL in RNDIS
+composition, for example, where there is no `cdc-wdm` node for QMI or MBIM to
+use. It adds the `apn_atdial` netifd protocol, which defines and activates the
+PDP context over AT and configures the address the modem reports.
+
+**Installing it does not make netifd aware of it.** netifd reads protocol
+handlers only when it starts, so the protocol is registered the first time you
+set up a modem onto it — `apn-autoconfig-modem` restarts the network at that
+point and tells you beforehand. Package installs and upgrades deliberately never
+do this on their own: a network restart that arrives with an unrelated package
+update, on a router reachable only through the interfaces it takes down, is not
+a thing a package should decide for you.
+
+Setting up a modem places its interface in the firewall zone your working uplink
+already uses, so the router's **clients** reach the Internet over it, not just
+the router. The zone is resolved and appended to, never created: no zone,
+policy, rule or masquerading flag is changed, and removing the modem takes out
+exactly the entry that was added. If no single zone can be resolved — an unusual
+firewall with no clear uplink zone — setup stops and says so rather than leaving
+you with a modem only the router can use.
+
+Multi-WAN preference between uplinks stays yours: a provisioned modem is the
+least preferred route by default, so it takes over only when nothing better is
+available, and `mwan3` policy is never touched.
+
+Support for Intel XMM devices (Fibocom L850, L860) is implemented in the same
+protocol but **has not been validated on hardware** — no such device has been
+driven by this project. It is reported as `alpha`/`synthetic` and should be
+treated as untested.
 
 The inventory service starts automatically on a live installation so a modem
 that was already attached is discovered without reconnecting it. GPIO reset is

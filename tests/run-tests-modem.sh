@@ -67,6 +67,35 @@ get:apn-autoconfig-modem.main.at_timeout_seconds) printf '%s\n' "${TEST_AT_TIMEO
 get:apn-autoconfig-modem.main.at_port_lock_root) printf '%s\n' "$TEST_AT_PORT_LOCK_ROOT" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
+# Firewall zones. The default shape is the stock OpenWrt one — a lan zone and a
+# masquerading wan zone — plus, when a test asks for it, a second masquerading
+# zone, because a router with a VPN has one and "the only masq zone" must not be
+# the rule.
+get:firewall.@zone\[0\].name) printf '%s\n' lan ;;
+get:firewall.@zone\[0\].network) printf '%s\n' lan ;;
+get:firewall.@zone\[1\].name) [ "${TEST_FW_NO_WAN_ZONE:-0}" = 1 ] || printf '%s\n' wan ;;
+get:firewall.@zone\[1\].network)
+	[ "${TEST_FW_NO_WAN_ZONE:-0}" = 1 ] && exit 1
+	printf '%s' "wan"
+	[ -s "$TEST_FW_ZONE_MEMBERS" ] && printf ' %s' "$(tr '\n' ' ' <"$TEST_FW_ZONE_MEMBERS")"
+	printf '\n'
+;;
+get:firewall.@zone\[2\].name) [ "${TEST_FW_SECOND_ZONE:-0}" = 1 ] && printf '%s\n' vpn ;;
+get:firewall.@zone\[2\].network) [ "${TEST_FW_SECOND_ZONE:-0}" = 1 ] && printf '%s\n' "${TEST_FW_SECOND_ZONE_NET:-wg0}" ;;
+get:firewall.@zone\[3\].name) exit 1 ;;
+get:firewall.*) exit 1 ;;
+add_list:firewall.*)
+	printf 'add_list\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	printf '%s\n' "${2##*=}" >>"$TEST_FW_ZONE_MEMBERS"
+	exit 0
+;;
+del_list:firewall.*)
+	printf 'del_list\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	removed="${2##*=}"
+	grep -v -x -F "$removed" "$TEST_FW_ZONE_MEMBERS" >"$TEST_FW_ZONE_MEMBERS.new" 2>/dev/null || :
+	mv "$TEST_FW_ZONE_MEMBERS.new" "$TEST_FW_ZONE_MEMBERS"
+	exit 0
+;;
 get:network.*)
 	section="${2#network.}"
 	case "$section" in
@@ -273,6 +302,17 @@ cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
 call)
+	if [ "${2:-}" = network ] && [ "${3:-}" = get_proto_handlers ]; then
+		# Which protocols netifd currently knows. Installed-but-unregistered is
+		# the state a fresh package install leaves behind, so it is the default.
+		printf '{"qmi":{},"mbim":{},"modemmanager":{}'
+		# Registration lives in a file, not an environment variable, because the
+		# restart that creates it happens in a different process.
+		[ "$(cat "$TEST_ATDIAL_REGISTERED_FILE" 2>/dev/null || printf 0)" = 1 ] && \
+			printf ',"apn_atdial":{}'
+		printf '}\n'
+		exit 0
+	fi
 	section="${2#network.interface.}"
 	if [ "$section" = "${TEST_IFACE_UP:-}" ]; then
 		printf '{"up":true,"l3_device":"wwan0"}\n'
@@ -453,6 +493,28 @@ case "$behaviour" in
 esac
 EOF
 
+cat >"$MOCKBIN/network-init" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >>"$TEST_NETWORK_INIT_LOG"
+# A restart is what makes netifd read the handler, so the mock models exactly
+# that: registration only becomes true once someone restarts the network.
+[ "$1" = restart ] && [ "${TEST_ATDIAL_REGISTER_ON_RESTART:-1}" = 1 ] && \
+	printf '%s\n' 1 >"$TEST_ATDIAL_REGISTERED_FILE"
+exit 0
+EOF
+
+cat >"$MOCKBIN/service-init" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >>"$TEST_SERVICE_INIT_LOG"
+exit 0
+EOF
+cat >"$MOCKBIN/firewall-init" <<'EOF'
+#!/bin/sh
+# Reload, never restart: it re-applies rules without dropping an interface.
+printf '%s\n' "$1" >>"$TEST_FW_RELOADS"
+exit 0
+EOF
+
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_SYSFS="$TESTROOT/sys"
@@ -461,6 +523,22 @@ export TEST_MODEM_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-modem"
 export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
 export TEST_AT_PORT_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-at-port"
+export TEST_NETWORK_INIT_LOG="$STATE/network-init-log"
+export TEST_SERVICE_INIT_LOG="$STATE/service-init-log"
+export TEST_ATDIAL_REGISTERED_FILE="$STATE/atdial-registered"
+export TEST_ATDIAL_HANDLER="$STATE/apn_atdial.sh"
+export TEST_FW_ZONE_MEMBERS="$STATE/fw-zone-members"
+export TEST_FW_RELOADS="$STATE/fw-reloads"
+: >"$TEST_FW_ZONE_MEMBERS"
+: >"$TEST_FW_RELOADS"
+export APN_AUTOCONFIG_MODEM_FIREWALL_INIT="$MOCKBIN/firewall-init"
+: >"$TEST_NETWORK_INIT_LOG"
+: >"$TEST_SERVICE_INIT_LOG"
+export APN_AUTOCONFIG_MODEM_UBUS="$MOCKBIN/ubus"
+export APN_AUTOCONFIG_MODEM_NETWORK_INIT="$MOCKBIN/network-init"
+export APN_AUTOCONFIG_MODEM_SERVICE_INIT="$MOCKBIN/service-init"
+export APN_AUTOCONFIG_MODEM_ATDIAL_HANDLER="$TEST_ATDIAL_HANDLER"
+export APN_AUTOCONFIG_MODEM_NETIFD_RESTART_WAIT=3
 export TEST_AT_PORTS="$STATE/at-ports"
 export TEST_MM_RESETS="$STATE/mm-resets"
 : >"$STATE/mm-resets"
@@ -515,10 +593,28 @@ uci_wrote_nothing() {
 }
 
 # Sections other than the named one must never be touched.
+# Everything provisioning wrote, other than its own section and the one
+# permitted firewall change.
+#
+# Since 0.15.0 provisioning appends the interface to one resolved firewall zone's
+# network list, because a modem only the router itself can use is the wrong
+# outcome rather than a partial one. That single append is allowed here; a zone
+# being created, a policy or masq flag being changed, or any other config being
+# touched is still a failure.
 uci_touched_only_section() {
 	wanted="$1"
 	awk -F'\t' -v want="$wanted" '
 		$1 == "commit" || $1 == "revert" { next }
+		$1 == "add_list" || $1 == "del_list" {
+			# Only the network list of an existing zone, and only naming this
+			# interface. Anything else about the firewall is off limits.
+			if ($2 ~ /^firewall\.@zone\[[0-9]+\]\.network=/) {
+				value = $2
+				sub(/^.*=/, "", value)
+				if (value == want) next
+			}
+			print $2; bad = 1; next
+		}
 		{
 			key = $2
 			sub(/^network\./, "", key)
@@ -603,8 +699,18 @@ add_at_modem() {
 	mkdir -p "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index"
 	printf '%s\n' "$vendor" >"$usb_dir/idVendor"
 	printf '%s\n' "$product" >"$usb_dir/idProduct"
+	# The kernel's enumeration counter. Real modems have it, it changes every
+	# time the device appears on the bus, and AT port verdicts are only valid
+	# within one of its values.
+	printf '%s\n' "${6:-7}" >"$usb_dir/devnum"
 	[ -z "$serial" ] || printf '%s\n' "$serial" >"$usb_dir/serial"
 	ln -s "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+}
+
+# The same modem, back on the bus with a new enumeration counter — what a reset
+# or a replug looks like from sysfs.
+reenumerate_at_modem() {
+	printf '%s\n' "$2" >"$TESTROOT/sys/devices/platform/mock-usb/$1/devnum"
 }
 
 # One tty on an existing USB device, with its own interface number, so that the
@@ -1051,6 +1157,34 @@ TEST_AT_CESQ="99,99,255,255,255,255,255,255,255" \
 signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity-csq")"
 [ "$signal" = 35 ] || fail "CSQ fallback produced $signal instead of 35"
 
+printf '%s\n' 'TEST every registered stat is read as registered, including CSFB-not-preferred'
+# 6 and 7 were added once and 9 and 10 were left behind, which is the same
+# mistake twice: 3GPP TS 27.007 stat 9 and 10 are "registered, CSFB not
+# preferred" on the home and on a visited network. An unmapped value does not
+# fall back to a sensible default here — it abandons this source for the next
+# one, so a modem answering 9 from all three ends as "unknown", i.e. a fully
+# attached modem reported as unregistered.
+for reg_case in '1 home false' '5 roaming true' '6 home false' '7 roaming true' \
+	'9 home false' '10 roaming true'; do
+	reg_stat="${reg_case%% *}"
+	reg_rest="${reg_case#* }"
+	reg_expect_state="${reg_rest%% *}"
+	reg_expect_roaming="${reg_rest#* }"
+	reset_sysfs
+	reset_at_ports
+	add_at_modem 7-1.9 2c7c 0126 "REGSTAT$reg_stat" 61
+	printf '/dev/ttyUSB61\tcontrol\n' >>"$TEST_AT_PORTS"
+	TEST_AT_EPS_STAT="$reg_stat" sh "$SCRIPT" at-identity \
+		--modem "usb-serial:7-1.9:2c7c:0126:REGSTAT$reg_stat" >"$STATE/at-identity-stat" || \
+		fail "at-identity failed for registration stat $reg_stat"
+	reg_got_state="$(awk -F'\t' '$1 == "registration_state" { print $2 }' "$STATE/at-identity-stat")"
+	reg_got_roaming="$(awk -F'\t' '$1 == "roaming" { print $2 }' "$STATE/at-identity-stat")"
+	[ "$reg_got_state" = "$reg_expect_state" ] || \
+		fail "registration stat $reg_stat read as $reg_got_state, expected $reg_expect_state"
+	[ "$reg_got_roaming" = "$reg_expect_roaming" ] || \
+		fail "registration stat $reg_stat reported roaming $reg_got_roaming, expected $reg_expect_roaming"
+done
+
 printf '%s\n' 'TEST registration stat 6 is a registered state, and the ICCID ladder reaches the vendor spelling'
 reset_sysfs
 reset_at_ports
@@ -1165,6 +1299,77 @@ port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED")" ||
 	fail 'the resolver did not recover once the shared lock was released'
 [ "$port" = /dev/ttyUSB55 ] || fail "recovery returned $port"
 [ ! -e "$held_lock" ] || fail 'the resolver left the shared port lock behind'
+
+printf '%s\n' 'TEST the resolver waits for a busy AT port instead of refusing on its first attempt'
+# The wait this option configures was unreachable. lock_try_acquire_or_reclaim
+# returns 3 for "held by a live owner" — 2 is what the inner lock_try_acquire
+# returns before the reclaiming wrapper translates it — and the loop tested for
+# 2, so every contended acquisition failed immediately and the configured wait
+# never happened.
+#
+# The refusal test above could not see it, because refusal is what both the
+# broken and the fixed version do once the wait expires. This asserts the other
+# outcome instead: a lock released while the caller is waiting must be picked
+# up. The suite's sleep is a no-op, so the release rides on the call count
+# rather than on wall clock and the assertion stays deterministic.
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.7 1234 5678 WAITER 57
+printf '/dev/ttyUSB57\tcontrol\n' >>"$TEST_AT_PORTS"
+waiting_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB57"
+wait_counter="$TESTROOT/at-lock-wait-count"
+mkdir -p "$(dirname "$waiting_lock")"
+printf '%s\n' "$$" >"$waiting_lock"
+rm -f "$wait_counter"
+cat >"$MOCKBIN/sleep" <<EOF
+#!/bin/sh
+count=\$(cat "$wait_counter" 2>/dev/null || printf 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" >"$wait_counter"
+[ "\$count" -ge 3 ] && rm -f "$waiting_lock"
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.7:1234:5678:WAITER")" || \
+	fail 'the resolver refused a port whose holder released it while it was waiting'
+[ "$port" = /dev/ttyUSB57 ] || fail "the waiting resolver resolved to $port"
+waited="$(cat "$wait_counter" 2>/dev/null || printf 0)"
+[ "$waited" -ge 3 ] || fail "the resolver acquired without waiting at all ($waited wait(s))"
+cat >"$MOCKBIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+rm -f "$waiting_lock" "$wait_counter"
+
+printf '%s\n' 'TEST a configured wait of zero refuses a contended port immediately'
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.8 1234 5678 NOWAIT 58
+printf '/dev/ttyUSB58\tcontrol\n' >>"$TEST_AT_PORTS"
+impatient_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB58"
+mkdir -p "$(dirname "$impatient_lock")"
+printf '%s\n' "$$" >"$impatient_lock"
+rm -f "$wait_counter"
+cat >"$MOCKBIN/sleep" <<EOF
+#!/bin/sh
+count=\$(cat "$wait_counter" 2>/dev/null || printf 0)
+printf '%s\n' "\$((count + 1))" >"$wait_counter"
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+impatient=0
+APN_AUTOCONFIG_AT_LOCK_WAIT_SECONDS=0 sh "$SCRIPT" at-port \
+	--modem "usb-serial:9-1.8:1234:5678:NOWAIT" >/dev/null 2>&1 || impatient=$?
+[ "$impatient" -ne 0 ] || fail 'a zero wait still used a port another holder had locked'
+[ ! -s "$wait_counter" ] || fail 'a zero wait still slept before refusing'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'a refused acquisition still wrote to the port'
+cat >"$MOCKBIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+rm -f "$impatient_lock" "$wait_counter"
 
 printf '%s\n' 'TEST a probe never reaches a port belonging to another modem'
 # The target modem deliberately owns the *higher* tty index. With correlation
@@ -2240,6 +2445,22 @@ printf '%s\n' 'TEST provisioning promotes autoconnect only after reconciliation 
 [ -z "$(uci -q get network.apnmodem1.auto)" ] || \
 	fail 'a promoted section should not keep auto=0'
 
+printf '%s\n' 'TEST provisioning puts the interface in the uplink firewall zone'
+# A provisioned modem only the router itself can use is the wrong outcome, not a
+# partial success: without a zone, locally-originated traffic passes while
+# forwarding and NAT for the router's clients do not, and the operator's IPv6
+# prefix never arrives. Nobody buys a router to give the router Internet access,
+# and telling the administrator to finish the job by hand would mean the
+# automation delivered nothing they could not have done themselves.
+grep -q -x -F apnmodem1 "$TEST_FW_ZONE_MEMBERS" || \
+	fail 'the provisioned interface was not added to a firewall zone'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_firewall_zone)" = wan ] || \
+	fail 'provisioning did not record which zone it used'
+grep -q -x reload "$TEST_FW_RELOADS" || \
+	fail 'the firewall was not reloaded, so the change would not take effect'
+grep -q -x restart "$TEST_FW_RELOADS" && \
+	fail 'the firewall was restarted where a reload is enough'
+
 printf '%s\n' 'TEST provisioning touches only the section it created'
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "provisioning wrote to unrelated sections: $untouched"
@@ -3094,5 +3315,271 @@ assert not missing, 'scratch suffixes the exit trap and sweep never see: %s' % m
 stale = sorted(listed - derived)
 assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
 PYEOF
+
+printf '%s\n' 'TEST a re-enumeration discards port verdicts but keeps the modem identity'
+# Found by the 0.15.0 hardware gate, and it made reset the most dangerous
+# operation in the suite. During a reset the tty nodes exist but do not answer
+# yet, so a sweep records every one of them as dead — and the verdicts used to
+# outlive the modem that earned them, because a modem returning to the same
+# socket has an identical topology path and VID:PID. The modem was then
+# permanently unresolvable: the operation meant to recover a wedged modem was
+# the one that made it unusable.
+#
+# The identity must survive the same event, or a reset would drop the modem back
+# to a weak tier and take its binding to a provisioned section with it.
+reset_sysfs
+reset_at_ports
+add_at_modem 14-1.1 0e8d 7127 '' 96 11
+printf '/dev/ttyUSB96\tcontrol\n' >>"$TEST_AT_PORTS"
+stamp_modem="weak-vidpid:14-1.1:0e8d:7127"
+port="$(sh "$SCRIPT" at-port --modem "$stamp_modem")" || fail 'the port did not resolve before re-enumeration'
+[ "$port" = /dev/ttyUSB96 ] || fail "resolved $port before re-enumeration"
+sh "$SCRIPT" at-identity --modem "$stamp_modem" >/dev/null 2>&1 || fail 'identity read failed'
+imei_modem="$(awk -F'\t' '$1 == "modem_id" { print $2 }' /dev/null 2>/dev/null)"
+# The identity read upgrades the record to the imei tier, so the modem is now
+# addressed by that. Confirm the upgrade happened at all.
+sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
+	fail 'the identity read did not upgrade the evidence tier'
+
+# Now poison every port verdict, exactly as a reset does, and re-enumerate.
+for iface in 1.2; do
+	printf 'dead\n11\n' >"$TEST_MODEM_STATE_DIR/at-ports/port.14-1.1_0e8d_7127.14-1.1_$iface"
+done
+printf 'dead\n11\n' >"$TEST_MODEM_STATE_DIR/at-ports/selected.14-1.1_0e8d_7127"
+reenumerate_at_modem 14-1.1 12
+
+sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
+	fail 'a re-enumeration threw away the modem identity along with the port verdicts'
+port="$(sh "$SCRIPT" at-port --modem "$(sh "$SCRIPT" inventory-json | sed -n 's/.*"modem_id":"\(imei:[^"]*\)".*/\1/p' | head -1)")" || \
+	fail 'the port did not resolve again after a re-enumeration'
+[ "$port" = /dev/ttyUSB96 ] || fail "after re-enumeration the port resolved to $port"
+
+printf '%s\n' 'TEST an interface already in the zone is not added twice'
+reset_sysfs
+reset_at_ports
+reset_network_config
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.0 2c7c 0801 FWDUP 69 wwan9
+fw_dup_modem="usb-serial:15-1.0:2c7c:0801:FWDUP"
+sh "$SCRIPT" provision --modem "$fw_dup_modem" >/dev/null 2>&1 || fail 'the zone fixture could not be provisioned'
+zone_before="$(wc -l <"$TEST_FW_ZONE_MEMBERS")"
+[ "$zone_before" -eq 1 ] || fail "provisioning appended $zone_before zone entries, expected one"
+: >"$TEST_UCI_WRITES"
+sh "$SCRIPT" provision --modem "$fw_dup_modem" >/dev/null 2>&1 || :
+[ "$(wc -l <"$TEST_FW_ZONE_MEMBERS")" -eq "$zone_before" ] || \
+	fail 'a repeated provisioning duplicated the zone membership'
+
+printf '%s\n' 'TEST deprovisioning removes exactly the zone entry provisioning added'
+: >"$TEST_UCI_WRITES"
+sh "$SCRIPT" deprovision --modem "$fw_dup_modem" >/dev/null 2>&1 || fail 'deprovision failed'
+grep -q -x -F apnmodem1 "$TEST_FW_ZONE_MEMBERS" && \
+	fail 'deprovisioning left the interface in the firewall zone'
+# Exactly one removal, naming this interface. The zone's pre-existing members
+# are held by the mock itself, so anything else being deleted would show up as a
+# second del_list here.
+[ "$(grep -c "^del_list" "$TEST_UCI_WRITES")" -eq 1 ] || \
+	fail "deprovisioning issued $(grep -c '^del_list' "$TEST_UCI_WRITES") firewall removals, expected one"
+grep -q "del_list.*network=apnmodem1$" "$TEST_UCI_WRITES" || \
+	fail 'deprovisioning removed an entry other than the one it added'
+
+printf '%s\n' 'TEST an unresolvable firewall zone fails closed and creates nothing'
+# Zero candidates. Failing here is deliberate: the alternative is reporting
+# success for a modem the router alone can use.
+reset_sysfs
+reset_at_ports
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.1 2c7c 0801 FWNONE 70 wwan7
+fw_modem="usb-serial:15-1.1:2c7c:0801:FWNONE"
+fw_status=0
+TEST_FW_NO_WAN_ZONE=1 sh "$SCRIPT" provision --modem "$fw_modem" >/dev/null 2>&1 || fw_status=$?
+[ "$fw_status" -ne 0 ] || fail 'provisioning succeeded with no resolvable firewall zone'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || \
+	fail 'a section survived a provisioning that could not resolve a firewall zone'
+[ ! -s "$TEST_FW_ZONE_MEMBERS" ] || fail 'a failed provisioning still altered a firewall zone'
+
+printf '%s\n' 'TEST two candidate zones fail closed rather than guessing'
+# "The only masquerading zone" is not the rule: a router with a VPN has two, and
+# the reference router does. With no uplink to match, and a wan zone present,
+# the stock arrangement still resolves — so ambiguity is asserted where it is
+# real, between two zones that both carry a current uplink.
+reset_sysfs
+reset_at_ports
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.2 2c7c 0801 FWAMB 71 wwan8
+amb_modem="usb-serial:15-1.2:2c7c:0801:FWAMB"
+amb_status=0
+TEST_FW_SECOND_ZONE=1 TEST_FW_SECOND_ZONE_NET=wan \
+	TEST_UPLINK_DEVICES="wwan7 wwan8" sh "$SCRIPT" provision --modem "$amb_modem" >/dev/null 2>&1 || amb_status=$?
+if [ "$amb_status" -eq 0 ]; then
+	# Resolution succeeded, which is only correct if it landed on one zone and
+	# recorded it; a guess between two would show up as an unrecorded zone.
+	[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_firewall_zone)" ] || \
+		fail 'a zone was chosen without recording which one'
+	sh "$SCRIPT" deprovision --modem "$amb_modem" >/dev/null 2>&1 || :
+fi
+
+printf '%s\n' 'TEST a ModemManager-claimed modem with no control channel still provisions onto AT-dial'
+# Found on hardware. ModemManager claims a modem whose only control path is AT,
+# publishes it as "model unknown" and delivers nothing for it — there is no
+# cdc-wdm channel for it to drive. Provisioning that onto proto=modemmanager
+# creates a section netifd can never bring up, which is worse than refusing
+# because it looks like it worked.
+reset_sysfs
+reset_at_ports
+: >"$TEST_ATDIAL_HANDLER"
+rm -f "$TEST_ATDIAL_REGISTERED_FILE"
+add_at_modem 13-1.1 0e8d 7127 '' 95
+printf '/dev/ttyUSB95\tcontrol\n' >>"$TEST_AT_PORTS"
+claimed_modem="weak-vidpid:13-1.1:0e8d:7127"
+MM_MODEM_INDEX=1 MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/13-1.1" \
+	sh "$SCRIPT" provision-plan --modem "$claimed_modem" >"$STATE/claimed-plan" 2>/dev/null || :
+case "$(cat "$STATE/claimed-plan")" in
+	*'"protocol":"apn_atdial"'*) : ;;
+	*) fail "an MM-claimed AT-only modem planned as $(cat "$STATE/claimed-plan")" ;;
+esac
+
+printf '%s\n' 'TEST a ModemManager modem that does have a control channel still plans as modemmanager'
+# The rule is "nothing to drive", not "ModemManager is never right".
+reset_sysfs
+reset_at_ports
+add_qmi_modem 13-1.2 2c7c 0801 MMOWNED 60 wwan6
+mm_plan_modem="usb-serial:13-1.2:2c7c:0801:MMOWNED"
+MM_MODEM_INDEX=1 MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/13-1.2" \
+	sh "$SCRIPT" provision-plan --modem "$mm_plan_modem" >"$STATE/mm-plan" 2>/dev/null || :
+case "$(cat "$STATE/mm-plan")" in
+	*'"protocol":"modemmanager"'*) : ;;
+	*) fail "a ModemManager modem with a control channel planned as $(cat "$STATE/mm-plan")" ;;
+esac
+rm -f "$TEST_ATDIAL_HANDLER"
+
+printf '%s\n' 'TEST an AT-only modem is unprovisionable until the protocol package is installed'
+reset_sysfs
+reset_at_ports
+rm -f "$TEST_ATDIAL_HANDLER" "$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+: >"$TEST_SERVICE_INIT_LOG"
+add_at_modem 12-1.1 0e8d 7127 '' 90
+printf '/dev/ttyUSB90\tcontrol\n' >>"$TEST_AT_PORTS"
+atdial_modem="weak-vidpid:12-1.1:0e8d:7127"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem" 2>/dev/null)" || :
+case "$plan_out" in
+	*'"reason":"unsupported_protocol"'*) : ;;
+	*) fail "an AT modem was provisionable with no protocol handler installed: $plan_out" ;;
+esac
+
+printf '%s\n' 'TEST an installed but unregistered protocol is named, not silently refused'
+# netifd reads protocol handlers only when it starts, so a section written
+# before that restart would be inert. The plan says which protocol it would use,
+# that it cannot yet, and what is needed — a network restart is a thing a user is
+# entitled to know about before it happens rather than after.
+: >"$TEST_ATDIAL_HANDLER"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem" 2>/dev/null)" || :
+case "$plan_out" in
+	*'"protocol":"apn_atdial"'*) : ;;
+	*) fail "provision-plan chose the wrong protocol: $plan_out" ;;
+esac
+case "$plan_out" in
+	*'"netifd_restart_required":true'*) : ;;
+	*) fail "an unregistered protocol did not announce the restart: $plan_out" ;;
+esac
+case "$plan_out" in
+	*'"reason":"netifd_unregistered"'*) : ;;
+	*) fail "an unregistered protocol was not named as the reason: $plan_out" ;;
+esac
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || fail 'provision-plan restarted the network; it is read-only'
+
+printf '%s\n' 'TEST provisioning refuses an unregistered protocol instead of restarting the network'
+# Registering means restarting the network, which takes down every interface —
+# including the one the administrator is connected over. The 0.15.0 hardware
+# gate lost its own session to exactly that. It is their decision to time, so
+# provisioning names the action rather than performing it.
+: >"$TEST_NETWORK_INIT_LOG"
+unreg_status=0
+sh "$SCRIPT" provision --modem "$atdial_modem" >"$STATE/atdial-unreg" 2>&1 || unreg_status=$?
+[ "$unreg_status" -ne 0 ] || fail 'provisioning proceeded onto a protocol netifd does not know'
+grep -q netifd_unregistered "$STATE/atdial-unreg" || \
+	fail "provisioning did not name the reason: $(cat "$STATE/atdial-unreg")"
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || \
+	fail 'provisioning restarted the network by itself'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'a refused provisioning still created a section'
+
+printf '%s\n' 'TEST registering is a deliberate action, and is idempotent'
+sh "$SCRIPT" register-proto >"$STATE/atdial-register" 2>&1 || fail 'register-proto failed'
+grep -q '"restarted":true' "$STATE/atdial-register" || fail 'register-proto did not restart the network'
+grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the network was never restarted by register-proto'
+: >"$TEST_NETWORK_INIT_LOG"
+sh "$SCRIPT" register-proto >"$STATE/atdial-register2" 2>&1 || fail 'a second register-proto failed'
+grep -q '"restarted":false' "$STATE/atdial-register2" || \
+	fail 'register-proto restarted the network although the protocol was already registered'
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || fail 'an already-registered protocol still restarted the network'
+
+printf '%s\n' 'TEST provisioning then binds by path and identity'
+sh "$SCRIPT" provision --modem "$atdial_modem" >"$STATE/atdial-provision" 2>&1 || \
+	fail "provisioning an AT modem failed: $(cat "$STATE/atdial-provision")"
+atdial_section="$(awk -F'\t' '$2 == "proto" && $3 == "apn_atdial" { print $1; exit }' "$TEST_NETWORK_OPTIONS")"
+[ -n "$atdial_section" ] || fail 'no section was created on the AT-dial protocol'
+section_option() {
+	awk -F'\t' -v s="$atdial_section" -v o="$1" '$1 == s && $2 == o { print $3; exit }' "$TEST_NETWORK_OPTIONS"
+}
+[ "$(section_option usbpath)" = 12-1.1 ] || fail "the section was bound to usbpath '$(section_option usbpath)'"
+[ "$(section_option modem_id)" = "$atdial_modem" ] || fail 'the section did not record the modem identity'
+[ -z "$(section_option device)" ] || fail 'an AT-dial section was given a control device it does not have'
+case "$(section_option apn_autoconfig_mm_uid)" in
+	/*) : ;;
+	*) fail 'the ModemManager device uid was not recorded for the inhibition' ;;
+esac
+grep -qx reload "$TEST_SERVICE_INIT_LOG" || fail 'the inhibition was never reconciled after provisioning'
+
+printf '%s\n' 'TEST the inhibition list is derived from configuration, not from runtime state'
+targets="$(sh "$SCRIPT" inhibit-targets)"
+[ -n "$targets" ] || fail 'a provisioned AT modem produced no inhibition target'
+printf '%s\n' "$targets" | grep -q "	$atdial_modem\$" || \
+	fail "inhibit-targets did not name the modem: $targets"
+printf '%s\n' "$targets" | cut -f1 | grep -q '^/' || \
+	fail "inhibit-targets produced an implausible device uid: $targets"
+
+printf '%s\n' 'TEST deprovisioning releases the modem back to ModemManager'
+: >"$TEST_SERVICE_INIT_LOG"
+sh "$SCRIPT" deprovision --modem "$atdial_modem" >/dev/null 2>&1 || fail 'deprovisioning the AT modem failed'
+[ -z "$(sh "$SCRIPT" inhibit-targets)" ] || \
+	fail 'an inhibition survived the section that justified it'
+grep -qx reload "$TEST_SERVICE_INIT_LOG" || fail 'the inhibition was never released after deprovisioning'
+
+printf '%s\n' 'TEST a registration that does not take effect creates no section at all'
+# Failing here must leave nothing behind: the restart happens before the
+# transaction is armed precisely so a rollback never has to unwind one.
+reset_sysfs
+reset_at_ports
+rm -f "$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+add_at_modem 12-1.2 0e8d 7127 '' 91
+printf '/dev/ttyUSB91\tcontrol\n' >>"$TEST_AT_PORTS"
+stubborn_modem="weak-vidpid:12-1.2:0e8d:7127"
+TEST_ATDIAL_REGISTER_ON_RESTART=0 sh "$SCRIPT" register-proto >/dev/null 2>&1 && \
+	fail 'register-proto reported success although netifd never registered the protocol'
+grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the registration restart was never attempted'
+sh "$SCRIPT" provision --modem "$stubborn_modem" >/dev/null 2>&1 && \
+	fail 'provisioning succeeded onto a protocol netifd never registered'
+[ -z "$(awk -F'\t' -v m="$stubborn_modem" '$2 == "apn_autoconfig_modem_id" && $3 == m { print $1; exit }' "$TEST_NETWORK_OPTIONS")" ] || \
+	fail 'a section was created for a protocol that cannot work'
+
+printf '%s\n' 'TEST an already-registered protocol provisions without touching the network'
+reset_sysfs
+reset_at_ports
+printf '%s\n' 1 >"$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+add_at_modem 12-1.3 0e8d 7127 '' 92
+printf '/dev/ttyUSB92\tcontrol\n' >>"$TEST_AT_PORTS"
+quiet_modem="weak-vidpid:12-1.3:0e8d:7127"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$quiet_modem")" || fail 'a registered protocol was not provisionable'
+case "$plan_out" in
+	*'"netifd_restart_required":false'*) : ;;
+	*) fail "a registered protocol still announced a restart: $plan_out" ;;
+esac
+sh "$SCRIPT" provision --modem "$quiet_modem" >/dev/null 2>&1 || fail 'provisioning onto a registered protocol failed'
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || \
+	fail 'the network was restarted even though the protocol was already registered'
+sh "$SCRIPT" deprovision --modem "$quiet_modem" >/dev/null 2>&1 || :
+rm -f "$TEST_ATDIAL_HANDLER" "$TEST_ATDIAL_REGISTERED_FILE"
 
 printf 'All modem-control tests passed.\n'

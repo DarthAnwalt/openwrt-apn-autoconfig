@@ -2,7 +2,8 @@
 
 This is the APN-backend contract. Its v1 meanings were released in 0.9.2 and
 have not changed since; later releases added backends that conform to it —
-native MBIM in 0.12.0, native AT in 0.14.0 — rather than altering it. The
+native MBIM in 0.12.0, native AT identity in 0.14.0, the AT-dial backend in
+0.15.0 — rather than altering it. The
 accepted target architecture adds a lower-level modem-control boundary without
 weakening this profile safety contract; see
 [`architecture.md`](architecture.md). Any compatibility mapping or successor API
@@ -180,20 +181,14 @@ AT identity is implemented in `apn-autoconfig-modem` from 0.14.0, as
 for the whole read and emits the v1 identity TSV below, unchanged from what the
 QMI and MBIM adapters produce.
 
-### Which component answers the APN engine is decided in 0.15.0
+### Which component answers the APN engine: decided in 0.15.0
 
-There is deliberately **no `/usr/libexec/apn-autoconfig-at` in 0.14.0**, and this
-is a decision rather than an omission.
+There is deliberately **no `/usr/libexec/apn-autoconfig-at`**, and this is a
+decision rather than an omission.
 
-The engine only ever asks about a configured netifd target; it has no way to
-speak about a modem that has none. An AT-managed modem gets its first netifd
-target in 0.15.0, with the Fibocom protocol. Until then the identity has exactly
-two consumers — the inventory and the LuCI page — and both reach it through the
-modem package directly. An adapter shaped for the engine would be a connector to
-a socket that does not exist yet, and the shape it should take depends on facts
-that arrive with its first caller.
-
-Two candidates are on the table, to be chosen in 0.15.0 against a real consumer:
+0.14.0 left it open because the engine only ever asks about a configured netifd
+target, and an AT-managed modem had none. Two candidates were recorded, to be
+chosen against a real consumer rather than in the abstract:
 
 1. **A thin `/usr/libexec/apn-autoconfig-at`** with `capabilities` and
    `identity <device>`, matching the QMI and MBIM adapters exactly. Uniform, and
@@ -206,17 +201,23 @@ Two candidates are on the table, to be chosen in 0.15.0 against a real consumer:
    costs a second dispatch shape in the engine, and a harder dependency on the
    modem package for that target class.
 
-The second currently looks better, precisely because two components parsing AT
-replies while racing for one serial port is the failure this release exists to
-prevent. It is not chosen yet: a decision taken without its caller in front of
-us is the kind that gets discovered to be wrong during a hardware gate.
+**The second is chosen.** 0.15.0 brings the caller — an `apn_atdial` target —
+and with it the deciding fact: the protocol handler must hold the AT port for
+the whole dial, so a third component parsing AT replies on the same tty would be
+contending with both the modem package and the handler. One resolver, one parser
+and one owner of the port lock is worth a second dispatch shape in the engine.
 
-One 0.14.0 obligation is **not** deferred with it: the QMI adapter's existing AT
-fallback must take the shared AT port lock, so two components of this project
-cannot write to one `ttyUSB` at the same time. That is independent of who
-eventually answers the engine.
+The engine therefore resolves an AT-managed target in two steps, both existing
+commands: `apn-autoconfig-modem resolve --interface <section>` for the modem
+identity, then `apn-autoconfig-modem at-identity --modem <id>` for the v1
+identity TSV. The dependency on the modem package for this target class is real
+and is declared, not implied.
 
-### Properties fixed now, whichever shape wins
+One 0.14.0 obligation was **not** deferred with the decision and is met: the QMI
+adapter's AT fallback takes the shared AT port lock, so two components of this
+project cannot write to one `ttyUSB` at the same time.
+
+### Properties fixed by that decision
 
 AT is an **identity-only backend, permanently**. Its capability map reports
 `identity: true` and `profile_read`, `profile_write` and `profile_apply` all
@@ -262,13 +263,19 @@ the matcher and the GUI see one shape regardless of transport:
   roaming, 2 to searching, 3 to denied and 0 to idle. A denied registration is
   permanent and must not be reported as retryable.
 
-  `<stat>` **6 and 7 also mean registered** — SMS-only on the home and visited
-  network respectively — and map to home and roaming. This is not a
-  specification curiosity: a device attached over LTE or 5G with no CS domain
-  reports exactly this from `AT+CREG?`, and the first modem measured for this
-  contract did. Omitting 6 and 7 would report a fully registered modem as
-  unregistered whenever `CREG` is the source that answers, which is also why
-  `CEREG` and `CGREG` are preferred over it rather than merely listed first.
+  `<stat>` **6, 7, 9 and 10 also mean registered.** 6 and 7 are SMS-only on the
+  home and visited network; 9 and 10 are "CSFB not preferred" on the same pair.
+  All four map to home or roaming accordingly. This is not a specification
+  curiosity: a device attached over LTE or 5G with no CS domain reports exactly
+  this from `AT+CREG?`, and the first modem measured for this contract did.
+  Omitting them reports a fully registered modem as unregistered whenever the
+  source that answers is the one using them, which is also why `CEREG` and
+  `CGREG` are preferred over `CREG` rather than merely listed first.
+
+  9 and 10 were missing from the shipped 0.14.x mapping and were fixed in
+  0.15.0. The failure was silent in the worst way: an unmapped value falls
+  through to the next source, and a modem answering 9 from all three ends as
+  `unknown` — the same class of mistake 6 and 7 were added to correct.
 - `signal_quality` uses `AT+CESQ` RSRP through the same -120 dBm to -80 dBm
   mapping the QMI adapter documents, falling back to `AT+CSQ` RSSI through the
   same -110 dBm to -50 dBm scale. `AT+CSQ` value 99 means unknown and leaves the
@@ -292,3 +299,44 @@ disabled with an explanation, and the command fails with target-contract exit
 code 4 without mutation. Status still reports the observed roaming state, but
 uses `roaming_policy: "unsupported"`; APN operations ignore any stale
 `network.<interface>.allow_roaming` value owned by another connection stack.
+
+## The AT-dial backend (`apn_atdial`)
+
+0.15.0 adds the first backend whose netifd protocol this project ships itself.
+Its full behaviour is normative in [`atdial-contract-v1.md`](atdial-contract-v1.md);
+this section states only what the engine must know.
+
+A target whose `proto` is `apn_atdial` selects backend `atdial`. It differs from
+the three that came before in exactly two ways that reach this contract.
+
+**Identity is delegated, not adapted.** There is no
+`/usr/libexec/apn-autoconfig-atdial`. The engine resolves the modem identity
+bound to the section with `apn-autoconfig-modem resolve --interface <section>`
+and then reads identity with `apn-autoconfig-modem at-identity --modem <id>`,
+which returns the same v1 identity TSV every other backend produces. Capability
+is `identity: true` when both commands are available and the modem package can
+reach the modem; `backend-command-unavailable` otherwise.
+
+**The profile is applied, never written.** `profile_read` and `profile_write`
+are permanently false and `profile_apply` is true. The engine owns `apn`,
+`username`, `password`, `auth` and `pdptype` — the same five options as QMI and
+MBIM, so baseline capture and restore reuse the existing branch with no change
+to the v3 baseline format — and the protocol handler applies them on the next
+interface start. Nothing is written into the modem as owned state.
+
+`pdptype` takes canonical 3GPP values: `IP`, `IPV6`, `IPV4V6`. This differs from
+QMI's `ip` and MBIM's `ipv4` because it is passed to `AT+CGDCONT` verbatim,
+where nothing else is valid. The engine writes the canonical spelling; the
+handler normalises a hand-written one.
+
+Roaming policy is supported through the single `allow_roaming` option, so
+`roaming_policy_read` and `roaming_policy_write` are both true. It is not the
+`allow_roaming`/`allow_partner` pair MBIM uses: there is no partner concept
+here, and the handler enforces the policy itself by refusing to dial on a
+roaming registration. As with MBIM, the GUI's labels for this control are
+backend-specific.
+
+Implementation and validation state are reported per path rather than per
+backend, because they genuinely differ: the RNDIS/ECM dial is `stable`/`hardware`
+on the strength of the FM350-GL gate, while the Intel XMM tail is
+`alpha`/`synthetic` until such a device has actually been driven.

@@ -3232,6 +3232,40 @@ stale = sorted(listed - derived)
 assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
 PYEOF
 
+printf '%s\n' 'TEST a ModemManager-claimed modem with no control channel still provisions onto AT-dial'
+# Found on hardware. ModemManager claims a modem whose only control path is AT,
+# publishes it as "model unknown" and delivers nothing for it — there is no
+# cdc-wdm channel for it to drive. Provisioning that onto proto=modemmanager
+# creates a section netifd can never bring up, which is worse than refusing
+# because it looks like it worked.
+reset_sysfs
+reset_at_ports
+: >"$TEST_ATDIAL_HANDLER"
+rm -f "$TEST_ATDIAL_REGISTERED_FILE"
+add_at_modem 13-1.1 0e8d 7127 '' 95
+printf '/dev/ttyUSB95\tcontrol\n' >>"$TEST_AT_PORTS"
+claimed_modem="weak-vidpid:13-1.1:0e8d:7127"
+MM_MODEM_INDEX=1 MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/13-1.1" \
+	sh "$SCRIPT" provision-plan --modem "$claimed_modem" >"$STATE/claimed-plan" 2>/dev/null || :
+case "$(cat "$STATE/claimed-plan")" in
+	*'"protocol":"apn_atdial"'*) : ;;
+	*) fail "an MM-claimed AT-only modem planned as $(cat "$STATE/claimed-plan")" ;;
+esac
+
+printf '%s\n' 'TEST a ModemManager modem that does have a control channel still plans as modemmanager'
+# The rule is "nothing to drive", not "ModemManager is never right".
+reset_sysfs
+reset_at_ports
+add_qmi_modem 13-1.2 2c7c 0801 MMOWNED 60 wwan6
+mm_plan_modem="usb-serial:13-1.2:2c7c:0801:MMOWNED"
+MM_MODEM_INDEX=1 MM_PHYSDEV="$TESTROOT/sys/devices/platform/mock-usb/13-1.2" \
+	sh "$SCRIPT" provision-plan --modem "$mm_plan_modem" >"$STATE/mm-plan" 2>/dev/null || :
+case "$(cat "$STATE/mm-plan")" in
+	*'"protocol":"modemmanager"'*) : ;;
+	*) fail "a ModemManager modem with a control channel planned as $(cat "$STATE/mm-plan")" ;;
+esac
+rm -f "$TEST_ATDIAL_HANDLER"
+
 printf '%s\n' 'TEST an AT-only modem is unprovisionable until the protocol package is installed'
 reset_sysfs
 reset_at_ports

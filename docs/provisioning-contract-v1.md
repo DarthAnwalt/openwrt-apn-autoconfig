@@ -176,8 +176,29 @@ restarts the network reaches routers whose administrator is not present, is not
 expecting an interruption, and may be reachable only through the interfaces
 being restarted; the project whose implementation informed this release took a
 remote router off the network twice doing exactly that, once during an update
-that had nothing to do with modems. Provisioning is the opposite situation: the
-user is configuring a modem, at the console, and waiting for this to happen.
+that had nothing to do with modems.
+
+**Provisioning is not automatically the opposite situation, and an earlier
+version of this contract was wrong to say it was.** It claimed the restart is
+safe there because the user is "at the console, waiting for it". The 0.15.0
+hardware gate disproved that on the first attempt: `/etc/init.d/network restart`
+restarts *every* interface, including the overlay the router is administered
+over. On the reference router it dropped ZeroTier and made travelmate
+re-associate the WiFi uplink to a different network, which changed the router's
+address and left it reachable only by ICMP from outside — alive, serving its own
+clients, and impossible to log into. Being at the console is not the same as
+being on the LAN, and the interfaces this restart takes down include the ones
+that carry administration.
+
+So provisioning **must not restart the network implicitly**. When a protocol is
+installed but unregistered, `provision` fails closed with `netifd_unregistered`
+and says what to do; registering it is a separate action the administrator takes
+deliberately, having been told that every interface — including any VPN or
+overlay they are connected over — will go down and may come back differently.
+
+A reboot is the other honest answer and is often the better one: it restores
+overlays and uplinks through their normal start-up path rather than leaving
+whichever of them happens to reconnect first.
 
 ## States
 

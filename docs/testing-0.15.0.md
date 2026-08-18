@@ -233,6 +233,47 @@ the whole reason the inhibit approach was chosen over restarting ModemManager.
    the same router with both modems present, and per-modem presentation checked
    with two modems rather than one.
 
+## What the first hardware attempt found, 2026-08-18
+
+The gate was started and stopped early. Three things are worth recording before
+it is resumed, because two of them are findings rather than test results.
+
+**Confirmed on hardware, as the contract predicted:**
+
+- the FM350-GL is present with **no network device at all** and `rndis_host` not
+  loaded, so the driver-binding step is load-bearing rather than defensive;
+- installing the protocol handler does **not** register it with netifd —
+  `get_proto_handlers` still did not list it after the file was in place;
+- `provision-plan` reported `netifd_restart_required: true`, and after the fix
+  below chose `apn_atdial` bound to `2-1.3`.
+
+**Defect found before any modem was touched.** ModemManager ownership
+short-circuited the protocol mapping, so the FM350 — observed protocol `at`, no
+control device, published by ModemManager as "model unknown" — was planned as
+`proto=modemmanager`. That would have created a section netifd can never bring
+up. ModemManager owning a modem now selects its protocol only when there is a
+control channel for it to drive. Fixed, with a regression.
+
+**The registration restart cost administrative access, and the contract's
+justification for it was wrong.** `/etc/init.d/network restart` restarted every
+interface including the ZeroTier overlay the router is administered over, and
+travelmate re-associated the uplink to a different network. The router stayed
+alive and kept serving its own clients, but became reachable only by ICMP from
+outside — its address had changed and the route to its LAN ran over the overlay
+that was now down.
+
+The contract said provisioning could restart the network because the user is "at
+the console, waiting for it". Being at the console is not the same as being on
+the LAN. `provisioning-contract-v1.md` has been corrected: provisioning fails
+closed with `netifd_unregistered` and registration becomes a separate action the
+administrator takes deliberately, having been told what it will take down.
+
+**When the gate resumes**, it must therefore start from a session that does not
+depend on the router's own overlays, or accept a reboot as the registration
+step. Everything after registration — inhibit, driver bind, dial, roaming
+refusal, interruption, reset, contention, browser pass — is untouched by this
+and remains to be run.
+
 ## The XMM path has no hardware gate, and says so
 
 No L850 or L860 is available. The XMM tail therefore completes fixture coverage

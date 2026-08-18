@@ -2016,8 +2016,28 @@ network_section_names() {
 provision_protocol_for_record() {
 	provision_owner_state="$1"
 	provision_observed_protocol="$2"
+	provision_control_channel="$3"
+	# ModemManager owning a modem means ModemManager should drive it — but only
+	# when there is something for it to drive. A modem whose only control path
+	# is AT has no cdc-wdm channel at all, and ModemManager claims it anyway:
+	# on the reference hardware it publishes such a modem as "model unknown"
+	# and delivers nothing for it. Provisioning that onto proto=modemmanager
+	# creates a section netifd can never bring up, which is worse than
+	# refusing, because it looks like it worked.
+	#
+	# Found on hardware, not in a fixture: the plan for the measured FM350-GL
+	# said `modemmanager` while every field in the same record said the modem
+	# has no control device and speaks only AT.
 	case "$provision_owner_state" in
-		modemmanager) printf '%s\n' modemmanager; return 0 ;;
+		modemmanager)
+			if [ -z "$provision_control_channel" ] && \
+				[ "$provision_observed_protocol" = at ] && netifd_proto_available; then
+				printf '%s\n' "$ATDIAL_PROTO"
+				return 0
+			fi
+			printf '%s\n' modemmanager
+			return 0
+		;;
 	esac
 	case "$provision_observed_protocol" in
 		qmi) printf '%s\n' qmi; return 0 ;;
@@ -2122,7 +2142,8 @@ provision_evaluate() {
 		PROVISION_REASON="already_configured"
 		return 4
 	fi
-	PROVISION_PROTOCOL="$(provision_protocol_for_record "$provision_owner_state" "$provision_observed_protocol" 2>/dev/null || :)"
+	PROVISION_PROTOCOL="$(provision_protocol_for_record "$provision_owner_state" \
+		"$provision_observed_protocol" "$provision_control_device" 2>/dev/null || :)"
 	if [ -z "$PROVISION_PROTOCOL" ]; then
 		PROVISION_REASON="unsupported_protocol"
 		return 4

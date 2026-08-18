@@ -233,6 +233,18 @@ the whole reason the inhibit approach was chosen over restarting ModemManager.
    the same router with both modems present, and per-modem presentation checked
    with two modems rather than one.
 
+## Hardware gate: runtime path complete, 2026-08-18
+
+Evidence in [`router-test-0.15.0.md`](router-test-0.15.0.md). The FM350-GL path
+is validated end to end — provisioning, AT identity, APN match, dial, verified
+Internet, reconnect, reset, and ModemManager coexistence with a production modem
+that never moved. Three defects were found there that no fixture had caught, all
+fixed with regressions.
+
+Still outstanding: roaming refusal (needs a roaming registration), a live `TERM`
+during the destructive window, the browser pass, the whole packaging gate, and
+the XMM path, which has no hardware and stays `alpha`/`synthetic`.
+
 ## What the first hardware attempt found, 2026-08-18
 
 The gate was started and stopped early. Three things are worth recording before

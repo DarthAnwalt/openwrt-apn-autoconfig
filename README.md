@@ -336,6 +336,12 @@ do this on their own: a network restart that arrives with an unrelated package
 update, on a router reachable only through the interfaces it takes down, is not
 a thing a package should decide for you.
 
+**A provisioned interface is not placed in a firewall zone.** Provisioning never
+touches firewall configuration, so after setting up a modem you must add its
+interface to your `wan` zone yourself. Until you do, the router itself reaches
+the Internet over the modem but your LAN clients do not, and an IPv6 prefix from
+the operator will not arrive.
+
 Support for Intel XMM devices (Fibocom L850, L860) is implemented in the same
 protocol but **has not been validated on hardware** — no such device has been
 driven by this project. It is reported as `alpha`/`synthetic` and should be

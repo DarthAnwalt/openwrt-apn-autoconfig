@@ -641,8 +641,18 @@ add_at_modem() {
 	mkdir -p "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index"
 	printf '%s\n' "$vendor" >"$usb_dir/idVendor"
 	printf '%s\n' "$product" >"$usb_dir/idProduct"
+	# The kernel's enumeration counter. Real modems have it, it changes every
+	# time the device appears on the bus, and AT port verdicts are only valid
+	# within one of its values.
+	printf '%s\n' "${6:-7}" >"$usb_dir/devnum"
 	[ -z "$serial" ] || printf '%s\n' "$serial" >"$usb_dir/serial"
 	ln -s "$usb_dir/$bus_port:1.2" "$TESTROOT/sys/class/tty/ttyUSB$tty_index/device"
+}
+
+# The same modem, back on the bus with a new enumeration counter — what a reset
+# or a replug looks like from sysfs.
+reenumerate_at_modem() {
+	printf '%s\n' "$2" >"$TESTROOT/sys/devices/platform/mock-usb/$1/devnum"
 }
 
 # One tty on an existing USB device, with its own interface number, so that the
@@ -3231,6 +3241,44 @@ assert not missing, 'scratch suffixes the exit trap and sweep never see: %s' % m
 stale = sorted(listed - derived)
 assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
 PYEOF
+
+printf '%s\n' 'TEST a re-enumeration discards port verdicts but keeps the modem identity'
+# Found by the 0.15.0 hardware gate, and it made reset the most dangerous
+# operation in the suite. During a reset the tty nodes exist but do not answer
+# yet, so a sweep records every one of them as dead — and the verdicts used to
+# outlive the modem that earned them, because a modem returning to the same
+# socket has an identical topology path and VID:PID. The modem was then
+# permanently unresolvable: the operation meant to recover a wedged modem was
+# the one that made it unusable.
+#
+# The identity must survive the same event, or a reset would drop the modem back
+# to a weak tier and take its binding to a provisioned section with it.
+reset_sysfs
+reset_at_ports
+add_at_modem 14-1.1 0e8d 7127 '' 96 11
+printf '/dev/ttyUSB96\tcontrol\n' >>"$TEST_AT_PORTS"
+stamp_modem="weak-vidpid:14-1.1:0e8d:7127"
+port="$(sh "$SCRIPT" at-port --modem "$stamp_modem")" || fail 'the port did not resolve before re-enumeration'
+[ "$port" = /dev/ttyUSB96 ] || fail "resolved $port before re-enumeration"
+sh "$SCRIPT" at-identity --modem "$stamp_modem" >/dev/null 2>&1 || fail 'identity read failed'
+imei_modem="$(awk -F'\t' '$1 == "modem_id" { print $2 }' /dev/null 2>/dev/null)"
+# The identity read upgrades the record to the imei tier, so the modem is now
+# addressed by that. Confirm the upgrade happened at all.
+sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
+	fail 'the identity read did not upgrade the evidence tier'
+
+# Now poison every port verdict, exactly as a reset does, and re-enumerate.
+for iface in 1.2; do
+	printf 'dead\n11\n' >"$TEST_MODEM_STATE_DIR/at-ports/port.14-1.1_0e8d_7127.14-1.1_$iface"
+done
+printf 'dead\n11\n' >"$TEST_MODEM_STATE_DIR/at-ports/selected.14-1.1_0e8d_7127"
+reenumerate_at_modem 14-1.1 12
+
+sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
+	fail 'a re-enumeration threw away the modem identity along with the port verdicts'
+port="$(sh "$SCRIPT" at-port --modem "$(sh "$SCRIPT" inventory-json | sed -n 's/.*"modem_id":"\(imei:[^"]*\)".*/\1/p' | head -1)")" || \
+	fail 'the port did not resolve again after a re-enumeration'
+[ "$port" = /dev/ttyUSB96 ] || fail "after re-enumeration the port resolved to $port"
 
 printf '%s\n' 'TEST a ModemManager-claimed modem with no control channel still provisions onto AT-dial'
 # Found on hardware. ModemManager claims a modem whose only control path is AT,

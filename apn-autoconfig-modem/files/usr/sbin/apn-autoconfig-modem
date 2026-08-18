@@ -893,6 +893,45 @@ at_cached_imei() {
 	printf '%s\n' "$cached_imei_value"
 }
 
+# A port verdict is only true for the enumeration that produced it.
+#
+# Which tty answers AT is a property of *this* appearance on the bus. The IMEI
+# beside it in the same directory is a property of the modem and must survive a
+# reset, so the enumeration is stamped into the verdict's *value* rather than
+# into the key it shares with identity: a verdict from an earlier enumeration
+# reads as absent, and identity is untouched.
+#
+# 0.14.0 recorded the intent that "a re-enumeration correctly invalidates
+# everything", and the key never delivered it — a modem returning to the same
+# socket comes back with an identical topology path and VID:PID. The 0.15.0
+# hardware gate found what that costs. During a reset the ports exist but do not
+# answer yet, the sweep recorded `dead` for all seven of them, and those
+# verdicts outlived the modem that earned them, leaving it permanently
+# unresolvable. The operation meant to recover a wedged modem was the one that
+# made it unusable, and nothing about it looked broken.
+at_enumeration_stamp() {
+	stamp_value="$(usb_attr "$1" devnum 2>/dev/null || :)"
+	[ -n "$stamp_value" ] || stamp_value=-
+	printf '%s\n' "$stamp_value"
+}
+
+# The cached value, or nothing when it belongs to an earlier enumeration.
+at_cache_read_stamped() {
+	stamped_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	[ -n "$stamped_value" ] || return 1
+	[ "$(sed -n '2p' "$1" 2>/dev/null || :)" = "$2" ] || return 1
+	printf '%s\n' "$stamped_value"
+}
+
+at_cache_write_stamped() {
+	mkdir -p "$(at_cache_dir)" 2>/dev/null || return 1
+	printf '%s\n%s\n' "$2" "$3" >"$1.$$" 2>/dev/null || return 1
+	mv -f "$1.$$" "$1" 2>/dev/null || {
+		rm -f "$1.$$" 2>/dev/null || :
+		return 1
+	}
+}
+
 at_cache_write() {
 	cache_file="$1"
 	cache_value="$2"
@@ -1377,7 +1416,8 @@ at_cached_port() {
 	# is safe on the discovery path.
 	cached_usb_path="$1"
 	cached_scope="$(at_cache_scope "$cached_usb_path")" || return 1
-	cached_interface="$(sed -n '1p' "$(at_selection_file "$cached_scope")" 2>/dev/null || :)"
+	cached_interface="$(at_cache_read_stamped "$(at_selection_file "$cached_scope")" \
+		"$(at_enumeration_stamp "$cached_usb_path")" 2>/dev/null || :)"
 	[ -n "$cached_interface" ] || return 1
 	cached_device="$(at_candidate_ports "$cached_usb_path" | \
 		awk -F '\t' -v want="$cached_interface" '$3 == want { print $2; exit }')"
@@ -1399,7 +1439,8 @@ at_resolve_port() {
 	[ -n "$candidates" ] || return 1
 
 	selection_file="$(at_selection_file "$resolve_scope")"
-	cached_interface="$(sed -n '1p' "$selection_file" 2>/dev/null || :)"
+	resolve_stamp="$(at_enumeration_stamp "$resolve_usb_path")"
+	cached_interface="$(at_cache_read_stamped "$selection_file" "$resolve_stamp" 2>/dev/null || :)"
 	if [ -n "$cached_interface" ]; then
 		cached_device="$(printf '%s\n' "$candidates" | \
 			awk -F '\t' -v want="$cached_interface" '$3 == want { print $2; exit }')"
@@ -1423,13 +1464,13 @@ at_resolve_port() {
 		[ -n "$device" ] || continue
 		[ -n "$interface" ] || continue
 		verdict_file="$(at_port_verdict_file "$resolve_scope" "$interface")"
-		verdict="$(sed -n '1p' "$verdict_file" 2>/dev/null || :)"
+		verdict="$(at_cache_read_stamped "$verdict_file" "$resolve_stamp" 2>/dev/null || :)"
 		[ "$verdict" = dead ] && continue
 		at_probe_port "$device"
 		probe_result=$?
 		if [ "$probe_result" -eq 0 ]; then
-			at_cache_write "$verdict_file" ok || :
-			at_cache_write "$selection_file" "$interface" || :
+			at_cache_write_stamped "$verdict_file" ok "$resolve_stamp" || :
+			at_cache_write_stamped "$selection_file" "$interface" "$resolve_stamp" || :
 			AT_RESOLVED_PORT="$device"
 			AT_RESOLVED_MODEL="$AT_PROBE_MODEL"
 			resolve_result=0
@@ -1439,7 +1480,7 @@ at_resolve_port() {
 		# is a live channel whose verdict may change once the modem finishes
 		# booting, and caching that would make a transient state permanent.
 		if [ "$probe_result" -eq 2 ]; then
-			at_cache_write "$verdict_file" dead || :
+			at_cache_write_stamped "$verdict_file" dead "$resolve_stamp" || :
 		fi
 	done <"$AT_CANDIDATES_FILE"
 	rm -f "$AT_CANDIDATES_FILE" 2>/dev/null || :
@@ -1560,14 +1601,16 @@ kv_value_from() {
 }
 
 protocol_is_netifd_direct() {
-	case "$1" in qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;; *) return 1 ;; esac
+	case "$1" in apn_atdial|qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;; *) return 1 ;; esac
 }
 
 netifd_interface_for_record() {
 	control_device="$1"
 	data_device="$2"
 	usb_path="$3"
+	modem_identity="$4"
 	control_name="${control_device#/dev/}"
+	usb_label="${usb_path##*/}"
 	uci -q show network 2>/dev/null | while IFS= read -r line; do
 		case "$line" in network.*.proto=*) : ;; *) continue ;; esac
 		section="${line#network.}"
@@ -1589,6 +1632,23 @@ netifd_interface_for_record() {
 		if [ "$matched" -eq 0 ] && [ -n "$section_devpath" ] && [ -n "$usb_path" ]; then
 			candidate_usb="$(physical_usb_device_path "$section_devpath" 2>/dev/null || :)"
 			[ "$candidate_usb" = "$usb_path" ] && matched=1
+		fi
+		# A section for a modem with no control channel has no device to name.
+		# It is bound by identity and by physical path instead — and identity is
+		# tried first, because it is the stronger of the two and survives the
+		# modem being moved to another socket.
+		#
+		# Without this the binding was invisible: provisioning created the
+		# section, and the very next step could not find any modem bound to it.
+		if [ "$matched" -eq 0 ] && [ -n "$modem_identity" ]; then
+			section_modem="$(uci -q get "network.${section}.modem_id" 2>/dev/null || :)"
+			[ -n "$section_modem" ] || \
+				section_modem="$(uci -q get "network.${section}.apn_autoconfig_modem_id" 2>/dev/null || :)"
+			[ -n "$section_modem" ] && [ "$section_modem" = "$modem_identity" ] && matched=1
+		fi
+		if [ "$matched" -eq 0 ] && [ -n "$usb_label" ]; then
+			section_usbpath="$(uci -q get "network.${section}.usbpath" 2>/dev/null || :)"
+			[ -n "$section_usbpath" ] && [ "$section_usbpath" = "$usb_label" ] && matched=1
 		fi
 		[ "$matched" -eq 1 ] || continue
 		printf '%s\t%s\n' "$section" "$proto"
@@ -1737,7 +1797,7 @@ scan_inventory_now() {
 		netifd_interface=""
 		netifd_proto=""
 		if [ "$ambiguous" -eq 0 ]; then
-			pairs="$(netifd_interface_for_record "$control_device" "$data_device" "$usb_path" 2>/dev/null || :)"
+			pairs="$(netifd_interface_for_record "$control_device" "$data_device" "$usb_path" "$modem_id" 2>/dev/null || :)"
 			pair_count="$(printf '%s\n' "$pairs" | awk 'NF { count++ } END { print count + 0 }')"
 			if [ "$pair_count" -gt 1 ]; then
 				ambiguous=1
@@ -1874,7 +1934,8 @@ print_modem_json() {
 			modemmanager|conflicting) : ;;
 			*)
 				[ -z "$record_scope" ] || \
-					{ [ -s "$(at_selection_file "$record_scope")" ] && capable_at_identity=1 ; }
+					{ at_cache_read_stamped "$(at_selection_file "$record_scope")" \
+						"$(at_enumeration_stamp "$usb_path")" >/dev/null 2>&1 && capable_at_identity=1 ; }
 			;;
 		esac
 	fi
@@ -2195,6 +2256,15 @@ provisioning_rollback() {
 		rm -f "$PROVISION_BASELINE_FILE"
 		PROVISION_BASELINE_FILE=""
 	fi
+	# The section was the record that justified holding a ModemManager
+	# inhibition, so removing it has to release the modem as well.
+	#
+	# Observed on hardware: a provisioning that failed at reconciliation rolled
+	# its section back correctly and left the holder running, so ModemManager
+	# stayed locked out of a modem this project no longer had any claim to —
+	# the modem belonged to nobody, which is the one outcome the inhibition
+	# design is meant never to produce.
+	reload_inhibitors
 }
 
 provision_cmd() {

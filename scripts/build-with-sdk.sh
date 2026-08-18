@@ -223,6 +223,13 @@ inspect_package "$5" apn-autoconfig-modem 14 \
 	lib/apk/packages/apn-autoconfig-modem.conffiles \
 	lib/apk/packages/apn-autoconfig-modem.conffiles_static
 
+inspect_package "$6" apn-autoconfig-proto-atdial 5 \
+	lib/netifd/proto/apn_atdial.sh \
+	usr/share/apn-autoconfig-proto-atdial/atdial.sh \
+	usr/share/apn-autoconfig-proto-atdial/quirks \
+	usr/share/licenses/apn-autoconfig-proto-atdial/LICENSE \
+	lib/apk/packages/apn-autoconfig-proto-atdial.list
+
 for forbidden_dependency in modemmanager uqmi umbim kmod-button-hotplug; do
 	if grep -F -q '"'"$forbidden_dependency"'"' "$BUILD_ROOT/apn-autoconfig-modem-adbdump.json"; then
 		printf 'apn-autoconfig-modem unexpectedly depends on %s.\n' "$forbidden_dependency" >&2
@@ -237,6 +244,7 @@ for executable in \
 	usr/libexec/apn-autoconfig-modem-query \
 	usr/libexec/apn-autoconfig-modem-control \
 	etc/init.d/apn-autoconfig-modem \
+	usr/libexec/apn-autoconfig-modem-inhibit \
 	etc/hotplug.d/usb/50-apn-autoconfig-modem
 do
 	[ -x "$BUILD_ROOT/inspect-apn-autoconfig-modem/$executable" ] || {
@@ -245,18 +253,19 @@ do
 	}
 done
 
+# netifd spawns the protocol handler as a program, so one that shipped without
+# the execute bit would fail at the first bring-up and nowhere earlier.
+[ -x "$BUILD_ROOT/inspect-apn-autoconfig-proto-atdial/lib/netifd/proto/apn_atdial.sh" ] || {
+	printf '%s\n' 'Package file is not executable: /lib/netifd/proto/apn_atdial.sh' >&2
+	exit 1
+}
+
 (cd "$OUTPUT" && sha256sum \
 	apn-autoconfig-[0-9]*.apk \
 	apn-autoconfig-integration-huasifei-wh3000-*.apk \
 	apn-autoconfig-providers-*.apk \
 	luci-app-apn-autoconfig-*.apk \
-	apn-autoconfig-modem-*.apk >SHA256SUMS)
+	apn-autoconfig-modem-*.apk \
+	apn-autoconfig-proto-atdial-*.apk >SHA256SUMS)
 printf 'Built package(s):\n'
 find "$OUTPUT" -maxdepth 1 -type f -print
-
-inspect_package "$6" apn-autoconfig-proto-atdial 5 \
-	lib/netifd/proto/apn_atdial.sh \
-	usr/share/apn-autoconfig-proto-atdial/atdial.sh \
-	usr/share/apn-autoconfig-proto-atdial/quirks \
-	usr/share/licenses/apn-autoconfig-proto-atdial/LICENSE \
-	lib/apk/packages/apn-autoconfig-proto-atdial.list

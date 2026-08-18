@@ -37,11 +37,11 @@ single_package() {
 	printf '%s\n' "$1"
 }
 
-CORE_PACKAGE="$(single_package 'apn-autoconfig-[0-9]*.apk')"
+# The provider package is named because the fetch check below compares against
+# it. The rest are not named anywhere in this script: what goes into the feed is
+# whatever the build produced, and build-with-sdk.sh has already asserted that
+# every expected package exists before this runs.
 PROVIDER_PACKAGE="$(single_package 'apn-autoconfig-providers-*.apk')"
-LUCI_PACKAGE="$(single_package 'luci-app-apn-autoconfig-*.apk')"
-WH3000_PACKAGE="$(single_package 'apn-autoconfig-integration-huasifei-wh3000-*.apk')"
-MODEM_PACKAGE="$(single_package 'apn-autoconfig-modem-*.apk')"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/apn-autoconfig-repository.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT HUP INT TERM
@@ -60,7 +60,19 @@ cp "$PUBLIC_KEY" "$SITE_DIR/public-key.pem"
 cp "$INSTALLER" "$SITE_DIR/install.sh"
 chmod 0755 "$SITE_DIR/install.sh"
 cp "$PUBLIC_KEY" "$KEYS_DIR/apn-autoconfig.pem"
-cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$WH3000_PACKAGE" "$MODEM_PACKAGE" "$FEED_DIR/"
+# Every package in the build output, not a list maintained by hand.
+#
+# 0.15.0 shipped with the list naming five packages while the release built six,
+# so the one package that release existed for was signed into nothing and the
+# feed served an index without it. The build and its inspection had already been
+# corrected for the same omission; this was the third place the set of packages
+# was written down, and the one nothing checked.
+#
+# PACKAGE_DIR holds exactly what this project built, so a glob is the set.
+for feed_package in "$PACKAGE_DIR"/*.apk; do
+	[ -f "$feed_package" ] || fail "no packages found in $PACKAGE_DIR"
+	cp "$feed_package" "$FEED_DIR/"
+done
 
 (
 	cd "$FEED_DIR"
@@ -74,13 +86,13 @@ cp "$CORE_PACKAGE" "$PROVIDER_PACKAGE" "$LUCI_PACKAGE" "$WH3000_PACKAGE" "$MODEM
 	"$APK_TOOL" adbdump --format json packages.adb >packages.json
 )
 
-for package_name in \
-	apn-autoconfig \
-	apn-autoconfig-integration-huasifei-wh3000 \
-	apn-autoconfig-providers \
-	luci-app-apn-autoconfig \
-	apn-autoconfig-modem
-do
+# Assert the index carries every package that went into it, derived from the
+# packages themselves rather than from a list that can fall behind them.
+for feed_package in "$FEED_DIR"/*.apk; do
+	package_file="${feed_package##*/}"
+	# apn-autoconfig-modem-0.15.1-r1.apk -> apn-autoconfig-modem
+	package_name="$(printf '%s' "$package_file" | sed -e 's/\.apk$//' -e 's/-[0-9][^-]*-r[0-9]*$//')"
+	[ -n "$package_name" ] || fail "cannot derive a package name from $package_file"
 	grep -E -q '"name"[[:space:]]*:[[:space:]]*"'"$package_name"'"' \
 		"$FEED_DIR/packages.json" ||
 		fail "packages.adb does not contain $package_name"

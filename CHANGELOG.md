@@ -1,5 +1,33 @@
 # Changelog
 
+## apn-autoconfig 0.15.1 / apn-autoconfig-modem 0.15.1 / apn-autoconfig-proto-atdial 0.15.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.15.1 (2026-08-19)
+
+A packaging-only patch. No runtime behaviour changes.
+
+**0.15.0's signed feed did not contain `apn-autoconfig-proto-atdial`.** The
+release built it, inspected it, attached it to the GitHub Release and pinned it
+in the checksums — and then the repository builder, which had its own list of
+five package names, signed an index without it. Installing the suite from the
+feed failed outright:
+
+```
+ERROR: unable to select packages:
+  apn-autoconfig-proto-atdial (no such package)
+```
+
+Found by the signed-feed smoke, which is exactly the step that exists to catch
+it, and on the first attempt after publication.
+
+That list was the **third** place the set of packages was written down. The
+build script and its APK inspection had already been corrected for the same
+omission before 0.15.0 shipped; this was the copy nothing checked. So the fix is
+not another list: the feed now carries every package the build produced, and
+asserts the index contains each of them by deriving the names from the packages
+themselves. `verify.sh` fails if that ever goes back to being a fixed list.
+
+Per the project's own rule, this is a follow-up patch release rather than a
+rewritten tag: v0.15.0 stays as published.
+
 ## apn-autoconfig 0.15.0 / apn-autoconfig-modem 0.15.0 / apn-autoconfig-proto-atdial 0.15.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.15.0 (2026-08-18)
 
 The first netifd protocol this project ships, for modems that expose no control

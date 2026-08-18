@@ -312,17 +312,17 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.15.0-r1.apk \
-  ./luci-app-apn-autoconfig-0.15.0-r1.apk
+  ./apn-autoconfig-0.15.1-r1.apk \
+  ./luci-app-apn-autoconfig-0.15.1-r1.apk
 ```
 
-`apn-autoconfig-modem-0.15.0-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.15.1-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it. It adds read-only modem
 inventory, stable identity, control-owner arbitration and a coordinator-based
 `modem-reset` path alongside the compatibility path. Install it when those
 functions are required.
 
-`apn-autoconfig-proto-atdial-0.15.0-r1.apk` is also optional, and only useful
+`apn-autoconfig-proto-atdial-0.15.1-r1.apk` is also optional, and only useful
 for a modem that exposes no control channel at all — a Fibocom FM350-GL in RNDIS
 composition, for example, where there is no `cdc-wdm` node for QMI or MBIM to
 use. It adds the `apn_atdial` netifd protocol, which defines and activates the

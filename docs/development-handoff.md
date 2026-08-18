@@ -245,7 +245,8 @@ hygiene:
 
    ```sh
    apk add apn-autoconfig apn-autoconfig-modem apn-autoconfig-providers \
-       luci-app-apn-autoconfig apn-autoconfig-integration-huasifei-wh3000
+       apn-autoconfig-proto-atdial luci-app-apn-autoconfig \
+       apn-autoconfig-integration-huasifei-wh3000
    tr ' ' '\n' < /etc/apk/world | grep apn-autoconfig | grep -v '^[a-z0-9-]*$'
    ```
 

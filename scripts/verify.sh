@@ -153,6 +153,14 @@ for package_dir in "$ROOT"/*/Makefile; do
 		exit 1
 	}
 done
+# The signed feed must carry whatever the build produced rather than a list
+# maintained beside it. 0.15.0 published a feed missing the package that release
+# existed for, because that list was the third place the set of packages was
+# written down and the only one nothing checked.
+grep -F -q 'for feed_package in "$PACKAGE_DIR"/*.apk' "$ROOT/scripts/build-repository.sh" || {
+	printf '%s\n' 'scripts/build-repository.sh must add every built package to the feed, not a fixed list.' >&2
+	exit 1
+}
 grep -F -q '+apn-autoconfig-modem ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
 grep -F -q '+kmod-usb-net-rndis ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
 # A package script must never restart the network: it reaches administrators who

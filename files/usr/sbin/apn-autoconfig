@@ -347,7 +347,7 @@ capture_old_profile() {
 		modemmanager) capture_owned_profile allowedauth iptype ;;
 		# MBIM shares qmi.sh's option names but not its value vocabulary; see
 		# mbim_set_profile.
-		qmi|mbim) capture_owned_profile auth pdptype ;;
+		qmi|mbim|atdial) capture_owned_profile auth pdptype ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read APN profiles" ;;
 	esac
 }
@@ -379,6 +379,10 @@ restore_old_profile() {
 		;;
 		mbim)
 			log warning "restoring previous MBIM profile for interface $INTERFACE"
+			restore_owned_profile auth pdptype
+		;;
+		atdial)
+			log warning "restoring previous AT-dial profile for interface $INTERFACE"
 			restore_owned_profile auth pdptype
 		;;
 		*) return 1 ;;
@@ -437,6 +441,27 @@ modemmanager_set_profile() {
 	set_owned_profile "$apn" "$username" "$password" allowedauth "$auth" iptype "$ip_type"
 }
 
+atdial_set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+	# AT+CGDCONT accepts IP, IPV6 and IPV4V6 and nothing else, and the value is
+	# passed to it verbatim. Writing the canonical spelling here is what keeps
+	# the handler's normalisation a safety net for hand-written sections rather
+	# than a path this project relies on.
+	case "$ip_type" in
+		ipv4) ip_type=IP ;;
+		ipv6) ip_type=IPV6 ;;
+		ipv4v6) ip_type=IPV4V6 ;;
+	esac
+	set_owned_profile "$apn" "$username" "$password" auth "$auth" pdptype "$ip_type"
+}
+
 qmi_set_profile() {
 	apn="$1"
 	username="$2"
@@ -475,6 +500,7 @@ set_profile() {
 		modemmanager) modemmanager_set_profile "$@" ;;
 		qmi) qmi_set_profile "$@" ;;
 		mbim) mbim_set_profile "$@" ;;
+		atdial) atdial_set_profile "$@" ;;
 		*) return 1 ;;
 	esac
 }
@@ -659,6 +685,32 @@ target_protocol_capabilities() {
 				TARGET_REASON="backend-command-unavailable"
 			fi
 		;;
+		apn_atdial)
+			TARGET_BACKEND="atdial"
+			# The handler enforces the policy itself by refusing to dial on a
+			# roaming registration, using the same allow_roaming option as
+			# ModemManager — but with the opposite default, so LuCI's labels
+			# for this backend must be its own, as they already are for MBIM.
+			TARGET_ROAMING_POLICY_READ=true
+			TARGET_ROAMING_POLICY_WRITE=true
+			# The FM350-GL path is what the hardware gate covers. The Intel XMM
+			# tail inside the same handler is alpha/synthetic, and that
+			# distinction lives in the modem record rather than here, because
+			# it is a property of the device rather than of this backend.
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
+			if ! command_exists apn-autoconfig-modem; then
+				TARGET_REASON="backend-command-unavailable"
+			else
+				TARGET_IDENTITY=true
+				# The profile is a set of netifd options the handler applies.
+				# This backend owns no profile fields of its own to read or
+				# write, and that is permanent rather than unimplemented.
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
+			fi
+		;;
 		fibocom) TARGET_BACKEND="fibocom" ;;
 		atc|xmm|ncm|wwan|3g) TARGET_BACKEND="at" ;;
 		*) TARGET_BACKEND=""; TARGET_REASON="unsupported-protocol" ;;
@@ -667,7 +719,7 @@ target_protocol_capabilities() {
 
 protocol_is_cellular() {
 	case "$1" in
-		modemmanager|qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;;
+		apn_atdial|modemmanager|qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;;
 		*) return 1 ;;
 	esac
 }
@@ -1002,6 +1054,22 @@ read_roaming_policy() {
 		mbim_read_roaming_policy
 		return 0
 	fi
+	if [ "$TARGET_BACKEND" = atdial ]; then
+		# Same option as ModemManager, read the same way, but an absent value
+		# means blocked rather than allowed: the handler refuses to dial on a
+		# roaming registration unless the option explicitly says otherwise.
+		if value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null)"; then
+			case "$value" in
+				0) ROAMING_POLICY="explicit-block"; ROAMING_ALLOWED=false ;;
+				1) ROAMING_POLICY="explicit-allow"; ROAMING_ALLOWED=true ;;
+				*) ROAMING_POLICY="invalid"; ROAMING_ALLOWED=false ;;
+			esac
+		else
+			ROAMING_POLICY="default-block"
+			ROAMING_ALLOWED=false
+		fi
+		return 0
+	fi
 	if [ "$TARGET_BACKEND" != modemmanager ]; then
 		# Roaming policy belongs to the connection manager. QMI has no tested
 		# policy mapping, so it is reported as unsupported rather than guessed.
@@ -1214,6 +1282,36 @@ mbim_resolve_control_device() {
 	resolve_control_device mbim
 }
 
+# AT identity comes from apn-autoconfig-modem, not from an adapter here.
+#
+# This is the decision 0.14.0 deferred until it had a caller. The protocol
+# handler holds the AT port for a whole bring-up, so a second resolver and
+# parser in this package would contend with both it and the modem package for
+# one serial port — the failure the mandatory port lock exists to prevent. One
+# implementation, one owner of the lock.
+atdial_read_sim() {
+	command_exists apn-autoconfig-modem || \
+		die_code 3 "apn-autoconfig-modem is required to read identity for $TARGET_ID"
+
+	atdial_modem_id="$(apn-autoconfig-modem resolve --interface "$INTERFACE" 2>/dev/null || :)"
+	[ -n "$atdial_modem_id" ] || \
+		die_code 4 "no unambiguous modem is bound to $TARGET_ID"
+	state_value_is_safe "$atdial_modem_id" || die "unsafe modem identity for $TARGET_ID"
+
+	atdial_status=0
+	apn-autoconfig-modem at-identity --modem "$atdial_modem_id" >"$SIM_DATA" || atdial_status=$?
+	case "$atdial_status" in
+		0) : ;;
+		# 4 is an ownership refusal — another control owner holds the modem —
+		# which is a different thing from a modem that cannot answer yet.
+		4) die_code 4 "another control owner holds the modem bound to $TARGET_ID" ;;
+		3) die_code 3 "cannot yet read AT SIM identity for $TARGET_ID" ;;
+		*) die "the AT identity backend returned invalid or incomplete data" ;;
+	esac
+
+	native_parse_identity AT
+}
+
 qmi_read_sim() {
 	native_read_sim QMI "$QMI_ADAPTER" qmi_resolve_control_device
 }
@@ -1239,6 +1337,15 @@ native_read_sim() {
 		3) die_code 3 "cannot yet read $native_label SIM identity for $TARGET_ID" ;;
 		*) die "$native_label identity adapter returned invalid or incomplete data" ;;
 	esac
+	native_parse_identity "$native_label"
+}
+
+# Everything after the identity has been produced. Split out because the AT-dial
+# backend obtains the same v1 contract from apn-autoconfig-modem rather than
+# from an adapter of its own, and duplicating this validation is exactly how the
+# two would drift apart.
+native_parse_identity() {
+	native_label="$1"
 	[ "$(sed -n '1p' "$SIM_DATA")" = "v1" ] || die "unsupported $native_label identity contract"
 
 	SIM_INDEX="$(qmi_identity_value sim_index)"
@@ -1277,6 +1384,7 @@ read_sim() {
 		modemmanager) modemmanager_read_sim ;;
 		qmi) qmi_read_sim ;;
 		mbim) mbim_read_sim ;;
+		atdial) atdial_read_sim ;;
 		*) die_code 4 "backend $TARGET_BACKEND cannot read SIM identity" ;;
 	esac
 	for value in "$SIM_INDEX" "$MODEM_INDEX" "$ICCID" "$IMSI" "$EID" \
@@ -1463,7 +1571,7 @@ save_baseline() {
 			write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
 			write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
 		;;
-		qmi|mbim)
+		qmi|mbim|atdial)
 			write_baseline_option "$tmp" auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
 			write_baseline_option "$tmp" pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
 		;;
@@ -1497,7 +1605,7 @@ reset_cmd() {
 		baseline_backend="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
 		[ "$baseline_target" = "network:$baseline_interface" ] || die "v3 baseline target does not match its interface"
 		[ "$baseline_target" = "$TARGET_ID" ] || die "v3 baseline belongs to another target"
-		case "$baseline_backend" in modemmanager|qmi|mbim) : ;; *) die "unsupported backend in v3 baseline" ;; esac
+		case "$baseline_backend" in modemmanager|qmi|mbim|atdial) : ;; *) die "unsupported backend in v3 baseline" ;; esac
 		[ "$baseline_backend" = "$TARGET_BACKEND" ] || die "v3 baseline backend does not match the selected target"
 	fi
 
@@ -1519,6 +1627,7 @@ reset_cmd() {
 					v3:modemmanager:apn|v3:modemmanager:username|v3:modemmanager:password|v3:modemmanager:allowedauth|v3:modemmanager:iptype) : ;;
 					v3:qmi:apn|v3:qmi:username|v3:qmi:password|v3:qmi:auth|v3:qmi:pdptype) : ;;
 					v3:mbim:apn|v3:mbim:username|v3:mbim:password|v3:mbim:auth|v3:mbim:pdptype) : ;;
+					v3:atdial:apn|v3:atdial:username|v3:atdial:password|v3:atdial:auth|v3:atdial:pdptype) : ;;
 					*) die "invalid option in baseline" ;;
 				esac
 				case "$set_flag" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
@@ -2393,7 +2502,7 @@ configured_profile_matches_active() {
 			configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
 			configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
 		;;
-		qmi|mbim)
+		qmi|mbim|atdial)
 			configured_allowedauth="$(uci -q get "network.${INTERFACE}.auth" 2>/dev/null || printf '%s' -)"
 			configured_iptype="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)"
 		;;
@@ -2411,8 +2520,12 @@ configured_connectivity_ip_type() {
 		qmi) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' ip)" ;;
 		# An absent MBIM pdptype means "let the modem decide", not IPv4.
 		mbim) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)" ;;
+		# The AT-dial backend stores the canonical 3GPP spelling, which is
+		# uppercase; an absent value means the handler's own default.
+		atdial) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null | tr 'A-Z' 'a-z' || printf '%s' -)" ;;
 		*) value="-" ;;
 	esac
+	[ -n "$value" ] || value="-"
 	case "$value" in ip|ipv4) printf '%s\n' ipv4 ;; ipv6|ipv4v6) printf '%s\n' "$value" ;; *) printf '%s\n' - ;; esac
 }
 

@@ -107,6 +107,9 @@ show:network)
 	if [ "${TEST_SECOND_MM:-0}" = 1 ]; then
 		printf '%s\n' "network.wwan2=interface" "network.wwan2.proto='modemmanager'"
 	fi
+	if [ "${TEST_ATDIAL_SECTION:-0}" = 1 ]; then
+		printf '%s\n' "network.cellatdial=interface" "network.cellatdial.proto='apn_atdial'"
+	fi
 ;;
 get:network.apnmodem1.proto) [ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' qmi ;;
 get:network.apnmodem1.device)
@@ -158,6 +161,13 @@ get:network.cellqmi.pdptype) cat "$TEST_STATE/qmi-pdptype" ;;
 get:network.cellqmi.allow_roaming) cat "$TEST_STATE/qmi-allow_roaming" ;;
 get:network.cellmbim.proto) printf '%s\n' mbim ;;
 get:network.cellat.proto) printf '%s\n' atc ;;
+get:network.cellatdial.proto) printf '%s\n' apn_atdial ;;
+get:network.cellatdial.usbpath) printf '%s\n' 2-1.3 ;;
+get:network.cellatdial.modem_id) printf '%s\n' "${TEST_ATDIAL_MODEM_ID:-imei:016177002734885}" ;;
+get:network.cellatdial.apn) cat "$TEST_STATE/atdial-apn" 2>/dev/null || exit 1 ;;
+get:network.cellatdial.pdptype) cat "$TEST_STATE/atdial-pdptype" 2>/dev/null || exit 1 ;;
+get:network.cellatdial.auth) cat "$TEST_STATE/atdial-auth" 2>/dev/null || exit 1 ;;
+get:network.cellatdial.allow_roaming) cat "$TEST_STATE/atdial-roaming" 2>/dev/null || exit 1 ;;
 get:network.cellmbim.apn) cat "$TEST_STATE/mbim-apn" ;;
 get:network.cellmbim.username) cat "$TEST_STATE/mbim-username" ;;
 get:network.cellmbim.password) cat "$TEST_STATE/mbim-password" ;;
@@ -191,6 +201,17 @@ set:*)
 			case "$option" in apn|username|password|allowedauth|iptype|allow_roaming) printf '%s\n' "$value" >"$TEST_STATE/$option" ;; *) exit 1 ;; esac
 		;;
 		network.wwan2.apn=*) printf '%s\n' "${2#network.wwan2.apn=}" >"$TEST_STATE/apn-wwan2" ;;
+		network.cellatdial.*=*)
+			option="${2#network.cellatdial.}"
+			value="${option#*=}"
+			option="${option%%=*}"
+			case "$option" in
+				apn|username|password|auth|pdptype|allow_roaming)
+					printf '%s\n' "$value" >"$TEST_STATE/atdial-$option"
+				;;
+				*) exit 1 ;;
+			esac
+		;;
 		network.cellqmi.*=*)
 			option="${2#network.cellqmi.}"
 			value="${option#*=}"
@@ -2468,6 +2489,108 @@ else
 fi
 kill -TERM "$sweep_live_pid" 2>/dev/null || :
 wait "$sweep_live_pid" 2>/dev/null || :
+printf '%s\n' 'TEST the AT-dial backend gets its identity from apn-autoconfig-modem, not an adapter of its own'
+# The decision 0.14.0 deferred. The protocol handler holds the AT port for a
+# whole bring-up, so a second resolver here would contend with it and with the
+# modem package for one serial port.
+cat >"$MOCKBIN/apn-autoconfig-modem" <<'EOF'
+#!/bin/sh
+verb="$1"; shift
+printf '%s %s\n' "$verb" "$*" >>"$TEST_STATE/atdial-modem-calls"
+case "$verb" in
+	resolve) printf '%s\n' "${TEST_ATDIAL_MODEM_ID:-imei:016177002734885}" ;;
+	at-identity)
+		[ -n "${TEST_ATDIAL_IDENTITY_EXIT:-}" ] && exit "$TEST_ATDIAL_IDENTITY_EXIT"
+		printf 'v1\n'
+		printf 'sim_index\t1\n'
+		printf 'modem_index\t/dev/ttyUSB5\n'
+		printf 'iccid\t89492031246010483050\n'
+		printf 'imsi\t262023103971566\n'
+		printf 'eid\t\n'
+		printf 'operator_id\t\n'
+		printf 'operator_name\t\n'
+		printf 'gid1\t\n'
+		printf 'gid2\t\n'
+		printf 'modem_state\tconnected\n'
+		printf 'registration_state\thome\n'
+		printf 'roaming\tfalse\n'
+		printf 'serving_operator_id\t26202\n'
+		printf 'serving_operator_name\t\n'
+		printf 'access_technologies\tlte,5gnr\n'
+		printf 'signal_quality\t35\n'
+	;;
+	*) exit 2 ;;
+esac
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/apn-autoconfig-modem"
+export TEST_STATE="$STATE"
+: >"$STATE/atdial-modem-calls"
+
+atdial_targets="$(TEST_ATDIAL_SECTION=1 sh "$SCRIPT" targets-json)"
+python3 -c '
+import json, sys
+t = {x["id"]: x for x in json.loads(sys.argv[1])["targets"]}
+a = t["network:cellatdial"]
+assert a["backend"] == "atdial", a["backend"]
+c = a["capabilities"]
+assert c["identity"] is True, c
+assert c["profile_apply"] is True, c
+# Permanently false: the profile is a set of netifd options the handler
+# applies, and this backend owns no profile fields of its own.
+assert c["profile_read"] is False and c["profile_write"] is False, c
+assert c["roaming_policy_read"] is True and c["roaming_policy_write"] is True, c
+assert a["unavailable_reason"] == "", a["unavailable_reason"]
+' "$atdial_targets" || fail 'the AT-dial backend reported the wrong capabilities'
+
+atdial_detect="$(TEST_ATDIAL_SECTION=1 TEST_INTERFACE=cellatdial sh "$SCRIPT" detect-json)" || \
+	fail 'detect-json failed for an AT-dial target'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["target_backend"] == "atdial", d["target_backend"]
+assert d["iccid"] == "89492031246010483050", d["iccid"]
+assert d["registration_state"] == "home", d["registration_state"]
+' "$atdial_detect" || fail 'the AT-dial identity did not reach the engine'
+grep -q '^resolve --interface cellatdial' "$STATE/atdial-modem-calls" || \
+	fail 'the engine did not resolve the modem bound to the section'
+grep -q '^at-identity --modem ' "$STATE/atdial-modem-calls" || \
+	fail 'the engine did not ask the modem package for identity'
+
+printf '%s\n' 'TEST an ownership refusal from the modem package is not a retryable identity failure'
+: >"$STATE/atdial-modem-calls"
+atdial_status=0
+TEST_ATDIAL_SECTION=1 TEST_ATDIAL_IDENTITY_EXIT=4 TEST_INTERFACE=cellatdial \
+	sh "$SCRIPT" detect-json >/dev/null 2>&1 || atdial_status=$?
+[ "$atdial_status" -eq 4 ] || \
+	fail "an ownership refusal exited $atdial_status instead of the blocked class 4"
+
+printf '%s\n' 'TEST the AT-dial backend writes the canonical 3GPP PDP type, not qmi or mbim spelling'
+# AT+CGDCONT accepts IP, IPV6 and IPV4V6 and nothing else. A modem that answers
+# ERROR to a non-standard value keeps its previous context, so the previous
+# SIM APN survives every dial.
+rm -f "$STATE/atdial-pdptype" "$STATE/atdial-apn"
+TEST_ATDIAL_SECTION=1 TEST_INTERFACE=cellatdial sh "$SCRIPT" apply-manual \
+	--apn atdial.test --ip-type ipv4v6 >/dev/null 2>&1 || :
+[ "$(cat "$STATE/atdial-pdptype" 2>/dev/null || :)" = IPV4V6 ] || \
+	fail "the AT-dial backend wrote pdptype '$(cat "$STATE/atdial-pdptype" 2>/dev/null || echo none)' instead of IPV4V6"
+[ "$(cat "$STATE/atdial-apn" 2>/dev/null || :)" = atdial.test ] || \
+	fail 'the AT-dial backend did not write the requested APN'
+
+printf '%s\n' 'TEST an absent roaming option blocks for AT-dial, where it allows for ModemManager'
+# Same option, opposite default: the handler refuses to dial on a roaming
+# registration unless the option explicitly says otherwise, so a frontend that
+# reused ModemManager's label would tell the user the opposite of the truth.
+atdial_status_json="$(TEST_ATDIAL_SECTION=1 TEST_INTERFACE=cellatdial sh "$SCRIPT" status-json)" || \
+	fail 'status-json failed for an AT-dial target'
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+assert d["roaming_policy"] == "default-block", d["roaming_policy"]
+' "$atdial_status_json" || fail 'the AT-dial roaming default was not reported as blocked'
+
+rm -f "$MOCKBIN/apn-autoconfig-modem"
+
 rm -rf "$SCRATCH"/*
 
 printf '%s\n' 'All tests passed.'

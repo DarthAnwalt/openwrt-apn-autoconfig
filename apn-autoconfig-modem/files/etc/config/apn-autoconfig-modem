@@ -27,6 +27,13 @@ config apn_autoconfig_modem 'main'
 	# of silent ports, which on some modems is most of them.
 	option at_timeout_seconds '5'
 	option at_port_lock_root '/var/lock/apn-autoconfig-at-port'
+	# How long to wait for the shared AT port lock before refusing. Contention is
+	# normal and brief: another component of this suite is reading identity, or
+	# the AT-dial protocol handler is holding the port for a bring-up. Waiting is
+	# what keeps an ordinary overlap from surfacing as a failure. Zero refuses
+	# immediately. Failing to acquire is always a refusal, never a licence to use
+	# the port anyway.
+	option at_lock_wait_seconds '15'
 	option hardware_integration_file '/usr/share/apn-autoconfig/integrations/huasifei-wh3000'
 	# Route metric for sections this package creates. A provisioned modem is the
 	# least preferred route by default, so it cannot take the default route away

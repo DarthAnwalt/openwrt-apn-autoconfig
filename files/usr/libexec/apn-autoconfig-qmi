@@ -18,7 +18,20 @@ IDENTITY_LOCK_ROOT="${APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT:-/var/lock/apn-autoc
 # effectively exclusive and corrupt both reply streams. The per-control-device
 # identity lock above does not cover this: it is keyed by the QMI control node,
 # not by the serial port.
-AT_PORT_LOCK_ROOT="${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-/var/lock/apn-autoconfig-at-port}"
+# Resolution order is env, then the UCI option apn-autoconfig-modem owns, then
+# the built-in default — the same order that package uses. Reading only the env
+# var meant an administrator who changed the documented UCI option moved that
+# package's lock and left this one behind, so the two stopped excluding each
+# other while both still reported success.
+AT_PORT_LOCK_ROOT="${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-}"
+if [ -z "$AT_PORT_LOCK_ROOT" ]; then
+	AT_PORT_LOCK_ROOT="$(uci -q get apn-autoconfig-modem.main.at_port_lock_root 2>/dev/null || :)"
+fi
+case "$AT_PORT_LOCK_ROOT" in
+	/|*/../*|*/..|'') AT_PORT_LOCK_ROOT="/var/lock/apn-autoconfig-at-port" ;;
+	/*) : ;;
+	*) AT_PORT_LOCK_ROOT="/var/lock/apn-autoconfig-at-port" ;;
+esac
 AT_CACHE_DIR="${APN_AUTOCONFIG_QMI_AT_CACHE_DIR:-/var/run/apn-autoconfig-qmi}"
 IDENTITY_LOCK_DIR=
 AT_PORT_LOCK_PATH=

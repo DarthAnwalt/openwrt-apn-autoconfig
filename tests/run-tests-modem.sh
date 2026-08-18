@@ -1051,6 +1051,34 @@ TEST_AT_CESQ="99,99,255,255,255,255,255,255,255" \
 signal="$(awk -F'\t' '$1 == "signal_quality" { print $2 }' "$STATE/at-identity-csq")"
 [ "$signal" = 35 ] || fail "CSQ fallback produced $signal instead of 35"
 
+printf '%s\n' 'TEST every registered stat is read as registered, including CSFB-not-preferred'
+# 6 and 7 were added once and 9 and 10 were left behind, which is the same
+# mistake twice: 3GPP TS 27.007 stat 9 and 10 are "registered, CSFB not
+# preferred" on the home and on a visited network. An unmapped value does not
+# fall back to a sensible default here — it abandons this source for the next
+# one, so a modem answering 9 from all three ends as "unknown", i.e. a fully
+# attached modem reported as unregistered.
+for reg_case in '1 home false' '5 roaming true' '6 home false' '7 roaming true' \
+	'9 home false' '10 roaming true'; do
+	reg_stat="${reg_case%% *}"
+	reg_rest="${reg_case#* }"
+	reg_expect_state="${reg_rest%% *}"
+	reg_expect_roaming="${reg_rest#* }"
+	reset_sysfs
+	reset_at_ports
+	add_at_modem 7-1.9 2c7c 0126 "REGSTAT$reg_stat" 61
+	printf '/dev/ttyUSB61\tcontrol\n' >>"$TEST_AT_PORTS"
+	TEST_AT_EPS_STAT="$reg_stat" sh "$SCRIPT" at-identity \
+		--modem "usb-serial:7-1.9:2c7c:0126:REGSTAT$reg_stat" >"$STATE/at-identity-stat" || \
+		fail "at-identity failed for registration stat $reg_stat"
+	reg_got_state="$(awk -F'\t' '$1 == "registration_state" { print $2 }' "$STATE/at-identity-stat")"
+	reg_got_roaming="$(awk -F'\t' '$1 == "roaming" { print $2 }' "$STATE/at-identity-stat")"
+	[ "$reg_got_state" = "$reg_expect_state" ] || \
+		fail "registration stat $reg_stat read as $reg_got_state, expected $reg_expect_state"
+	[ "$reg_got_roaming" = "$reg_expect_roaming" ] || \
+		fail "registration stat $reg_stat reported roaming $reg_got_roaming, expected $reg_expect_roaming"
+done
+
 printf '%s\n' 'TEST registration stat 6 is a registered state, and the ICCID ladder reaches the vendor spelling'
 reset_sysfs
 reset_at_ports
@@ -1165,6 +1193,77 @@ port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.1:1234:5678:CONTENDED")" ||
 	fail 'the resolver did not recover once the shared lock was released'
 [ "$port" = /dev/ttyUSB55 ] || fail "recovery returned $port"
 [ ! -e "$held_lock" ] || fail 'the resolver left the shared port lock behind'
+
+printf '%s\n' 'TEST the resolver waits for a busy AT port instead of refusing on its first attempt'
+# The wait this option configures was unreachable. lock_try_acquire_or_reclaim
+# returns 3 for "held by a live owner" — 2 is what the inner lock_try_acquire
+# returns before the reclaiming wrapper translates it — and the loop tested for
+# 2, so every contended acquisition failed immediately and the configured wait
+# never happened.
+#
+# The refusal test above could not see it, because refusal is what both the
+# broken and the fixed version do once the wait expires. This asserts the other
+# outcome instead: a lock released while the caller is waiting must be picked
+# up. The suite's sleep is a no-op, so the release rides on the call count
+# rather than on wall clock and the assertion stays deterministic.
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.7 1234 5678 WAITER 57
+printf '/dev/ttyUSB57\tcontrol\n' >>"$TEST_AT_PORTS"
+waiting_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB57"
+wait_counter="$TESTROOT/at-lock-wait-count"
+mkdir -p "$(dirname "$waiting_lock")"
+printf '%s\n' "$$" >"$waiting_lock"
+rm -f "$wait_counter"
+cat >"$MOCKBIN/sleep" <<EOF
+#!/bin/sh
+count=\$(cat "$wait_counter" 2>/dev/null || printf 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" >"$wait_counter"
+[ "\$count" -ge 3 ] && rm -f "$waiting_lock"
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+port="$(sh "$SCRIPT" at-port --modem "usb-serial:9-1.7:1234:5678:WAITER")" || \
+	fail 'the resolver refused a port whose holder released it while it was waiting'
+[ "$port" = /dev/ttyUSB57 ] || fail "the waiting resolver resolved to $port"
+waited="$(cat "$wait_counter" 2>/dev/null || printf 0)"
+[ "$waited" -ge 3 ] || fail "the resolver acquired without waiting at all ($waited wait(s))"
+cat >"$MOCKBIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+rm -f "$waiting_lock" "$wait_counter"
+
+printf '%s\n' 'TEST a configured wait of zero refuses a contended port immediately'
+reset_sysfs
+reset_at_ports
+add_at_modem 9-1.8 1234 5678 NOWAIT 58
+printf '/dev/ttyUSB58\tcontrol\n' >>"$TEST_AT_PORTS"
+impatient_lock="$TEST_AT_PORT_LOCK_ROOT.ttyUSB58"
+mkdir -p "$(dirname "$impatient_lock")"
+printf '%s\n' "$$" >"$impatient_lock"
+rm -f "$wait_counter"
+cat >"$MOCKBIN/sleep" <<EOF
+#!/bin/sh
+count=\$(cat "$wait_counter" 2>/dev/null || printf 0)
+printf '%s\n' "\$((count + 1))" >"$wait_counter"
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+impatient=0
+APN_AUTOCONFIG_AT_LOCK_WAIT_SECONDS=0 sh "$SCRIPT" at-port \
+	--modem "usb-serial:9-1.8:1234:5678:NOWAIT" >/dev/null 2>&1 || impatient=$?
+[ "$impatient" -ne 0 ] || fail 'a zero wait still used a port another holder had locked'
+[ ! -s "$wait_counter" ] || fail 'a zero wait still slept before refusing'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'a refused acquisition still wrote to the port'
+cat >"$MOCKBIN/sleep" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+chmod 0755 "$MOCKBIN/sleep"
+rm -f "$impatient_lock" "$wait_counter"
 
 printf '%s\n' 'TEST a probe never reaches a port belonging to another modem'
 # The target modem deliberately owns the *higher* tty index. With correlation

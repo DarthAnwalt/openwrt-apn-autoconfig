@@ -130,6 +130,7 @@ get:apn-autoconfig.main.registration_wait_seconds) printf '%s\n' "${TEST_REGISTR
 get:apn-autoconfig.main.try_empty) printf '%s\n' 0 ;;
 get:apn-autoconfig.main.use_mwan3) printf '%s\n' auto ;;
 get:apn-autoconfig.main.lock_dir) printf '%s\n' "$TEST_LOCK" ;;
+get:apn-autoconfig-modem.main.at_port_lock_root) printf '%s\n' "${TEST_MODEM_AT_PORT_LOCK_ROOT:-}" ;;
 get:apn-autoconfig.main.action_state_dir) printf '%s\n' "$TEST_ACTION_STATE" ;;
 get:apn-autoconfig.main.autostart) printf '%s\n' "${TEST_AUTOSTART:-0}" ;;
 get:apn-autoconfig.main.boot_delay) printf '%s\n' "${TEST_BOOT_DELAY:-0}" ;;
@@ -744,6 +745,30 @@ QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi sh "$SCRIPT" detect-json >/d
 grep -F -q '/dev/ttyUSB2' "$STATE/sms-tool-calls" || \
 	fail 'the QMI AT fallback did not resume once the shared lock was released'
 [ ! -e "$shared_at_lock" ] || fail 'the QMI AT fallback left the shared port lock behind'
+
+printf '%s\n' 'TEST the QMI AT fallback follows the lock root apn-autoconfig-modem is configured with'
+# The two packages agreed on the shared namespace only because the shipped UCI
+# value happened to equal the compiled-in default. This adapter read an
+# environment variable that nothing sets in production, so an administrator who
+# changed the documented option moved apn-autoconfig-modem's lock and left this
+# one behind — both packages then reported success while excluding nothing.
+: >"$STATE/sms-tool-calls"
+moved_lock_root="$TESTROOT/moved-at-port-lock"
+moved_at_lock="$moved_lock_root.ttyUSB2"
+mkdir -p "$(dirname "$moved_at_lock")"
+printf '%s\n' "$$" >"$moved_at_lock"
+TEST_MODEM_AT_PORT_LOCK_ROOT="$moved_lock_root" QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi \
+	env -u APN_AUTOCONFIG_AT_PORT_LOCK_ROOT sh "$SCRIPT" detect-json >/dev/null 2>&1 || :
+if grep -F -q '/dev/ttyUSB2' "$STATE/sms-tool-calls"; then
+	fail 'the QMI AT fallback ignored the configured lock root and wrote to a held port'
+fi
+rm -f "$moved_at_lock"
+: >"$STATE/sms-tool-calls"
+TEST_MODEM_AT_PORT_LOCK_ROOT="$moved_lock_root" QMI_FAIL_OPERATION=get-iccid TEST_INTERFACE=cellqmi \
+	env -u APN_AUTOCONFIG_AT_PORT_LOCK_ROOT sh "$SCRIPT" detect-json >/dev/null 2>&1 || :
+grep -F -q '/dev/ttyUSB2' "$STATE/sms-tool-calls" || \
+	fail 'the QMI AT fallback did not resume once the configured lock root was released'
+[ ! -e "$moved_at_lock" ] || fail 'the QMI AT fallback left a lock behind at the configured root'
 
 printf '%s\n' 'TEST concurrent QMI identity calls serialize access to the AT port'
 rm -f "$STATE/sms-tool-collisions"

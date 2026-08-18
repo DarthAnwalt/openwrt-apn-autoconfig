@@ -57,9 +57,9 @@ SMS_TOOL="${APN_AUTOCONFIG_MODEM_SMS_TOOL:-sms_tool}"
 # apn-autoconfig-qmi carries the same override for the same reason.
 SLEEP="${APN_AUTOCONFIG_MODEM_SLEEP:-sleep}"
 
-AT_PORT_LOCK_ROOT="/var/lock/apn-autoconfig-at-port"
+AT_PORT_LOCK_ROOT="${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-/var/lock/apn-autoconfig-at-port}"
 AT_TIMEOUT_SECONDS="5"
-AT_LOCK_WAIT_SECONDS="15"
+AT_LOCK_WAIT_SECONDS="${APN_AUTOCONFIG_AT_LOCK_WAIT_SECONDS:-15}"
 
 COMMAND_NAME=""
 REQUESTED_MODEM=""
@@ -281,7 +281,18 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
 	value="$(uci -q get "${CONFIG}.main.at_timeout_seconds")" && [ -n "$value" ] && AT_TIMEOUT_SECONDS="$value"
-	value="$(uci -q get "${CONFIG}.main.at_port_lock_root")" && [ -n "$value" ] && AT_PORT_LOCK_ROOT="$value"
+	# The AT port lock namespace is shared with apn-autoconfig-qmi and the
+	# AT-dial protocol handler, so all three must resolve it identically or the
+	# lock silently stops excluding anything. The order is env, then UCI, then
+	# the built-in default, and it is the same order in every package. The env
+	# override exists for the fixtures; in production nothing sets it and the
+	# administrator's UCI value wins, exactly as before.
+	[ -n "${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-}" ] || {
+		value="$(uci -q get "${CONFIG}.main.at_port_lock_root")" && [ -n "$value" ] && AT_PORT_LOCK_ROOT="$value"
+	}
+	[ -n "${APN_AUTOCONFIG_AT_LOCK_WAIT_SECONDS:-}" ] || {
+		value="$(uci -q get "${CONFIG}.main.at_lock_wait_seconds")" && [ -n "$value" ] && AT_LOCK_WAIT_SECONDS="$value"
+	}
 	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
 	value="$(uci -q get "${CONFIG}.main.quirk_table")" && [ -n "$value" ] && QUIRK_TABLE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
@@ -316,6 +327,7 @@ validate_config() {
 	case "$AT_TIMEOUT_SECONDS" in ''|*[!0-9]*) die "at_timeout_seconds must be numeric" ;; esac
 	[ "$AT_TIMEOUT_SECONDS" -gt 0 ] || die "at_timeout_seconds must be greater than zero"
 	case "$AT_PORT_LOCK_ROOT" in /|*/../*|*/..) die "unsafe at_port_lock_root" ;; /*) : ;; *) die "at_port_lock_root must be absolute" ;; esac
+	case "$AT_LOCK_WAIT_SECONDS" in ''|*[!0-9]*) die "at_lock_wait_seconds must be a non-negative integer" ;; esac
 	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
 	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
 	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
@@ -935,7 +947,15 @@ at_port_lock_acquire() {
 			AT_PORT_LOCK_HELD=1
 			return 0
 		fi
-		[ "$at_lock_status" -eq 2 ] || { AT_PORT_LOCK_PATH=""; return 1; }
+		# "Held by a live owner" is 3, not 2 — 2 is what the inner
+		# lock_try_acquire returns, and the reclaiming wrapper translates it.
+		# Testing for 2 here made the whole wait below unreachable: every
+		# contended acquisition failed on its first attempt, so the port was
+		# reported busy the instant another component held it instead of after
+		# the wait this option configures. Contention is normal and brief —
+		# an identity read is seconds, a dial is longer — so refusing
+		# immediately turned an ordinary overlap into a user-visible failure.
+		[ "$at_lock_status" -eq 3 ] || { AT_PORT_LOCK_PATH=""; return 1; }
 		[ "$at_lock_waited" -lt "$AT_LOCK_WAIT_SECONDS" ] || { AT_PORT_LOCK_PATH=""; return 1; }
 		sleep 1
 		at_lock_waited=$((at_lock_waited + 1))
@@ -1063,10 +1083,15 @@ at_read_registration() {
 		case "$at_reg_stat" in
 			1) AT_REGISTRATION=home; AT_ROAMING=false ;;
 			5) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
-			# 6 and 7 are registered states — SMS only, on the home and on a
-			# visited network. Treating them as absent is the classic mistake.
-			6) AT_REGISTRATION=home; AT_ROAMING=false ;;
-			7) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
+			# 6/7 and 9/10 are registered states too — SMS only, and CSFB not
+			# preferred, each on the home and on a visited network. Treating
+			# them as absent is the classic mistake, and an unmapped value here
+			# does not merely fall back: it moves on to the next source and,
+			# when every source agrees, ends as "unknown". 9 and 10 were left
+			# out when 6 and 7 were added, so the same modem could be reported
+			# as unregistered while fully attached.
+			6|9) AT_REGISTRATION=home; AT_ROAMING=false ;;
+			7|10) AT_REGISTRATION=roaming; AT_ROAMING=true ;;
 			2) AT_REGISTRATION=searching ;;
 			3) AT_REGISTRATION=denied ;;
 			0) AT_REGISTRATION=idle ;;

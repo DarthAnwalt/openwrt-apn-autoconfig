@@ -32,6 +32,16 @@ applicable texts are in `data/licenses/`, and attribution is in
 Every binary package installs its applicable license text. The provider package
 also installs its third-party NOTICE.
 
+## Behavioural references
+
+Some behaviour in this repository was designed after studying other free
+software, without incorporating any of its code. Those references, the specific
+findings taken from them and the points where this project deliberately diverges
+are recorded in `THIRD_PARTY_NOTICES.md`. Reusing a factual finding creates no
+licensing obligation, but attribution is recorded anyway, and no reference
+relaxes this project's own requirement for independent safety design and its own
+hardware evidence.
+
 ## External runtime components
 
 OpenWrt, LuCI, ModemManager, curl and other declared dependencies are separate

@@ -192,6 +192,48 @@ is scanned can be claimed moments later — on the reference router ModemManager
 publishes a freshly attached modem only after it has finished probing every
 port, so unowned-then-owned is the ordinary sequence rather than a race.
 
+### Taking a modem away from ModemManager
+
+Added in 0.15.0, for one specific and narrow purpose: a modem this project is
+about to dial over AT cannot be owned by ModemManager at the same time.
+
+The case is not hypothetical. ModemManager claims a Fibocom FM350-GL on the
+reference router and reports it as `model unknown`, because the RNDIS data
+interface has no bound driver and it cannot drive what it has claimed. It holds
+the ports and delivers nothing for them, and every AT operation this project
+needs is correctly refused while it does.
+
+The mechanism is ModemManager's own: `mmcli --inhibit-device=<uid>`, where the
+uid is the stable physical device path already collected during discovery as
+`modem.generic.physdev`. Inhibition is what that interface exists for, it names
+one device rather than a volatile index, and it releases only that device.
+
+Four rules make it safe:
+
+1. **It is scoped to a provisioned modem.** The inhibitor is started when this
+   project provisions an `apn_atdial` section for that exact `modem_id`, and
+   stopped when the section is removed. Discovery never inhibits anything;
+   inventory remains read-only.
+2. **It is held by a supervised process, not left as a side effect.** An
+   inhibition lasts exactly as long as the process holding it, so it is a procd
+   instance whose lifetime matches the provisioning state. A dead holder
+   releases the modem back to ModemManager, which is the correct failure
+   direction: the modem returns to a working owner rather than to none.
+3. **ModemManager may win the race, and that is expected.** It can claim the
+   modem between the request and the inhibition taking effect. Provisioning
+   therefore verifies that ownership actually moved and recovers if it did not,
+   rather than assuming the request was atomic.
+4. **ModemManager is never restarted.** A restart drops every session it
+   manages, which on a router with a second, working MM-managed modem means
+   taking down production connectivity to configure an unrelated device. No
+   operation in this project restarts it.
+
+While an inhibition is held for a modem, its observed owner state becomes
+`none` — which is the truth: ModemManager no longer has a `Modem` object for it.
+The inhibition is recorded in the provisioning state so that removal can undo
+exactly what provisioning did, and so that a holder found running for a modem
+this project did not provision is reported rather than adopted.
+
 ## AT port resolution
 
 Added in 0.14.0. A modem commonly exposes three to seven tty nodes, of which

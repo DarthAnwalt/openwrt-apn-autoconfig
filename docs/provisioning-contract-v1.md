@@ -27,9 +27,10 @@ In scope for v1:
 - exact rollback of everything provisioning created; and
 - removal of project-owned provisioning state without touching anything else.
 
-Out of scope for v1: adoption of user-created sections, MBIM profile mutation,
-eSIM, Fibocom dial protocol, multi-bearer policy, and any mutation of `mwan3`,
-Travelmate, firewall or routing configuration.
+Out of scope for v1: adoption of user-created sections, eSIM, multi-bearer
+policy, and any mutation of `mwan3`, Travelmate, firewall or routing
+configuration. MBIM profile mutation arrived in 0.12.0 and the AT-dial protocol
+in 0.15.0; both conform to the rules below rather than altering them.
 
 ## Ownership
 
@@ -115,8 +116,9 @@ held:
 1. exactly one inventory record matches `--modem`, and it is present;
 2. `ambiguous` is false and `owner_state` is not `conflicting`;
 3. `netifd_interface` is empty — the modem is not already bound;
-4. the modem's protocol has an implemented provisioning path (`qmi` or
-   `modemmanager` in v1; `mbim` and `at` are recognised but refused);
+4. the modem's protocol has an implemented provisioning path — `qmi`,
+   `modemmanager`, `mbim`, or `at` when the AT-dial protocol package is
+   installed **and** registered with netifd;
 5. the required control/data attributes for that protocol are resolved and
    unambiguous; and
 6. the chosen section name is free.
@@ -124,6 +126,51 @@ held:
 Any failure is terminal and performs no mutation. Uncertainty is not permission:
 a failed or unparseable owner discovery blocks provisioning exactly as it blocks
 a reset.
+
+### An AT modem needs its protocol registered, not merely installed
+
+Added in 0.15.0. An observed protocol of `at` provisions to `proto=apn_atdial`,
+bound by stable USB path, and that mapping has a precondition the other
+protocols do not have.
+
+netifd reads `/lib/netifd/proto/*.sh` **only when it starts**. Neither
+`/etc/init.d/network reload` nor `ubus call network reload` re-reads them —
+`reload` re-reads `/etc/config/network` and nothing else. So a protocol handler
+installed into a running system is present on disk and unknown to netifd, and a
+section using it is inert, reporting `available: false` and an unsupported
+protocol type.
+
+The asymmetry that follows is worth stating plainly, because it decides where
+the restart belongs:
+
+- **Installing the package for the first time needs a netifd restart**, because
+  registration lives in netifd's memory.
+- **Updating the handler's logic does not**, because netifd spawns the script
+  from disk for every setup and teardown. New dial logic is picked up by the
+  next bring-up on its own.
+- **Adding or renaming an interface option does**, because the option schema
+  comes from the handler's `dump` output and is cached alongside the
+  registration. An option netifd has not seen is not accepted from the config.
+
+The middle case is the common one, which is why an update is not treated as a
+restart trigger. The third is a release-planning constraint rather than a
+runtime one: an option added mid-life reaches users at their next reboot, so it
+must be introduced with a default that behaves exactly as its absence did.
+
+`provision-plan` therefore reports `netifd_restart_required`, computed from
+`ubus call network get_proto_handlers`, and `provision` performs the restart as
+a distinct step **before** arming the section-creating transaction — so a
+restart never sits inside a window that a rollback would have to unwind. After
+the restart it re-checks registration and fails closed if the protocol is still
+absent. No section is created on the strength of a handler netifd does not know.
+
+**The restart is never performed from a package script.** A `postinst` that
+restarts the network reaches routers whose administrator is not present, is not
+expecting an interruption, and may be reachable only through the interfaces
+being restarted; the project whose implementation informed this release took a
+remote router off the network twice doing exactly that, once during an update
+that had nothing to do with modems. Provisioning is the opposite situation: the
+user is configuring a modem, at the console, and waiting for this to happen.
 
 ## States
 
@@ -237,6 +284,12 @@ used, and, when it cannot, a stable machine-readable reason:
 `already_configured`, `ambiguous`, `conflicting_owner`, `unsupported_protocol`,
 `not_present`, `name_unavailable`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
+
+0.15.0 adds `netifd_restart_required` to the same response, additively. It is
+true only for a protocol this project ships whose handler netifd has not
+registered, and it tells a frontend that the provisioning it is about to start
+will briefly restart the network — which is a thing a user is entitled to be
+told before it happens rather than after.
 
 0.13.0 adds three read-only fields to the same response, additively and without
 changing the meaning of any existing one: `can_control_bearer`,

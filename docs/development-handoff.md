@@ -4,8 +4,9 @@ This is the shortest safe entry point for the next implementation task. Read it
 with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-contract-v1.md),
 [`modem-contract-v1.md`](modem-contract-v1.md),
 [`provisioning-contract-v1.md`](provisioning-contract-v1.md),
-[`mbim-contract-v1.md`](mbim-contract-v1.md), the latest version-specific test
-plan — currently [`testing-0.14.0.md`](testing-0.14.0.md) — and
+[`mbim-contract-v1.md`](mbim-contract-v1.md),
+[`atdial-contract-v1.md`](atdial-contract-v1.md), the latest version-specific
+test plan — currently [`testing-0.15.0.md`](testing-0.15.0.md) — and
 [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
@@ -17,46 +18,52 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.13.2 is released. The suite discovers a modem, provisions it, selects
+Version 0.14.1 is released. The suite discovers a modem, provisions it, selects
 and applies an APN, verifies real Internet access, controls the connection and
 manages roaming policy — over ModemManager, native QMI and native MBIM — and
-presents all of it through the reorganized frontend that 0.13.0 delivered.
+identifies a modem that answers only 3GPP AT, which 0.14.0 added as the
+precondition for what follows.
 
-The next release is **0.14.0, the AT identity backend and bounded AT
-transport**. Its plan is [`testing-0.14.0.md`](testing-0.14.0.md), and the
-contract deltas are already written into
-[`modem-contract-v1.md`](modem-contract-v1.md) and
-[`backend-contract-v1.md`](backend-contract-v1.md).
+The next release is **0.15.0, the AT-dialed connection path**. Its plan is
+[`testing-0.15.0.md`](testing-0.15.0.md) and its normative behaviour is
+[`atdial-contract-v1.md`](atdial-contract-v1.md).
 
-Four points there are easy to get wrong.
+Five points there are easy to get wrong.
 
-It is a **dependency, not a feature wanted for its own sake.** An FM350 in RNDIS
-composition exposes no `cdc-wdm` node, so neither the QMI nor the MBIM adapter
-can read its SIM. Without AT identity, 0.15.0 could dial that modem and still
-have no way to choose an APN for it.
+**The protocol handler must create the network device, not wait for one.** The
+measured FM350-GL presents an RNDIS interface pair with **no driver bound** on
+this image, so it has no network device at all. A handler that resolves a netdev
+before loading `rndis_host` finds nothing, forever.
 
-**The command vocabulary is the easy part.** The 3GPP core reads are uniform
-across vendors, and the bootstrap that learns which modem this is uses no vendor
-knowledge at all — `AT+CGMI`/`AT+CGMM` are the *output* of the probe, not a
-precondition for it. The work is port ownership: resolving a port by observed
-role, bounding every call on images without an external `timeout`, and holding a
-mandatory lock rather than an opportunistic one.
+**The AT port is asked for, never probed for.** `apn-autoconfig-modem` already
+resolves ports by role, caches negative verdicts and refuses under ModemManager.
+A second resolver in the protocol package would race the first for the same tty,
+which is the exact failure 0.14.0 was built to prevent.
 
-**One earlier rule is reversed.** Multiple AT ports on one proven USB device
-were terminal ambiguity, which made an ordinary seven-port modem permanently
-unusable rather than safe. Ports on one device are redundancy; ambiguity between
-devices still fails closed.
+**The AT port lock is mandatory, and this is where it earns its cost.** The
+address published on the interface comes from a reply to `AT+CGPADDR`. A
+component that waits for the lock, fails, and proceeds anyway configures the
+interface with someone else's answer — up, wrong, and silent about it.
 
-**Reset becomes one capability with three implementations** chosen by control
-owner. Under ModemManager the answer is to ask ModemManager to reset, not to
-refuse: refusing would encode one deployment's shape into the contract and leave
-a ModemManager user with no reset at all on a board without GPIO.
+**Ownership is taken with ModemManager's own mechanism, or not at all.**
+`mmcli --inhibit-device` names one stable device and is held by a supervised
+process for exactly as long as the provisioning that asked for it. ModemManager
+is never restarted: it would drop every session it manages, including the
+working modem next to the one being configured.
 
-The hardware gate is where this release is decided, and it needs two modems
-attached at once. Fixtures cannot reproduce a port that accepts a write and
-never answers, a port that answers `OK` while being a debug channel, a reset
-that removes its own port mid-command, or a re-enumeration that renumbers a
-neighbouring modem's tty nodes — and those are the failures that matter.
+**Registration with netifd is not the same as installation.** netifd reads
+`/lib/netifd/proto/*.sh` only at start, while it spawns the handler from disk for
+every setup — so changed dial logic arrives on the next bring-up, and a first
+install does need a restart. The option schema follows registration, not the
+logic: a new interface option is not accepted until netifd has been restarted,
+so one must be introduced with a default that behaves exactly as its absence
+did. That restart belongs to an explicit provisioning a user is waiting for,
+never to a package script.
+
+The hardware gate decides this release, and its evidence is deliberately uneven:
+the FM350-GL path is validated, and the Intel XMM tail for the L850/L860 is
+`alpha`/`synthetic` because no such device has been driven here. Fixtures cannot
+reproduce a link that carries nothing because ARP was left enabled.
 
 ## Released package and file map
 
@@ -66,23 +73,42 @@ neighbouring modem's tty nodes — and those are the failures that matter.
 - `luci-app-apn-autoconfig`: optional consumer of the public machine API.
 - `apn-autoconfig-integration-huasifei-wh3000`: optional tested BTN_0/GPIO
   integration and its kernel dependency. It is not a generic button package.
+- `apn-autoconfig-proto-atdial`: optional netifd protocol `apn_atdial` for
+  AT-dialed RNDIS/ECM/NCM modems with no control channel. Installing it does not
+  register it with netifd; see the provisioning contract.
 - `files/usr/sbin/apn-autoconfig`: target discovery, backend dispatch, matching,
   state, connectivity verification, rollback and public CLI/JSON API.
 - `files/usr/libexec/apn-autoconfig-qmi`: bounded read-only QMI/SIM transport.
 - `files/usr/libexec/apn-autoconfig-query` and `-control`: narrow LuCI/rpcd
   allowlists. Do not grant LuCI the general-purpose CLI.
+- `apn-autoconfig-proto-atdial/files/lib/netifd/proto/apn_atdial.sh`: the dial
+  handler. It sends only literal AT strings and never accepts a command from
+  UCI, the environment or a caller.
+- `apn-autoconfig-proto-atdial/files/usr/libexec/apn-autoconfig-atdial-at`:
+  bounded AT executor and client of the shared AT port lock namespace.
 - `tests/run-tests.sh`: backend, state, failure, rollback, injection, reset and
   compatibility regressions.
+- `tests/run-tests-atdial.sh`: dial sequence, error classes, lock refusal,
+  interruption and quirk regressions for the protocol package.
 - `scripts/verify.sh`: required local and CI gate.
 
 ## Target package map
 
 The accepted names are `apn-autoconfig-modem`, `apn-autoconfig`,
-`apn-autoconfig-providers`, `apn-autoconfig-proto-fibocom`,
+`apn-autoconfig-providers`, `apn-autoconfig-proto-atdial`,
 `apn-autoconfig-esim`, optional `apn-autoconfig-lpac`, the existing
 `luci-app-apn-autoconfig` and the existing Huasifei integration package.
 Logical component names such as “modem control” must not become generic global
 package, UCI, executable or ubus names.
+
+The same rule reaches further than package names. **netifd protocol names are a
+global namespace shared with every other package on the router**, and a
+collision there overwrites a file rather than refusing an install:
+`luci-app-5gmodem` already ships `/lib/netifd/proto/fibocom.sh`, which is why
+the protocol added in 0.15.0 is `apn_atdial` and the package that carries it is
+`apn-autoconfig-proto-atdial`. Protocol names must also be valid shell
+identifiers, because netifd builds handler function names from them — a hyphen
+produces a function definition `dash` refuses to parse.
 
 `apn-autoconfig-modem` becomes the lower-level dependency. It owns read-only
 inventory, stable identity, runtime capabilities, control-owner arbitration,

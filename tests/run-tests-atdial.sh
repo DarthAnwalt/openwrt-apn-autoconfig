@@ -68,8 +68,17 @@ printf '%s\t%s\n' "$verb" "$modem" >>"$TEST_MODEM_LOG"
 case "$verb" in
 	at-port)
 		[ -n "${TEST_AT_PORT_EXIT:-}" ] && exit "$TEST_AT_PORT_EXIT"
+		# A modem_id the inventory no longer knows: what a stale recorded
+		# identity looks like once the evidence tier has been upgraded.
+		if [ -n "${TEST_STALE_MODEM_ID:-}" ] && [ "$modem" = "$TEST_STALE_MODEM_ID" ]; then
+			exit 3
+		fi
 		[ -n "${TEST_AT_PORT:-}" ] || exit 3
 		printf '%s\n' "$TEST_AT_PORT"
+	;;
+	inventory-json)
+		printf '{"version":"v1","modems":[{"modem_id":"%s","usb_path":"/sys/devices/mock/%s"}]}\n' \
+			"${TEST_CURRENT_MODEM_ID:-imei:016177002734885}" "${TEST_MODEM_USB_PATH:-2-1.3}"
 	;;
 	status-json)
 		printf '{"version":"v1","modem_id":"%s","usb_path":"%s","owner_state":"%s"}\n' \
@@ -784,5 +793,39 @@ at_sent 'AT+CGACT=0,1' || fail 'a TERM in the destructive window left the PDP co
 for leftover in "$APN_ATDIAL_SCRATCH_DIR"/apn-atdial.*.reply "$APN_ATDIAL_SCRATCH_DIR"/apn-atdial.*.timeout; do
 	[ -e "$leftover" ] && fail 'a TERM in the destructive window left a scratch file behind'
 done
+
+printf '%s\n' 'TEST an identity upgraded since provisioning is re-resolved from the path'
+# Found on hardware. A section records the modem_id it was provisioned with, and
+# that id can stop existing without the modem moving: the evidence tier is
+# upgraded the moment something learns the IMEI — an identity read, or
+# ModemManager identifying a modem it previously could not. `weak-vidpid:…`
+# becomes `imei:…`, and the handler was left asking about a modem that was no
+# longer called that, reporting NO_AT_PORT for a modem sitting right there.
+#
+# The section is bound by path *and* identity precisely so this is recoverable.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+TEST_OPT_modem_id="weak-vidpid:2-1.3:0e8d:7127"
+TEST_STALE_MODEM_ID="weak-vidpid:2-1.3:0e8d:7127"
+TEST_CURRENT_MODEM_ID="imei:016177002734885"
+export TEST_STALE_MODEM_ID TEST_CURRENT_MODEM_ID
+proto_apn_atdial_setup wwan_at || fail "setup failed after an identity upgrade: ${PROTO_ERROR:-none}"
+[ "$PROTO_ADDRESS" = 10.9.146.175 ] || fail 'the dial did not recover after the identity was upgraded'
+grep -q "at-port	imei:016177002734885" "$TEST_MODEM_LOG" || \
+	fail 'the handler never retried with the identity the path resolves to now'
+unset TEST_STALE_MODEM_ID TEST_CURRENT_MODEM_ID
+
+printf '%s\n' 'TEST a modem that is genuinely gone is still NO_AT_PORT'
+# The recovery above must not turn a removed modem into a silent success.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+TEST_AT_PORT=""
+export TEST_AT_PORT
+proto_apn_atdial_setup wwan_at && fail 'setup succeeded with no resolvable port at all'
+[ "$PROTO_ERROR" = NO_AT_PORT ] || fail "reported $PROTO_ERROR instead of NO_AT_PORT"
 
 printf '%s\n' 'All AT-dial protocol tests passed.'

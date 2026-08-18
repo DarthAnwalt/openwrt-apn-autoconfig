@@ -37,6 +37,29 @@ atdial_log() {
 	echo "apn_atdial[$$] $*"
 }
 
+# The identity currently bound to this physical path.
+#
+# A section records the modem_id it was provisioned with, and that id can stop
+# existing without the modem going anywhere: the evidence tier is upgraded the
+# moment something learns the IMEI — an identity read, or ModemManager
+# identifying a modem it could not identify before — and `weak-vidpid:…` becomes
+# `imei:…`. Observed on hardware between provisioning and the first dial, which
+# left the handler asking about a modem that was no longer called that and
+# getting NO_AT_PORT for a modem sitting right there.
+#
+# The section is bound by path *and* identity for exactly this reason. When the
+# recorded identity no longer resolves, the path still names the same device, so
+# the current identity is looked up from it rather than failing.
+atdial_modem_id_for_usbpath() {
+	local path="$1" record
+	[ -n "$path" ] || return 1
+	[ -x "$ATDIAL_MODEM_BIN" ] || return 1
+	command -v jsonfilter >/dev/null 2>&1 || return 1
+	record="$("$ATDIAL_MODEM_BIN" inventory-json 2>/dev/null)" || return 1
+	printf '%s' "$record" | tr '{' '\n' | grep -F "\"usb_path\":\"" | grep -F "/$path\"" |
+		sed -n 's/.*"modem_id":"\([^"]*\)".*/\1/p' | sed -n '1p'
+}
+
 # One field of the modem package's read-only record. status-json opens no
 # control channel, so this is safe to call while this handler holds the AT port
 # lock — which asking at-port again would not be, because resolving a port that
@@ -341,6 +364,17 @@ proto_apn_atdial_setup() {
 		# that has to reach the user as a different error.
 		local port_status=0
 		dial="$("$ATDIAL_MODEM_BIN" at-port --modem "$modem_id" 2>/dev/null)" || port_status=$?
+		# 3 is "no such modem", which for a device still on its path means the
+		# identity was upgraded rather than the modem removed.
+		if [ "$port_status" -eq 3 ] && [ -n "$usbpath" ]; then
+			value="$(atdial_modem_id_for_usbpath "$usbpath" || :)"
+			if [ -n "$value" ] && [ "$value" != "$modem_id" ]; then
+				atdial_log "modem_id \"$modem_id\" no longer resolves; $usbpath is now $value"
+				modem_id="$value"
+				port_status=0
+				dial="$("$ATDIAL_MODEM_BIN" at-port --modem "$modem_id" 2>/dev/null)" || port_status=$?
+			fi
+		fi
 		if [ "$port_status" -eq 4 ]; then
 			atdial_fail "$interface" OWNER_CONFLICT 1 \
 				"another control owner holds $modem_id; not opening its AT port"

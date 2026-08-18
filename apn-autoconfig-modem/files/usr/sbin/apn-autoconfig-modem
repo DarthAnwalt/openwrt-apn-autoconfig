@@ -1993,7 +1993,16 @@ provisioning_rollback() {
 	if [ -n "$PROVISION_CREATED_SECTION" ]; then
 		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
 		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
-		if uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+		if ! uci -q get "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+			# Rollback is armed before the section is written, which is the
+			# required order: an interruption in the gap must not find the
+			# cleanup disarmed. So the gap is reachable, and reaching it means
+			# there is nothing to remove rather than that removal failed.
+			# Observed on hardware: SIGPIPE on the first log line after arming
+			# lands exactly here, and `uci delete` on an absent section reports
+			# failure, which used to be logged as one.
+			:
+		elif uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
 			uci commit network >/dev/null 2>&1 || \
 				log err "failed to commit removal of staging section $PROVISION_CREATED_SECTION"
 		else

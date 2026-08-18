@@ -69,13 +69,34 @@ get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HA
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
 	section="${2#network.}"
-	name="${section%%.*}"
-	option="${section#*.}"
-	awk -F'\t' -v name="$name" -v option="$option" \
-		'$1 == name && $2 == option { print $3; found=1 } END { exit found ? 0 : 1 }' \
-		"$TEST_NETWORK_OPTIONS" 2>/dev/null
+	case "$section" in
+	*.*)
+		name="${section%%.*}"
+		option="${section#*.}"
+		awk -F'\t' -v name="$name" -v option="$option" \
+			'$1 == name && $2 == option { print $3; found=1 } END { exit found ? 0 : 1 }' \
+			"$TEST_NETWORK_OPTIONS" 2>/dev/null
+	;;
+	*)
+		# Real uci answers a bare section name with the section type, which is how
+		# a caller asks whether a section exists at all. Without this the mock
+		# reported every section as absent, because "${section#*.}" on a name with
+		# no dot yields the name itself and no option ever matches it.
+		awk -F= -v want="network.$section" \
+			'$1 == want { print $2; found=1 } END { exit found ? 0 : 1 }' \
+			"$TEST_NETWORK_SECTIONS" 2>/dev/null
+	;;
+	esac
 ;;
 set:network.*)
+	# Lets a test reach the window between arming the provisioning rollback and
+	# writing the section, which is otherwise only reachable by winning a race
+	# with a signal.
+	if [ -n "${TEST_UCI_SECTION_CREATE_FAILS:-}" ]; then
+		case "$2" in
+			"network.${TEST_UCI_SECTION_CREATE_FAILS}=interface") exit 1 ;;
+		esac
+	fi
 	# Every write is journalled so a test can assert exactly which keys were
 	# touched, not merely that the end state looks right.
 	printf 'set\t%s\n' "$2" >>"$TEST_UCI_WRITES"
@@ -106,6 +127,15 @@ set:network.*)
 delete:network.*)
 	printf 'delete\t%s\n' "$2" >>"$TEST_UCI_WRITES"
 	target="${2#network.}"
+	# Real uci reports failure when the target does not exist, and a mock that
+	# always succeeds hides every caller that treats "nothing to delete" as a
+	# failed delete. That difference cost a hardware gate once: the rollback
+	# logged a removal failure for a section it had never created, and the
+	# fixtures could not see it.
+	case "$target" in
+		*.*) grep -q "^network\.${target%%.*}\.${target#*.}=" "$TEST_NETWORK_SECTIONS" 2>/dev/null || exit 1 ;;
+		*) grep -q -E "^network\.${target}(=|\.)" "$TEST_NETWORK_SECTIONS" 2>/dev/null || exit 1 ;;
+	esac
 	case "$target" in
 		*.*)
 			name="${target%%.*}"
@@ -217,8 +247,23 @@ printf 'up %s\n' "$1" >>"$TEST_EVENTS"
 	: >"$TEST_STATE/up-before-owner"
 EOF
 
+# Records what the script logged, so a test can assert on the message and not
+# merely on the end state. A cleanup that leaves correct state while reporting a
+# failure it did not have is still a defect: it sends an operator looking for
+# residue that was never written.
 cat >"$MOCKBIN/logger" <<'EOF'
 #!/bin/sh
+[ -n "${TEST_LOGFILE:-}" ] || exit 0
+logger_priority=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-t) shift 2 ;;
+		-p) logger_priority="$2"; shift 2 ;;
+		--) shift; break ;;
+		*) break ;;
+	esac
+done
+printf '%s\t%s\n' "$logger_priority" "$*" >>"$TEST_LOGFILE"
 exit 0
 EOF
 
@@ -444,6 +489,9 @@ export APN_AUTOCONFIG_MODEM_BIN="$SCRIPT"
 # against whatever else on the machine happens to be using /tmp, and the sweep
 # fixture can plant a dead PID's files without racing a real run.
 export APN_AUTOCONFIG_MODEM_TMP_DIR="$SCRATCH"
+TEST_LOGFILE="$STATE/log.txt"
+export TEST_LOGFILE
+: >"$TEST_LOGFILE"
 
 : >"$TEST_NETWORK_SECTIONS"
 : >"$TEST_NETWORK_OPTIONS"
@@ -2480,12 +2528,49 @@ else
 		fail 'a second SIGPIPE during cleanup left the shared APN lock behind'
 	[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
 		fail 'a second SIGPIPE during cleanup left the per-modem lock behind'
+	if grep -q 'failed to remove staging section' "$TEST_LOGFILE"; then
+		fail 'the rollback reported a removal failure it did not have'
+	fi
 	pipe_shared_leaked="$(ls "$SCRATCH" 2>/dev/null || :)"
 	[ -z "$pipe_shared_leaked" ] || {
 		printf 'left behind:\n%s\n' "$pipe_shared_leaked" >&2
 		fail 'a second SIGPIPE during cleanup left the scratch files behind'
 	}
 fi
+
+printf '%s\n' 'TEST a rollback armed before the section exists reports no failure'
+# The rollback is armed before the staging section is written, which is the
+# required order: an interruption in the gap must not find the cleanup disarmed.
+# That makes the gap reachable, and on the reference router SIGPIPE on the first
+# log line after arming landed squarely in it. `uci delete` on a section that was
+# never created reports failure, and the rollback logged that as "failed to
+# remove staging section" — telling an operator that state had been left behind
+# when nothing had been written at all.
+#
+# Found by the 0.14.1 hardware gate rather than by a fixture, because before this
+# release an untrapped SIGPIPE never ran the exit trap and so never reached this
+# path. Driven here through a refused section creation, which reaches the same
+# window deterministically instead of by racing a signal.
+provision_fixture
+: >"$TEST_LOGFILE"
+TEST_UCI_SECTION_CREATE_FAILS=apnmodem1
+export TEST_UCI_SECTION_CREATE_FAILS
+prov_gap_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || prov_gap_status=$?
+TEST_UCI_SECTION_CREATE_FAILS=""
+export TEST_UCI_SECTION_CREATE_FAILS
+[ "$prov_gap_status" -ne 0 ] || \
+	fail 'provisioning reported success although the section could not be created'
+if grep -q 'failed to remove staging section' "$TEST_LOGFILE"; then
+	grep 'staging section' "$TEST_LOGFILE" >&2
+	fail 'the rollback reported a removal failure for a section that was never created'
+fi
+[ "$(network_section_count apnmodem)" -eq 0 ] || \
+	fail 'a refused section creation left a section behind'
+[ ! -e "$TEST_APN_LOCK_DIR" ] || \
+	fail 'a refused section creation left the shared APN lock behind'
+[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+	fail 'a refused section creation left the per-modem lock behind'
 
 printf '%s\n' 'TEST two simultaneous provisioning attempts create exactly one section'
 provision_fixture

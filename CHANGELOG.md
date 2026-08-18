@@ -33,6 +33,13 @@ enough.
   That is the one failure a behavioural test cannot reach: a suffix missing from
   the list is still removed by the caller's own exit trap and only leaks in the
   `SIGKILL` case.
+- **The rollback no longer reports a removal it never had to do.** The
+  provisioning rollback is armed *before* the staging section is written, which
+  is the required order — an interruption in that gap must not find the cleanup
+  disarmed. Trapping `PIPE` made that gap reachable for the first time, and
+  landing in it made `uci delete` fail on a section that had never been created,
+  which was logged as `failed to remove staging section`. The state was always
+  correct; the message sent an operator looking for residue that did not exist.
 
 No API, schema, exit-code or configuration change. Upgrading needs no action.
 

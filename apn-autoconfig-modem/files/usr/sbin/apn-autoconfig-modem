@@ -69,14 +69,23 @@ REQUESTED_INTERFACE=""
 # then live only in the subshell, the parent's exit trap would see an empty
 # variable, and the file would survive the process that made it. LuCI polls two
 # such commands, so the leak grew with every page load.
-INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
-MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
-MM_INDEX_FILE="/tmp/apn-autoconfig-modem.$$.mm-indexes"
-MM_IDENTITY_FILE="/tmp/apn-autoconfig-modem.$$.mm-identity"
-CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
-AT_OUTPUT_FILE="/tmp/apn-autoconfig-modem.$$.at-output"
-AT_CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.at-candidates"
-BOUNDED_TIMEOUT_MARKER="/tmp/apn-autoconfig-modem.$$.bounded-timeout"
+TMP_DIR="${APN_AUTOCONFIG_MODEM_TMP_DIR:-/tmp}"
+TMP_BASE="$TMP_DIR/$PROG.$$"
+INVENTORY_FILE="$TMP_BASE.inventory"
+MM_USB_PATHS_FILE="$TMP_BASE.mm-usb-paths"
+MM_INDEX_FILE="$TMP_BASE.mm-indexes"
+MM_IDENTITY_FILE="$TMP_BASE.mm-identity"
+CANDIDATES_FILE="$TMP_BASE.candidates"
+AT_OUTPUT_FILE="$TMP_BASE.at-output"
+AT_CANDIDATES_FILE="$TMP_BASE.at-candidates"
+BOUNDED_TIMEOUT_MARKER="$TMP_BASE.bounded-timeout"
+# Every scratch suffix this process can create, in one list, because two
+# separate things have to agree on it: the exit trap removes them by exact name,
+# and sweep_dead_scratch_files recognizes a dead predecessor's files by the same
+# names. A suffix added to only one of the two leaks again. The four derived
+# from INVENTORY_FILE are here for the same reason as the eight base paths: the
+# sweep sees names, not variables.
+TMP_SUFFIXES="inventory inventory.display inventory.merged inventory.dupes inventory.weak-dupes mm-usb-paths mm-indexes mm-identity candidates at-output at-candidates bounded-timeout"
 MM_DISCOVERY_UNCERTAIN=0
 
 LOCK_HELD=0
@@ -153,15 +162,11 @@ cleanup_files() {
 	# can observe a half-created staging section.
 	provisioning_rollback
 	# Named scratch files only, never a wildcard under a shared directory.
-	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE" "$INVENTORY_FILE.display" \
-		"$INVENTORY_FILE.merged" "$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
-	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
-	[ -z "$MM_INDEX_FILE" ] || rm -f "$MM_INDEX_FILE"
-	[ -z "$MM_IDENTITY_FILE" ] || rm -f "$MM_IDENTITY_FILE"
-	[ -z "$CANDIDATES_FILE" ] || rm -f "$CANDIDATES_FILE"
-	[ -z "$AT_OUTPUT_FILE" ] || rm -f "$AT_OUTPUT_FILE"
-	[ -z "$AT_CANDIDATES_FILE" ] || rm -f "$AT_CANDIDATES_FILE"
-	[ -z "$BOUNDED_TIMEOUT_MARKER" ] || rm -f "$BOUNDED_TIMEOUT_MARKER"
+	# TMP_BASE is assigned once at the top level, so unlike the paths this
+	# replaces it cannot be the empty string a subshell assignment left behind.
+	for tmp_suffix in $TMP_SUFFIXES; do
+		rm -f "$TMP_BASE.$tmp_suffix"
+	done
 	# The AT port lock is the innermost level, so it is released before the
 	# per-modem and global locks below.
 	if [ "$AT_PORT_LOCK_HELD" -eq 1 ] && [ -n "$AT_PORT_LOCK_PATH" ]; then
@@ -179,9 +184,58 @@ cleanup_files() {
 	APN_LOCK_BORROWED=0
 }
 
+# No trap can cover SIGKILL, so a scratch file can always outlive the process
+# that created it: rpcd SIGKILLs a LuCI helper that exceeds its exec timeout
+# (30s by default), and the OOM killer asks nobody either. /tmp is RAM on the
+# target, so the next run removes what a provably dead predecessor left instead
+# of leaving it there until the next reboot.
+#
+# The glob only finds candidates. Every path this removes is one the function
+# rebuilt itself from a validated PID and a known suffix, because /tmp is shared
+# with the rest of the system and a wildcard removal there is exactly what this
+# project forbids for its lock and state roots. A file whose PID is still alive
+# is left alone: it belongs either to a concurrent apn-autoconfig-modem or to an
+# unrelated process that was given the same number, and neither is ours to
+# delete.
+sweep_dead_scratch_files() {
+	# Deletion is the half that has to be careful, so an unusable scratch
+	# directory sweeps nothing rather than resolving names against the working
+	# directory.
+	case "$TMP_DIR" in /*) : ;; *) return 0 ;; esac
+	[ -d "$TMP_DIR" ] || return 0
+	sweep_count=0
+	for sweep_suffix in $TMP_SUFFIXES; do
+		for sweep_path in "$TMP_DIR/$PROG."[0-9]*".$sweep_suffix"; do
+			[ -e "$sweep_path" ] || continue
+			sweep_pid="${sweep_path##*/}"
+			sweep_pid="${sweep_pid#"$PROG."}"
+			sweep_pid="${sweep_pid%".$sweep_suffix"}"
+			case "$sweep_pid" in ''|*[!0-9]*) continue ;; esac
+			# Our own PID can appear here after the number was reused, and those
+			# files are stale by definition: nothing has been written yet.
+			if [ "$sweep_pid" != "$$" ] && kill -0 "$sweep_pid" 2>/dev/null; then
+				continue
+			fi
+			# /tmp is world-writable, so a symlink or a directory can be planted
+			# under one of these names. Neither is a scratch file of ours.
+			[ -L "$sweep_path" ] && continue
+			[ -f "$sweep_path" ] || continue
+			rm -f "$TMP_DIR/$PROG.$sweep_pid.$sweep_suffix" || continue
+			sweep_count=$((sweep_count + 1))
+		done
+	done
+	[ "$sweep_count" -eq 0 ] || \
+		log notice "removed $sweep_count scratch file(s) left by an interrupted earlier run"
+}
+
 on_exit() {
 	on_exit_status=$?
 	trap - 0 HUP INT TERM
+	# PIPE is ignored rather than restored for the duration of the cleanup: the
+	# reader that went away may have been reading stderr too, and a reset that
+	# logs its way back through modem power-on, ifup and provisioning rollback
+	# must not be killed halfway by a second SIGPIPE.
+	trap '' PIPE
 	cleanup_files
 	exit "$on_exit_status"
 }
@@ -190,8 +244,24 @@ on_signal() {
 	exit 143
 }
 
+# Death by an untrapped signal never runs the exit trap, and SIGPIPE was the one
+# left out: every read-only command gathers its whole answer into scratch files
+# before it writes the first byte, so a reader that has already gone away kills
+# this process at exactly the moment when there is the most to clean up.
+# `inventory-json | head -1`, a captured pipeline whose reader exits early or an
+# SSH session that dies mid-command each left the scratch set behind, and a reset
+# interrupted this way skipped its modem power-on, its interface restore and its
+# lock release as well.
+#
+# 141 is the status the process already reported when the default action killed
+# it, so no caller sees a new one; what changes is that the exit trap now runs.
+on_pipe() {
+	exit 141
+}
+
 trap on_exit 0
 trap on_signal HUP INT TERM
+trap on_pipe PIPE
 
 load_config() {
 	command_exists uci || die "uci is required"
@@ -1923,7 +1993,16 @@ provisioning_rollback() {
 	if [ -n "$PROVISION_CREATED_SECTION" ]; then
 		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
 		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
-		if uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+		if ! uci -q get "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+			# Rollback is armed before the section is written, which is the
+			# required order: an interruption in the gap must not find the
+			# cleanup disarmed. So the gap is reachable, and reaching it means
+			# there is nothing to remove rather than that removal failed.
+			# Observed on hardware: SIGPIPE on the first log line after arming
+			# lands exactly here, and `uci delete` on an absent section reports
+			# failure, which used to be logged as one.
+			:
+		elif uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
 			uci commit network >/dev/null 2>&1 || \
 				log err "failed to commit removal of staging section $PROVISION_CREATED_SECTION"
 		else
@@ -2859,6 +2938,11 @@ EOF
 }
 
 main() {
+	# Before anything of ours exists under these names, and on every entry point,
+	# because the interrupted run that left them may have been started from any
+	# of them: LuCI polls this binary directly and never reaches a service
+	# restart, and the hotplug and boot workers only ever call back into here.
+	sweep_dead_scratch_files
 	COMMAND_NAME="${1:-}"
 	case "$COMMAND_NAME" in -h|--help|help|'') usage; return 0 ;; esac
 	shift

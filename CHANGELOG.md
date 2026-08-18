@@ -1,5 +1,48 @@
 # Changelog
 
+## apn-autoconfig 0.14.1 / apn-autoconfig-modem 0.14.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.14.1 (2026-08-18)
+
+A defect fix. Both binaries trapped `HUP`, `INT` and `TERM` but not `PIPE`, and
+death by an untrapped signal never runs the exit trap.
+
+The visible symptom was scratch files accumulating in `/tmp`, which is RAM on
+the target. That is the small half. Every command gathers its data into scratch
+files before it writes the first byte of its answer, so a reader that has
+already gone away kills the process at the point where there is the most to
+clean up — and a *mutation* interrupted the same way skipped its rollback, its
+modem power-on and its lock release. A `status-json | head -1`, a captured
+pipeline whose reader exits early, or an SSH session that dies mid-command was
+enough.
+
+- **Both scripts trap `PIPE` and exit 141**, the status a caller already saw
+  when the default action killed the process, so only the leak changes.
+- **The exit trap ignores `PIPE` for its own duration.** A rollback logs its way
+  out, and the reader that went away may have been reading stderr too — `2>&1 |
+  tee` over a mutation is ordinary — so without this the cleanup takes a second
+  `SIGPIPE` on its own first log line and dies halfway, leaving the staging
+  section, the locks and the scratch files it had just started removing.
+- **The next run sweeps what `SIGKILL` left behind**, which no trap can cover:
+  rpcd kills a LuCI helper that exceeds its exec timeout, 30 seconds by default.
+  The sweep globs only to find candidates — every path it removes is one it
+  rebuilt from an all-digits PID and a suffix from the same list the exit trap
+  uses, it skips live PIDs, and it refuses anything that is not a regular file.
+  `/tmp` is shared, and a wildcard removal there is what this project already
+  forbids for its lock and state roots.
+- **Every scratch suffix is named once per script**, and a structural test reads
+  the paths back out of each script and requires the list to name every one.
+  That is the one failure a behavioural test cannot reach: a suffix missing from
+  the list is still removed by the caller's own exit trap and only leaks in the
+  `SIGKILL` case.
+- **The rollback no longer reports a removal it never had to do.** The
+  provisioning rollback is armed *before* the staging section is written, which
+  is the required order — an interruption in that gap must not find the cleanup
+  disarmed. Trapping `PIPE` made that gap reachable for the first time, and
+  landing in it made `uci delete` fail on a section that had never been created,
+  which was logged as `failed to remove staging section`. The state was always
+  correct; the message sent an operator looking for residue that did not exist.
+
+No API, schema, exit-code or configuration change. Upgrading needs no action.
+
 ## apn-autoconfig 0.14.0 / apn-autoconfig-modem 0.14.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.14.0 (2026-08-17)
 
 The third and last identity backend. A modem that answers 3GPP AT but exposes

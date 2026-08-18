@@ -10,6 +10,7 @@ BASE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 TESTROOT="$(CDPATH= cd -- /tmp && pwd -P)/apn-autoconfig-modem-test.$$"
 MOCKBIN="$TESTROOT/bin"
 STATE="$TESTROOT/state"
+SCRATCH="$TESTROOT/scratch"
 SCRIPT="$BASE/apn-autoconfig-modem/files/usr/sbin/apn-autoconfig-modem"
 ACTION_WORKER="$BASE/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-action"
 BOOT_WORKER="$BASE/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-boot"
@@ -23,7 +24,7 @@ cleanup() {
 }
 trap cleanup 0 HUP INT TERM
 
-mkdir -p "$MOCKBIN" "$STATE" "$TESTROOT/sys" "$TESTROOT/run" "$TESTROOT/lock" "$TESTROOT/action"
+mkdir -p "$MOCKBIN" "$STATE" "$SCRATCH" "$TESTROOT/sys" "$TESTROOT/run" "$TESTROOT/lock" "$TESTROOT/action"
 HARDWARE_MARKER="$TESTROOT/huasifei-wh3000-integration"
 GPIO="$TESTROOT/sys/class/gpio/modem_power/value"
 mkdir -p "$(dirname "$GPIO")"
@@ -68,13 +69,34 @@ get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HA
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
 get:network.*)
 	section="${2#network.}"
-	name="${section%%.*}"
-	option="${section#*.}"
-	awk -F'\t' -v name="$name" -v option="$option" \
-		'$1 == name && $2 == option { print $3; found=1 } END { exit found ? 0 : 1 }' \
-		"$TEST_NETWORK_OPTIONS" 2>/dev/null
+	case "$section" in
+	*.*)
+		name="${section%%.*}"
+		option="${section#*.}"
+		awk -F'\t' -v name="$name" -v option="$option" \
+			'$1 == name && $2 == option { print $3; found=1 } END { exit found ? 0 : 1 }' \
+			"$TEST_NETWORK_OPTIONS" 2>/dev/null
+	;;
+	*)
+		# Real uci answers a bare section name with the section type, which is how
+		# a caller asks whether a section exists at all. Without this the mock
+		# reported every section as absent, because "${section#*.}" on a name with
+		# no dot yields the name itself and no option ever matches it.
+		awk -F= -v want="network.$section" \
+			'$1 == want { print $2; found=1 } END { exit found ? 0 : 1 }' \
+			"$TEST_NETWORK_SECTIONS" 2>/dev/null
+	;;
+	esac
 ;;
 set:network.*)
+	# Lets a test reach the window between arming the provisioning rollback and
+	# writing the section, which is otherwise only reachable by winning a race
+	# with a signal.
+	if [ -n "${TEST_UCI_SECTION_CREATE_FAILS:-}" ]; then
+		case "$2" in
+			"network.${TEST_UCI_SECTION_CREATE_FAILS}=interface") exit 1 ;;
+		esac
+	fi
 	# Every write is journalled so a test can assert exactly which keys were
 	# touched, not merely that the end state looks right.
 	printf 'set\t%s\n' "$2" >>"$TEST_UCI_WRITES"
@@ -105,6 +127,15 @@ set:network.*)
 delete:network.*)
 	printf 'delete\t%s\n' "$2" >>"$TEST_UCI_WRITES"
 	target="${2#network.}"
+	# Real uci reports failure when the target does not exist, and a mock that
+	# always succeeds hides every caller that treats "nothing to delete" as a
+	# failed delete. That difference cost a hardware gate once: the rollback
+	# logged a removal failure for a section it had never created, and the
+	# fixtures could not see it.
+	case "$target" in
+		*.*) grep -q "^network\.${target%%.*}\.${target#*.}=" "$TEST_NETWORK_SECTIONS" 2>/dev/null || exit 1 ;;
+		*) grep -q -E "^network\.${target}(=|\.)" "$TEST_NETWORK_SECTIONS" 2>/dev/null || exit 1 ;;
+	esac
 	case "$target" in
 		*.*)
 			name="${target%%.*}"
@@ -216,8 +247,23 @@ printf 'up %s\n' "$1" >>"$TEST_EVENTS"
 	: >"$TEST_STATE/up-before-owner"
 EOF
 
+# Records what the script logged, so a test can assert on the message and not
+# merely on the end state. A cleanup that leaves correct state while reporting a
+# failure it did not have is still a defect: it sends an operator looking for
+# residue that was never written.
 cat >"$MOCKBIN/logger" <<'EOF'
 #!/bin/sh
+[ -n "${TEST_LOGFILE:-}" ] || exit 0
+logger_priority=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-t) shift 2 ;;
+		-p) logger_priority="$2"; shift 2 ;;
+		--) shift; break ;;
+		*) break ;;
+	esac
+done
+printf '%s\t%s\n' "$logger_priority" "$*" >>"$TEST_LOGFILE"
 exit 0
 EOF
 
@@ -438,6 +484,14 @@ export TEST_STATE="$STATE"
 export APN_AUTOCONFIG_MODEM_ACTION_WORKER="$ACTION_WORKER"
 export APN_AUTOCONFIG_MODEM_ACTION_COMMAND="$SCRIPT"
 export APN_AUTOCONFIG_MODEM_BIN="$SCRIPT"
+# The coordinator's scratch files live in a directory of this run's own, so the
+# assertions about what it leaves behind compare against "empty" instead of
+# against whatever else on the machine happens to be using /tmp, and the sweep
+# fixture can plant a dead PID's files without racing a real run.
+export APN_AUTOCONFIG_MODEM_TMP_DIR="$SCRATCH"
+TEST_LOGFILE="$STATE/log.txt"
+export TEST_LOGFILE
+: >"$TEST_LOGFILE"
 
 : >"$TEST_NETWORK_SECTIONS"
 : >"$TEST_NETWORK_OPTIONS"
@@ -571,6 +625,63 @@ reset_at_ports() {
 }
 
 reset_sysfs
+
+# The SIGPIPE regressions below need an interpreter that behaves like the
+# target's BusyBox ash, where an untrapped SIGPIPE is fatal and the exit trap
+# therefore never runs. bash does not: it reports status 141 and runs the exit
+# trap anyway, both for a failed builtin write and for an async signal. On any
+# host whose /bin/sh is bash — every macOS — a SIGPIPE test run through `sh`
+# passes against the exact code it exists to reject, which is worse than not
+# having it. So the interpreter is chosen by probing for the behavior instead of
+# by trusting a name, and a host with no such shell is told, not quietly passed.
+# A parent that ignores SIGPIPE hands the disposition to every descendant, and
+# POSIX forbids a shell from un-ignoring a signal that was already ignored when
+# it started: `trap - PIPE` cannot undo it from the inside. GitHub Actions runs
+# steps from exactly such a parent, so without this every candidate below looks
+# "not fatal" for a reason that has nothing to do with the shell, and the guard
+# turns an environment property into a release-blocking failure. Reset the
+# disposition in a helper that execs the shell, using the python3 these suites
+# already require for their structural assertions.
+cat >"$TESTROOT/sigdfl.py" <<'SIGDFLEOF'
+import os, signal, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])
+SIGDFLEOF
+# Bare candidates if python3 is somehow absent: the structural assertions below
+# need it too, so this only changes which message the run fails with.
+if command -v python3 >/dev/null 2>&1; then
+	SIGDFL="python3 $TESTROOT/sigdfl.py"
+else
+	SIGDFL=""
+fi
+
+cat >"$TESTROOT/pipe-probe.sh" <<'EOF'
+trap 'printf %s reached-exit-trap >&2' 0
+kill -PIPE $$
+printf %s survived-the-signal >&2
+EOF
+PIPE_SHELL=""
+for candidate_shell in sh dash 'busybox sh' ash; do
+	command -v "${candidate_shell%% *}" >/dev/null 2>&1 || continue
+	probe_output="$($SIGDFL $candidate_shell "$TESTROOT/pipe-probe.sh" 2>&1 >/dev/null || :)"
+	[ -z "$probe_output" ] || continue
+	PIPE_SHELL="$SIGDFL $candidate_shell"
+	break
+done
+if [ -z "$PIPE_SHELL" ]; then
+	if [ "${CI:-}" = true ] || [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
+		printf '%s\n' 'No shell on this host treats an untrapped SIGPIPE as fatal; the SIGPIPE regressions cannot run.' >&2
+		exit 1
+	fi
+	{
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+		printf '%s\n' '!! WARNING: the SIGPIPE regressions did NOT run. No shell on this host'
+		printf '%s\n' '!! treats an untrapped SIGPIPE as fatal, so they would pass whether or'
+		printf '%s\n' '!! not the coordinator cleans up after one. Install dash or busybox to'
+		printf '%s\n' '!! close the gap; CI is the authoritative run for them here.'
+		printf '%s\n' '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'
+	} >&2
+fi
 
 # ---- tests ----
 
@@ -2329,6 +2440,138 @@ fi
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "interrupted provisioning wrote to unrelated sections: $untouched"
 
+printf '%s\n' 'TEST a real PIPE during provisioning rolls back and releases both locks'
+# The same destructive window as the TERM case above, interrupted by the one
+# signal this coordinator used to die from with no cleanup at all: PIPE was
+# missing from the trap list, and death by an untrapped signal never runs the
+# exit trap. A verb whose output is piped somewhere, a reader that stops early or
+# an SSH session that dies mid-command skipped the rollback, left the staging
+# section published and left both locks behind for the next caller to reclaim.
+if [ -z "$PIPE_SHELL" ]; then
+	printf 'SKIP: no shell on this host treats an untrapped SIGPIPE as fatal\n'
+else
+	provision_fixture
+	RECONCILE_HANG=1
+	export RECONCILE_HANG
+	$PIPE_SHELL "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 &
+	pipe_prov_pid=$!
+	pipe_prov_wait=0
+	while [ "$pipe_prov_wait" -lt 100 ]; do
+		[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_owner 2>/dev/null)" ] && break
+		pipe_prov_wait=$((pipe_prov_wait + 1))
+		/bin/sleep 0.1
+	done
+	[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_owner 2>/dev/null)" ] || \
+		fail 'the SIGPIPE test never observed the staging section it needs to interrupt'
+	kill -PIPE "$pipe_prov_pid"
+	pipe_prov_status=0
+	wait "$pipe_prov_pid" || pipe_prov_status=$?
+	RECONCILE_HANG=0
+	export RECONCILE_HANG
+	[ "$pipe_prov_status" -eq 141 ] || \
+		fail "provisioning interrupted by SIGPIPE exited $pipe_prov_status instead of 141"
+	# Same reaping requirement as the TERM case, reached through the same cleanup:
+	# the engine must not be left running against a target about to be deleted
+	# underneath it. The bounded grace period is for a shell that is still on its
+	# way out of a foreground sleep, not for one that was never signalled.
+	pipe_orphan_pid="$(cat "$TEST_RECONCILE_PID" 2>/dev/null || :)"
+	pipe_orphan_wait=0
+	while [ -n "$pipe_orphan_pid" ] && [ "$pipe_orphan_wait" -lt 20 ] && \
+		kill -0 "$pipe_orphan_pid" 2>/dev/null; do
+		pipe_orphan_wait=$((pipe_orphan_wait + 1))
+		/bin/sleep 0.1
+	done
+	if [ -n "$pipe_orphan_pid" ] && kill -0 "$pipe_orphan_pid" 2>/dev/null; then
+		kill -TERM "$pipe_orphan_pid" 2>/dev/null || :
+		fail 'the APN engine was left running as an orphan after a SIGPIPE'
+	fi
+	[ "$(network_section_count apnmodem)" -eq 0 ] || \
+		fail 'a SIGPIPE during provisioning left its staging section behind'
+	[ ! -e "$TEST_MODEM_STATE_DIR/provisioning/usb-serial_1-1.2_2c7c_0801_RM520SERIAL01.tsv" ] || \
+		fail 'a SIGPIPE during provisioning left the baseline behind'
+	[ ! -e "$TEST_APN_LOCK_DIR" ] || \
+		fail 'a SIGPIPE during provisioning left the shared APN lock behind'
+	[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+		fail 'a SIGPIPE during provisioning left the per-modem lock behind'
+fi
+
+printf '%s\n' 'TEST the rollback finishes when the reader was reading stderr too'
+# The reader that went away may have been reading stderr as well — `provision
+# 2>&1 | tee` is the ordinary way to keep a record of a mutation — and the
+# rollback logs its way out. Unless PIPE is ignored for the duration of the exit
+# trap, the rollback's own first log line takes a second SIGPIPE and kills the
+# process halfway through it, so the staging section, both locks and the scratch
+# files all survive a cleanup that appeared to start.
+#
+# No explicit signal here: the coordinator's own first log line is what hits the
+# closed pipe, and it is emitted after both locks are held and the rollback is
+# armed. `ifdown` is the step immediately after the log line the second SIGPIPE
+# would land on, which is what makes it the proof that cleanup ran to the end
+# rather than merely started.
+if [ -z "$PIPE_SHELL" ]; then
+	printf 'SKIP: no shell on this host treats an untrapped SIGPIPE as fatal\n'
+else
+	provision_fixture
+	rm -rf "$SCRATCH"/*
+	{
+		pipe_shared_status=0
+		$PIPE_SHELL "$SCRIPT" provision --modem "$PROV_MODEM" || pipe_shared_status=$?
+		printf '%s\n' "$pipe_shared_status" >"$STATE/pipe-shared-status"
+	} 2>&1 | true
+	[ "$(cat "$STATE/pipe-shared-status")" = 141 ] || \
+		fail "provisioning onto a closed stdout and stderr exited $(cat "$STATE/pipe-shared-status") instead of 141"
+	grep -q '^down apnmodem1$' "$TEST_EVENTS" || \
+		fail 'the rollback died on a second SIGPIPE before it could take the staging section down'
+	[ "$(network_section_count apnmodem)" -eq 0 ] || \
+		fail 'a second SIGPIPE during cleanup left the staging section behind'
+	[ ! -e "$TEST_APN_LOCK_DIR" ] || \
+		fail 'a second SIGPIPE during cleanup left the shared APN lock behind'
+	[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+		fail 'a second SIGPIPE during cleanup left the per-modem lock behind'
+	if grep -q 'failed to remove staging section' "$TEST_LOGFILE"; then
+		fail 'the rollback reported a removal failure it did not have'
+	fi
+	pipe_shared_leaked="$(ls "$SCRATCH" 2>/dev/null || :)"
+	[ -z "$pipe_shared_leaked" ] || {
+		printf 'left behind:\n%s\n' "$pipe_shared_leaked" >&2
+		fail 'a second SIGPIPE during cleanup left the scratch files behind'
+	}
+fi
+
+printf '%s\n' 'TEST a rollback armed before the section exists reports no failure'
+# The rollback is armed before the staging section is written, which is the
+# required order: an interruption in the gap must not find the cleanup disarmed.
+# That makes the gap reachable, and on the reference router SIGPIPE on the first
+# log line after arming landed squarely in it. `uci delete` on a section that was
+# never created reports failure, and the rollback logged that as "failed to
+# remove staging section" — telling an operator that state had been left behind
+# when nothing had been written at all.
+#
+# Found by the 0.14.1 hardware gate rather than by a fixture, because before this
+# release an untrapped SIGPIPE never ran the exit trap and so never reached this
+# path. Driven here through a refused section creation, which reaches the same
+# window deterministically instead of by racing a signal.
+provision_fixture
+: >"$TEST_LOGFILE"
+TEST_UCI_SECTION_CREATE_FAILS=apnmodem1
+export TEST_UCI_SECTION_CREATE_FAILS
+prov_gap_status=0
+sh "$SCRIPT" provision --modem "$PROV_MODEM" >/dev/null 2>&1 || prov_gap_status=$?
+TEST_UCI_SECTION_CREATE_FAILS=""
+export TEST_UCI_SECTION_CREATE_FAILS
+[ "$prov_gap_status" -ne 0 ] || \
+	fail 'provisioning reported success although the section could not be created'
+if grep -q 'failed to remove staging section' "$TEST_LOGFILE"; then
+	grep 'staging section' "$TEST_LOGFILE" >&2
+	fail 'the rollback reported a removal failure for a section that was never created'
+fi
+[ "$(network_section_count apnmodem)" -eq 0 ] || \
+	fail 'a refused section creation left a section behind'
+[ ! -e "$TEST_APN_LOCK_DIR" ] || \
+	fail 'a refused section creation left the shared APN lock behind'
+[ ! -e "${TEST_MODEM_LOCK_ROOT}.usb-serial_1-1.2_2c7c_0801_RM520SERIAL01" ] || \
+	fail 'a refused section creation left the per-modem lock behind'
+
 printf '%s\n' 'TEST two simultaneous provisioning attempts create exactly one section'
 provision_fixture
 sh "$SCRIPT" provision --modem "$PROV_MODEM" >"$STATE/prov-a.json" 2>/dev/null &
@@ -2692,16 +2935,17 @@ assert "apn-autoconfig-modem reset --modem" in text
 ' "$CORE_SCRIPT" || fail 'apn-autoconfig no longer contains the expected coordinator delegation hooks'
 
 printf '%s\n' 'TEST no command leaves a scratch file behind in /tmp'
-# Compares the exact set of scratch files, not their count: /tmp is shared, so a
-# count is affected by anything else on the machine and by leftovers from an
-# earlier run. Only a file that appears and stays is a leak.
+# Compares the exact set of scratch files, not their count: the coordinator's
+# scratch directory is /tmp on a router, so a count is affected by anything else
+# on the machine and by leftovers from an earlier run. Only a file that appears
+# and stays is a leak. This run redirects that directory into TESTROOT, which
+# makes the comparison exact without changing what it means.
 #
 # The fixtures never caught this because the names carry the PID: every run made
 # its own, so nothing collided and nothing failed. LuCI polls provision-plan and
 # status-json, which is how an open page grew /tmp without bound.
 scratch_list() {
-	ls /tmp/apn-autoconfig-modem.*.inventory /tmp/apn-autoconfig-modem.*.candidates \
-		/tmp/apn-autoconfig-modem.*.mm-usb-paths 2>/dev/null | sort
+	ls "$SCRATCH" 2>/dev/null | sort
 }
 scratch_list >"$STATE/scratch-before"
 provision_fixture
@@ -2718,5 +2962,137 @@ scratch_new="$(comm -13 "$STATE/scratch-before" "$STATE/scratch-after")"
 	printf 'leaked scratch files:\n%s\n' "$scratch_new" >&2
 	fail 'a command left a scratch file behind in /tmp'
 }
+
+printf '%s\n' 'TEST a reader that stopped early leaves no scratch file behind'
+# The test above only covers the exits the shell controls. Death by an untrapped
+# signal skips the exit trap entirely, and PIPE was missing from the trap list:
+# every read-only command gathers its whole answer into scratch files before it
+# writes the first byte, so a reader that has already gone away kills the process
+# at the point where there is the most to clean up. `true` has long exited by
+# then, which makes the closed pipe deterministic rather than a race.
+#
+# The exit status is asserted as well, for two reasons: 141 is what a caller saw
+# before this was fixed and must keep seeing, and a command that stopped writing
+# to stdout altogether would otherwise make this test pass without ever
+# reproducing the defect.
+if [ -z "$PIPE_SHELL" ]; then
+	printf 'SKIP: no shell on this host treats an untrapped SIGPIPE as fatal\n'
+else
+	provision_fixture
+	for pipe_cmd in inventory-json status-json provision-plan; do
+		rm -rf "$SCRATCH"/*
+		{
+			pipe_cmd_status=0
+			case "$pipe_cmd" in
+				inventory-json) $PIPE_SHELL "$SCRIPT" "$pipe_cmd" 2>/dev/null || pipe_cmd_status=$? ;;
+				*) $PIPE_SHELL "$SCRIPT" "$pipe_cmd" --modem "$PROV_MODEM" 2>/dev/null || pipe_cmd_status=$? ;;
+			esac
+			printf '%s\n' "$pipe_cmd_status" >"$STATE/pipe-cmd-status"
+		} | true
+		[ "$(cat "$STATE/pipe-cmd-status")" = 141 ] || \
+			fail "$pipe_cmd did not reach a closed reader; the leak case was not exercised"
+		pipe_leaked="$(ls "$SCRATCH" 2>/dev/null || :)"
+		[ -z "$pipe_leaked" ] || {
+			printf 'left behind by %s:\n%s\n' "$pipe_cmd" "$pipe_leaked" >&2
+			fail "$pipe_cmd leaked its scratch files when the reader went away"
+		}
+	done
+fi
+
+printf '%s\n' 'TEST the next run removes only a provably dead run scratch files'
+# No trap can cover SIGKILL — rpcd sends it to a LuCI helper that outruns its
+# exec timeout — so the guarantee cannot be "the coordinator always cleans up
+# after itself". It has to be "the next run cleans up after a predecessor that
+# provably cannot". Everything else in this shared directory has to survive
+# that, including a live sibling's files and the core engine's own scratch set,
+# which shares the first half of this package's name.
+sh -c 'exit 0' &
+sweep_dead_pid=$!
+wait "$sweep_dead_pid" 2>/dev/null || :
+/bin/sleep 30 &
+sweep_live_pid=$!
+if kill -0 "$sweep_dead_pid" 2>/dev/null; then
+	printf 'SKIP: PID %s did not stay dead on this host\n' "$sweep_dead_pid"
+else
+	rm -rf "$SCRATCH"/*
+	for sweep_suffix in inventory inventory.display inventory.merged \
+		inventory.dupes inventory.weak-dupes mm-usb-paths mm-indexes \
+		mm-identity candidates at-output at-candidates bounded-timeout; do
+		printf 'stale\n' >"$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.$sweep_suffix"
+	done
+	printf 'live\n' >"$SCRATCH/apn-autoconfig-modem.$sweep_live_pid.inventory"
+	printf 'core engine\n' >"$SCRATCH/apn-autoconfig.$sweep_dead_pid.sim"
+	printf 'key\n' >"$SCRATCH/apn-autoconfig-modem.pem"
+	printf 'not a pid\n' >"$SCRATCH/apn-autoconfig-modem.notapid.inventory"
+	printf 'not our suffix\n' >"$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.journal"
+	mkdir -p "$SCRATCH/apn-autoconfig-modem.999998.candidates"
+	printf 'must survive\n' >"$STATE/sweep-symlink-target"
+	ln -s "$STATE/sweep-symlink-target" "$SCRATCH/apn-autoconfig-modem.999997.inventory"
+	sh "$SCRIPT" inventory-json >/dev/null || fail 'inventory-json failed while sweeping'
+	for sweep_suffix in inventory inventory.display inventory.merged \
+		inventory.dupes inventory.weak-dupes mm-usb-paths mm-indexes \
+		mm-identity candidates at-output at-candidates bounded-timeout; do
+		[ ! -e "$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.$sweep_suffix" ] || \
+			fail "a dead run's .$sweep_suffix scratch file survived the next run"
+	done
+	[ -e "$SCRATCH/apn-autoconfig-modem.$sweep_live_pid.inventory" ] || \
+		fail 'the sweep deleted a scratch file belonging to a live process'
+	[ -e "$SCRATCH/apn-autoconfig.$sweep_dead_pid.sim" ] || \
+		fail 'the sweep deleted a scratch file belonging to the core engine'
+	[ -e "$SCRATCH/apn-autoconfig-modem.pem" ] || \
+		fail 'the sweep deleted an unrelated file sharing the package prefix'
+	[ -e "$SCRATCH/apn-autoconfig-modem.notapid.inventory" ] || \
+		fail 'the sweep deleted a file whose PID field is not a PID'
+	[ -e "$SCRATCH/apn-autoconfig-modem.$sweep_dead_pid.journal" ] || \
+		fail 'the sweep deleted a file with a suffix the coordinator never creates'
+	[ -d "$SCRATCH/apn-autoconfig-modem.999998.candidates" ] || \
+		fail 'the sweep removed a directory planted under a scratch name'
+	[ -L "$SCRATCH/apn-autoconfig-modem.999997.inventory" ] || \
+		fail 'the sweep removed a symlink planted under a scratch name'
+	[ -e "$STATE/sweep-symlink-target" ] || \
+		fail 'the sweep followed a symlink out of the scratch directory'
+fi
+kill -TERM "$sweep_live_pid" 2>/dev/null || :
+wait "$sweep_live_pid" 2>/dev/null || :
+rm -rf "$SCRATCH"/*
+
+printf '%s\n' 'TEST every scratch path the coordinator builds is in the swept suffix list'
+# The two tests above can only prove the suffixes that exist today are handled.
+# The list is what makes the exit trap and the sweep agree, and a suffix added to
+# only one of the two silently stops being cleaned up in exactly the SIGKILL case
+# no behavioral test can reach. This is structural on purpose: it reads the
+# scratch paths back out of the script and requires the list to name every one,
+# so the next path added to this file cannot be left out of either mechanism.
+# The AT framework added five of them, and this assertion is what caught their
+# absence when this fix was rebased onto the released 0.14.0.
+python3 - "$SCRIPT" <<'PYEOF' || fail 'the swept suffix list does not match the scratch paths the coordinator builds'
+import re, sys
+
+text = open(sys.argv[1], encoding='utf-8').read()
+
+listed = re.search(r'^TMP_SUFFIXES="([^"]*)"$', text, re.M)
+assert listed, 'TMP_SUFFIXES is not declared as a single-line quoted list'
+listed = set(listed.group(1).split())
+
+# Paths built straight off the per-PID base, and the extra suffixes appended to
+# one of those variables ("$INVENTORY_FILE.display" and friends).
+built = {}
+for var, suffix in re.findall(r'^([A-Z][A-Z0-9_]*)="\$TMP_BASE\.([^"]+)"$', text, re.M):
+    built[var] = suffix
+derived = set(built.values())
+for var, extra in re.findall(r'"\$([A-Z][A-Z0-9_]*)\.([A-Za-z0-9._-]+)"', text):
+    if var in built:
+        derived.add(built[var] + '.' + extra)
+
+# A scratch path that skips TMP_BASE escapes both the trap loop and the sweep,
+# and would also ignore the test suite's private scratch directory.
+literal = re.findall(r'"/tmp/apn-autoconfig-modem\.\$\$\.([^"]+)"', text)
+assert not literal, 'scratch paths bypass TMP_BASE: %s' % sorted(literal)
+
+missing = sorted(derived - listed)
+assert not missing, 'scratch suffixes the exit trap and sweep never see: %s' % missing
+stale = sorted(listed - derived)
+assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
+PYEOF
 
 printf 'All modem-control tests passed.\n'

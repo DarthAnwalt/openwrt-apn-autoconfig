@@ -1,7 +1,9 @@
 # 0.15.0 AT-dial test and release plan
 
-Status: implementation and fixture coverage complete; **no hardware, SDK or
-publication gate has run.**
+Status: implementation, fixture coverage, the hardware gate and the packaging
+gate are complete for the FM350-GL path. **Only the signed-feed smoke remains**,
+and it cannot run until the release is published. Evidence in
+[`router-test-0.15.0.md`](router-test-0.15.0.md).
 
 What has passed, as of 2026-08-18:
 
@@ -11,19 +13,18 @@ What has passed, as of 2026-08-18:
   `tests/run-tests-modem.sh`, `tests/run-tests.sh`,
   `tests/test-package-lifecycle.sh` and the two LuCI suites.
 
-What has **not** run, and must before this release is called anything:
+What has **not** run:
 
-- the official OpenWrt 25.12 SDK build and the inspection of the produced APK.
-  The SDK is a Linux x86_64 toolchain and the work was done on macOS, so this
-  goes through the GitHub Actions workflow;
-- every step of the hardware gate below;
-- the signed-feed smoke.
+- the signed-feed smoke, which needs the release published first;
+- roaming refusal, deferred with its own entry in
+  [`architecture.md`](architecture.md);
+- a client-forwarded packet, a live `TERM` mid-dial, and the browser pass.
 
-Nothing in this document may be read as evidence for those. In particular the
-`stable`/`hardware` capability the AT-dial backend reports is a claim about the
-FM350-GL path that **the hardware gate has not yet confirmed in this release**;
-it rests on the contract being implemented as written, which is exactly the kind
-of assumption this project's evidence ladder exists to refuse.
+The `stable`/`hardware` capability the AT-dial backend reports is now backed by
+the gate rather than by the contract being implemented as written: the FM350-GL
+path was provisioned, dialled, verified, reset and recovered against installed
+packages. The Intel XMM path inside the same handler remains
+`alpha`/`synthetic`, and nothing here is evidence for it.
 
 0.15.0 adds the first netifd protocol this project ships, `apn_atdial`, against
 [`atdial-contract-v1.md`](atdial-contract-v1.md). The release is finished when a

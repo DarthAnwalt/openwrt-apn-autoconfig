@@ -1,11 +1,11 @@
 # 0.15.0 WH3000 AT-dial validation
 
 Date: 2026-08-18
-Status: **runtime gate complete for the FM350-GL path.** The packaging gate is
-not: everything below ran against files deployed directly onto the router, not
-against APKs built by the official SDK. Modem and SIM identifiers are omitted.
+Status: **runtime and packaging gates complete for the FM350-GL path.** Only the
+signed-feed smoke remains, and it cannot run before the release is published.
+Modem and SIM identifiers are omitted.
 
-Four defects were found here that no fixture had caught, and each is recorded
+Five defects were found here that no fixture had caught, and each is recorded
 with what it would have cost. That is the argument for the gate.
 
 ## Environment
@@ -171,3 +171,76 @@ firewall change.
 - **the browser pass**;
 - **packaging**: SDK build, APK inspection, install/upgrade/removal, and the
   signed-feed smoke.
+
+## Packaging gate, against APKs from the official SDK
+
+Everything above was first proven with files copied onto the router. This
+section is the same suite installed as real packages built by the official
+OpenWrt 25.12.5 SDK, on a router restored to a genuine 0.14.1 first — packages
+*and* files — so the upgrade started from the state users are actually in.
+
+**Two defects the SDK build found before any of it could run.**
+
+The build script did not know about `apn-autoconfig-proto-atdial` at all: not
+staged, not configured, not compiled, not collected. A 0.15.0 release would have
+shipped the four familiar packages and silently omitted the one the release
+exists for. No fixture can see this — fixtures test the source tree, and this is
+about what the SDK emits.
+
+Then the first successful build produced six packages and wrote a `SHA256SUMS`
+naming five. Every hardware gate installs checksum-verified artifacts, so the
+new package was the one that could not be verified before installing it.
+
+Both are now covered: the package is built and inspected against an exact file
+list, its handler has an execute-bit assertion of its own because netifd spawns
+it as a program, and `verify.sh` fails when any first-party package is missing
+from the build or its inspection.
+
+The inspection also caught the inhibit worker added to `apn-autoconfig-modem`,
+refusing the package until the file count and list were updated — the mechanism
+doing precisely its job.
+
+**Results, on installed packages:**
+
+- checksums verified on the router before installing; all six match;
+- `0.14.1 → 0.15.0` upgrade of five packages plus a first install of the sixth,
+  with existing `/etc/config` preserved and `.apk-new` written beside them;
+- **the upgrade did not touch the network**: `lan` uptime 27104 s and
+  `trm_wwan` 8612 s both span it, and `wwan` stayed up;
+- provisioning on the released packages reached `http=200` through the modem,
+  with `apnmodem1` in the `wan` zone and the inhibitor running;
+- `register-proto` reported `restarted:false` against an already-registered
+  protocol, so the deliberate action is idempotent;
+- **removal** took the handler and its share directory, left the shared AT port
+  lock namespace untouched, left the other five packages installed, and did not
+  disturb the network — `trm_wwan` uptime 9597 s spans it.
+
+## Defect 5: an identity upgraded under a live section
+
+Found on the released packages, with the modem sitting still.
+
+A section records the `modem_id` it was provisioned with, and that id can stop
+existing while the modem does not move: the evidence tier is upgraded the moment
+something learns the IMEI. Here ModemManager supplied it — once `rndis_host` gave
+the FM350 a network device, ModemManager identified a modem it had been
+publishing as "model unknown", and `weak-vidpid:…` became `imei:…` between
+provisioning and the first dial.
+
+The handler was then asking about a modem no longer called that, got "not
+present", and reported `NO_AT_PORT` every three seconds for a modem with seven
+working tty nodes in front of it.
+
+The section is bound by path *and* identity for exactly this case, and only the
+identity half was being used. When the recorded id no longer resolves, the
+current identity is now looked up from the path. A modem that is genuinely gone
+still fails.
+
+## Still outstanding after this gate
+
+- **the signed-feed smoke**, which needs the release published first;
+- **roaming refusal**, deferred with a roaming SIM arriving 2026-08-19 and
+  recorded in [`architecture.md`](architecture.md);
+- **a client-forwarded packet** through the modem;
+- **a live `TERM`** during the destructive window;
+- **the browser pass**;
+- **the Intel XMM path**, which has no hardware and stays `alpha`/`synthetic`.

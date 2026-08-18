@@ -26,18 +26,32 @@ function call(command, args, env) {
 	});
 }
 
-/* provision-plan always prints a complete answer and uses its exit code to
- * carry the refusal class, so a non-zero exit is a result rather than a
- * failure. Whether the body parses is what decides. */
-function callPlan(command, args) {
-	return fs.exec(command, args).then(function(result) {
-		try {
-			return JSON.parse(result.stdout);
-		}
-		catch (e) {
-			throw new Error(_('The modem helper returned invalid JSON'));
-		}
-	});
+/* The provisioning verdict now travels with the inventory record itself.
+ *
+ * It used to be a provision-plan call per modem, which meant one helper process
+ * and one full hardware scan for each — so a page load paid the scan 1+N times
+ * and took seconds, with none of it spent waiting on the modems. The fields are
+ * additive and carry the same names and meanings the separate call returned, so
+ * this reshapes a record rather than changing what any of it means. */
+function planOf(modem) {
+	if (!modem || typeof modem !== 'object')
+		return { error: 'no record' };
+	/* A record without the verdict is not a modem that cannot be provisioned —
+	 * it is an answer we did not get, and the two must not read the same. This
+	 * is what an older backend, or a truncated response, looks like from here. */
+	if (modem.provision_reason == null && modem.can_provision == null)
+		return { error: 'no provisioning verdict in the inventory record' };
+	return {
+		can_provision: modem.can_provision,
+		reason: modem.provision_reason,
+		section: modem.provision_section,
+		existing_section: modem.provision_existing_section,
+		protocol: modem.provision_protocol,
+		netifd_restart_required: modem.netifd_restart_required,
+		can_control_bearer: modem.can_control_bearer,
+		connection_section: modem.connection_section,
+		connection_owned: modem.connection_owned
+	};
 }
 
 function text(value) {
@@ -278,19 +292,17 @@ return view.extend({
 					var modems = inventory && Array.isArray(inventory.modems) ? inventory.modems : [];
 					if (!modems.length)
 						return inventory;
-					/* One plan and one operation state per modem. Both are
-					 * read-only and bounded; neither starts modem traffic. */
+					/* The plan arrives with the record. Only the operation
+					 * state still needs a call of its own, because it is a
+					 * coordinator fact rather than an inventory one. */
 					return Promise.all(modems.map(function(modem) {
-						return Promise.all([
-							callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
-								.catch(function(error) { return { error: error.message }; }),
-							call(modemQueryCommand, [ 'action-status', modem.modem_id ])
-								.catch(function(error) { return { error: error.message }; })
-						]).then(function(pair) {
-							modem.plan = pair[0];
-							modem.operation = pair[1];
-							return modem;
-						});
+						modem.plan = planOf(modem);
+						return call(modemQueryCommand, [ 'action-status', modem.modem_id ])
+							.catch(function(error) { return { error: error.message }; })
+							.then(function(operation) {
+								modem.operation = operation;
+								return modem;
+							});
 					})).then(function() { return inventory; });
 				})
 		]);
@@ -640,15 +652,10 @@ return view.extend({
 		return call(modemQueryCommand, [ 'inventory' ]).then(function(inventory) {
 			var modems = Array.isArray(inventory.modems) ? inventory.modems : [];
 			return Promise.all(modems.map(function(modem) {
-				return Promise.all([
-					callPlan(modemQueryCommand, [ 'provision-plan', modem.modem_id ])
-						.catch(function(error) { return { error: error.message }; }),
-					call(modemQueryCommand, [ 'action-status', modem.modem_id ])
-						.catch(function(error) { return { error: error.message }; })
-				]).then(function(pair) {
-					modem.plan = pair[0];
-					modem.operation = pair[1];
-				});
+				modem.plan = planOf(modem);
+				return call(modemQueryCommand, [ 'action-status', modem.modem_id ])
+					.catch(function(error) { return { error: error.message }; })
+					.then(function(operation) { modem.operation = operation; });
 			})).then(function() { return inventory; });
 		}).then(function(inventory) {
 			self.modemInventory = inventory;

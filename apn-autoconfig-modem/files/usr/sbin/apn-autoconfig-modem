@@ -1617,7 +1617,30 @@ record_seen() {
 
 # ---- inventory scan orchestration ----
 
+SCAN_DONE=0
+
+# One scan per process.
+#
+# The scan is expensive — hundreds of external commands — and several commands
+# call it more than once: provision-plan evaluates, then resolves bearer
+# control, and each of those independently wanted a fresh inventory. Repeating
+# it inside one invocation buys nothing, because nothing between the two calls
+# can change the hardware, and the second scan is exactly as stale or fresh as
+# the first. A rescan is still a separate command, and every new process starts
+# with an empty cache, so nothing here makes a stale answer durable.
 scan_inventory() {
+	[ "$SCAN_DONE" -eq 0 ] || return 0
+	scan_inventory_now
+	SCAN_DONE=1
+}
+
+# Explicitly re-reads the hardware, whatever this process has already done.
+force_scan_inventory() {
+	SCAN_DONE=0
+	scan_inventory
+}
+
+scan_inventory_now() {
 	: >"$CANDIDATES_FILE"
 	: >"$MM_USB_PATHS_FILE"
 	mkdir -p "$STATE_DIR" 2>/dev/null || :
@@ -1869,6 +1892,12 @@ print_modem_json() {
 	json_key_string last_seen "$last_seen"; printf ','
 	json_key_boolean ambiguous "$ambiguous"; printf ','
 	json_key_string ambiguity_reason "$ambiguity_reason"
+	# Only the inventory asks for these, and only because asking separately
+	# cost one process and one full scan per modem.
+	if [ -n "${2:-}" ]; then
+		printf ','
+		print_provisioning_fields "$2"
+	fi
 	printf '}'
 }
 
@@ -1891,6 +1920,35 @@ overlay_transitioning() {
 	done <"$INVENTORY_FILE"
 }
 
+# The provisioning verdict for one record, as additive fields on the modem
+# object. Additive: no existing field changes shape or meaning.
+#
+# This exists to remove a cost rather than to add a feature. A frontend needs
+# both the inventory and, per modem, whether it can be provisioned and whether
+# its bearer can be controlled — and asking separately meant one process per
+# modem, each running the full scan again. The page therefore paid the scan
+# 1+N times, which is the measured reason it took seconds rather than the
+# hardware being slow.
+print_provisioning_fields() {
+	plan_modem="$1"
+	plan_status=0
+	provision_evaluate "$plan_modem" || plan_status=$?
+	plan_connection=0
+	connection_resolve_section "$plan_modem" connect "$PROVISION_RECORD" || plan_connection=$?
+
+	printf '"can_provision":%s,' \
+		"$([ "$plan_status" -eq 0 ] && [ "$PROVISION_REASON" = ok ] && printf true || printf false)"
+	json_key_string provision_reason "$PROVISION_REASON"; printf ','
+	json_key_string provision_section "$PROVISION_SECTION"; printf ','
+	json_key_string provision_existing_section "$PROVISION_EXISTING"; printf ','
+	json_key_string provision_protocol "$PROVISION_PROTOCOL"; printf ','
+	printf '"netifd_restart_required":%s,' \
+		"$([ "$PROVISION_PROTOCOL" = "$ATDIAL_PROTO" ] && netifd_restart_required && printf true || printf false)"
+	printf '"can_control_bearer":%s,' "$([ "$plan_connection" -eq 0 ] && printf true || printf false)"
+	json_key_string connection_section "$CONNECTION_SECTION"; printf ','
+	printf '"connection_owned":%s' "$([ "$CONNECTION_OWNED" = 1 ] && printf true || printf false)"
+}
+
 inventory_json_cmd() {
 	scan_inventory
 	overlay_transitioning >"$INVENTORY_FILE.display"
@@ -1901,7 +1959,8 @@ inventory_json_cmd() {
 	while IFS= read -r line; do
 		[ -n "$line" ] || continue
 		printf '%s' "$separator"
-		print_modem_json "$line"
+		inventory_modem_id="$(field "$line" 1)"
+		print_modem_json "$line" "$inventory_modem_id"
 		separator=','
 	done <"$INVENTORY_FILE.display"
 	printf ']}\n'
@@ -2722,7 +2781,9 @@ wait_for_modem_departure() {
 	depart_target_id="$1"
 	depart_started="$(date +%s 2>/dev/null || printf '%s' 0)"
 	while :; do
-		scan_inventory
+		# Forced: this loop exists to watch the modem leave the bus, so a
+		# memoised inventory would report the state before the reset forever.
+		force_scan_inventory
 		if awk -F '\t' -v id="$depart_target_id" \
 			'$1 == id { found=1; exit } END { exit(found ? 0 : 1) }' \
 			"$INVENTORY_FILE" 2>/dev/null; then
@@ -2757,7 +2818,9 @@ wait_for_control_owner() {
 	# LuCI-labelled maximum into a much longer outage with the interface down.
 	wait_started="$(date +%s 2>/dev/null || printf '%s' 0)"
 	while :; do
-		scan_inventory
+		# Forced, for the same reason as the departure loop above: it is
+		# waiting for the hardware to come back.
+		force_scan_inventory
 		if awk -F '\t' -v id="$wait_target_id" -v owner="$expected_owner" \
 			'$1 == id && $8 == owner && $12 == 0 { found=1; exit } END { exit(found ? 0 : 1) }' \
 			"$INVENTORY_FILE" 2>/dev/null; then
@@ -3060,7 +3123,7 @@ action_start_cmd() {
 }
 
 rescan_cmd() {
-	scan_inventory
+	force_scan_inventory
 	rm -f "$INVENTORY_FILE"
 	printf 'ok\n'
 }

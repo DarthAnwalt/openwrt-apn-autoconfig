@@ -480,27 +480,73 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.strictEqual(unsupported.testUi.modals.length, 0,
 			'manual entry must not open for a target that cannot apply a profile');
 	}).then(function() {
-	/* ---- transport: a refusal arrives with a non-zero exit code ---- */
+	/* ---- the page must not scan once per modem ---- */
 
-	/* provision-plan carries its refusal class in the exit status while still
-	 * printing a complete answer. Treating that as a failure once put the raw
-	 * JSON on the page, unmasked modem identity included. */
+	/* Measured at roughly four seconds of backend critical path, and none of it
+	 * spent waiting on hardware: the inventory scan ran once plus once per modem,
+	 * because each modem's verdict was a separate helper process that rescanned
+	 * from scratch. A second modem made it worse, which is why this is asserted
+	 * with three. */
+	var callLog = [];
+	var countingApp = loadView(function(command, args) {
+		callLog.push(args[0]);
+		if (args[0] === 'inventory')
+			return { code: 0, stdout: JSON.stringify({
+				version: 'v1',
+				modems: [ 'A', 'B', 'C' ].map(function(tag) {
+					return {
+						modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL' + tag,
+						protocol: 'qmi',
+						can_provision: true,
+						provision_reason: 'ok',
+						provision_section: 'apnmodem1',
+						provision_existing_section: '',
+						provision_protocol: 'qmi',
+						netifd_restart_required: false,
+						can_control_bearer: false,
+						connection_section: '',
+						connection_owned: false
+					};
+				})
+			}) };
+		return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
+	});
+	countingApp.modemBox = element('div');
+	return Promise.resolve(countingApp.refreshProvisioning()).then(function() {
+		assert.strictEqual(callLog.filter(function(v) { return v === 'inventory'; }).length, 1,
+			'the inventory must be read once per refresh, not once per modem');
+		assert.strictEqual(callLog.filter(function(v) { return v === 'provision-plan'; }).length, 0,
+			'the verdict must arrive with the record, not from a scan per modem');
+		assert.strictEqual(countingApp.modemInventory.modems.length, 3,
+			'every modem must still get its verdict');
+		countingApp.modemInventory.modems.forEach(function(modem) {
+			assert.strictEqual(modem.plan.reason, 'ok', 'each record must carry its own verdict');
+		});
+	});
+	}).then(function() {
+	/* ---- transport: a refusal arrives with the record ---- */
+
+	/* A refusal is now ordinary data on the record rather than a call that
+	 * failed. What must not change is what the page does with it: a
+	 * plain-language explanation, never the raw fields, never the unmasked
+	 * identity. */
 	var planApp = loadView(function(command, args) {
 		if (args[0] === 'inventory')
 			return { code: 0, stdout: JSON.stringify({
 				version: 'v1',
-				modems: [ { modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01', protocol: 'qmi' } ]
-			}) };
-		if (args[0] === 'provision-plan')
-			return { code: 4, stdout: JSON.stringify({
-				version: 'v1',
-				modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01',
-				can_provision: false,
-				reason: 'already_configured',
-				section: '',
-				existing_section: '',
-				protocol: '',
-				device: ''
+				modems: [ {
+					modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01',
+					protocol: 'qmi',
+					can_provision: false,
+					provision_reason: 'already_configured',
+					provision_section: '',
+					provision_existing_section: '',
+					provision_protocol: '',
+					netifd_restart_required: false,
+					can_control_bearer: false,
+					connection_section: '',
+					connection_owned: false
+				} ]
 			}) };
 		return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
 	});
@@ -508,9 +554,9 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 	return Promise.resolve(planApp.refreshProvisioning()).then(function() {
 		var plan = planApp.modemInventory.modems[0].plan;
 		assert.strictEqual(plan.reason, 'already_configured',
-			'a refusal delivered with a non-zero exit code must be read as a result');
+			'a refusal carried in the inventory record must be read as a result');
 		assert.ok(!plan.error,
-			'a complete answer must not be turned into an error by its exit code');
+			'a complete answer must not be reported as a failed check');
 
 		var rendered = collectText(planApp.modemBox.children).join(' ');
 		assert.strictEqual(rendered.indexOf('can_provision'), -1,
@@ -520,23 +566,21 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.ok(rendered.indexOf('belongs to a network interface you created') !== -1,
 			'a refused modem must get its plain-language explanation');
 
-		/* Output that is not an answer at all is still reported, without
-		 * echoing whatever the command printed. */
+		/* A record carrying no verdict is an answer we did not get, not a
+		 * modem that cannot be provisioned, and the two must not read alike. */
 		var brokenApp = loadView(function(command, args) {
 			if (args[0] === 'inventory')
 				return { code: 0, stdout: JSON.stringify({
 					version: 'v1',
 					modems: [ { modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01' } ]
 				}) };
-			if (args[0] === 'provision-plan')
-				return { code: 127, stdout: 'usb-serial:1-1.2:2c7c:0801:SERIAL01 exploded' };
 			return { code: 0, stdout: JSON.stringify({ busy: false, state: 'idle' }) };
 		});
 		brokenApp.modemBox = element('div');
 		return Promise.resolve(brokenApp.refreshProvisioning()).then(function() {
 			var brokenText = collectText(brokenApp.modemBox.children).join(' ');
-			assert.strictEqual(brokenText.indexOf('exploded'), -1,
-				'raw command output must not reach the page even when it fails');
+			assert.ok(!brokenApp.modemInventory.modems[0].plan.can_provision,
+				'a missing verdict must never read as permission');
 			assert.strictEqual(brokenText.indexOf('SERIAL01'), -1,
 				'a failed check must not leak the unmasked modem identity');
 			assert.ok(brokenText.indexOf('could not run') !== -1,

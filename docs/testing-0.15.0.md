@@ -15,7 +15,9 @@ What has passed, as of 2026-08-18:
 
 What has **not** run:
 
-- the signed-feed smoke, which needs the release published first;
+- ~~the signed-feed smoke~~ — run 2026-08-19 against the published feed. It
+  failed on the first attempt, found the packaging defect fixed in v0.15.1, and
+  passed against that;
 - roaming refusal, deferred with its own entry in
   [`architecture.md`](architecture.md);
 - a client-forwarded packet, a live `TERM` mid-dial, and the browser pass.

@@ -235,9 +235,51 @@ identity half was being used. When the recorded id no longer resolves, the
 current identity is now looked up from the path. A modem that is genuinely gone
 still fails.
 
+## Signed-feed smoke, 2026-08-19 — and the defect it found
+
+Run against the published feed immediately after v0.15.0, and it failed on the
+first attempt:
+
+```
+ERROR: unable to select packages:
+  apn-autoconfig-proto-atdial (no such package)
+```
+
+0.15.0 built the package, inspected it, attached it to the GitHub Release and
+covered it in the checksums — and published a signed feed without it, because
+the repository builder carried its own list of five package names. That was the
+**third** place the set of packages was written down; the other two had already
+been corrected for the same omission before the release shipped, and this was
+the copy nothing checked.
+
+Fixed in v0.15.1 by removing the list rather than extending it: the feed takes
+whatever the build produced and asserts the index contains each of them, with
+`verify.sh` failing if it becomes a fixed list again.
+
+**The smoke then passed against v0.15.1:**
+
+- the pins the hardware gate wrote were cleared first, and they were in the
+  `apn-autoconfig><Q1…=` checksum form the handoff warns about, not `=`;
+  after `apk add` by bare name, every world entry was a bare name;
+- the whole suite was removed and reinstalled **from the signed feed with
+  signature verification** — no `--allow-untrusted` anywhere;
+- `apk list -I` confirms all six packages at 0.15.1 from the feed, which is the
+  check that matters rather than the exit status;
+- a feed install added no new pins;
+- the protocol registered, the modem provisioned, `http=200` through it, the
+  interface in the `wan` zone, and the ModemManager inhibitor running as procd
+  instance `inhibit-imei_…` — declared from configuration, so it came back on
+  its own after the package was reinstalled;
+- ModemManager held only the production RM520N-GL throughout.
+
+One behaviour worth recording because it looks alarming and is correct: removing
+the packages left the `apnmodem1` section in place, so once the handler was
+reinstalled netifd brought the interface back up by itself. The section is the
+administrator's configuration and netifd owns the bearer; package removal is not
+a statement about which modem they want.
+
 ## Still outstanding after this gate
 
-- **the signed-feed smoke**, which needs the release published first;
 - **roaming refusal**, deferred with a roaming SIM arriving 2026-08-19 and
   recorded in [`architecture.md`](architecture.md);
 - **a client-forwarded packet** through the modem;

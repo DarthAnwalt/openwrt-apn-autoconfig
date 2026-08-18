@@ -3467,13 +3467,13 @@ case "$plan_out" in
 	*) fail "an AT modem was provisionable with no protocol handler installed: $plan_out" ;;
 esac
 
-printf '%s\n' 'TEST installing the handler makes it provisionable and announces the network restart'
+printf '%s\n' 'TEST an installed but unregistered protocol is named, not silently refused'
 # netifd reads protocol handlers only when it starts, so a section written
-# before that restart would be inert. The frontend is told beforehand, because
-# a network restart is a thing a user is entitled to know about in advance.
+# before that restart would be inert. The plan says which protocol it would use,
+# that it cannot yet, and what is needed — a network restart is a thing a user is
+# entitled to know about before it happens rather than after.
 : >"$TEST_ATDIAL_HANDLER"
-plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem")" || \
-	fail 'an AT modem with the handler installed was not provisionable'
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem" 2>/dev/null)" || :
 case "$plan_out" in
 	*'"protocol":"apn_atdial"'*) : ;;
 	*) fail "provision-plan chose the wrong protocol: $plan_out" ;;
@@ -3482,13 +3482,40 @@ case "$plan_out" in
 	*'"netifd_restart_required":true'*) : ;;
 	*) fail "an unregistered protocol did not announce the restart: $plan_out" ;;
 esac
+case "$plan_out" in
+	*'"reason":"netifd_unregistered"'*) : ;;
+	*) fail "an unregistered protocol was not named as the reason: $plan_out" ;;
+esac
 [ ! -s "$TEST_NETWORK_INIT_LOG" ] || fail 'provision-plan restarted the network; it is read-only'
 
-printf '%s\n' 'TEST provisioning registers the protocol first, then binds by path and identity'
+printf '%s\n' 'TEST provisioning refuses an unregistered protocol instead of restarting the network'
+# Registering means restarting the network, which takes down every interface —
+# including the one the administrator is connected over. The 0.15.0 hardware
+# gate lost its own session to exactly that. It is their decision to time, so
+# provisioning names the action rather than performing it.
 : >"$TEST_NETWORK_INIT_LOG"
+unreg_status=0
+sh "$SCRIPT" provision --modem "$atdial_modem" >"$STATE/atdial-unreg" 2>&1 || unreg_status=$?
+[ "$unreg_status" -ne 0 ] || fail 'provisioning proceeded onto a protocol netifd does not know'
+grep -q netifd_unregistered "$STATE/atdial-unreg" || \
+	fail "provisioning did not name the reason: $(cat "$STATE/atdial-unreg")"
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || \
+	fail 'provisioning restarted the network by itself'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || fail 'a refused provisioning still created a section'
+
+printf '%s\n' 'TEST registering is a deliberate action, and is idempotent'
+sh "$SCRIPT" register-proto >"$STATE/atdial-register" 2>&1 || fail 'register-proto failed'
+grep -q '"restarted":true' "$STATE/atdial-register" || fail 'register-proto did not restart the network'
+grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the network was never restarted by register-proto'
+: >"$TEST_NETWORK_INIT_LOG"
+sh "$SCRIPT" register-proto >"$STATE/atdial-register2" 2>&1 || fail 'a second register-proto failed'
+grep -q '"restarted":false' "$STATE/atdial-register2" || \
+	fail 'register-proto restarted the network although the protocol was already registered'
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || fail 'an already-registered protocol still restarted the network'
+
+printf '%s\n' 'TEST provisioning then binds by path and identity'
 sh "$SCRIPT" provision --modem "$atdial_modem" >"$STATE/atdial-provision" 2>&1 || \
 	fail "provisioning an AT modem failed: $(cat "$STATE/atdial-provision")"
-grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the network was never restarted to register the protocol'
 atdial_section="$(awk -F'\t' '$2 == "proto" && $3 == "apn_atdial" { print $1; exit }' "$TEST_NETWORK_OPTIONS")"
 [ -n "$atdial_section" ] || fail 'no section was created on the AT-dial protocol'
 section_option() {
@@ -3518,7 +3545,7 @@ sh "$SCRIPT" deprovision --modem "$atdial_modem" >/dev/null 2>&1 || fail 'deprov
 	fail 'an inhibition survived the section that justified it'
 grep -qx reload "$TEST_SERVICE_INIT_LOG" || fail 'the inhibition was never released after deprovisioning'
 
-printf '%s\n' 'TEST a protocol that stays unregistered creates no section at all'
+printf '%s\n' 'TEST a registration that does not take effect creates no section at all'
 # Failing here must leave nothing behind: the restart happens before the
 # transaction is armed precisely so a rollback never has to unwind one.
 reset_sysfs
@@ -3528,9 +3555,11 @@ rm -f "$TEST_ATDIAL_REGISTERED_FILE"
 add_at_modem 12-1.2 0e8d 7127 '' 91
 printf '/dev/ttyUSB91\tcontrol\n' >>"$TEST_AT_PORTS"
 stubborn_modem="weak-vidpid:12-1.2:0e8d:7127"
-TEST_ATDIAL_REGISTER_ON_RESTART=0 sh "$SCRIPT" provision --modem "$stubborn_modem" >/dev/null 2>&1 && \
-	fail 'provisioning succeeded onto a protocol netifd never registered'
+TEST_ATDIAL_REGISTER_ON_RESTART=0 sh "$SCRIPT" register-proto >/dev/null 2>&1 && \
+	fail 'register-proto reported success although netifd never registered the protocol'
 grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the registration restart was never attempted'
+sh "$SCRIPT" provision --modem "$stubborn_modem" >/dev/null 2>&1 && \
+	fail 'provisioning succeeded onto a protocol netifd never registered'
 [ -z "$(awk -F'\t' -v m="$stubborn_modem" '$2 == "apn_autoconfig_modem_id" && $3 == m { print $1; exit }' "$TEST_NETWORK_OPTIONS")" ] || \
 	fail 'a section was created for a protocol that cannot work'
 

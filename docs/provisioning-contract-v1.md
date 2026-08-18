@@ -211,11 +211,13 @@ runtime one: an option added mid-life reaches users at their next reboot, so it
 must be introduced with a default that behaves exactly as its absence did.
 
 `provision-plan` therefore reports `netifd_restart_required`, computed from
-`ubus call network get_proto_handlers`, and `provision` performs the restart as
-a distinct step **before** arming the section-creating transaction — so a
-restart never sits inside a window that a rollback would have to unwind. After
-the restart it re-checks registration and fails closed if the protocol is still
-absent. No section is created on the strength of a handler netifd does not know.
+`ubus call network get_proto_handlers`, alongside `reason: netifd_unregistered`
+and the protocol it *would* use. `provision` refuses in that state and creates
+nothing.
+
+Registering is its own command, `apn-autoconfig-modem register-proto`. It
+restarts the network, says so first, and reports whether a restart was actually
+needed — running it against an already-registered protocol changes nothing.
 
 **The restart is never performed from a package script.** A `postinst` that
 restarts the network reaches routers whose administrator is not present, is not
@@ -357,7 +359,7 @@ apn-autoconfig-modem action-start provision --modem <id>
 provisioned, the section name that would be created, the protocol that would be
 used, and, when it cannot, a stable machine-readable reason:
 `already_configured`, `ambiguous`, `conflicting_owner`, `unsupported_protocol`,
-`not_present`, `name_unavailable`. It never writes UCI, never creates state and
+`not_present`, `name_unavailable`, `netifd_unregistered`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
 
 `inhibit-targets` is read-only and lists the ModemManager inhibitions this

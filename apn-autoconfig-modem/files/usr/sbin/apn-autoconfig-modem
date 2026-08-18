@@ -2351,6 +2351,16 @@ provision_evaluate() {
 		PROVISION_REASON="unsupported_protocol"
 		return 4
 	fi
+	# Installed is not registered. netifd reads protocol handlers only when it
+	# starts, so a section written now would be inert — and registering it means
+	# restarting the network, which takes down every interface including the one
+	# the administrator is connected over. That is their decision to time, not
+	# ours to take inside an unrelated operation, so this refuses and names the
+	# action instead of performing it.
+	if [ "$PROVISION_PROTOCOL" = "$ATDIAL_PROTO" ] && netifd_restart_required; then
+		PROVISION_REASON="netifd_unregistered"
+		return 4
+	fi
 	PROVISION_DEVICE="$(provision_device_for_record "$PROVISION_PROTOCOL" "$provision_control_device" "$provision_usb_path" 2>/dev/null || :)"
 	if [ -z "$PROVISION_DEVICE" ]; then
 		PROVISION_REASON="unsupported_protocol"
@@ -2448,15 +2458,6 @@ provision_cmd() {
 	prov_protocol="$PROVISION_PROTOCOL"
 	prov_device="$PROVISION_DEVICE"
 	case "$prov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
-
-	# Registration, before anything is created. netifd only learns a protocol
-	# when it starts, so a section written now would be inert and the rollback
-	# would have to unwind it. Doing the restart here keeps it outside the
-	# window rollback is responsible for, and failing here creates nothing.
-	if [ "$prov_protocol" = "$ATDIAL_PROTO" ] && netifd_restart_required; then
-		netifd_register_proto || \
-			die_code 3 "netifd did not register $ATDIAL_PROTO after a network restart; not creating a section that cannot work"
-	fi
 
 	prov_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
 	prov_operation="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
@@ -3388,6 +3389,37 @@ action_start_cmd() {
 	print_action_json true "$REQUESTED_MODEM"
 }
 
+# Registers this package's netifd protocols by restarting the network.
+#
+# Separate, explicit and never implicit. It takes down every interface for a
+# moment — including a VPN or an overlay the administrator is connected over,
+# and including the access point they are on if that is how they reached the
+# router. The 0.15.0 hardware gate lost its own session to exactly that. So it
+# is asked for, announced, and never performed as a side effect of provisioning
+# a modem. A reboot achieves the same thing and is often the better choice.
+register_proto_cmd() {
+	netifd_proto_available || \
+		die_code 4 "the AT-dial protocol handler is not installed"
+	if netifd_proto_registered "$ATDIAL_PROTO"; then
+		printf '{'
+		json_key_string version v1; printf ','
+		json_key_string protocol "$ATDIAL_PROTO"; printf ','
+		json_key_string state registered; printf ','
+		printf '"restarted":false'
+		printf '}\n'
+		return 0
+	fi
+	log warning "restarting the network to register $ATDIAL_PROTO; every interface will drop briefly"
+	netifd_register_proto || \
+		die_code 3 "netifd did not register $ATDIAL_PROTO after a network restart"
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string protocol "$ATDIAL_PROTO"; printf ','
+	json_key_string state registered; printf ','
+	printf '"restarted":true'
+	printf '}\n'
+}
+
 rescan_cmd() {
 	force_scan_inventory
 	rm -f "$INVENTORY_FILE"
@@ -3439,6 +3471,9 @@ Commands:
                     print the v1 identity contract. Read-only
   inhibit-targets   List the ModemManager inhibitions this package owns, as
                     <device-uid><TAB><modem_id>. Read-only
+  register-proto    Register this package's netifd protocol by restarting the
+                    network. Every interface drops briefly, including one you
+                    may be connected over. Never done implicitly
   rescan            Synchronous full read-only rescan (updates first/last seen)
   rescan-async      Debounced rescan entry point for hotplug handlers
 EOF
@@ -3501,6 +3536,7 @@ main() {
 		action-start) action_start_cmd "$command_argument" ;;
 		action-status) action_status_cmd ;;
 		reset) reset_cmd ;;
+		register-proto) register_proto_cmd ;;
 		rescan) rescan_cmd ;;
 		rescan-async) rescan_async_cmd ;;
 		*) usage >&2; exit 2 ;;

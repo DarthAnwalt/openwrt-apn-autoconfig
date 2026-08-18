@@ -108,13 +108,17 @@ atdial_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-proto-atdia
 		"$atdial_version" "$core_version" >&2
 	exit 1
 }
+# The release heading names every first-party package and its version, so a
+# package whose version was forgotten cannot reach a release quietly.
+changelog_heading="## apn-autoconfig $core_version / apn-autoconfig-modem $modem_version / apn-autoconfig-proto-atdial $atdial_version / apn-autoconfig-providers"
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
-	grep -F -q "## apn-autoconfig $core_version / apn-autoconfig-modem $modem_version / apn-autoconfig-providers $database_version / luci-app-apn-autoconfig $luci_version" \
+	grep -F -q "$changelog_heading $database_version / luci-app-apn-autoconfig $luci_version" \
 		"$ROOT/CHANGELOG.md"
 else
-	grep -F "## apn-autoconfig $core_version / apn-autoconfig-modem $modem_version / apn-autoconfig-providers " "$ROOT/CHANGELOG.md" |
+	grep -F "$changelog_heading " "$ROOT/CHANGELOG.md" |
 		grep -F -q " / luci-app-apn-autoconfig $luci_version"
 fi
+grep -F -q "apn-autoconfig-proto-atdial-$atdial_version-r$atdial_release.apk" "$ROOT/README.md"
 grep -F -q "./apn-autoconfig-$core_version-r$core_release.apk" "$ROOT/README.md"
 grep -F -q "./luci-app-apn-autoconfig-$luci_version-r$luci_release.apk" "$ROOT/README.md"
 grep -F -q "apn-autoconfig-modem-$modem_version-r$modem_release.apk" "$ROOT/README.md"

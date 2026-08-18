@@ -1,6 +1,29 @@
 # 0.15.0 AT-dial test and release plan
 
-Status: in progress.
+Status: implementation and fixture coverage complete; **no hardware, SDK or
+publication gate has run.**
+
+What has passed, as of 2026-08-18:
+
+- `sh scripts/verify.sh`, including both LuCI suites — Node.js is installed on
+  the maintainer's machine, so they run rather than being skipped;
+- every fixture assertion listed below, in `tests/run-tests-atdial.sh`,
+  `tests/run-tests-modem.sh`, `tests/run-tests.sh`,
+  `tests/test-package-lifecycle.sh` and the two LuCI suites.
+
+What has **not** run, and must before this release is called anything:
+
+- the official OpenWrt 25.12 SDK build and the inspection of the produced APK.
+  The SDK is a Linux x86_64 toolchain and the work was done on macOS, so this
+  goes through the GitHub Actions workflow;
+- every step of the hardware gate below;
+- the signed-feed smoke.
+
+Nothing in this document may be read as evidence for those. In particular the
+`stable`/`hardware` capability the AT-dial backend reports is a claim about the
+FM350-GL path that **the hardware gate has not yet confirmed in this release**;
+it rests on the contract being implemented as written, which is exactly the kind
+of assumption this project's evidence ladder exists to refuse.
 
 0.15.0 adds the first netifd protocol this project ships, `apn_atdial`, against
 [`atdial-contract-v1.md`](atdial-contract-v1.md). The release is finished when a

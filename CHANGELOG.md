@@ -1,5 +1,90 @@
 # Changelog
 
+## apn-autoconfig 0.15.0 / apn-autoconfig-modem 0.15.0 / apn-autoconfig-proto-atdial 0.15.0 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.15.0 (2026-08-18)
+
+The first netifd protocol this project ships, for modems that expose no control
+channel at all.
+
+QMI, MBIM and ModemManager all speak to a `cdc-wdm` character device. A modem in
+an RNDIS, ECM or NCM composition has none: its data path is an ordinary usbnet
+interface, and the host has to define and activate the PDP context itself over
+an AT port and then configure the address the modem reports, because the modem
+serves no DHCP. 0.14.0 made such a modem identifiable; this release makes it
+usable.
+
+### What the release contains
+
+- **`apn-autoconfig-proto-atdial`**, providing the `apn_atdial` protocol. The
+  commands are unremarkable 3GPP — the release is the decisions around them.
+- **The driver is loaded rather than waited for.** The measured FM350-GL arrives
+  with no driver bound to its RNDIS pair, so it has no network device at all
+  until something loads `rndis_host`. A handler that waits for one waits forever.
+- **Ports are asked for, never probed for.** `apn-autoconfig-modem` already
+  resolves them by role, caches dead ports and refuses under ModemManager.
+- **The AT port lock is mandatory.** The address published on the interface is
+  read from a reply, so a component that waits for the lock, fails and proceeds
+  anyway configures the interface with someone else's answer.
+- **A live context is reused only under four guards**, each standing for a
+  failure that ends in an interface that is up and carries nothing: a stale APN
+  from the previous SIM, an IPv4 context under a dual-stack request, an active
+  context on a detached modem, and authentication lost to a modem reboot that
+  the context definition survived.
+- **A modem ModemManager has claimed but cannot drive is released** with
+  ModemManager's own `--inhibit-device`, held by a supervised process for as
+  long as the provisioning that asked for it. ModemManager is never restarted:
+  that would drop the working modem beside the one being configured. The device
+  uid is recorded so the inhibition can be held while the modem is absent, which
+  pre-empts ModemManager at the next hotplug instead of racing it.
+- **Registration with netifd is separated from installation.** netifd reads
+  protocol handlers only at start-up, so the first setup of a modem onto this
+  protocol restarts the network — announced beforehand, performed before
+  anything is created, and never from a package script.
+- **The APN engine gains the `atdial` backend**, resolving the 0.14.0 decision:
+  it asks `apn-autoconfig-modem` for identity rather than carrying an adapter of
+  its own, because the handler holds the AT port for a whole bring-up and a
+  third component parsing replies on that tty is the failure the lock exists to
+  prevent.
+
+### The Intel XMM path is not validated
+
+Fibocom L850 and L860 need a different tail after the same dial: the data
+channel must be bound explicitly, DNS comes from a vendor query, and the link
+does not answer ARP. All three are implemented, behind a transport quirk table.
+
+**No such device has been driven by this project.** The path is reported as
+`alpha`/`synthetic` and nothing here should be read as a hardware claim for it.
+The table is keyed by USB vendor and product rather than by reported model,
+which is a concession rather than a preference and is documented as one: the
+evidence available is another project's, and what it contains is the USB vendor.
+
+### Also in this release
+
+- **The modem page stops scanning once per modem.** Page load was measured at
+  roughly four seconds of backend critical path, none of it spent waiting on
+  hardware: the provisioning verdict for each modem was a separate helper
+  process that repeated the full scan. It now travels with the inventory record.
+- **Each modem's readings appear under that modem.** The radio and SIM block was
+  rendered once above every card, which with two modems attributed one modem's
+  network, signal and registration to both.
+
+### Defects fixed
+
+Three of these were found by writing the contracts, and one by writing the tests
+the contracts asked for. None was found by the suites, because in each case the
+suites asserted an outcome both the working and the broken version produce.
+
+- **The AT port lock never waited.** The reclaiming wrapper returns 3 for "held
+  by a live owner" and the caller tested for 2, so the configured wait was
+  unreachable and every contended acquisition failed immediately.
+- **The shared lock root could desynchronise.** One package read it from UCI and
+  another only from an environment variable nothing sets in production. They
+  agreed only because the shipped value equals the built-in default.
+- **Registration `stat` 9 and 10 fell through to unknown** — "registered, CSFB
+  not preferred", the same mistake 6 and 7 were added to fix.
+- **`pap-or-chap` cleared authentication instead of using it**, in this
+  release's own new code. A profile with credentials would have dialled without
+  them: address assigned, traffic dropped.
+
 ## apn-autoconfig 0.14.1 / apn-autoconfig-modem 0.14.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.14.1 (2026-08-18)
 
 A defect fix. Both binaries trapped `HUP`, `INT` and `TERM` but not `PIPE`, and

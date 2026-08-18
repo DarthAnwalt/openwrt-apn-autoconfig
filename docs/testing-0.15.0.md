@@ -241,9 +241,23 @@ Internet, reconnect, reset, and ModemManager coexistence with a production modem
 that never moved. Three defects were found there that no fixture had caught, all
 fixed with regressions.
 
-Still outstanding: roaming refusal (needs a roaming registration), a live `TERM`
-during the destructive window, the browser pass, the whole packaging gate, and
-the XMM path, which has no hardware and stays `alpha`/`synthetic`.
+Still outstanding: a live `TERM` during the destructive window, the browser
+pass, the whole packaging gate, and the XMM path, which has no hardware and
+stays `alpha`/`synthetic`.
+
+**Roaming refusal is deferred rather than skipped, and is owed by the next
+release.** The handler refuses to dial on a roaming registration unless
+`allow_roaming` is set, and every registration state that decision rests on has
+fixture coverage — but none of it has run against a modem actually registered on
+a visited network, because the SIM on the bench cannot be made to roam on
+demand. A roaming SIM arrives 2026-08-19.
+
+The release is not held for it. Waiting would buy a real delay for a test that
+runs just as well against the shipped code afterwards, and the alternative —
+shipping while quietly letting the gap close — is the only version of this that
+would be wrong. It is carried in [`architecture.md`](architecture.md) as an
+explicit obligation on the next release, major or patch, and the refusal path is
+described as fixture evidence until a roaming SIM has exercised it.
 
 ## What the first hardware attempt found, 2026-08-18
 

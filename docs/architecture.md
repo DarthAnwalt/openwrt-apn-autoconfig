@@ -369,6 +369,22 @@ have to preserve the existing global-to-specific acquisition order and prove
 that no CLI, LuCI, boot, hotplug, provisioning, eSIM or button path can acquire
 the pair in the opposite direction.
 
+### Roaming refusal has no hardware evidence
+
+Recorded 2026-08-18, owed by the next release, major or patch.
+
+The AT-dial handler refuses to dial on a roaming registration unless
+`allow_roaming` is set, and every registration state that decision depends on is
+covered by fixtures. None of it has run against a modem actually registered on a
+visited network: the SIM on the bench cannot be made to roam on demand, and a
+roaming one arrives 2026-08-19.
+
+0.15.0 was not held for it. A finished release waiting on the availability of a
+test SIM is a real delay bought for a test that runs just as well against the
+shipped code afterwards. What must not happen is the gap closing quietly, so
+until a roaming SIM has exercised it the refusal path is fixture evidence only,
+and this entry is what says so.
+
 ### Automatic escalation between reset methods
 
 Recorded 2026-08-16, deferred to 0.17.0.

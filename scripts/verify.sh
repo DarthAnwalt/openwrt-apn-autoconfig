@@ -135,6 +135,24 @@ grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
 grep -F -q '+jsonfilter ' "$ROOT/Makefile"
 grep -F -q '+sms-tool ' "$ROOT/Makefile"
 grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
+# Every first-party package must be wired into the SDK build and inspected
+# there. 0.15.0 added one and the build script did not know about it, so the
+# release would have been published without it — the packaging equivalent of a
+# file reaching a package undeclared, and invisible to every fixture.
+for package_dir in "$ROOT"/*/Makefile; do
+	package_name="$(sed -n 's/^PKG_NAME:=//p' "$package_dir" | head -1)"
+	[ -n "$package_name" ] || continue
+	case "$package_name" in apn-autoconfig-providers) continue ;; esac
+	grep -F -q "package/$package_name/compile" "$ROOT/scripts/build-with-sdk.sh" || {
+		printf 'Package %s is not built by scripts/build-with-sdk.sh.\n' "$package_name" >&2
+		exit 1
+	}
+	grep -F -q "inspect_package \"\$" "$ROOT/scripts/build-with-sdk.sh" && \
+		grep -F -q " $package_name " "$ROOT/scripts/build-with-sdk.sh" || {
+		printf 'Package %s is built but never inspected by scripts/build-with-sdk.sh.\n' "$package_name" >&2
+		exit 1
+	}
+done
 grep -F -q '+apn-autoconfig-modem ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
 grep -F -q '+kmod-usb-net-rndis ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
 # A package script must never restart the network: it reaches administrators who

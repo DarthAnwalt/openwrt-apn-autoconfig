@@ -341,10 +341,14 @@ the explicit interface start that follows.
 
 ## Quirks, and the Intel XMM tail
 
-Divergence from the specification is carried by the quirk table in
-`apn-autoconfig-modem`, keyed by the manufacturer and model the modem reports to
-`AT+CGMI` and `AT+CGMM`. Its rule is unchanged and absolute: an absent entry
+Divergence in how a modem moves data is carried by a transport quirk table in
+`apn-autoconfig-proto-atdial`. Its rule is the one the capability table in
+`apn-autoconfig-modem` already applies, and it is absolute: an absent entry
 means "not tested here", never "probably like the others".
+
+It is a **second** table rather than rows in the first, because it answers a
+different question — how this device moves data, not what it can be asked to do
+— and because it must be usable before any AT identity exists.
 
 | Key | Values | Effect |
 |---|---|---|
@@ -359,12 +363,25 @@ enabled before activation, or it answers empty), and the NCM link does not
 answer ARP, so without disabling it the address is configured and every packet
 dies in neighbour resolution.
 
-**Keying on the reported model rather than the USB id is the correct choice
-here, and the reason is specific.** The reference implementation detects XMM
-from `idVendor == 8087`, and its own notes record that L850 and L860-GL-16 both
-enumerate as `8087:095a`. The USB id cannot distinguish the two devices;
-`AT+CGMM` can. Since the quirk table is read after identity is known, it costs
-nothing to key on the more precise signal.
+**The table is keyed by USB vendor and product, with an open model column, and
+that is a concession rather than a preference.** Keying on what the modem
+reports about itself is the better shape and is what the capability table does.
+It is not available here: these entries come from another project's hardware
+reports, and what those reports contain is the USB vendor — their production
+code branches on `idVendor == 8087` and nothing else. No `AT+CGMM` string for
+these devices has been observed by anyone whose notes this project has read, so
+writing one into the table would be precisely the invention the "absent means
+untested" rule exists to prevent.
+
+The `model` column exists so an entry can be narrowed the day someone reads a
+real device, and it will be needed: those same notes record that an L850 and an
+L860-GL-16 both enumerate as `8087:095a`, so the USB id cannot tell the two
+apart. The handler already reads `AT+CGMM` while it holds the port and passes it
+to the lookup, so a measured string starts working without a code change.
+
+Vendor alone is not a licence either. Entries name the products that were
+reported, so an Intel part nobody has driven is still an untested modem and gets
+the standard path.
 
 Every XMM entry is marked in the table as sourced from a third-party hardware
 report rather than from this project's own bench, because that is what it is.

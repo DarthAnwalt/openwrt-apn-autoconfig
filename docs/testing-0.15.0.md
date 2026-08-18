@@ -35,8 +35,8 @@ using.
 - cold dial, context reuse guards, PDP-type fallback and `AT+CGAUTH`;
 - static IPv4 publication and the dynamic `dhcpv6` child;
 - teardown that releases the context and notifies nothing;
-- the quirk keys `data_channel`, `dns_source` and `link_arp`, and the XMM tail
-  they drive;
+- the transport quirk table, its keys `data_channel`, `dns_source` and
+  `link_arp`, and the XMM tail they drive;
 - provisioning of an `at` modem to `proto=apn_atdial`, including the netifd
   registration gate and the `netifd_restart_required` field;
 - the `mmcli --inhibit-device` holder, its lifecycle and its rollback;
@@ -146,9 +146,9 @@ ModemManager owns it — and the eSIM transport question is unaffected.
 34. `dns_source=xdns` → `AT+XDNS=1,1` precedes activation and DNS is read from
     `AT+XDNS?` rather than `CGCONTRDP`;
 35. `link_arp=off` → ARP is disabled and the route is on-link with no gateway;
-36. two entries differing only by model resolve independently — the assertion
-    that keying on `AT+CGMM` rather than the USB id actually separates an L850
-    from an L860.
+36. an Intel vendor id with a product the table does not list gets nothing —
+    the assertion that a vendor id alone is not a licence, since the two
+    reported Intel products are what the evidence covers.
 
 ### Interruption
 

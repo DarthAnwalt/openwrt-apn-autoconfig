@@ -20,8 +20,11 @@ sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-query"
 sh -n "$ROOT/apn-autoconfig-modem/files/usr/libexec/apn-autoconfig-modem-control"
 sh -n "$ROOT/apn-autoconfig-modem/files/etc/init.d/apn-autoconfig-modem"
 sh -n "$ROOT/apn-autoconfig-modem/files/etc/hotplug.d/usb/50-apn-autoconfig-modem"
+sh -n "$ROOT/apn-autoconfig-proto-atdial/files/lib/netifd/proto/apn_atdial.sh"
+sh -n "$ROOT/apn-autoconfig-proto-atdial/files/usr/share/apn-autoconfig-proto-atdial/atdial.sh"
 sh -n "$ROOT/tests/run-tests.sh"
 sh -n "$ROOT/tests/run-tests-modem.sh"
+sh -n "$ROOT/tests/run-tests-atdial.sh"
 sh -n "$ROOT/tests/test-database-update.sh"
 sh -n "$ROOT/tests/test-package-lifecycle.sh"
 sh -n "$ROOT/scripts/build-with-sdk.sh"
@@ -85,6 +88,8 @@ luci_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/luci-app-apn-autoconfig/Make
 luci_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/luci-app-apn-autoconfig/Makefile")"
 modem_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
 modem_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-modem/Makefile")"
+atdial_version="$(sed -n 's/^PKG_VERSION:=//p' "$ROOT/apn-autoconfig-proto-atdial/Makefile")"
+atdial_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-proto-atdial/Makefile")"
 [ -n "$core_version" ]
 [ -n "$core_release" ]
 [ -n "$luci_version" ]
@@ -93,6 +98,13 @@ modem_release="$(sed -n 's/^PKG_RELEASE:=//p' "$ROOT/apn-autoconfig-modem/Makefi
 [ -n "$modem_release" ]
 [ "$modem_version" = "$core_version" ] || {
 	printf 'Modem package version %s does not match suite version %s.\n' "$modem_version" "$core_version" >&2
+	exit 1
+}
+[ -n "$atdial_version" ]
+[ -n "$atdial_release" ]
+[ "$atdial_version" = "$core_version" ] || {
+	printf 'AT-dial protocol package version %s does not match suite version %s.\n' \
+		"$atdial_version" "$core_version" >&2
 	exit 1
 }
 if [ -n "${EXPECTED_RELEASE_TAG:-}" ]; then
@@ -118,6 +130,16 @@ grep -F -q 'DEPENDS:=+apn-autoconfig-providers ' "$ROOT/Makefile"
 grep -F -q '+jsonfilter ' "$ROOT/Makefile"
 grep -F -q '+sms-tool ' "$ROOT/Makefile"
 grep -F -q 'DEPENDS:=+apn-autoconfig +kmod-button-hotplug' "$ROOT/Makefile"
+grep -F -q '+apn-autoconfig-modem ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
+grep -F -q '+kmod-usb-net-rndis ' "$ROOT/apn-autoconfig-proto-atdial/Makefile"
+# A package script must never restart the network: it reaches administrators who
+# are not present and may be reachable only through the interfaces it restarts.
+# Registration belongs to provisioning, where someone is waiting for it.
+if grep -nE '(init\.d/network|network (restart|reload))' \
+	"$ROOT/apn-autoconfig-proto-atdial/Makefile"; then
+	printf '%s\n' 'The AT-dial package must not touch the network from a package script.' >&2
+	exit 1
+fi
 # Both native adapters are package payload; an unshipped adapter would make the
 # backend look implemented in the source tree and unavailable on a router.
 grep -F -q 'files/usr/libexec/apn-autoconfig-qmi $(1)/usr/libexec/apn-autoconfig-qmi' "$ROOT/Makefile"
@@ -206,6 +228,7 @@ sh "$ROOT/tests/test-installer.sh"
 sh "$ROOT/tests/test-package-lifecycle.sh"
 sh "$ROOT/tests/run-tests.sh"
 sh "$ROOT/tests/run-tests-modem.sh"
+sh "$ROOT/tests/run-tests-atdial.sh"
 if [ "$luci_suites_skipped" -eq 1 ]; then
 	printf '%s\n' 'Static and behavioral verification passed (LuCI suites SKIPPED: node not found).'
 else

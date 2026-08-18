@@ -41,6 +41,13 @@ A section created by this package carries three markers in `network.<section>`:
 | `apn_autoconfig_owner` | `apn-autoconfig-modem` |
 | `apn_autoconfig_modem_id` | the stable `modem_id` it was provisioned for |
 | `apn_autoconfig_provisioned` | UTC ISO-8601 timestamp of creation |
+| `apn_autoconfig_mm_uid` | the ModemManager device uid, on AT-dial sections only |
+
+`apn_autoconfig_mm_uid` is recorded so the ModemManager inhibition can be held
+while the modem is **absent**. That is not an optimisation: an inhibition
+registered before the modem's ports appear is what stops ModemManager claiming
+it at the next hotplug, and resolving the uid only when the device is present
+means racing ModemManager on every re-enumeration instead of pre-empting it.
 
 These are the authoritative ownership record. A section without all three is
 **not** project-owned and is never modified, promoted, disabled or deleted by
@@ -275,6 +282,7 @@ apn-autoconfig-modem provision-plan --modem <id>
 apn-autoconfig-modem provision --modem <id> [--autoconnect 0|1] [--apn <name> ...]
 apn-autoconfig-modem deprovision --modem <id>
 apn-autoconfig-modem connect|disconnect|reconnect --modem <id>
+apn-autoconfig-modem inhibit-targets
 apn-autoconfig-modem action-start provision --modem <id>
 ```
 
@@ -284,6 +292,14 @@ used, and, when it cannot, a stable machine-readable reason:
 `already_configured`, `ambiguous`, `conflicting_owner`, `unsupported_protocol`,
 `not_present`, `name_unavailable`. It never writes UCI, never creates state and
 never opens a control channel beyond the existing bounded inventory scan.
+
+`inhibit-targets` is read-only and lists the ModemManager inhibitions this
+package owns, one `<device-uid><TAB><modem_id>` line each. The service's init
+script turns each line into one supervised holder, so the set of held
+inhibitions is derived from configuration on every start and reload rather than
+from runtime state — it survives a reboot, and a removed section stops being
+declared. Provisioning and deprovisioning ask for a reload and procd reconciles
+the difference.
 
 0.15.0 adds `netifd_restart_required` to the same response, additively. It is
 true only for a protocol this project ships whose handler netifd has not

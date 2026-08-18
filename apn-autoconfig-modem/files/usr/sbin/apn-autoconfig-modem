@@ -56,6 +56,15 @@ SMS_TOOL="${APN_AUTOCONFIG_MODEM_SMS_TOOL:-sms_tool}"
 # one path a real sleep while the rest of the suite keeps an instant mock.
 # apn-autoconfig-qmi carries the same override for the same reason.
 SLEEP="${APN_AUTOCONFIG_MODEM_SLEEP:-sleep}"
+UBUS="${APN_AUTOCONFIG_MODEM_UBUS:-ubus}"
+NETWORK_INIT="${APN_AUTOCONFIG_MODEM_NETWORK_INIT:-/etc/init.d/network}"
+SERVICE_INIT="${APN_AUTOCONFIG_MODEM_SERVICE_INIT:-/etc/init.d/apn-autoconfig-modem}"
+# The AT-dial protocol this package can provision a modem onto. It lives in a
+# separate optional package, so its absence is an ordinary configuration rather
+# than an error.
+ATDIAL_PROTO=apn_atdial
+ATDIAL_HANDLER="${APN_AUTOCONFIG_MODEM_ATDIAL_HANDLER:-/lib/netifd/proto/apn_atdial.sh}"
+NETIFD_RESTART_WAIT_SECONDS="${APN_AUTOCONFIG_MODEM_NETIFD_RESTART_WAIT:-20}"
 
 AT_PORT_LOCK_ROOT="${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-/var/lock/apn-autoconfig-at-port}"
 AT_TIMEOUT_SECONDS="5"
@@ -1219,6 +1228,58 @@ at_read_identity() {
 	return 0
 }
 
+# ---- netifd protocol registration ----
+#
+# netifd reads /lib/netifd/proto/*.sh only when it starts, while it spawns a
+# handler from disk for every setup and teardown. So an installed protocol is on
+# disk and unknown to netifd until the network is restarted, and a section using
+# it is inert — but a handler *update* needs nothing, because the next bring-up
+# runs the new file. Only registration and the option schema wait.
+
+netifd_proto_available() {
+	[ -r "$ATDIAL_HANDLER" ]
+}
+
+netifd_proto_registered() {
+	command_exists "$UBUS" || return 1
+	registered_file="$TMP_BASE.protohandlers"
+	run_bounded_to_file 5 "$registered_file" "$UBUS" call network get_proto_handlers || {
+		rm -f "$registered_file" 2>/dev/null || :
+		return 1
+	}
+	registered_status=1
+	grep -q "\"$1\"" "$registered_file" 2>/dev/null && registered_status=0
+	rm -f "$registered_file" 2>/dev/null || :
+	return "$registered_status"
+}
+
+# True when a protocol this package would provision onto is installed but not
+# yet known to netifd. Reported by provision-plan so a frontend can say that the
+# network is about to be restarted before it happens rather than after.
+netifd_restart_required() {
+	netifd_proto_available || return 1
+	netifd_proto_registered "$ATDIAL_PROTO" && return 1
+	return 0
+}
+
+# Performed only from provisioning, and only as a step of its own before the
+# section transaction is armed — never from a package script. A restart takes
+# every interface down for a moment, which is acceptable when someone is
+# configuring this modem and waiting for it, and is not acceptable when it
+# arrives with an unrelated package update on a router nobody is sitting at.
+netifd_register_proto() {
+	command_exists "$NETWORK_INIT" || [ -x "$NETWORK_INIT" ] || return 1
+	log notice "restarting the network so netifd registers $ATDIAL_PROTO; interfaces will drop briefly"
+	"$NETWORK_INIT" restart >/dev/null 2>&1 || return 1
+	register_waited=0
+	while [ "$register_waited" -lt "$NETIFD_RESTART_WAIT_SECONDS" ]; do
+		netifd_proto_registered "$ATDIAL_PROTO" && return 0
+		"$SLEEP" 1
+		register_waited=$((register_waited + 1))
+	done
+	return 1
+}
+
 quirk_value() {
 	# Capabilities that are not portable across modems, keyed by what the modem
 	# reports about itself. An absent entry is "not tested here", never
@@ -1902,6 +1963,15 @@ provision_protocol_for_record() {
 	case "$provision_observed_protocol" in
 		qmi) printf '%s\n' qmi; return 0 ;;
 		mbim) printf '%s\n' mbim; return 0 ;;
+		# A modem that answers only AT has no control channel for any of the
+		# above. It becomes provisionable exactly when the optional protocol
+		# package is installed; whether netifd has registered it yet is a
+		# separate question, answered by netifd_restart_required.
+		at)
+			netifd_proto_available || return 1
+			printf '%s\n' "$ATDIAL_PROTO"
+			return 0
+		;;
 	esac
 	return 1
 }
@@ -1912,6 +1982,12 @@ provision_device_for_record() {
 		# Both native protocols dial through their own control device; only the
 		# ModemManager section is bound by physical path.
 		qmi|mbim) printf '%s\n' "$2" ;;
+		# The AT-dial protocol has no control device to bind to at all — that is
+		# the whole reason it exists — so it is bound by physical path and by
+		# stable identity, and resolves its own tty and network device. It wants
+		# the USB bus label (2-1.3), not the full sysfs path a ModemManager
+		# section carries, because that is how /sys/bus/usb/devices is indexed.
+		"$ATDIAL_PROTO") printf '%s\n' "${3##*/}" ;;
 		*) return 1 ;;
 	esac
 }
@@ -2076,6 +2152,15 @@ provision_cmd() {
 	prov_device="$PROVISION_DEVICE"
 	case "$prov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
 
+	# Registration, before anything is created. netifd only learns a protocol
+	# when it starts, so a section written now would be inert and the rollback
+	# would have to unwind it. Doing the restart here keeps it outside the
+	# window rollback is responsible for, and failing here creates nothing.
+	if [ "$prov_protocol" = "$ATDIAL_PROTO" ] && netifd_restart_required; then
+		netifd_register_proto || \
+			die_code 3 "netifd did not register $ATDIAL_PROTO after a network restart; not creating a section that cannot work"
+	fi
+
 	prov_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
 	prov_operation="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
 
@@ -2106,7 +2191,24 @@ provision_cmd() {
 	# cannot dial a vendor default before reconciliation chooses a profile.
 	uci set "network.${prov_section}=interface" || die "cannot create section $prov_section"
 	uci set "network.${prov_section}.proto=${prov_protocol}" || die "cannot set proto"
-	uci set "network.${prov_section}.device=${prov_device}" || die "cannot set device"
+	if [ "$prov_protocol" = "$ATDIAL_PROTO" ]; then
+		# No control device exists to name. The binding is the physical path
+		# plus the stable identity, and the handler re-resolves the path from
+		# the identity if the modem is moved to another socket.
+		uci set "network.${prov_section}.usbpath=${prov_device}" || die "cannot set usbpath"
+		uci set "network.${prov_section}.modem_id=${prov_modem}" || die "cannot set modem_id"
+		# The device uid ModemManager matches an inhibition against, recorded
+		# now so the holder can be started while the modem is *absent*. That is
+		# not an optimisation: an inhibition registered before the ports appear
+		# is what stops ModemManager claiming the modem at the next hotplug,
+		# and waiting until the device is back means racing it every time.
+		prov_mm_uid="$(field "$PROVISION_RECORD" 3)"
+		[ -z "$prov_mm_uid" ] || \
+			uci set "network.${prov_section}.apn_autoconfig_mm_uid=${prov_mm_uid}" || \
+			die "cannot record the ModemManager device uid"
+	else
+		uci set "network.${prov_section}.device=${prov_device}" || die "cannot set device"
+	fi
 	uci set "network.${prov_section}.disabled=1" || die "cannot stage the section as disabled"
 	uci set "network.${prov_section}.auto=0" || die "cannot stage the section without autostart"
 	# Losing the default route to a modem the administrator has not chosen as
@@ -2128,6 +2230,12 @@ provision_cmd() {
 	# auto=0 still keeps netifd from starting it on any unrelated reload.
 	uci delete "network.${prov_section}.disabled" || die "cannot enable the staging section"
 	uci commit network || die "cannot commit the enabled staging section"
+
+	# Take the modem away from ModemManager before the engine dials it. The
+	# holder is started from configuration, so a reload is the whole action —
+	# and it happens before reconciliation, because an AT-dialed modem cannot
+	# be reached at all while ModemManager owns its ports.
+	[ "$prov_protocol" = "$ATDIAL_PROTO" ] && reload_inhibitors
 
 	# The APN engine owns matching, profile application, connectivity
 	# verification and profile rollback. It borrows this operation's lock
@@ -2337,6 +2445,20 @@ connection_cmd() {
 	printf '}\n'
 }
 
+# Asks procd to re-derive the supervised inhibitions from configuration. procd
+# diffs the instances the init script declares, so one reload both starts a
+# newly provisioned modem's holder and stops one whose section has gone.
+#
+# Never fatal. Failing to reconcile a holder does not invalidate a provisioning
+# that has already succeeded, and ModemManager reclaiming a modem is a visible,
+# recoverable state rather than a corrupt one.
+reload_inhibitors() {
+	[ -x "$SERVICE_INIT" ] || return 0
+	"$SERVICE_INIT" reload >/dev/null 2>&1 || \
+		log warning "could not reconcile ModemManager inhibitions; check ${SERVICE_INIT##*/}"
+	return 0
+}
+
 deprovision_cmd() {
 	deprov_modem="$REQUESTED_MODEM"
 	[ -n "$deprov_modem" ] || die_code 2 "deprovision requires --modem"
@@ -2361,6 +2483,9 @@ deprovision_cmd() {
 	uci delete "network.${deprov_section}" || die "cannot remove section $deprov_section"
 	uci commit network || die "cannot commit removal of $deprov_section"
 	rm -f "$(provisioning_baseline_file "$deprov_modem")"
+	# The section was the record that justified holding an inhibition, so
+	# removing it releases the modem back to ModemManager.
+	reload_inhibitors
 
 	# The APN engine keeps its own per-target baseline and active state. Ask it
 	# to forget this now-deleted section rather than reaching into its files:
@@ -2386,6 +2511,30 @@ deprovision_cmd() {
 	printf '}\n'
 }
 
+# Every modem this package has provisioned onto the AT-dial protocol, as
+# "<device uid><TAB><modem_id>". The init script turns each line into one
+# supervised inhibition.
+#
+# The list comes from UCI rather than from runtime state, so it survives a
+# reboot and needs no scan: the section is the durable record of the decision,
+# and /var/run is not.
+inhibit_targets_cmd() {
+	for inhibit_section in $(network_section_names); do
+		inhibit_owner="$(uci -q get "network.${inhibit_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+		[ "$inhibit_owner" = "$PROVISION_OWNER" ] || continue
+		inhibit_proto="$(uci -q get "network.${inhibit_section}.proto" 2>/dev/null || :)"
+		[ "$inhibit_proto" = "$ATDIAL_PROTO" ] || continue
+		inhibit_uid="$(uci -q get "network.${inhibit_section}.apn_autoconfig_mm_uid" 2>/dev/null || :)"
+		inhibit_modem="$(uci -q get "network.${inhibit_section}.apn_autoconfig_modem_id" 2>/dev/null || :)"
+		case "$inhibit_uid" in
+			/*) : ;;
+			*) continue ;;
+		esac
+		safe_single_line "$inhibit_uid" || continue
+		printf '%s\t%s\n' "$inhibit_uid" "$inhibit_modem"
+	done
+}
+
 provision_plan_cmd() {
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "provision-plan requires --modem"
 	plan_status=0
@@ -2407,6 +2556,8 @@ provision_plan_cmd() {
 	json_key_string existing_section "$PROVISION_EXISTING"; printf ','
 	json_key_string protocol "$PROVISION_PROTOCOL"; printf ','
 	json_key_string device "$PROVISION_DEVICE"; printf ','
+	printf '"netifd_restart_required":%s,' \
+		"$([ "$PROVISION_PROTOCOL" = "$ATDIAL_PROTO" ] && netifd_restart_required && printf true || printf false)"
 	printf '"can_control_bearer":%s,' "$([ "$connection_status" -eq 0 ] && printf true || printf false)"
 	json_key_string connection_section "$CONNECTION_SECTION"; printf ','
 	printf '"connection_owned":%s' "$([ "$CONNECTION_OWNED" = 1 ] && printf true || printf false)"
@@ -2957,6 +3108,8 @@ Commands:
                     correlated ports by role. Refused under ModemManager
   at-identity       Read SIM and registration identity for --modem over AT and
                     print the v1 identity contract. Read-only
+  inhibit-targets   List the ModemManager inhibitions this package owns, as
+                    <device-uid><TAB><modem_id>. Read-only
   rescan            Synchronous full read-only rescan (updates first/last seen)
   rescan-async      Debounced rescan entry point for hotplug handlers
 EOF
@@ -3012,6 +3165,7 @@ main() {
 		at-port) at_port_cmd ;;
 		at-identity) at_identity_cmd ;;
 		provision-plan) provision_plan_cmd ;;
+		inhibit-targets) inhibit_targets_cmd ;;
 		provision) provision_cmd ;;
 		deprovision) deprovision_cmd ;;
 		connect|disconnect|reconnect) connection_cmd "$COMMAND_NAME" ;;

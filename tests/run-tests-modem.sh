@@ -273,6 +273,17 @@ cat >"$MOCKBIN/ubus" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
 call)
+	if [ "${2:-}" = network ] && [ "${3:-}" = get_proto_handlers ]; then
+		# Which protocols netifd currently knows. Installed-but-unregistered is
+		# the state a fresh package install leaves behind, so it is the default.
+		printf '{"qmi":{},"mbim":{},"modemmanager":{}'
+		# Registration lives in a file, not an environment variable, because the
+		# restart that creates it happens in a different process.
+		[ "$(cat "$TEST_ATDIAL_REGISTERED_FILE" 2>/dev/null || printf 0)" = 1 ] && \
+			printf ',"apn_atdial":{}'
+		printf '}\n'
+		exit 0
+	fi
 	section="${2#network.interface.}"
 	if [ "$section" = "${TEST_IFACE_UP:-}" ]; then
 		printf '{"up":true,"l3_device":"wwan0"}\n'
@@ -453,6 +464,22 @@ case "$behaviour" in
 esac
 EOF
 
+cat >"$MOCKBIN/network-init" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >>"$TEST_NETWORK_INIT_LOG"
+# A restart is what makes netifd read the handler, so the mock models exactly
+# that: registration only becomes true once someone restarts the network.
+[ "$1" = restart ] && [ "${TEST_ATDIAL_REGISTER_ON_RESTART:-1}" = 1 ] && \
+	printf '%s\n' 1 >"$TEST_ATDIAL_REGISTERED_FILE"
+exit 0
+EOF
+
+cat >"$MOCKBIN/service-init" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >>"$TEST_SERVICE_INIT_LOG"
+exit 0
+EOF
+
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_SYSFS="$TESTROOT/sys"
@@ -461,6 +488,17 @@ export TEST_MODEM_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-modem"
 export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
 export TEST_AT_PORT_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-at-port"
+export TEST_NETWORK_INIT_LOG="$STATE/network-init-log"
+export TEST_SERVICE_INIT_LOG="$STATE/service-init-log"
+export TEST_ATDIAL_REGISTERED_FILE="$STATE/atdial-registered"
+export TEST_ATDIAL_HANDLER="$STATE/apn_atdial.sh"
+: >"$TEST_NETWORK_INIT_LOG"
+: >"$TEST_SERVICE_INIT_LOG"
+export APN_AUTOCONFIG_MODEM_UBUS="$MOCKBIN/ubus"
+export APN_AUTOCONFIG_MODEM_NETWORK_INIT="$MOCKBIN/network-init"
+export APN_AUTOCONFIG_MODEM_SERVICE_INIT="$MOCKBIN/service-init"
+export APN_AUTOCONFIG_MODEM_ATDIAL_HANDLER="$TEST_ATDIAL_HANDLER"
+export APN_AUTOCONFIG_MODEM_NETIFD_RESTART_WAIT=3
 export TEST_AT_PORTS="$STATE/at-ports"
 export TEST_MM_RESETS="$STATE/mm-resets"
 : >"$STATE/mm-resets"
@@ -3193,5 +3231,106 @@ assert not missing, 'scratch suffixes the exit trap and sweep never see: %s' % m
 stale = sorted(listed - derived)
 assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
 PYEOF
+
+printf '%s\n' 'TEST an AT-only modem is unprovisionable until the protocol package is installed'
+reset_sysfs
+reset_at_ports
+rm -f "$TEST_ATDIAL_HANDLER" "$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+: >"$TEST_SERVICE_INIT_LOG"
+add_at_modem 12-1.1 0e8d 7127 '' 90
+printf '/dev/ttyUSB90\tcontrol\n' >>"$TEST_AT_PORTS"
+atdial_modem="weak-vidpid:12-1.1:0e8d:7127"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem" 2>/dev/null)" || :
+case "$plan_out" in
+	*'"reason":"unsupported_protocol"'*) : ;;
+	*) fail "an AT modem was provisionable with no protocol handler installed: $plan_out" ;;
+esac
+
+printf '%s\n' 'TEST installing the handler makes it provisionable and announces the network restart'
+# netifd reads protocol handlers only when it starts, so a section written
+# before that restart would be inert. The frontend is told beforehand, because
+# a network restart is a thing a user is entitled to know about in advance.
+: >"$TEST_ATDIAL_HANDLER"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$atdial_modem")" || \
+	fail 'an AT modem with the handler installed was not provisionable'
+case "$plan_out" in
+	*'"protocol":"apn_atdial"'*) : ;;
+	*) fail "provision-plan chose the wrong protocol: $plan_out" ;;
+esac
+case "$plan_out" in
+	*'"netifd_restart_required":true'*) : ;;
+	*) fail "an unregistered protocol did not announce the restart: $plan_out" ;;
+esac
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || fail 'provision-plan restarted the network; it is read-only'
+
+printf '%s\n' 'TEST provisioning registers the protocol first, then binds by path and identity'
+: >"$TEST_NETWORK_INIT_LOG"
+sh "$SCRIPT" provision --modem "$atdial_modem" >"$STATE/atdial-provision" 2>&1 || \
+	fail "provisioning an AT modem failed: $(cat "$STATE/atdial-provision")"
+grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the network was never restarted to register the protocol'
+atdial_section="$(awk -F'\t' '$2 == "proto" && $3 == "apn_atdial" { print $1; exit }' "$TEST_NETWORK_OPTIONS")"
+[ -n "$atdial_section" ] || fail 'no section was created on the AT-dial protocol'
+section_option() {
+	awk -F'\t' -v s="$atdial_section" -v o="$1" '$1 == s && $2 == o { print $3; exit }' "$TEST_NETWORK_OPTIONS"
+}
+[ "$(section_option usbpath)" = 12-1.1 ] || fail "the section was bound to usbpath '$(section_option usbpath)'"
+[ "$(section_option modem_id)" = "$atdial_modem" ] || fail 'the section did not record the modem identity'
+[ -z "$(section_option device)" ] || fail 'an AT-dial section was given a control device it does not have'
+case "$(section_option apn_autoconfig_mm_uid)" in
+	/*) : ;;
+	*) fail 'the ModemManager device uid was not recorded for the inhibition' ;;
+esac
+grep -qx reload "$TEST_SERVICE_INIT_LOG" || fail 'the inhibition was never reconciled after provisioning'
+
+printf '%s\n' 'TEST the inhibition list is derived from configuration, not from runtime state'
+targets="$(sh "$SCRIPT" inhibit-targets)"
+[ -n "$targets" ] || fail 'a provisioned AT modem produced no inhibition target'
+printf '%s\n' "$targets" | grep -q "	$atdial_modem\$" || \
+	fail "inhibit-targets did not name the modem: $targets"
+printf '%s\n' "$targets" | cut -f1 | grep -q '^/' || \
+	fail "inhibit-targets produced an implausible device uid: $targets"
+
+printf '%s\n' 'TEST deprovisioning releases the modem back to ModemManager'
+: >"$TEST_SERVICE_INIT_LOG"
+sh "$SCRIPT" deprovision --modem "$atdial_modem" >/dev/null 2>&1 || fail 'deprovisioning the AT modem failed'
+[ -z "$(sh "$SCRIPT" inhibit-targets)" ] || \
+	fail 'an inhibition survived the section that justified it'
+grep -qx reload "$TEST_SERVICE_INIT_LOG" || fail 'the inhibition was never released after deprovisioning'
+
+printf '%s\n' 'TEST a protocol that stays unregistered creates no section at all'
+# Failing here must leave nothing behind: the restart happens before the
+# transaction is armed precisely so a rollback never has to unwind one.
+reset_sysfs
+reset_at_ports
+rm -f "$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+add_at_modem 12-1.2 0e8d 7127 '' 91
+printf '/dev/ttyUSB91\tcontrol\n' >>"$TEST_AT_PORTS"
+stubborn_modem="weak-vidpid:12-1.2:0e8d:7127"
+TEST_ATDIAL_REGISTER_ON_RESTART=0 sh "$SCRIPT" provision --modem "$stubborn_modem" >/dev/null 2>&1 && \
+	fail 'provisioning succeeded onto a protocol netifd never registered'
+grep -qx restart "$TEST_NETWORK_INIT_LOG" || fail 'the registration restart was never attempted'
+[ -z "$(awk -F'\t' -v m="$stubborn_modem" '$2 == "apn_autoconfig_modem_id" && $3 == m { print $1; exit }' "$TEST_NETWORK_OPTIONS")" ] || \
+	fail 'a section was created for a protocol that cannot work'
+
+printf '%s\n' 'TEST an already-registered protocol provisions without touching the network'
+reset_sysfs
+reset_at_ports
+printf '%s\n' 1 >"$TEST_ATDIAL_REGISTERED_FILE"
+: >"$TEST_NETWORK_INIT_LOG"
+add_at_modem 12-1.3 0e8d 7127 '' 92
+printf '/dev/ttyUSB92\tcontrol\n' >>"$TEST_AT_PORTS"
+quiet_modem="weak-vidpid:12-1.3:0e8d:7127"
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$quiet_modem")" || fail 'a registered protocol was not provisionable'
+case "$plan_out" in
+	*'"netifd_restart_required":false'*) : ;;
+	*) fail "a registered protocol still announced a restart: $plan_out" ;;
+esac
+sh "$SCRIPT" provision --modem "$quiet_modem" >/dev/null 2>&1 || fail 'provisioning onto a registered protocol failed'
+[ ! -s "$TEST_NETWORK_INIT_LOG" ] || \
+	fail 'the network was restarted even though the protocol was already registered'
+sh "$SCRIPT" deprovision --modem "$quiet_modem" >/dev/null 2>&1 || :
+rm -f "$TEST_ATDIAL_HANDLER" "$TEST_ATDIAL_REGISTERED_FILE"
 
 printf 'All modem-control tests passed.\n'

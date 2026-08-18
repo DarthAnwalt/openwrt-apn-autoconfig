@@ -586,6 +586,27 @@ reset_sysfs
 # passes against the exact code it exists to reject, which is worse than not
 # having it. So the interpreter is chosen by probing for the behavior instead of
 # by trusting a name, and a host with no such shell is told, not quietly passed.
+# A parent that ignores SIGPIPE hands the disposition to every descendant, and
+# POSIX forbids a shell from un-ignoring a signal that was already ignored when
+# it started: `trap - PIPE` cannot undo it from the inside. GitHub Actions runs
+# steps from exactly such a parent, so without this every candidate below looks
+# "not fatal" for a reason that has nothing to do with the shell, and the guard
+# turns an environment property into a release-blocking failure. Reset the
+# disposition in a helper that execs the shell, using the python3 these suites
+# already require for their structural assertions.
+cat >"$TESTROOT/sigdfl.py" <<'SIGDFLEOF'
+import os, signal, sys
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+os.execvp(sys.argv[1], sys.argv[1:])
+SIGDFLEOF
+# Bare candidates if python3 is somehow absent: the structural assertions below
+# need it too, so this only changes which message the run fails with.
+if command -v python3 >/dev/null 2>&1; then
+	SIGDFL="python3 $TESTROOT/sigdfl.py"
+else
+	SIGDFL=""
+fi
+
 cat >"$TESTROOT/pipe-probe.sh" <<'EOF'
 trap 'printf %s reached-exit-trap >&2' 0
 kill -PIPE $$
@@ -594,9 +615,9 @@ EOF
 PIPE_SHELL=""
 for candidate_shell in sh dash 'busybox sh' ash; do
 	command -v "${candidate_shell%% *}" >/dev/null 2>&1 || continue
-	probe_output="$($candidate_shell "$TESTROOT/pipe-probe.sh" 2>&1 >/dev/null || :)"
+	probe_output="$($SIGDFL $candidate_shell "$TESTROOT/pipe-probe.sh" 2>&1 >/dev/null || :)"
 	[ -z "$probe_output" ] || continue
-	PIPE_SHELL="$candidate_shell"
+	PIPE_SHELL="$SIGDFL $candidate_shell"
 	break
 done
 if [ -z "$PIPE_SHELL" ]; then

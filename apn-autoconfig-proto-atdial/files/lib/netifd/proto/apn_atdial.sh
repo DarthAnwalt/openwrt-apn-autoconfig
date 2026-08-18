@@ -145,9 +145,38 @@ atdial_set_auth() {
 	case "$mode" in
 		pap)  atdial_at "$port" "AT+CGAUTH=1,1,\"$user\",\"$secret\"" >/dev/null 2>&1 ;;
 		chap) atdial_at "$port" "AT+CGAUTH=1,2,\"$user\",\"$secret\"" >/dev/null 2>&1 ;;
-		*)    atdial_at "$port" 'AT+CGAUTH=1,0' >/dev/null 2>&1 ;;
+		none|'') atdial_at "$port" 'AT+CGAUTH=1,0' >/dev/null 2>&1 ;;
+		# Never silently. AT+CGAUTH takes one protocol, so `pap-or-chap` has to
+		# be expanded into attempts by the caller — and falling through to
+		# "no authentication" here would hand the network a profile that has
+		# credentials without using them: an address is assigned and no traffic
+		# passes, which looks like a working connection from every angle except
+		# the only one that matters.
+		*) return 1 ;;
 	esac
 	return 0
+}
+
+# The authentication protocols to try, in order.
+#
+# AT+CGAUTH accepts one protocol per context, so a normalized `pap-or-chap`
+# profile becomes bounded attempts — CHAP first, as the MBIM backend already
+# does for the same reason. The protocol that worked is remembered, so the next
+# bring-up starts with it instead of rediscovering it every time.
+atdial_auth_attempts() {
+	local mode="$1" interface="$2" remembered=""
+	case "$mode" in
+		pap-or-chap)
+			remembered="$(cat "$ATDIAL_SCRATCH_DIR/apn-atdial-authmode.$interface" 2>/dev/null || :)"
+			case "$remembered" in
+				pap) printf 'pap\nchap\n' ;;
+				chap) printf 'chap\npap\n' ;;
+				*) printf 'chap\npap\n' ;;
+			esac
+		;;
+		''|none) printf 'none\n' ;;
+		*) printf '%s\n' "$mode" ;;
+	esac
 }
 
 # Define the context, authenticate it, activate it and return the address.
@@ -429,15 +458,28 @@ proto_apn_atdial_setup() {
 	fi
 
 	if [ -z "$address" ]; then
-		address="$(atdial_activate "$dial" "$pdptype" "$apn" "$auth" "$username" "$password" || :)"
-		# Some SIMs bring up the default bearer only under one PDP type. This
-		# fires only after a failure, so the ordinary case pays nothing for it.
-		if [ -z "$address" ]; then
-			local alternate=IPV4V6
-			[ "$pdptype" = IPV4V6 ] && alternate=IP
-			atdial_log "no address with $pdptype, retrying with $alternate"
-			address="$(atdial_activate "$dial" "$alternate" "$apn" "$auth" "$username" "$password" || :)"
-		fi
+		local alternate=IPV4V6 try_pdp try_auth effective_auth=""
+		[ "$pdptype" = IPV4V6 ] && alternate=IP
+		# Some SIMs bring up the default bearer only under one PDP type, and a
+		# `pap-or-chap` profile has to be resolved to one protocol. Both are
+		# failure paths only: a profile that works on the first attempt issues
+		# exactly the commands it always did.
+		for try_pdp in "$pdptype" "$alternate"; do
+			[ "$try_pdp" = "$alternate" ] && [ -z "$address" ] && \
+				atdial_log "no address with $pdptype, retrying with $alternate"
+			for try_auth in $(atdial_auth_attempts "$auth" "$interface"); do
+				address="$(atdial_activate "$dial" "$try_pdp" "$apn" "$try_auth" "$username" "$password" || :)"
+				[ -n "$address" ] && { effective_auth="$try_auth"; break; }
+			done
+			[ -n "$address" ] && break
+		done
+		# Remember which protocol the network accepted, not which was requested.
+		case "$auth" in
+			pap-or-chap)
+				[ -z "$effective_auth" ] || printf '%s' "$effective_auth" \
+					>"$ATDIAL_SCRATCH_DIR/apn-atdial-authmode.$interface" 2>/dev/null || :
+			;;
+		esac
 	fi
 	if [ -z "$address" ]; then
 		atdial_fail "$interface" NO_IP_ADDRESS 1 'the context did not activate under either PDP type'

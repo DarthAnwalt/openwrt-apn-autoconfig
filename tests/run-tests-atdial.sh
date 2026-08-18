@@ -665,4 +665,124 @@ proto_apn_atdial_setup wwan_at || fail "setup failed: ${PROTO_ERROR:-none}"
 grep -qF 'AT+XDATACHANNEL' "$TEST_AT_LOG" && \
 	fail 'an unlisted Intel product was given the XMM data channel'
 
+printf '%s\n' 'TEST pap-or-chap becomes bounded attempts, and the protocol that worked is remembered'
+# AT+CGAUTH takes one protocol per context. Falling through to "no
+# authentication" would hand the network a profile that has credentials without
+# using them — an address is assigned and no traffic passes, which looks like a
+# working connection from every angle except the only one that matters.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+TEST_OPT_auth=pap-or-chap
+TEST_OPT_username=user
+TEST_OPT_password=secret
+proto_apn_atdial_setup wwan_at || fail "setup failed: ${PROTO_ERROR:-none}"
+at_sent 'AT+CGAUTH=1,2,"user","secret"' || fail 'CHAP was not attempted first for pap-or-chap'
+grep -qF 'AT+CGAUTH=1,0' "$TEST_AT_LOG" && \
+	fail 'a profile with credentials had its authentication cleared'
+[ "$(cat "$APN_ATDIAL_SCRATCH_DIR/apn-atdial-authmode.wwan_at" 2>/dev/null || :)" = chap ] || \
+	fail 'the protocol that worked was not remembered'
+
+printf '%s\n' 'TEST a remembered protocol is tried first on the next bring-up'
+: >"$TEST_AT_LOG"
+printf '%s' pap >"$APN_ATDIAL_SCRATCH_DIR/apn-atdial-authmode.wwan_at"
+proto_apn_atdial_setup wwan_at || fail "setup failed: ${PROTO_ERROR:-none}"
+first_auth="$(grep -o 'AT+CGAUTH=1,[12]' "$TEST_AT_LOG" | head -1)"
+[ "$first_auth" = 'AT+CGAUTH=1,1' ] || \
+	fail "the remembered protocol was not tried first (got ${first_auth:-none})"
+
+printf '%s\n' 'TEST no credential and no SIM identifier is ever written to the log'
+# Asserted by scanning what the handler actually printed, not by reading the
+# source: a log line added later would slip past a source review.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+at_reply 'AT+CGDCONT?' '+CGDCONT: 1,"IPV4V6","old.operator","",0,0'
+at_reply 'AT+CGACT?' '+CGACT: 1,1'
+TEST_OPT_auth=chap
+TEST_OPT_username=subscriber
+TEST_OPT_password=hunter2
+TEST_OPT_apn=secret.apn
+proto_apn_atdial_setup wwan_at >"$STATE/handler-output" 2>&1 || \
+	fail "setup failed: ${PROTO_ERROR:-none}"
+for leak in hunter2 subscriber; do
+	grep -qF "$leak" "$STATE/handler-output" && \
+		fail "the handler logged a credential ($leak)"
+done
+# The AT log is the wire, not a log file: credentials belong there and nowhere
+# else. This asserts the distinction rather than assuming it.
+grep -qF 'hunter2' "$TEST_AT_LOG" || fail 'the credential never reached the modem at all'
+
+printf '%s\n' 'TEST the AT port lock is released before addresses are published, not after'
+# Identity and status readers contend for the same tty. Holding it through
+# publication would keep them waiting for work that no longer needs the port.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+lock_at_publish=held
+proto_init_update() {
+	PROTO_UPDATED="$1"
+	[ "$ATDIAL_LOCK_HELD" -eq 0 ] && lock_at_publish=released
+}
+proto_apn_atdial_setup wwan_at || fail "setup failed: ${PROTO_ERROR:-none}"
+proto_init_update() { PROTO_UPDATED="$1"; }
+[ "$lock_at_publish" = released ] || \
+	fail 'the AT port lock was still held while addresses were being published'
+
+printf '%s\n' 'TEST a TERM during the destructive window releases the context and the lock'
+# The one case fixtures can reach that hardware cannot be asked to reproduce on
+# demand. netifd can stop a handler at any moment, and an interrupted bring-up
+# must not leave a child on the serial port or the shared lock held by a process
+# that is gone — the next attempt would then wait on a dead owner, and so would
+# every other component of the suite.
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+interrupt_lock="$APN_ATDIAL_AT_PORT_LOCK_ROOT.ttyUSB5"
+# The handler, not just the library: the interruption handling under test is
+# defined there, and sourcing only the library left the trap pointing at a
+# command that does not exist — which fails as a hang rather than as an error.
+cat >"$TESTROOT/interrupted-dial.sh" <<INNER
+INCLUDE_ONLY=1
+. "$HANDLER"
+atdial_scratch_init
+atdial_lock_acquire /dev/ttyUSB5 || exit 9
+ATDIAL_ACTIVATED=1
+ATDIAL_DIAL_PORT=/dev/ttyUSB5
+trap 'atdial_interrupted' HUP INT TERM
+printf 'armed\n' >"$STATE/interrupt-armed"
+# Stand in the destructive window and wait to be killed there. Bounded, so a
+# trap that stops working fails this test instead of hanging the suite.
+_spin=0
+while [ "\$_spin" -lt 2000 ]; do
+	/bin/sleep 0.05
+	_spin=\$((_spin + 1))
+done
+exit 7
+INNER
+rm -f "$STATE/interrupt-armed"
+sh "$TESTROOT/interrupted-dial.sh" &
+interrupt_pid=$!
+interrupt_waited=0
+while [ ! -s "$STATE/interrupt-armed" ] && [ "$interrupt_waited" -lt 50 ]; do
+	/bin/sleep 0.1
+	interrupt_waited=$((interrupt_waited + 1))
+done
+[ -s "$STATE/interrupt-armed" ] || fail 'the interrupted dial never reached the destructive window'
+[ -f "$interrupt_lock" ] || fail 'the interrupted dial never took the AT port lock'
+kill -TERM "$interrupt_pid" 2>/dev/null || :
+interrupt_status=0
+wait "$interrupt_pid" 2>/dev/null || interrupt_status=$?
+[ "$interrupt_status" -ne 7 ] || fail 'the TERM never reached the interrupted dial'
+
+[ ! -f "$interrupt_lock" ] || fail 'a TERM in the destructive window left the AT port lock behind'
+at_sent 'AT+CGACT=0,1' || fail 'a TERM in the destructive window left the PDP context active'
+for leftover in "$APN_ATDIAL_SCRATCH_DIR"/apn-atdial.*.reply "$APN_ATDIAL_SCRATCH_DIR"/apn-atdial.*.timeout; do
+	[ -e "$leftover" ] && fail 'a TERM in the destructive window left a scratch file behind'
+done
+
 printf '%s\n' 'All AT-dial protocol tests passed.'

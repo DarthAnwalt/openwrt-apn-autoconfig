@@ -62,7 +62,9 @@ for package_hook in \
 	"$BASE/apn-autoconfig-modem/Makefile:Package/apn-autoconfig-modem/prerm" \
 	"$BASE/apn-autoconfig-modem/Makefile:Package/apn-autoconfig-modem/postrm" \
 	"$BASE/Makefile:Package/apn-autoconfig/prerm" \
-	"$BASE/Makefile:Package/apn-autoconfig/postrm"
+	"$BASE/Makefile:Package/apn-autoconfig/postrm" \
+	"$BASE/apn-autoconfig-proto-atdial/Makefile:Package/apn-autoconfig-proto-atdial/postinst" \
+	"$BASE/apn-autoconfig-proto-atdial/Makefile:Package/apn-autoconfig-proto-atdial/postrm"
 do
 	makefile="${package_hook%%:*}"
 	hook="${package_hook#*:}"
@@ -164,5 +166,49 @@ reset_sandbox
 live_postrm
 [ ! -e "$SANDBOX/etc/config/apn-autoconfig-modem" ] || \
 	fail 'removal left its own configuration behind'
+
+printf '%s\n' 'TEST the AT-dial package never touches the network from a package script'
+# netifd registers a protocol handler only when it starts, so it is tempting to
+# restart the network on install. That reaches administrators who are not
+# present and may be reachable only through the interfaces it takes down — the
+# project this release studied took a remote router off the network twice doing
+# exactly that, once during an update that had nothing to do with modems.
+# Registration belongs to provisioning, where someone is waiting for it.
+for atdial_hook in postinst postrm; do
+	script="$TESTROOT/atdial-$atdial_hook.sh"
+	extract_hook "$BASE/apn-autoconfig-proto-atdial/Makefile" \
+		"Package/apn-autoconfig-proto-atdial/$atdial_hook" >"$script"
+	if grep -nE '(init\.d/network|network (restart|reload)|ubus call network)' "$script"; then
+		fail "the AT-dial $atdial_hook touches the network"
+	fi
+	reset_sandbox
+	: >"$RECORD"
+	RECORD_FILE="$RECORD" IPKG_INSTROOT="$SANDBOX" PATH="$MOCKBIN:$PATH" \
+		sh "$script" >/dev/null 2>&1 || \
+		fail "the AT-dial $atdial_hook failed during an offline install"
+	[ ! -s "$RECORD" ] || \
+		fail "the AT-dial $atdial_hook acted during an offline install: $(cat "$RECORD")"
+done
+
+printf '%s\n' 'TEST removing the AT-dial package leaves the shared AT port locks alone'
+# That namespace is shared with apn-autoconfig-modem and apn-autoconfig-qmi, and
+# a lock in it may belong to a live operation in either. A stale one is already
+# reclaimed by the live-owner check at the next attempt.
+script="$TESTROOT/atdial-postrm.sh"
+extract_hook "$BASE/apn-autoconfig-proto-atdial/Makefile" \
+	'Package/apn-autoconfig-proto-atdial/postrm' >"$script"
+reset_sandbox
+: >"$RECORD"
+RECORD_FILE="$RECORD" PATH="$MOCKBIN:$PATH" sh "$script" >/dev/null 2>&1 || \
+	fail 'the AT-dial postrm failed on a live removal'
+if grep -q 'apn-autoconfig-at-port' "$RECORD"; then
+	fail 'removing the AT-dial package touched the shared AT port lock namespace'
+fi
+# Sections on this protocol are the administrator's configuration, and netifd
+# owns the bearer either way; removing a package is not a statement about which
+# modem they want.
+if grep -qE 'uci .*(delete|commit) network' "$RECORD"; then
+	fail 'removing the AT-dial package deleted network configuration'
+fi
 
 printf '%s\n' 'All package lifecycle tests passed.'

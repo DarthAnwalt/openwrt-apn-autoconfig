@@ -336,11 +336,17 @@ do this on their own: a network restart that arrives with an unrelated package
 update, on a router reachable only through the interfaces it takes down, is not
 a thing a package should decide for you.
 
-**A provisioned interface is not placed in a firewall zone.** Provisioning never
-touches firewall configuration, so after setting up a modem you must add its
-interface to your `wan` zone yourself. Until you do, the router itself reaches
-the Internet over the modem but your LAN clients do not, and an IPv6 prefix from
-the operator will not arrive.
+Setting up a modem places its interface in the firewall zone your working uplink
+already uses, so the router's **clients** reach the Internet over it, not just
+the router. The zone is resolved and appended to, never created: no zone,
+policy, rule or masquerading flag is changed, and removing the modem takes out
+exactly the entry that was added. If no single zone can be resolved — an unusual
+firewall with no clear uplink zone — setup stops and says so rather than leaving
+you with a modem only the router can use.
+
+Multi-WAN preference between uplinks stays yours: a provisioned modem is the
+least preferred route by default, so it takes over only when nothing better is
+available, and `mwan3` policy is never touched.
 
 Support for Intel XMM devices (Fibocom L850, L860) is implemented in the same
 protocol but **has not been validated on hardware** — no such device has been

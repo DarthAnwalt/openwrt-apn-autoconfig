@@ -106,6 +106,7 @@ RESET_INTERFACE=""
 RESET_INTERFACE_RESTORE_ARMED=0
 PROVISION_ROLLBACK_ARMED=0
 PROVISION_CREATED_SECTION=""
+PROVISION_CREATED_ZONE=""
 PROVISION_BASELINE_FILE=""
 PROVISION_CHILD_PID=""
 REQUESTED_AUTOCONNECT=1
@@ -2132,6 +2133,147 @@ provision_device_for_record() {
 	esac
 }
 
+# ---- firewall zone membership ----
+#
+# A provisioned modem that only the router itself can use is the wrong outcome,
+# not a partial success. Locally-originated traffic passes without any zone;
+# forwarding and NAT for the router's clients do not, and the operator's IPv6
+# prefix never arrives. See docs/provisioning-contract-v1.md for why this came
+# into scope after the 0.15.0 hardware gate.
+
+FIREWALL_INIT="${APN_AUTOCONFIG_MODEM_FIREWALL_INIT:-/etc/init.d/firewall}"
+
+# The l3 devices currently carrying a default route.
+firewall_uplink_devices() {
+	command_exists ip || return 1
+	ip route show default 2>/dev/null | sed -n 's/.*[ \t]dev[ \t]\{1,\}\([^ \t]\{1,\}\).*/\1/p'
+}
+
+# The netifd interface whose l3 device this is, if any.
+firewall_interface_for_device() {
+	command_exists "$UBUS" || return 1
+	iface_dump="$TMP_BASE.ifdump"
+	run_bounded_to_file 5 "$iface_dump" "$UBUS" call network.interface dump || {
+		rm -f "$iface_dump" 2>/dev/null || :
+		return 1
+	}
+	# One pass, no jsonfilter dependency for a shape this simple: the interface
+	# name always precedes its l3_device inside the same object.
+	awk -v want="$1" '
+		/"interface"[ \t]*:/ { name = $0; sub(/^.*"interface"[ \t]*:[ \t]*"/, "", name); sub(/".*$/, "", name) }
+		/"l3_device"[ \t]*:/ {
+			dev = $0; sub(/^.*"l3_device"[ \t]*:[ \t]*"/, "", dev); sub(/".*$/, "", dev)
+			if (dev == want && name != "") { print name; exit }
+		}
+	' "$iface_dump"
+	rm -f "$iface_dump" 2>/dev/null || :
+}
+
+# The zone index whose network list contains this interface.
+firewall_zone_index_for_interface() {
+	zone_wanted="$1"
+	zone_index=0
+	while zone_name="$(uci -q get "firewall.@zone[$zone_index].name" 2>/dev/null)"; [ -n "$zone_name" ]; do
+		for zone_entry in $(uci -q get "firewall.@zone[$zone_index].network" 2>/dev/null || :); do
+			if [ "$zone_entry" = "$zone_wanted" ]; then
+				printf '%s\n' "$zone_index"
+				return 0
+			fi
+		done
+		zone_index=$((zone_index + 1))
+	done
+	return 1
+}
+
+firewall_zone_index_by_name() {
+	zone_index=0
+	while zone_name="$(uci -q get "firewall.@zone[$zone_index].name" 2>/dev/null)"; [ -n "$zone_name" ]; do
+		if [ "$zone_name" = "$1" ]; then
+			printf '%s\n' "$zone_index"
+			return 0
+		fi
+		zone_index=$((zone_index + 1))
+	done
+	return 1
+}
+
+# Where a new uplink belongs: the zone the working uplink is already in.
+#
+# Deliberately not "the only masquerading zone" — a router with a VPN commonly
+# has two, and the reference router does. Matching the neighbour means the modem
+# is treated exactly as the uplink beside it already is, whatever policy that
+# zone carries.
+#
+# Prints "<index>\t<name>". Zero or several candidates fail closed.
+firewall_resolve_uplink_zone() {
+	resolve_zone_found=""
+	resolve_zone_count=0
+	for resolve_dev in $(firewall_uplink_devices 2>/dev/null || :); do
+		resolve_iface="$(firewall_interface_for_device "$resolve_dev" 2>/dev/null || :)"
+		[ -n "$resolve_iface" ] || continue
+		resolve_index="$(firewall_zone_index_for_interface "$resolve_iface" 2>/dev/null || :)"
+		[ -n "$resolve_index" ] || continue
+		case " $resolve_zone_found " in
+			*" $resolve_index "*) continue ;;
+		esac
+		resolve_zone_found="${resolve_zone_found} ${resolve_index}"
+		resolve_zone_count=$((resolve_zone_count + 1))
+	done
+	if [ "$resolve_zone_count" -eq 1 ]; then
+		resolve_index="${resolve_zone_found# }"
+		printf '%s\t%s\n' "$resolve_index" "$(uci -q get "firewall.@zone[$resolve_index].name")"
+		return 0
+	fi
+	[ "$resolve_zone_count" -eq 0 ] || return 1
+	# No uplink at all yet — a fresh router. The stock OpenWrt arrangement is a
+	# zone named wan, and putting the first uplink there is what makes a modem
+	# work out of the box rather than after a manual step.
+	resolve_index="$(firewall_zone_index_by_name wan 2>/dev/null || :)"
+	[ -n "$resolve_index" ] || return 1
+	printf '%s\t%s\n' "$resolve_index" wan
+}
+
+# Appends the interface to that zone. Returns 0 when it was added, 3 when it was
+# already there, 1 when no single zone could be resolved.
+firewall_add_interface() {
+	add_iface="$1"
+	add_pair="$(firewall_resolve_uplink_zone 2>/dev/null || :)"
+	[ -n "$add_pair" ] || return 1
+	add_index="${add_pair%%	*}"
+	add_name="${add_pair#*	}"
+	for add_entry in $(uci -q get "firewall.@zone[$add_index].network" 2>/dev/null || :); do
+		[ "$add_entry" = "$add_iface" ] && { printf '%s\n' "$add_name"; return 3; }
+	done
+	uci add_list "firewall.@zone[$add_index].network=$add_iface" >/dev/null 2>&1 || return 1
+	uci commit firewall >/dev/null 2>&1 || return 1
+	firewall_reload
+	printf '%s\n' "$add_name"
+	return 0
+}
+
+# Removes exactly the entry provisioning added, identified by the zone recorded
+# on the section. A zone the administrator added the interface to themselves is
+# never touched, because it was never recorded here.
+firewall_remove_interface() {
+	remove_iface="$1"
+	remove_name="$2"
+	[ -n "$remove_name" ] || return 0
+	remove_index="$(firewall_zone_index_by_name "$remove_name" 2>/dev/null || :)"
+	[ -n "$remove_index" ] || return 0
+	uci del_list "firewall.@zone[$remove_index].network=$remove_iface" >/dev/null 2>&1 || return 0
+	uci commit firewall >/dev/null 2>&1 || return 0
+	firewall_reload
+}
+
+# Reload, never restart, and never the network: this re-applies rules without
+# dropping an interface.
+firewall_reload() {
+	[ -x "$FIREWALL_INIT" ] || return 0
+	"$FIREWALL_INIT" reload >/dev/null 2>&1 || \
+		log warning "could not reload the firewall; the provisioned interface may not forward yet"
+	return 0
+}
+
 # Returns the project-owned section already provisioned for this modem, if any.
 provision_existing_section() {
 	wanted_modem="$1"
@@ -2232,6 +2374,7 @@ provisioning_baseline_file() {
 provisioning_rollback() {
 	[ "$PROVISION_ROLLBACK_ARMED" -eq 1 ] || return 0
 	PROVISION_ROLLBACK_ARMED=0
+	PROVISION_ROLLBACK_SECTION="$PROVISION_CREATED_SECTION"
 	if [ -n "$PROVISION_CREATED_SECTION" ]; then
 		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
 		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
@@ -2251,6 +2394,10 @@ provisioning_rollback() {
 			log err "failed to remove staging section $PROVISION_CREATED_SECTION during rollback"
 		fi
 		PROVISION_CREATED_SECTION=""
+	fi
+	if [ -n "$PROVISION_CREATED_ZONE" ]; then
+		firewall_remove_interface "$PROVISION_ROLLBACK_SECTION" "$PROVISION_CREATED_ZONE"
+		PROVISION_CREATED_ZONE=""
 	fi
 	if [ -n "$PROVISION_BASELINE_FILE" ]; then
 		rm -f "$PROVISION_BASELINE_FILE"
@@ -2380,6 +2527,30 @@ provision_cmd() {
 	# auto=0 still keeps netifd from starting it on any unrelated reload.
 	uci delete "network.${prov_section}.disabled" || die "cannot enable the staging section"
 	uci commit network || die "cannot commit the enabled staging section"
+
+	# Put the interface where the working uplink already is, before the engine
+	# dials. A modem only the router itself can use is the wrong outcome, not a
+	# partial one: without a zone, locally-originated traffic passes while
+	# forwarding and NAT for the router's clients do not.
+	#
+	# Resolved and appended, never created — and recorded on the section so
+	# removal takes out exactly this entry. Zero or several candidate zones fail
+	# closed like every other resolution here.
+	prov_zone_status=0
+	prov_zone="$(firewall_add_interface "$prov_section")" || prov_zone_status=$?
+	case "$prov_zone_status" in
+		0)
+			PROVISION_CREATED_ZONE="$prov_zone"
+			uci set "network.${prov_section}.apn_autoconfig_firewall_zone=${prov_zone}" || \
+				die "cannot record the firewall zone"
+			uci commit network || die "cannot commit the firewall zone marker"
+			log notice "added $prov_section to firewall zone $prov_zone so clients can use it"
+		;;
+		3) log notice "$prov_section is already in firewall zone $prov_zone" ;;
+		*)
+			die_code 4 "cannot resolve one firewall zone for $prov_section; add it to your uplink zone and retry"
+		;;
+	esac
 
 	# Take the modem away from ModemManager before the engine dials it. The
 	# holder is started from configuration, so a reload is the whole action —
@@ -2630,6 +2801,10 @@ deprovision_cmd() {
 
 	log notice "removing project-owned section $deprov_section for modem $deprov_modem"
 	ifdown "$deprov_section" >/dev/null 2>&1 || :
+	# Only the zone provisioning recorded. A zone the administrator put this
+	# interface in themselves was never recorded here and is never touched.
+	deprov_zone="$(uci -q get "network.${deprov_section}.apn_autoconfig_firewall_zone" 2>/dev/null || :)"
+	[ -z "$deprov_zone" ] || firewall_remove_interface "$deprov_section" "$deprov_zone"
 	uci delete "network.${deprov_section}" || die "cannot remove section $deprov_section"
 	uci commit network || die "cannot commit removal of $deprov_section"
 	rm -f "$(provisioning_baseline_file "$deprov_modem")"

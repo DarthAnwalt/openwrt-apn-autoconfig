@@ -5,7 +5,7 @@ Status: **runtime gate complete for the FM350-GL path.** The packaging gate is
 not: everything below ran against files deployed directly onto the router, not
 against APKs built by the official SDK. Modem and SIM identifiers are omitted.
 
-Three defects were found here that no fixture had caught, and each is recorded
+Four defects were found here that no fixture had caught, and each is recorded
 with what it would have cost. That is the argument for the gate.
 
 ## Environment
@@ -123,16 +123,42 @@ binding to a provisioned section with it. Confirmed on this hardware: after the
 fix, a reset left the port resolving immediately, the stamp advanced from 21 to
 22, and the identity tier stayed `imei`.
 
-## Recorded, not fixed here
+## Defect 4: a provisioned modem only the router could use
 
-**A provisioned section is in no firewall zone.** IPv4 worked for the router
-itself and the IPv6 child reported `zone none`. Traffic originating on the
-router passes; forwarding for LAN clients would not, and the operator prefix
-would not arrive. Provisioning deliberately does not mutate firewall
-configuration — that is out of scope by the provisioning contract — so this is a
-documentation obligation for the user rather than a defect, and it needs saying
-in the README before anyone follows these steps expecting a working uplink for
-their clients.
+The first run left the section in no firewall zone at all. The router reached
+the Internet over the modem; nothing behind it could, because forwarding and NAT
+never applied, and the IPv6 child reported `zone none`.
+
+This was originally recorded here as a documentation obligation, on the grounds
+that provisioning does not mutate firewall configuration. That was the wrong
+call and the maintainer rejected it: nobody buys a router to give the router
+Internet access, and an administrator who has to configure the firewall by hand
+could have configured the connection by hand too — the automation would have
+delivered nothing. Firewall zone membership is now in scope, under rules as
+narrow as the rest of provisioning.
+
+Verified on this hardware after the change:
+
+- `firewall.@zone[1].network` went from `wan wan6 wwan trm_wwan trm_wwan6` to the
+  same list plus `apnmodem1`, and `apn_autoconfig_firewall_zone=wan` was recorded
+  on the section;
+- `nft` then showed `eth2` in the wan zone's input, forward and output sets and
+  covered by `masquerade IPv4 wan traffic` — the rules that were missing;
+- the zone was resolved from the interface already carrying a default route, not
+  from "the only masquerading zone": this router has **two** masquerading zones,
+  `wan` and `wireguard`, so that rule would have been a coin toss.
+
+**What was not demonstrated, and why.** A packet forwarded from a real client
+was not captured. The attempt used `ping -I <lan-address>` with the other two
+uplinks down, which failed with `Network unreachable` — and that is a property of
+the test, not of the configuration: a locally generated packet carrying a foreign
+source address does not match the on-link default route, while a forwarded packet
+is routed by destination and masqueraded on egress. Traffic out of `eth2` itself
+was proven separately (`http=200`).
+
+Closing this needs one client device on the router's WiFi while the other
+uplinks are down, and it is the last piece of evidence outstanding for the
+firewall change.
 
 ## Not covered by this gate
 

@@ -27,10 +27,56 @@ In scope for v1:
 - exact rollback of everything provisioning created; and
 - removal of project-owned provisioning state without touching anything else.
 
-Out of scope for v1: adoption of user-created sections, eSIM, multi-bearer
-policy, and any mutation of `mwan3`, Travelmate, firewall or routing
-configuration. MBIM profile mutation arrived in 0.12.0 and the AT-dial protocol
-in 0.15.0; both conform to the rules below rather than altering them.
+Also in scope, from 0.15.0: **placing the provisioned interface in the firewall
+zone the working uplink already uses**, so that the router's *clients* reach the
+Internet over the modem.
+
+Out of scope: adoption of user-created sections, eSIM, multi-bearer policy, and
+any mutation of `mwan3`, Travelmate or routing configuration. MBIM profile
+mutation arrived in 0.12.0 and the AT-dial protocol in 0.15.0; both conform to
+the rules below rather than altering them.
+
+### Why firewall zone membership had to come into scope
+
+v1 excluded firewall configuration entirely, on the instinct that a tool should
+not touch a user's security policy. The 0.15.0 hardware gate showed what that
+instinct costs: a fully provisioned modem, dialled and verified, gave Internet
+access to the **router** and to nothing behind it. Locally-originated traffic
+passes; forwarding and NAT for LAN clients do not happen, and the operator's IPv6
+prefix never arrives.
+
+That is not a partial success, it is the wrong outcome. Nobody buys a router to
+give the router Internet access. And documenting it as a step the administrator
+must perform afterwards does not rescue the release: if they have to configure
+the firewall by hand, they could have configured the connection by hand too, and
+the automation has delivered nothing. Commercial firmware treats a modem as
+plug-in-and-it-works; this project exists because OpenWrt does not, so stopping
+one step short of a working uplink misses the point of it.
+
+So provisioning places the interface in a zone, under rules as narrow as the rest
+of this contract:
+
+1. **The zone is resolved, never created.** The target is the zone that already
+   contains the interface currently carrying a default route — the working
+   uplink's own zone, so the modem is treated exactly as the uplink beside it
+   already is. On a router with no uplink at all, a zone named `wan` is used if
+   one exists, which is the stock OpenWrt arrangement.
+2. **Zero or several candidates fail closed**, like every other resolution here.
+   "The only masquerading zone" is deliberately *not* the rule: a router with a
+   VPN commonly has two, and the reference router does.
+3. **Only the zone's `network` list is touched**, by appending one entry. No zone
+   is created or deleted, no policy, rule, redirect or `masq` flag is changed,
+   and an interface already listed is left alone rather than duplicated.
+4. **What was done is recorded on the section** as
+   `apn_autoconfig_firewall_zone`, so removal takes out exactly the entry
+   provisioning added and nothing else — and so a zone the administrator added
+   the interface to themselves is never removed by this project.
+5. **The firewall is reloaded, not restarted**, and the network is not touched at
+   all: `fw4 reload` re-applies rules without dropping an interface.
+
+`mwan3` remains out of scope. Multi-WAN *policy* is a decision about preference
+between uplinks, which is the administrator's; zone membership is what makes the
+interface usable at all.
 
 ## Ownership
 

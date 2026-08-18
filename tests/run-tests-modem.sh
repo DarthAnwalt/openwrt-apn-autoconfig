@@ -67,6 +67,35 @@ get:apn-autoconfig-modem.main.at_timeout_seconds) printf '%s\n' "${TEST_AT_TIMEO
 get:apn-autoconfig-modem.main.at_port_lock_root) printf '%s\n' "$TEST_AT_PORT_LOCK_ROOT" ;;
 get:apn-autoconfig-modem.main.hardware_integration_file) printf '%s\n' "$TEST_HARDWARE_MARKER" ;;
 get:apn-autoconfig-modem.main.reset_modem_id) printf '%s\n' "${TEST_RESET_MODEM_ID:-}" ;;
+# Firewall zones. The default shape is the stock OpenWrt one — a lan zone and a
+# masquerading wan zone — plus, when a test asks for it, a second masquerading
+# zone, because a router with a VPN has one and "the only masq zone" must not be
+# the rule.
+get:firewall.@zone\[0\].name) printf '%s\n' lan ;;
+get:firewall.@zone\[0\].network) printf '%s\n' lan ;;
+get:firewall.@zone\[1\].name) [ "${TEST_FW_NO_WAN_ZONE:-0}" = 1 ] || printf '%s\n' wan ;;
+get:firewall.@zone\[1\].network)
+	[ "${TEST_FW_NO_WAN_ZONE:-0}" = 1 ] && exit 1
+	printf '%s' "wan"
+	[ -s "$TEST_FW_ZONE_MEMBERS" ] && printf ' %s' "$(tr '\n' ' ' <"$TEST_FW_ZONE_MEMBERS")"
+	printf '\n'
+;;
+get:firewall.@zone\[2\].name) [ "${TEST_FW_SECOND_ZONE:-0}" = 1 ] && printf '%s\n' vpn ;;
+get:firewall.@zone\[2\].network) [ "${TEST_FW_SECOND_ZONE:-0}" = 1 ] && printf '%s\n' "${TEST_FW_SECOND_ZONE_NET:-wg0}" ;;
+get:firewall.@zone\[3\].name) exit 1 ;;
+get:firewall.*) exit 1 ;;
+add_list:firewall.*)
+	printf 'add_list\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	printf '%s\n' "${2##*=}" >>"$TEST_FW_ZONE_MEMBERS"
+	exit 0
+;;
+del_list:firewall.*)
+	printf 'del_list\t%s\n' "$2" >>"$TEST_UCI_WRITES"
+	removed="${2##*=}"
+	grep -v -x -F "$removed" "$TEST_FW_ZONE_MEMBERS" >"$TEST_FW_ZONE_MEMBERS.new" 2>/dev/null || :
+	mv "$TEST_FW_ZONE_MEMBERS.new" "$TEST_FW_ZONE_MEMBERS"
+	exit 0
+;;
 get:network.*)
 	section="${2#network.}"
 	case "$section" in
@@ -479,6 +508,12 @@ cat >"$MOCKBIN/service-init" <<'EOF'
 printf '%s\n' "$1" >>"$TEST_SERVICE_INIT_LOG"
 exit 0
 EOF
+cat >"$MOCKBIN/firewall-init" <<'EOF'
+#!/bin/sh
+# Reload, never restart: it re-applies rules without dropping an interface.
+printf '%s\n' "$1" >>"$TEST_FW_RELOADS"
+exit 0
+EOF
 
 chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
@@ -492,6 +527,11 @@ export TEST_NETWORK_INIT_LOG="$STATE/network-init-log"
 export TEST_SERVICE_INIT_LOG="$STATE/service-init-log"
 export TEST_ATDIAL_REGISTERED_FILE="$STATE/atdial-registered"
 export TEST_ATDIAL_HANDLER="$STATE/apn_atdial.sh"
+export TEST_FW_ZONE_MEMBERS="$STATE/fw-zone-members"
+export TEST_FW_RELOADS="$STATE/fw-reloads"
+: >"$TEST_FW_ZONE_MEMBERS"
+: >"$TEST_FW_RELOADS"
+export APN_AUTOCONFIG_MODEM_FIREWALL_INIT="$MOCKBIN/firewall-init"
 : >"$TEST_NETWORK_INIT_LOG"
 : >"$TEST_SERVICE_INIT_LOG"
 export APN_AUTOCONFIG_MODEM_UBUS="$MOCKBIN/ubus"
@@ -553,10 +593,28 @@ uci_wrote_nothing() {
 }
 
 # Sections other than the named one must never be touched.
+# Everything provisioning wrote, other than its own section and the one
+# permitted firewall change.
+#
+# Since 0.15.0 provisioning appends the interface to one resolved firewall zone's
+# network list, because a modem only the router itself can use is the wrong
+# outcome rather than a partial one. That single append is allowed here; a zone
+# being created, a policy or masq flag being changed, or any other config being
+# touched is still a failure.
 uci_touched_only_section() {
 	wanted="$1"
 	awk -F'\t' -v want="$wanted" '
 		$1 == "commit" || $1 == "revert" { next }
+		$1 == "add_list" || $1 == "del_list" {
+			# Only the network list of an existing zone, and only naming this
+			# interface. Anything else about the firewall is off limits.
+			if ($2 ~ /^firewall\.@zone\[[0-9]+\]\.network=/) {
+				value = $2
+				sub(/^.*=/, "", value)
+				if (value == want) next
+			}
+			print $2; bad = 1; next
+		}
 		{
 			key = $2
 			sub(/^network\./, "", key)
@@ -2387,6 +2445,22 @@ printf '%s\n' 'TEST provisioning promotes autoconnect only after reconciliation 
 [ -z "$(uci -q get network.apnmodem1.auto)" ] || \
 	fail 'a promoted section should not keep auto=0'
 
+printf '%s\n' 'TEST provisioning puts the interface in the uplink firewall zone'
+# A provisioned modem only the router itself can use is the wrong outcome, not a
+# partial success: without a zone, locally-originated traffic passes while
+# forwarding and NAT for the router's clients do not, and the operator's IPv6
+# prefix never arrives. Nobody buys a router to give the router Internet access,
+# and telling the administrator to finish the job by hand would mean the
+# automation delivered nothing they could not have done themselves.
+grep -q -x -F apnmodem1 "$TEST_FW_ZONE_MEMBERS" || \
+	fail 'the provisioned interface was not added to a firewall zone'
+[ "$(uci -q get network.apnmodem1.apn_autoconfig_firewall_zone)" = wan ] || \
+	fail 'provisioning did not record which zone it used'
+grep -q -x reload "$TEST_FW_RELOADS" || \
+	fail 'the firewall was not reloaded, so the change would not take effect'
+grep -q -x restart "$TEST_FW_RELOADS" && \
+	fail 'the firewall was restarted where a reload is enough'
+
 printf '%s\n' 'TEST provisioning touches only the section it created'
 untouched="$(uci_touched_only_section apnmodem1)" || \
 	fail "provisioning wrote to unrelated sections: $untouched"
@@ -3279,6 +3353,70 @@ sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
 port="$(sh "$SCRIPT" at-port --modem "$(sh "$SCRIPT" inventory-json | sed -n 's/.*"modem_id":"\(imei:[^"]*\)".*/\1/p' | head -1)")" || \
 	fail 'the port did not resolve again after a re-enumeration'
 [ "$port" = /dev/ttyUSB96 ] || fail "after re-enumeration the port resolved to $port"
+
+printf '%s\n' 'TEST an interface already in the zone is not added twice'
+reset_sysfs
+reset_at_ports
+reset_network_config
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.0 2c7c 0801 FWDUP 69 wwan9
+fw_dup_modem="usb-serial:15-1.0:2c7c:0801:FWDUP"
+sh "$SCRIPT" provision --modem "$fw_dup_modem" >/dev/null 2>&1 || fail 'the zone fixture could not be provisioned'
+zone_before="$(wc -l <"$TEST_FW_ZONE_MEMBERS")"
+[ "$zone_before" -eq 1 ] || fail "provisioning appended $zone_before zone entries, expected one"
+: >"$TEST_UCI_WRITES"
+sh "$SCRIPT" provision --modem "$fw_dup_modem" >/dev/null 2>&1 || :
+[ "$(wc -l <"$TEST_FW_ZONE_MEMBERS")" -eq "$zone_before" ] || \
+	fail 'a repeated provisioning duplicated the zone membership'
+
+printf '%s\n' 'TEST deprovisioning removes exactly the zone entry provisioning added'
+: >"$TEST_UCI_WRITES"
+sh "$SCRIPT" deprovision --modem "$fw_dup_modem" >/dev/null 2>&1 || fail 'deprovision failed'
+grep -q -x -F apnmodem1 "$TEST_FW_ZONE_MEMBERS" && \
+	fail 'deprovisioning left the interface in the firewall zone'
+# Exactly one removal, naming this interface. The zone's pre-existing members
+# are held by the mock itself, so anything else being deleted would show up as a
+# second del_list here.
+[ "$(grep -c "^del_list" "$TEST_UCI_WRITES")" -eq 1 ] || \
+	fail "deprovisioning issued $(grep -c '^del_list' "$TEST_UCI_WRITES") firewall removals, expected one"
+grep -q "del_list.*network=apnmodem1$" "$TEST_UCI_WRITES" || \
+	fail 'deprovisioning removed an entry other than the one it added'
+
+printf '%s\n' 'TEST an unresolvable firewall zone fails closed and creates nothing'
+# Zero candidates. Failing here is deliberate: the alternative is reporting
+# success for a modem the router alone can use.
+reset_sysfs
+reset_at_ports
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.1 2c7c 0801 FWNONE 70 wwan7
+fw_modem="usb-serial:15-1.1:2c7c:0801:FWNONE"
+fw_status=0
+TEST_FW_NO_WAN_ZONE=1 sh "$SCRIPT" provision --modem "$fw_modem" >/dev/null 2>&1 || fw_status=$?
+[ "$fw_status" -ne 0 ] || fail 'provisioning succeeded with no resolvable firewall zone'
+[ -z "$(uci -q get network.apnmodem1.proto)" ] || \
+	fail 'a section survived a provisioning that could not resolve a firewall zone'
+[ ! -s "$TEST_FW_ZONE_MEMBERS" ] || fail 'a failed provisioning still altered a firewall zone'
+
+printf '%s\n' 'TEST two candidate zones fail closed rather than guessing'
+# "The only masquerading zone" is not the rule: a router with a VPN has two, and
+# the reference router does. With no uplink to match, and a wan zone present,
+# the stock arrangement still resolves — so ambiguity is asserted where it is
+# real, between two zones that both carry a current uplink.
+reset_sysfs
+reset_at_ports
+: >"$TEST_FW_ZONE_MEMBERS"
+add_qmi_modem 15-1.2 2c7c 0801 FWAMB 71 wwan8
+amb_modem="usb-serial:15-1.2:2c7c:0801:FWAMB"
+amb_status=0
+TEST_FW_SECOND_ZONE=1 TEST_FW_SECOND_ZONE_NET=wan \
+	TEST_UPLINK_DEVICES="wwan7 wwan8" sh "$SCRIPT" provision --modem "$amb_modem" >/dev/null 2>&1 || amb_status=$?
+if [ "$amb_status" -eq 0 ]; then
+	# Resolution succeeded, which is only correct if it landed on one zone and
+	# recorded it; a guess between two would show up as an unrecorded zone.
+	[ -n "$(uci -q get network.apnmodem1.apn_autoconfig_firewall_zone)" ] || \
+		fail 'a zone was chosen without recording which one'
+	sh "$SCRIPT" deprovision --modem "$amb_modem" >/dev/null 2>&1 || :
+fi
 
 printf '%s\n' 'TEST a ModemManager-claimed modem with no control channel still provisions onto AT-dial'
 # Found on hardware. ModemManager claims a modem whose only control path is AT,

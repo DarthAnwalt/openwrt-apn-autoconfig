@@ -454,19 +454,6 @@ return view.extend({
 		self.resetButtons = [];
 		self.resetButton = null;
 
-		var radio = [];
-		if (status && !status.error)
-			radio.push(table([
-				row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id),
-					_('The network currently carrying the radio link. While roaming this differs from the provider your APN profile was matched from.')),
-				row(_('Registration'), registrationLabel(status),
-					_('Whether the modem is registered on a network. APN profiles are never tested before registration succeeds.')),
-				row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
-				row(_('Signal quality'), signalQuality(status.signal_quality)),
-				row(_('Mobile interface'), '%s: %s'.format(status.interface,
-					status.interface_up ? _('up') : _('down or pending')))
-			]));
-
 		var cards;
 		if (!inventory || inventory.error)
 			cards = [ E('p', { 'class': 'apn-modem-unavailable' }, [
@@ -477,13 +464,68 @@ return view.extend({
 			if (!modems.length)
 				cards = [ E('p', {}, [ _('No modem was detected by the current read-only scan.') ]) ];
 			else
-				cards = modems.map(function(modem) { return self.modemCard(modem); });
+				cards = modems.map(function(modem) {
+					return self.modemCard(modem, self.radioBelongsTo(modem, status) ? status : null);
+				});
 		}
 
-		return radio.concat(cards);
+		/* The radio block belongs to whichever modem is the APN target. If that
+		 * modem is not in the inventory — the package may be absent, or the
+		 * target may be an interface no scanned modem claims — it is shown on
+		 * its own rather than dropped, because it is still true. */
+		var orphan = [];
+		if (status && !status.error) {
+			var claimed = (inventory && Array.isArray(inventory.modems) ? inventory.modems : [])
+				.some(function(modem) { return self.radioBelongsTo(modem, status); });
+			if (!claimed)
+				orphan.push(E('div', { 'class': 'apn-modem-entry' }, [
+					E('h4', {}, [ _('Mobile connection') ]),
+					self.radioTable(status)
+				]));
+		}
+
+		return orphan.concat(cards);
 	},
 
-	modemCard: function(modem) {
+	/* Which modem the radio and SIM readings describe.
+	 *
+	 * They used to be rendered once, above every card. With one modem that read
+	 * as a page header; with two it silently attributed one modem's signal,
+	 * network and registration to both, and nothing on the page said which one
+	 * it meant. The APN status names its interface, and a modem names the
+	 * interface bound to it, so the two can simply be matched. */
+	radioBelongsTo: function(modem, status) {
+		if (!modem || !status || status.error || !status.interface)
+			return false;
+		var plan = modem.plan || {};
+		return status.interface === modem.netifd_interface ||
+			status.interface === plan.connection_section;
+	},
+
+	radioTable: function(status) {
+		return table([
+			row(_('Serving network'), networkLabel(status.serving_operator_name, status.serving_operator_id),
+				_('The network currently carrying the radio link. While roaming this differs from the provider your APN profile was matched from.')),
+			row(_('Registration'), registrationLabel(status),
+				_('Whether the modem is registered on a network. APN profiles are never tested before registration succeeds.')),
+			row(_('Access technologies'), (status.access_technologies || '').replace(/,/g, ' + ')),
+			row(_('Signal quality'), signalQuality(status.signal_quality)),
+			row(_('Mobile interface'), '%s: %s'.format(status.interface,
+				status.interface_up ? _('up') : _('down or pending')))
+		]);
+	},
+
+	/* A name for one modem, so a page showing two of them says which is which.
+	 * The model is what a person recognises; the interface is what distinguishes
+	 * two of the same model. Neither is an identifier that needs masking. */
+	modemHeading: function(modem) {
+		var plan = modem.plan || {};
+		var name = this.modemModelLabel(modem);
+		var iface = modem.netifd_interface || plan.connection_section;
+		return iface ? '%s — %s'.format(name, iface) : name;
+	},
+
+	modemCard: function(modem, status) {
 		var self = this;
 		var plan = modem.plan || {};
 		var buttons = [];
@@ -530,7 +572,17 @@ return view.extend({
 		if (modem.capabilities && modem.capabilities.reset === true)
 			buttons.push(self.resetButtonFor(modem));
 
-		var nodes = [ table(rows), E('p', {}, [ explanation ]) ];
+		var nodes = [ E('h4', { 'class': 'apn-modem-title' }, [ self.modemHeading(modem) ]),
+			table(rows), E('p', {}, [ explanation ]) ];
+		/* The SIM and radio readings for this modem, under this modem. The
+		 * heading is deliberately "SIM and radio" rather than "radio": the eSIM
+		 * release adds a profile list beneath it, and it should arrive inside a
+		 * section that already exists rather than by rearranging this one. */
+		if (status)
+			nodes.push(E('div', { 'class': 'apn-modem-radio' }, [
+				E('h5', {}, [ _('SIM and radio') ]),
+				self.radioTable(status)
+			]));
 		var operationText = self.modemOperationText(modem.operation);
 		if (operationText)
 			nodes.push(E('p', { 'class': 'apn-action-status' }, [ operationText ]));
@@ -1464,6 +1516,9 @@ return view.extend({
 					'.apn-autoconfig-page .apn-details{margin-top:.75rem}' +
 					'.apn-autoconfig-page .apn-details summary{cursor:pointer;font-weight:600;padding:.35rem 0}' +
 					'.apn-autoconfig-page .apn-modem-entry{padding:.75rem 0;border-top:1px solid rgba(128,128,128,.25)}' +
+					'.apn-autoconfig-page .apn-modem-title{margin:0 0 .5rem 0}' +
+					'.apn-autoconfig-page .apn-modem-radio{margin-top:.75rem}' +
+					'.apn-autoconfig-page .apn-modem-radio h5{margin:0 0 .35rem 0;font-weight:600;opacity:.85}' +
 					'.apn-autoconfig-page .apn-button-row{display:flex;flex-wrap:wrap;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-policy-controls{display:flex;flex-wrap:wrap;align-items:center;gap:.5rem;margin-top:1rem}' +
 					'.apn-autoconfig-page .apn-state-good{color:#2d8a43;font-weight:600}' +

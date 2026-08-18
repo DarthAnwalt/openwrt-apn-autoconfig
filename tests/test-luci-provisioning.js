@@ -480,6 +480,70 @@ Promise.resolve(actionApp.startModemAction(modem, 'provision')).then(function() 
 		assert.strictEqual(unsupported.testUi.modals.length, 0,
 			'manual entry must not open for a target that cannot apply a profile');
 	}).then(function() {
+	/* ---- each modem's readings belong to that modem ---- */
+
+	/* The radio and SIM readings used to be rendered once, above every card.
+	 * With one modem that reads as a page header; with two it attributes one
+	 * modem's network, signal and registration to both, and nothing on the page
+	 * says which one it means. The APN status names its interface and a modem
+	 * names the interface bound to it, so they are matched rather than stacked. */
+	var twoModemApp = loadView();
+	var twoModemInventory = {
+		version: 'v1',
+		modems: [
+			{
+				modem_id: 'usb-serial:1-1.2:2c7c:0801:SERIAL01',
+				manufacturer: 'Quectel', model: 'RM520N-GL',
+				protocol: 'qmi', netifd_interface: 'wwan',
+				can_provision: false, provision_reason: 'already_configured',
+				can_control_bearer: true, connection_section: 'wwan', connection_owned: false
+			},
+			{
+				modem_id: 'imei:016177002734885',
+				manufacturer: 'Fibocom', model: 'FM350-GL',
+				protocol: 'at', netifd_interface: 'apnmodem1',
+				can_provision: false, provision_reason: 'already_provisioned',
+				can_control_bearer: true, connection_section: 'apnmodem1', connection_owned: true
+			}
+		]
+	};
+	twoModemInventory.modems.forEach(function(modem) { modem.plan = { reason: modem.provision_reason,
+		can_control_bearer: modem.can_control_bearer, connection_section: modem.connection_section }; });
+	var radioStatus = {
+		interface: 'apnmodem1', interface_up: true,
+		serving_operator_name: 'Vodafone', serving_operator_id: '26202',
+		registration_state: 'home', access_technologies: 'lte,5gnr', signal_quality: 35
+	};
+	var areaNodes = twoModemApp.modemAreaNodes(twoModemInventory, radioStatus);
+	var cardTexts = areaNodes.map(function(node) { return collectText(node).join(' '); });
+
+	var withRadio = cardTexts.filter(function(t) { return t.indexOf('Vodafone') !== -1; });
+	assert.strictEqual(withRadio.length, 1,
+		'the radio readings must appear exactly once, not above every modem');
+	assert.ok(withRadio[0].indexOf('FM350-GL') !== -1,
+		'the radio readings must sit with the modem whose interface they describe');
+	assert.ok(cardTexts.some(function(t) {
+			return t.indexOf('RM520N-GL') !== -1 && t.indexOf('Vodafone') === -1;
+		}),
+		'the other modem must not be given readings that belong to its neighbour');
+
+	cardTexts.forEach(function(t) {
+		assert.strictEqual(t.indexOf('SERIAL01'), -1, 'a heading must not leak an unmasked identity');
+		assert.strictEqual(t.indexOf('016177002734885'), -1, 'a heading must not leak an IMEI');
+	});
+	assert.ok(cardTexts.some(function(t) { return t.indexOf('RM520N-GL \u2014 wwan') !== -1; }),
+		'each modem must be named by model and interface so two of them can be told apart');
+
+	/* Readings for an interface no scanned modem claims are still true, so they
+	 * are shown on their own rather than dropped. */
+	var orphanNodes = twoModemApp.modemAreaNodes(twoModemInventory,
+		Object.assign({}, radioStatus, { interface: 'wwan9' }));
+	var orphanText = orphanNodes.map(function(node) { return collectText(node).join(' '); }).join(' | ');
+	assert.ok(orphanText.indexOf('Vodafone') !== -1,
+		'readings for an unmatched interface must not be dropped');
+	assert.ok(orphanText.indexOf('Mobile connection') !== -1,
+		'unmatched readings must be labelled rather than attributed to a modem');
+	}).then(function() {
 	/* ---- the page must not scan once per modem ---- */
 
 	/* Measured at roughly four seconds of backend critical path, and none of it

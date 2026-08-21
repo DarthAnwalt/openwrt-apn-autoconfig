@@ -1,8 +1,10 @@
 # 0.15.2 corrective test and release plan
 
-Status: **in progress.** 0.15.2 is a defect release against the published
-0.15.1 packages. Every defect below was found on the reference hardware after an
-ordinary reboot, not by review.
+Status: **in progress; automated and CLI hardware gates passed, authenticated
+LuCI pass pending.** Detailed router evidence is in
+[`router-test-0.15.2.md`](router-test-0.15.2.md). 0.15.2 is a defect release
+against the published 0.15.1 packages. Every defect below was found on the
+reference hardware after an ordinary reboot, not by review.
 
 The release is finished when a router with two modems behaves like a router with
 one — automatically, without being asked to choose — and when a modem this

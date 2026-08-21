@@ -322,7 +322,7 @@ inventory, stable identity, control-owner arbitration and a coordinator-based
 `modem-reset` path alongside the compatibility path. Install it when those
 functions are required.
 
-`apn-autoconfig-proto-atdial-0.15.2-r1.apk` is also optional, and only useful
+`apn-autoconfig-proto-atdial-0.15.2-r2.apk` is also optional, and only useful
 for a modem that exposes no control channel at all — a Fibocom FM350-GL in RNDIS
 composition, for example, where there is no `cdc-wdm` node for QMI or MBIM to
 use. It adds the `apn_atdial` netifd protocol, which defines and activates the

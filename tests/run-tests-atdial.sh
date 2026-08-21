@@ -78,9 +78,13 @@ case "$verb" in
 	;;
 	inventory-json)
 		printf '{"version":"v1","modems":[{"modem_id":"%s","usb_path":"/sys/devices/mock/%s"}]}\n' \
-			"${TEST_CURRENT_MODEM_ID:-imei:016177002734885}" "${TEST_MODEM_USB_PATH:-2-1.3}"
+			"${TEST_CURRENT_MODEM_ID:-imei:016177002734885}" \
+			"${TEST_INVENTORY_USB_PATH:-${TEST_MODEM_USB_PATH:-2-1.3}}"
 	;;
 	status-json)
+		if [ -n "${TEST_STALE_MODEM_ID:-}" ] && [ "$modem" = "$TEST_STALE_MODEM_ID" ]; then
+			exit 3
+		fi
 		printf '{"version":"v1","modem_id":"%s","usb_path":"%s","owner_state":"%s"}\n' \
 			"$modem" "${TEST_MODEM_USB_PATH:-}" "${TEST_OWNER_STATE:-none}"
 	;;
@@ -235,7 +239,8 @@ reset_case() {
 	ATDIAL_ACTIVATED=0
 	ATDIAL_LOCK_HELD=0
 	ATDIAL_LOCK_PATH=""
-	unset TEST_AT_PORT_EXIT TEST_MODPROBE_CREATES TEST_MODPROBE_USB 2>/dev/null || :
+	unset TEST_AT_PORT_EXIT TEST_MODPROBE_CREATES TEST_MODPROBE_USB \
+		TEST_INVENTORY_USB_PATH 2>/dev/null || :
 	TEST_AT_PORT=/dev/ttyUSB5
 	TEST_OWNER_STATE=none
 	TEST_MODEM_USB_PATH=2-1.3
@@ -814,8 +819,37 @@ export TEST_STALE_MODEM_ID TEST_CURRENT_MODEM_ID
 proto_apn_atdial_setup wwan_at || fail "setup failed after an identity upgrade: ${PROTO_ERROR:-none}"
 [ "$PROTO_ADDRESS" = 10.9.146.175 ] || fail 'the dial did not recover after the identity was upgraded'
 grep -q "at-port	imei:016177002734885" "$TEST_MODEM_LOG" || \
-	fail 'the handler never retried with the identity the path resolves to now'
+	fail 'the handler did not use the identity the path resolves to now'
+grep -q "at-port	weak-vidpid:2-1.3:0e8d:7127" "$TEST_MODEM_LOG" && \
+	fail 'the handler first attempted the known-stale identity'
+
+# Teardown has the same obligation: otherwise a clean netifd stop leaves a PDP
+# context active merely because the strong identity was demoted at boot.
+: >"$TEST_MODEM_LOG"
+: >"$TEST_AT_LOG"
+proto_apn_atdial_teardown wwan_at
+grep -q "at-port	imei:016177002734885" "$TEST_MODEM_LOG" || \
+	fail 'teardown did not resolve the current identity from the physical path'
+grep -q "at-port	weak-vidpid:2-1.3:0e8d:7127" "$TEST_MODEM_LOG" && \
+	fail 'teardown attempted the known-stale identity'
+at_sent 'AT+CGACT=0,1' || fail 'teardown left the upgraded modem context active'
 unset TEST_STALE_MODEM_ID TEST_CURRENT_MODEM_ID
+
+printf '%s\n' 'TEST path fallback refuses when the recorded modem is still present elsewhere'
+reset_case
+add_usb_modem 2-1.3
+add_netdev 2-1.3 0 eth2
+happy_modem
+TEST_OPT_modem_id="imei:old-modem"
+TEST_CURRENT_MODEM_ID="imei:replacement"
+TEST_MODEM_USB_PATH=2-1.8
+TEST_INVENTORY_USB_PATH=2-1.3
+export TEST_CURRENT_MODEM_ID TEST_MODEM_USB_PATH TEST_INVENTORY_USB_PATH
+proto_apn_atdial_setup wwan_at && fail 'setup mixed a replacement netdev with the old modem identity'
+[ "$PROTO_ERROR" = MODEM_BINDING_CONFLICT ] || \
+	fail "reported $PROTO_ERROR instead of MODEM_BINDING_CONFLICT"
+grep -q "at-port" "$TEST_MODEM_LOG" && fail 'a binding conflict still reached an AT port'
+unset TEST_CURRENT_MODEM_ID
 
 printf '%s\n' 'TEST a modem that is genuinely gone is still NO_AT_PORT'
 # The recovery above must not turn a removed modem into a silent success.

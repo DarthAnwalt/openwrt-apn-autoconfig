@@ -19,7 +19,11 @@ requires a volatile corroboration from the current USB enumeration, so an
 identical replacement in the same socket cannot inherit it. Both halves fail
 closed: a section whose recorded modem is present on this bus is never claimed
 by another one. The upgrade copies 0.15.1's volatile evidence synchronously
-before a reboot can erase it.
+before a reboot can erase it. The AT-dial handler also resolves that deliberate
+post-reboot identity demotion from the physical path before asking for a control
+port. This avoids a false `modem imei:… is not present` error on every boot and
+still refuses a path fallback when the recorded modem actually remains present
+somewhere else.
 
 **Two modems stopped the program instead of doubling its work.** `interface=auto`
 selected a target only when there was exactly one to select, and otherwise

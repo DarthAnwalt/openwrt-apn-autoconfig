@@ -73,6 +73,32 @@ atdial_modem_field() {
 	printf '%s' "$record" | jsonfilter -e "@.$field" 2>/dev/null
 }
 
+# Reconcile the identity stored in a netifd section with the modem currently
+# occupying its recorded physical path, without first asking the modem package
+# to operate on an identity that discovery no longer publishes.  That is the
+# ordinary post-reboot state for an AT-only modem: persistent manufacturer and
+# model evidence survives, while the IMEI is deliberately demoted until a fresh
+# AT read proves it belongs to this enumeration.
+#
+# Refuse the path fallback when the recorded identity still exists elsewhere.
+# In that case this is a physical replacement or move, not an evidence-tier
+# change, and mixing the old modem's control port with the new modem's netdev
+# would configure the wrong device.
+atdial_refresh_modem_binding() {
+	local recorded_id="$1" path="$2" current_id recorded_path
+	ATDIAL_BOUND_MODEM_ID="$recorded_id"
+	[ -n "$recorded_id" ] && [ -n "$path" ] || return 0
+
+	current_id="$(atdial_modem_id_for_usbpath "$path" || :)"
+	[ -n "$current_id" ] && [ "$current_id" != "$recorded_id" ] || return 0
+
+	recorded_path="$(atdial_modem_field "$recorded_id" usb_path || :)"
+	[ -z "$recorded_path" ] || return 2
+
+	ATDIAL_BOUND_MODEM_ID="$current_id"
+	return 0
+}
+
 # Arms before the first command that changes anything. netifd can be stopped at
 # any moment, and an interrupted bring-up must not leave a child holding the
 # serial port or the shared lock: the next attempt would then fail on a lock
@@ -277,7 +303,7 @@ proto_apn_atdial_init_config() {
 proto_apn_atdial_setup() {
 	local interface="$1"
 	local usbpath modem_id device atport apn username password auth pdptype metric allow_roaming
-	local netdev dial stat waited kicked address gw dns1 dns2 rdp mask live_pdp zone6 value
+	local netdev dial stat waited kicked address gw dns1 dns2 rdp mask live_pdp zone6 value binding_status
 
 	json_get_vars usbpath modem_id device atport apn username password auth \
 		pdptype metric allow_roaming
@@ -358,6 +384,17 @@ proto_apn_atdial_setup() {
 	# different thing from having found no port.
 	dial="$atport"
 	if [ -z "$dial" ] && [ -n "$modem_id" ] && [ -x "$ATDIAL_MODEM_BIN" ]; then
+		binding_status=0
+		atdial_refresh_modem_binding "$modem_id" "$usbpath" || binding_status=$?
+		if [ "$binding_status" -eq 2 ]; then
+			atdial_fail "$interface" MODEM_BINDING_CONFLICT 1 \
+				"the modem recorded for usbpath \"$usbpath\" is still present at another path"
+			return 1
+		fi
+		if [ "$ATDIAL_BOUND_MODEM_ID" != "$modem_id" ]; then
+			atdial_log "modem_id \"$modem_id\" was superseded at $usbpath by $ATDIAL_BOUND_MODEM_ID"
+			modem_id="$ATDIAL_BOUND_MODEM_ID"
+		fi
 		# Once, with its status captured. `if ! cmd` would have inverted the
 		# status before it could be read, and exit 4 here is an ownership
 		# refusal rather than a failure to find a port — a different outcome
@@ -688,14 +725,21 @@ atdial_reuse_is_safe() {
 
 proto_apn_atdial_teardown() {
 	local interface="$1"
-	local modem_id usbpath atport dial
+	local modem_id usbpath atport dial binding_status
 
 	json_get_vars modem_id usbpath atport
 
 	atdial_scratch_init
 	dial="$atport"
 	if [ -z "$dial" ] && [ -n "$modem_id" ] && [ -x "$ATDIAL_MODEM_BIN" ]; then
-		dial="$("$ATDIAL_MODEM_BIN" at-port --modem "$modem_id" 2>/dev/null || :)"
+		binding_status=0
+		atdial_refresh_modem_binding "$modem_id" "$usbpath" || binding_status=$?
+		if [ "$binding_status" -eq 0 ]; then
+			modem_id="$ATDIAL_BOUND_MODEM_ID"
+			dial="$("$ATDIAL_MODEM_BIN" at-port --modem "$modem_id" 2>/dev/null || :)"
+		else
+			atdial_log "refusing teardown through a stale modem binding at $usbpath"
+		fi
 	fi
 
 	# The context is released rather than left up.

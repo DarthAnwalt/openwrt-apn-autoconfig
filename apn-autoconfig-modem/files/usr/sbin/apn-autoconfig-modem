@@ -2480,7 +2480,11 @@ provision_evaluate() {
 		PROVISION_EXISTING="$(provision_section_by_path "$provision_interface" 2>/dev/null || :)"
 		if [ -n "$PROVISION_EXISTING" ]; then
 			PROVISION_REBOUND=1
-			log notice "section $PROVISION_EXISTING was provisioned as $(uci -q get "network.${PROVISION_EXISTING}.apn_autoconfig_modem_id" 2>/dev/null || printf '?'); the modem on its path is now $1"
+			# inventory-json is the LuCI polling surface.  Recovery is an
+			# expected read-only post-reboot state, so logging it on every poll
+			# turns a useful diagnostic into unbounded journal noise.
+			[ "$COMMAND_NAME" = inventory-json ] || \
+				log notice "section $PROVISION_EXISTING was provisioned as $(uci -q get "network.${PROVISION_EXISTING}.apn_autoconfig_modem_id" 2>/dev/null || printf '?'); the modem on its path is now $1"
 		fi
 	fi
 	if [ -n "$PROVISION_EXISTING" ]; then

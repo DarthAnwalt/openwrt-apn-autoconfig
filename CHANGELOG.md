@@ -23,7 +23,8 @@ before a reboot can erase it. The AT-dial handler also resolves that deliberate
 post-reboot identity demotion from the physical path before asking for a control
 port. This avoids a false `modem imei:… is not present` error on every boot and
 still refuses a path fallback when the recorded modem actually remains present
-somewhere else.
+somewhere else. The recovered binding remains visible in the inventory but is
+not logged again on every LuCI poll.
 
 **Two modems stopped the program instead of doubling its work.** `interface=auto`
 selected a target only when there was exactly one to select, and otherwise

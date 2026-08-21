@@ -316,7 +316,7 @@ apk add --allow-untrusted \
   ./luci-app-apn-autoconfig-0.15.2-r1.apk
 ```
 
-`apn-autoconfig-modem-0.15.2-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.15.2-r2.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it. It adds read-only modem
 inventory, stable identity, control-owner arbitration and a coordinator-based
 `modem-reset` path alongside the compatibility path. Install it when those

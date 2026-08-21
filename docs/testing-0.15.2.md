@@ -54,7 +54,9 @@ CLI were affected. This is also what blocks the roaming evidence 0.15.0 owed.
 
 - `modem-reset` fan-out. The power-cycle is one physical operation on one board
   modem; it acts on the target it is given, or on the first managed one.
-- any change to the AT-dial handler's dial sequence.
+- unrelated changes to the AT-dial handler's dial sequence; resolving the
+  deliberate post-reboot identity demotion before port lookup is part of the
+  reboot fix;
 - the Intel XMM path, which stays `alpha`/`synthetic`.
 
 ## Fixture assertions
@@ -74,6 +76,8 @@ In `tests/run-tests-modem.sh`:
   resolves is still recognised through its physical path, reports
   `already_provisioned`, is owned for bearer control, and nothing is written to
   the configuration to establish it;
+- the high-frequency `inventory-json` path does not repeat a recovery notice on
+  every poll;
 - the claim is refused when the id the section records still names a modem that
   is present, so one modem can never take another's section.
 

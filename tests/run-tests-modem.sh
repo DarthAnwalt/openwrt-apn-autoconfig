@@ -2412,6 +2412,14 @@ plan_out="$(sh "$SCRIPT" provision-plan --modem "$rebind_modem")" || plan_status
 	fail 'bearer control did not agree that the recovered section is ours'
 uci_wrote_nothing || fail 'recovering the binding wrote to the configuration'
 
+# inventory-json is polled by LuCI. The recovery verdict belongs in its JSON,
+# not as the same syslog notice on every refresh.
+: >"$TEST_LOGFILE"
+sh "$SCRIPT" inventory-json >/dev/null 2>/dev/null || fail 'inventory failed for a rebound project section'
+if grep -q 'the modem on its path is now' "$TEST_LOGFILE"; then
+	fail 'a normal inventory poll logged the same stale-identity recovery again'
+fi
+
 printf '%s\n' 'TEST the path claim is refused when the identity the section recorded is a modem that is present'
 # Fail-closed half: a recorded id that still names a modem on this bus belongs
 # to that modem. Claiming the section for the modem on the path anyway would

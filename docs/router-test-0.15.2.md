@@ -2,7 +2,7 @@
 
 Date: 2026-08-22
 
-Status: **hardware and CLI gate passed; authenticated LuCI pass pending.**
+Status: **all pre-publication hardware, CLI and LuCI gates passed.**
 
 Reference system: Huasifei WH3000 on OpenWrt 25.12.5, with a Quectel
 RM520N-GL managed by ModemManager and a Fibocom FM350-GL on the project-owned
@@ -99,6 +99,12 @@ the 5 MB test budget and the SIM's 100 MB allowance.
 - Reboot, persistent display identity, current-enumeration revalidation,
   two-target automatic reconciliation, blocked-roaming aggregation and bounded
   roaming connection: passed on hardware.
-- LuCI URL and application page: reachable. The in-app browser had no
-  authenticated LuCI session, so visual assertions about the selector and
-  control enablement remain pending rather than being inferred from unit tests.
+- Authenticated LuCI pass: passed. Automatic mode showed both modem cards, the
+  Fibocom model and project ownership, with neither `Target unavailable` nor
+  the old multiple-target error. Its APN panel explained that reconciliation
+  covers both targets and kept roaming controls disabled until one was chosen.
+  Selecting `apnmodem1` refreshed the header and panel to that target, displayed
+  roaming plus `Explicitly block`, and scoped the policy text to
+  `network.apnmodem1`; returning to Automatic restored the two-modem view.
+  Settings showed `Automatic (every writable target)`. No browser console
+  errors were recorded and no setting was saved or changed during the pass.

@@ -1,7 +1,7 @@
 # 0.15.2 corrective test and release plan
 
-Status: **in progress; automated and CLI hardware gates passed, authenticated
-LuCI pass pending.** Detailed router evidence is in
+Status: **all pre-publication gates passed; ready for release.** The signed-feed
+smoke remains a post-publication gate. Detailed router evidence is in
 [`router-test-0.15.2.md`](router-test-0.15.2.md). 0.15.2 is a defect release
 against the published 0.15.1 packages. Every defect below was found on the
 reference hardware after an ordinary reboot, not by review.

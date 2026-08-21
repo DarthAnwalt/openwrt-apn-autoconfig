@@ -107,6 +107,13 @@ unavailable for the device class:
    `weak-vidpid` and upgraded to `imei` once identity is obtained. This is not
    circular, but it does mean such a modem is weakly identified until something
    asks for its identity, and two of them would stay ambiguous until then.
+   The IMEI it learned is therefore **persistent evidence**: it lives in `identity_dir`
+   (`/etc/apn-autoconfig-modem/identity` by default) rather than in the volatile
+   state directory, and is rewritten only when it changes. It becomes strong
+   identity only after an explicit read corroborates it for the current USB
+   enumeration. Keeping every part in tmpfs made an ordinary reboot lose even
+   safe display and ownership recovery evidence — see
+   [Identity outlives a boot](#identity-outlives-a-boot).
 3. **`weak-vidpid`: bus/port + vendor:product only.** Used only for initial
    classification when neither `usb-serial` nor `imei` evidence is available.
    Never sufficient alone to rebind an existing record to a new `/dev` name
@@ -299,6 +306,43 @@ multi-second hang:
   apply one port's verdict to a different port; keying by interface path makes
   re-enumeration invalidate the entries that genuinely changed and keep the ones
   that did not.
+
+### Identity outlives a boot
+
+Port verdicts, the selected port, and the proof that an IMEI belongs to *this*
+enumeration stay volatile. The IMEI and the `AT+CGMI`/`AT+CGMM`/`AT+CGMR`
+strings beside it persist as evidence. Manufacturer/model strings remain safe
+to display after reboot; the IMEI is not promoted to strong identity until a
+fresh explicit AT read corroborates it.
+
+The distinction is not cosmetic. A modem with no USB serial reaches its strong
+identity only through a cached IMEI, and discovery is forbidden to probe for
+one. With the cache in tmpfs, every reboot renamed such a modem from
+`imei:<n>` to `weak-vidpid:<path>:<vid>:<pid>` while the section provisioned for
+it still recorded the strong id — so the package reported its own interface as
+one the administrator had created, refused to touch it, and displayed the modem
+as unidentified with no model. Nothing about it looked broken. This was observed
+on the reference hardware after a routine reboot of a working 0.15.1.
+
+Two rules follow:
+
+- identity evidence is written to `identity_dir`. The 0.15.2 package migration
+  copies the old volatile records synchronously while a running upgrade still
+  has them; discovery remains read-only;
+- a project-owned section is recognised by **path as well as identity**. When
+  the `apn_autoconfig_modem_id` a section records no longer resolves, the modem
+  the section's physical path leads to claims it — the same recovery the AT-dial
+  handler performs for a live dial. It stays fail-closed: the section must carry
+  the ownership marker, the record must be unambiguous, and a recorded id that
+  still names a modem present on this bus belongs to that modem, so the claim is
+  refused rather than transferred.
+
+A different modem of the same model in the same socket may inherit the previous
+model string for display, but it does not inherit strong identity or mutation
+authority. The persistent IMEI must match a volatile, enumeration-stamped
+corroboration record before discovery uses the `imei` tier. Re-enumeration or
+reboot removes that proof and the record stays `weak-vidpid` until the next
+explicit identity read.
 
 Resolution never runs at all while `owner_state` is `modemmanager` or
 `conflicting`. ModemManager holds the command port of the modems it manages,

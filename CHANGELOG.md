@@ -1,5 +1,58 @@
 # Changelog
 
+## apn-autoconfig 0.15.2 / apn-autoconfig-modem 0.15.2 / apn-autoconfig-proto-atdial 0.15.2 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.15.2 (unreleased)
+
+A defect release. Everything here was found on the reference hardware by
+rebooting a working 0.15.1, which is the one thing the 0.15.0 gate never did.
+
+**A reboot made the package forget its own modem.** A modem with no USB serial
+reaches its strong identity through an IMEI that an explicit AT read learned,
+and discovery is forbidden to probe for one. That IMEI was cached in tmpfs. So
+every reboot renamed the FM350-GL from `imei:…` back to `weak-vidpid:…` while
+the section provisioned for it still recorded the strong id — and the package
+reported its own interface as one the user had created, refused to touch it, and
+displayed the modem as `Unidentified (0e8d:7127)` with no model. Identity
+evidence is now persistent, kept apart from the port verdicts that are only true
+for one enumeration, and a project-owned section is recognised by its physical
+path as well as by the identity it recorded. Strong IMEI identity additionally
+requires a volatile corroboration from the current USB enumeration, so an
+identical replacement in the same socket cannot inherit it. Both halves fail
+closed: a section whose recorded modem is present on this bus is never claimed
+by another one. The upgrade copies 0.15.1's volatile evidence synchronously
+before a reboot can erase it.
+
+**Two modems stopped the program instead of doubling its work.** `interface=auto`
+selected a target only when there was exactly one to select, and otherwise
+failed every command — `status` included — with `multiple writable cellular
+targets found; select one explicitly`. The LuCI page showed "Target unavailable"
+and asked the user to choose before anything would work again, which is the
+opposite of what automatic configuration is for: a second modem is a modem
+somebody attached because they want to use it. Automatic mode now manages every
+enabled target it can write a profile to. `reconcile` and `apply` run against
+each in turn, each with its own state, locking and rollback;
+`status`, `detect` and `modem-reset` act on the target with the lowest netifd
+route metric; and `apply-manual` and `reset` still refuse to spread a profile
+you typed, or a rollback, over targets you did not name. One target can no
+longer hide another: a hard failure or roaming-policy block on one is reported
+even when another succeeded. Administratively disabled targets are never
+started automatically. Roaming-policy changes require one explicit target when
+several are managed, because allowing roaming data is a billing decision, not
+APN reconciliation to spread silently.
+
+**The roaming policy could not be set on an AT-dialed target.** The engine gated
+`roaming-policy-set` on `profile_write`, and `atdial` owns no profile fields of
+its own by design, so the command failed on a capability that has nothing to do
+with it while the target's own record correctly advertised
+`roaming_policy_write`. The gate now tests the capability it means.
+
+LuCI gains a target selector above the tabs whenever more than one cellular
+target exists. It is a view control: it changes nothing, and its default lets an
+APN operation started from the page cover every managed target, exactly as the
+engine does. Roaming controls ask for one selected target, and the selector is
+refreshed after topology/provisioning changes. The per-modem power-cycle button
+now names its own modem's interface — with two modems, the card for one could
+otherwise power-cycle the other.
+
 ## apn-autoconfig 0.15.1 / apn-autoconfig-modem 0.15.1 / apn-autoconfig-proto-atdial 0.15.1 / apn-autoconfig-providers 2026.08.10 / luci-app-apn-autoconfig 0.15.1 (2026-08-19)
 
 A packaging-only patch. No runtime behaviour changes.

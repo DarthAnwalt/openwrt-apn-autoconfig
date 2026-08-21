@@ -312,17 +312,17 @@ Install locally built packages on OpenWrt 25.12 in one transaction:
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.10-r1.apk \
-  ./apn-autoconfig-0.15.1-r1.apk \
-  ./luci-app-apn-autoconfig-0.15.1-r1.apk
+  ./apn-autoconfig-0.15.2-r1.apk \
+  ./luci-app-apn-autoconfig-0.15.2-r1.apk
 ```
 
-`apn-autoconfig-modem-0.15.1-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.15.2-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it. It adds read-only modem
 inventory, stable identity, control-owner arbitration and a coordinator-based
 `modem-reset` path alongside the compatibility path. Install it when those
 functions are required.
 
-`apn-autoconfig-proto-atdial-0.15.1-r1.apk` is also optional, and only useful
+`apn-autoconfig-proto-atdial-0.15.2-r1.apk` is also optional, and only useful
 for a modem that exposes no control channel at all — a Fibocom FM350-GL in RNDIS
 composition, for example, where there is no `cdc-wdm` node for QMI or MBIM to
 use. It adds the `apn_atdial` netifd protocol, which defines and activates the
@@ -797,10 +797,24 @@ uci commit apn-autoconfig
 `use_mwan3` accepts `auto`, `always`, or `never`. `auto` uses `mwan3 use` only
 when mwan3 exists and knows the configured interface.
 
-`interface` accepts `auto` or a UCI network section name. Automatic mode selects
-only when exactly one discovered target has a complete write/apply backend. It
-does not guess between two eligible modems. Existing upgrades retain their
-explicit conffile value (for example `wwan`).
+`interface` accepts `auto` or a UCI network section name. Automatic mode manages
+**every** discovered target with a complete write/apply backend: a second modem
+you attached is a modem you want to use, so `reconcile` and `apply` run against
+each of them in turn, each with its own state, locking and rollback. A disabled
+section does not participate automatically; an explicit `--target` can still
+inspect it. A project-owned section that is still staged is disabled and does
+not count until it is promoted.
+
+Commands that can only mean one target still ask for one. `status`, `detect`,
+`modem-reset` and their JSON forms act on the **first** managed target — the one
+with the lowest netifd route metric, which is where the administrator has
+already said which uplink matters, with the section name breaking a tie —
+and `apply-manual`, `reset`, and roaming-policy changes refuse rather than
+spread a user decision over targets you did not name. `--target
+network:<section>` selects one explicitly for any command, and setting
+`interface` to a section name
+restricts the program to it and leaves every other target alone. Existing
+upgrades retain their explicit conffile value (for example `wwan`).
 
 The current primary SIM is resolved on every command by matching the
 ModemManager device to `network.<interface>.device`. This is necessary because

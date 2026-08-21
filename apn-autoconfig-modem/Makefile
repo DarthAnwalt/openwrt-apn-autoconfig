@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig-modem
-PKG_VERSION:=0.15.1
+PKG_VERSION:=0.15.2
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -62,6 +62,12 @@ endef
 define Package/apn-autoconfig-modem/postinst
 #!/bin/sh
 [ -n "$${IPKG_INSTROOT}" ] && exit 0
+if [ -x /usr/sbin/apn-autoconfig-modem ]; then
+	# 0.15.1 kept AT identity in tmpfs. Preserve it synchronously while the
+	# running system still has it; a service-start worker may lose this race to
+	# an immediate reboot after package installation.
+	/usr/sbin/apn-autoconfig-modem migrate-identity-cache >/dev/null 2>&1 || exit 1
+fi
 if [ -x /etc/init.d/apn-autoconfig-modem ]; then
 	/etc/init.d/apn-autoconfig-modem enable >/dev/null 2>&1 || exit 1
 	/etc/init.d/apn-autoconfig-modem restart >/dev/null 2>&1 || exit 1
@@ -105,6 +111,14 @@ for state_file in /var/run/apn-autoconfig-modem/at-ports/port.* \
 	/var/run/apn-autoconfig-modem/at-ports/imei.*; do
 	[ -f "$${state_file}" ] && rm -f "$${state_file}"
 done
+# Persistent identity evidence. Same rule, on flash rather than tmpfs: exact
+# project-owned names, regular files only, and the directory only if it empties.
+for state_file in /etc/apn-autoconfig-modem/identity/identity.* \
+	/etc/apn-autoconfig-modem/identity/imei.*; do
+	[ -f "$${state_file}" ] && rm -f "$${state_file}"
+done
+rmdir /etc/apn-autoconfig-modem/identity 2>/dev/null || :
+rmdir /etc/apn-autoconfig-modem 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/provisioning 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/at-ports 2>/dev/null || :

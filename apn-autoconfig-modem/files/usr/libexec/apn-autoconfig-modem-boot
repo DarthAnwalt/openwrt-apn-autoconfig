@@ -53,6 +53,12 @@ delay="$(numeric_value boot_delay 10)" || exit $?
 log notice "waiting ${delay}s before the first modem inventory scan"
 [ "$delay" -eq 0 ] || sleep "$delay"
 
+# Normally postinst has already copied the pre-0.15.2 volatile identity cache.
+# Keep this idempotent fallback for service starts that did not pass through a
+# package upgrade (manual file replacement, interrupted postinst).
+"$MODEM_BIN" migrate-identity-cache >/dev/null 2>&1 || \
+	log warning "could not preserve legacy modem identity evidence"
+
 "$MODEM_BIN" rescan >/dev/null 2>&1 &
 CHILD_PID=$!
 status=0

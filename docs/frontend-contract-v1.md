@@ -1,8 +1,8 @@
 # Frontend contract v1 (0.13.0)
 
-Status: accepted design for 0.13.0. Nothing here is implemented yet. This
-document is normative for `luci-app-apn-autoconfig` and for the one runtime rule
-the reorganization depends on. It inherits every rule in
+Status: implemented in 0.13.0 and amended for multi-target operation in 0.15.2.
+This document is normative for `luci-app-apn-autoconfig` and for the runtime
+rules the organization depends on. It inherits every rule in
 [`architecture.md`](architecture.md),
 [`provisioning-contract-v1.md`](provisioning-contract-v1.md) and
 [`modem-contract-v1.md`](modem-contract-v1.md).
@@ -62,6 +62,43 @@ therefore always visible and always shows:
 
 A failure never lives only inside a tab. When the last result is a failure or an
 operation is running, the strip says so regardless of which tab is open.
+
+## Several managed targets, one page
+
+A router with two modems is ordinary, and the page must not treat it as a
+configuration error. The engine manages every writable target automatically; the
+page therefore shows a **target selector** above the tabs whenever more than one
+cellular target was discovered, and never asks the user to choose one before it
+will display anything.
+
+The selector is a view control. It changes nothing on the router and saves
+nothing:
+
+- its default, "Automatic — all managed targets", displays the engine's own
+  first target and lets APN reconciliation run against every managed one;
+- selecting a target scopes both the display and the buttons on that panel to
+  it, by passing `network:<section>` to the query and control wrappers.
+
+Roaming permission is deliberately excluded from fan-out. In the automatic
+multi-target view its controls are disabled with guidance to select one modem;
+allowing a capped roaming SIM in one modem must not silently enable roaming on
+another. The selector inventory is refreshed after provisioning and ordinary
+panel refreshes, so hotplug or a newly created target does not require a browser
+reload.
+
+Two consequences are normative rather than cosmetic:
+
+- the confirmation dialog names the scope it is about to act on, because "every
+  managed target: wwan, apnmodem1" and "apnmodem1 only" are different
+  operations and the button looks identical;
+- a control that belongs to one modem's card passes that modem's own interface.
+  The per-modem power-cycle button does, and must: without it the engine
+  resolves whichever target it manages first, and the card for one modem could
+  power-cycle the other.
+
+An unavailable status is a fact about one target, never about the set. The page
+says so, and offers the others as somewhere else to look rather than as a choice
+that has to be made before the program will work again.
 
 ## Manual APN entry
 

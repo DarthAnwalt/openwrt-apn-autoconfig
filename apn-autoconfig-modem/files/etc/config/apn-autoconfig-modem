@@ -3,6 +3,13 @@ config apn_autoconfig_modem 'main'
 	option boot_delay '10'
 	option sysfs_root '/sys'
 	option state_dir '/var/run/apn-autoconfig-modem'
+	# Identity evidence — the IMEI and the model strings an AT read learned —
+	# kept apart from volatile scan state because it describes the modem rather
+	# than this boot. Model strings are safe to display after reboot. The cached
+	# IMEI is accepted as strong identity only after a fresh read corroborates it
+	# for the current USB enumeration, so an identical replacement in the same
+	# socket cannot inherit it.
+	option identity_dir '/etc/apn-autoconfig-modem/identity'
 	option lock_root '/var/lock/apn-autoconfig-modem'
 	option action_state_dir '/tmp/apn-autoconfig-modem-action'
 	option hotplug_coalesce_seconds '3'

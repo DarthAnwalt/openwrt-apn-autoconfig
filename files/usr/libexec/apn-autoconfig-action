@@ -33,11 +33,17 @@ trap cleanup_start_lock 0
 
 case "$ACTION" in reconcile|modem-reset|apply-manual|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;; *) exit 2 ;; esac
 case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
+# "auto" is a target in its own right: every target the engine manages, which
+# is what an operation started without naming one means when several are
+# managed. Only APN reconciliation accepts it: a profile the user typed, a
+# power-cycle, and a roaming-policy change all require one deliberate target.
 case "$ACTION:$TARGET" in
 	database-*:) : ;;
+	reconcile:auto) : ;;
 	*:network:*) target_interface="${TARGET#network:}"; case "$target_interface" in ''|*[!A-Za-z0-9_]*) exit 2 ;; esac ;;
 	*) exit 2 ;;
 esac
+
 timestamp() {
 	date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
 }
@@ -85,9 +91,6 @@ esac
 write_state running "" "operation is running"
 logger -t "$PROG" -p user.notice -- "starting background operation: $ACTION" 2>/dev/null || :
 case "$ACTION" in
-	roaming-default) "$COMMAND" roaming-policy-set default --target "$TARGET" & ;;
-	roaming-allow) "$COMMAND" roaming-policy-set allow --target "$TARGET" & ;;
-	roaming-block) "$COMMAND" roaming-policy-set block --target "$TARGET" & ;;
 	database-check) "$DATABASE_COMMAND" check & ;;
 	database-install) "$DATABASE_COMMAND" install & ;;
 	apply-manual)
@@ -119,7 +122,22 @@ case "$ACTION" in
 		fi
 		manual_password=""
 	;;
-	*) "$COMMAND" "$ACTION" --target "$TARGET" & ;;
+	*)
+		# The command line is assembled first and started once, so that the
+		# recorded child PID is the engine itself. Running it from a wrapper
+		# function put a subshell in between, and the TERM this worker forwards
+		# on interruption reached the subshell instead of the operation.
+		case "$ACTION" in
+			roaming-default) set -- roaming-policy-set default ;;
+			roaming-allow) set -- roaming-policy-set allow ;;
+			roaming-block) set -- roaming-policy-set block ;;
+			*) set -- "$ACTION" ;;
+		esac
+		# No --target: the engine then resolves every target it manages, which
+		# is what an operation started without naming one means.
+		[ "$TARGET" = auto ] || set -- "$@" --target "$TARGET"
+		"$COMMAND" "$@" &
+	;;
 esac
 CHILD_PID=$!
 status=0

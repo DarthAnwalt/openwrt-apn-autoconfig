@@ -6,7 +6,7 @@ with [`architecture.md`](architecture.md), [`backend-contract-v1.md`](backend-co
 [`provisioning-contract-v1.md`](provisioning-contract-v1.md),
 [`mbim-contract-v1.md`](mbim-contract-v1.md),
 [`atdial-contract-v1.md`](atdial-contract-v1.md), the latest version-specific
-test plan — currently [`testing-0.15.0.md`](testing-0.15.0.md) — and
+test plan — currently [`testing-0.15.2.md`](testing-0.15.2.md) — and
 [`roadmap.md`](roadmap.md) before changing runtime behavior. The README
 describes released behavior; the changelog records shipped differences rather
 than future intentions.
@@ -18,17 +18,14 @@ architectural releases.
 
 ## Current state and next release
 
-Version 0.14.1 is released. The suite discovers a modem, provisions it, selects
-and applies an APN, verifies real Internet access, controls the connection and
-manages roaming policy — over ModemManager, native QMI and native MBIM — and
-identifies a modem that answers only 3GPP AT, which 0.14.0 added as the
-precondition for what follows.
+Version 0.15.1 is released. It includes the AT-dialed FM350 path from 0.15.0
+and the signed-feed packaging repair from 0.15.1. The next release is the
+corrective **0.15.2** described in [`testing-0.15.2.md`](testing-0.15.2.md): it
+repairs reboot identity/ownership recovery, makes automatic APN reconciliation
+cover every enabled writable target, and fixes AT-dial roaming-policy control.
+Roaming permission itself remains a one-target decision; it never fans out.
 
-The next release is **0.15.0, the AT-dialed connection path**. Its plan is
-[`testing-0.15.0.md`](testing-0.15.0.md) and its normative behaviour is
-[`atdial-contract-v1.md`](atdial-contract-v1.md).
-
-Five points there are easy to get wrong.
+The 0.15.0 implementation constraints below remain active invariants.
 
 **The protocol handler must create the network device, not wait for one.** The
 measured FM350-GL presents an RNDIS interface pair with **no driver bound** on

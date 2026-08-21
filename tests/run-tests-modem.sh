@@ -49,6 +49,7 @@ show:network)
 ;;
 get:apn-autoconfig-modem.main.sysfs_root) printf '%s\n' "$TEST_SYSFS" ;;
 get:apn-autoconfig-modem.main.state_dir) printf '%s\n' "$TEST_MODEM_STATE_DIR" ;;
+get:apn-autoconfig-modem.main.identity_dir) printf '%s\n' "$TEST_MODEM_IDENTITY_DIR" ;;
 get:apn-autoconfig-modem.main.lock_root) printf '%s\n' "$TEST_MODEM_LOCK_ROOT" ;;
 get:apn-autoconfig.main.lock_dir) printf '%s\n' "$TEST_APN_LOCK_DIR" ;;
 get:apn-autoconfig.main.qmi_identity_lock_root) printf '%s\n' "$TEST_QMI_IDENTITY_LOCK_ROOT" ;;
@@ -519,6 +520,9 @@ chmod 0755 "$MOCKBIN"/*
 export PATH="$MOCKBIN:/usr/bin:/bin"
 export TEST_SYSFS="$TESTROOT/sys"
 export TEST_MODEM_STATE_DIR="$TESTROOT/run"
+# Persistent on the target: /etc, not tmpfs. Tests keep it apart from the
+# volatile state dir so that wiping the latter reproduces a reboot exactly.
+export TEST_MODEM_IDENTITY_DIR="$TESTROOT/identity"
 export TEST_MODEM_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-modem"
 export TEST_APN_LOCK_DIR="$TESTROOT/lock/apn-autoconfig.lock"
 export TEST_QMI_IDENTITY_LOCK_ROOT="$TESTROOT/lock/apn-autoconfig-qmi-identity"
@@ -728,6 +732,10 @@ reset_at_ports() {
 	: >"$TEST_AT_PORTS"
 	: >"$TEST_AT_PROBES"
 	rm -rf "$TEST_MODEM_STATE_DIR/at-ports"
+	# Identity evidence is persistent on the target, so a fixture reset has to
+	# clear it explicitly. Leaving it would carry one test's IMEI into the next
+	# test that reuses the same socket and VID:PID, which is the same key.
+	rm -rf "$TEST_MODEM_IDENTITY_DIR"
 }
 
 reset_sysfs
@@ -1214,6 +1222,72 @@ assert m["firmware_revision"] == "EC25EFAR06A11M4G", m
 : >"$TEST_AT_PROBES"
 sh "$SCRIPT" inventory-json >/dev/null
 [ ! -s "$TEST_AT_PROBES" ] || fail 'displaying identity evidence caused a probe'
+
+printf '%s\n' 'TEST display identity survives reboot without granting stale strong identity'
+# The volatile state dir is tmpfs on the target. Keeping the IMEI there meant an
+# ordinary reboot demoted a modem with no USB serial from `imei:...` back to
+# `weak-vidpid:...`, while the section provisioned for it still recorded the
+# strong id — so the package reported its own interface as one the user had
+# created, with no model to show for it. Observed on the reference hardware.
+#
+# The reboot here is exactly the tmpfs going away: the persistent directory is
+# untouched, and nothing is allowed to probe to recover what it holds.
+reset_sysfs
+reset_at_ports
+reset_network_config
+add_at_modem 7-1.8 0e8d 7127 '' 53
+printf '/dev/ttyUSB53\tcontrol\n' >>"$TEST_AT_PORTS"
+sh "$SCRIPT" at-identity --modem "weak-vidpid:7-1.8:0e8d:7127" >/dev/null || \
+	fail 'at-identity failed against the serial-less modem'
+[ -s "$TEST_MODEM_IDENTITY_DIR/imei.7-1.8_0e8d_7127" ] || \
+	fail 'the IMEI was not written to persistent storage'
+[ ! -e "$TEST_MODEM_STATE_DIR/at-ports/imei.7-1.8_0e8d_7127" ] || \
+	fail 'the IMEI was written to volatile state as well'
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["modem_id"] == "imei:016177002734885", m
+assert m["evidence_tier"] == "imei", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'the identity read did not upgrade the evidence tier'
+
+rm -rf "$TEST_MODEM_STATE_DIR"
+: >"$TEST_AT_PROBES"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+# Persistent identity is safe for display, but cannot prove that an identical
+# replacement modem was not placed in the same socket while the router was
+# down. Strong identity returns after the first explicit AT identity read.
+assert m["modem_id"] == "weak-vidpid:7-1.8:0e8d:7127", m
+assert m["evidence_tier"] == "weak-vidpid", m
+assert m["model"] == "FM350-GL", m
+assert m["manufacturer"] == "Fibocom Wireless Inc.", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'a reboot lost persistent modem display evidence'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'recovering identity after a reboot probed the modem'
+
+printf '%s\n' 'TEST upgrading from 0.15.1 preserves volatile identity before reboot'
+# The new binary is installed while the old release's tmpfs is still present.
+# postinst must copy that evidence synchronously; relying on a later inventory
+# read is too late when the next event is an immediate reboot.
+reset_sysfs
+reset_at_ports
+add_at_modem 7-1.8 0e8d 7127 '' 53
+mkdir -p "$TEST_MODEM_STATE_DIR/at-ports"
+printf '%s\n' 016177002734885 >"$TEST_MODEM_STATE_DIR/at-ports/imei.7-1.8_0e8d_7127"
+printf 'Fibocom Wireless Inc.\tFM350-GL\t81600.0000.00.29.20.16\n' \
+	>"$TEST_MODEM_STATE_DIR/at-ports/identity.7-1.8_0e8d_7127"
+sh "$SCRIPT" migrate-identity-cache >/dev/null || fail 'legacy identity migration failed'
+rm -rf "$TEST_MODEM_STATE_DIR"
+: >"$TEST_AT_PROBES"
+python3 -c '
+import json, sys
+m = json.loads(sys.argv[1])["modems"][0]
+assert m["modem_id"] == "weak-vidpid:7-1.8:0e8d:7127", m
+assert m["evidence_tier"] == "weak-vidpid", m
+assert m["model"] == "FM350-GL", m
+assert m["manufacturer"] == "Fibocom Wireless Inc.", m
+' "$(sh "$SCRIPT" inventory-json)" || fail 'upgrade migration did not survive reboot'
+[ ! -s "$TEST_AT_PROBES" ] || fail 'migrated identity required an AT probe after reboot'
 
 printf '%s\n' 'TEST a modem with no readable SIM fails rather than reporting a partial identity'
 # The port resolves and answers every hardware query, so the failure has to come
@@ -2308,6 +2382,54 @@ plan_out="$(sh "$SCRIPT" provision-plan --modem "$plan_modem")" || plan_status=$
 [ "$(plan_json "$plan_out" reason)" = already_configured ] || \
 	fail 'an unowned section bound to the modem must block provisioning, not be adopted'
 
+printf '%s\n' 'TEST a project-owned section still recognises its modem after the identity it recorded is gone'
+# The other side of the reboot defect. A modem_id is evidence, and evidence can
+# be lost while the device does not move: the AT-supplied IMEI that makes a
+# serial-less modem strong is learned by an explicit read, so a cold cache turns
+# `imei:...` back into `weak-vidpid:...`. The section still records the id it
+# was provisioned with, the identity lookup misses, and the package calls its
+# own interface one the user created and refuses to touch it.
+#
+# The section is bound by path *and* identity, so the path half answers here —
+# the same recovery the AT-dial handler already performs for a live dial.
+reset_sysfs
+reset_network_config
+reset_at_ports
+add_at_modem 8-1.5 0e8d 7127 '' 54
+add_network_section apnmodem1 apn_atdial
+add_section_option apnmodem1 usbpath 8-1.5
+add_section_option apnmodem1 apn_autoconfig_owner apn-autoconfig-modem
+add_section_option apnmodem1 apn_autoconfig_modem_id imei:016177002734885
+rebind_modem='weak-vidpid:8-1.5:0e8d:7127'
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$rebind_modem")" || plan_status=$?
+[ "$plan_status" -eq 0 ] || fail "a section whose recorded identity went stale exited $plan_status"
+[ "$(plan_json "$plan_out" reason)" = already_provisioned ] || \
+	fail 'a project-owned section was not recognised once the identity it recorded stopped resolving'
+[ "$(plan_json "$plan_out" existing_section)" = apnmodem1 ] || \
+	fail 'the recovered section was not reported'
+[ "$(plan_json "$plan_out" connection_owned)" = True ] || \
+	fail 'bearer control did not agree that the recovered section is ours'
+uci_wrote_nothing || fail 'recovering the binding wrote to the configuration'
+
+printf '%s\n' 'TEST the path claim is refused when the identity the section recorded is a modem that is present'
+# Fail-closed half: a recorded id that still names a modem on this bus belongs
+# to that modem. Claiming the section for the modem on the path anyway would
+# hand one modem the section of another.
+reset_network_config
+add_at_modem 8-1.6 1234 5678 OTHERMODEM 56
+add_network_section apnmodem1 apn_atdial
+add_section_option apnmodem1 usbpath 8-1.5
+add_section_option apnmodem1 apn_autoconfig_owner apn-autoconfig-modem
+add_section_option apnmodem1 apn_autoconfig_modem_id 'usb-serial:8-1.6:1234:5678:OTHERMODEM'
+plan_status=0
+plan_out="$(sh "$SCRIPT" provision-plan --modem "$rebind_modem")" || plan_status=$?
+[ "$plan_status" -eq 4 ] || fail "a section owned by a present modem exited $plan_status instead of the blocked class 4"
+[ "$(plan_json "$plan_out" reason)" = already_configured ] || \
+	fail 'a section whose recorded modem is present was claimed by another modem'
+[ "$(plan_json "$plan_out" existing_section)" = '' ] || \
+	fail 'a section belonging to a present modem was reported as this one\047s'
+
 printf '%s\n' 'TEST provision-plan refuses an ambiguous modem without inspecting it further'
 reset_sysfs
 reset_network_config
@@ -3316,7 +3438,7 @@ stale = sorted(listed - derived)
 assert not stale, 'TMP_SUFFIXES names suffixes nothing builds: %s' % stale
 PYEOF
 
-printf '%s\n' 'TEST a re-enumeration discards port verdicts but keeps the modem identity'
+printf '%s\n' 'TEST a re-enumeration discards port verdicts and requires fresh strong identity proof'
 # Found by the 0.15.0 hardware gate, and it made reset the most dangerous
 # operation in the suite. During a reset the tty nodes exist but do not answer
 # yet, so a sweep records every one of them as dead — and the verdicts used to
@@ -3325,8 +3447,9 @@ printf '%s\n' 'TEST a re-enumeration discards port verdicts but keeps the modem 
 # permanently unresolvable: the operation meant to recover a wedged modem was
 # the one that made it unusable.
 #
-# The identity must survive the same event, or a reset would drop the modem back
-# to a weak tier and take its binding to a provisioned section with it.
+# Manufacturer/model display evidence survives, but strong IMEI identity must
+# be corroborated again: a same-model replacement can occupy the same socket.
+# Project-owned section recovery uses its independent path binding meanwhile.
 reset_sysfs
 reset_at_ports
 add_at_modem 14-1.1 0e8d 7127 '' 96 11
@@ -3348,11 +3471,18 @@ done
 printf 'dead\n11\n' >"$TEST_MODEM_STATE_DIR/at-ports/selected.14-1.1_0e8d_7127"
 reenumerate_at_modem 14-1.1 12
 
-sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
-	fail 'a re-enumeration threw away the modem identity along with the port verdicts'
-port="$(sh "$SCRIPT" at-port --modem "$(sh "$SCRIPT" inventory-json | sed -n 's/.*"modem_id":"\(imei:[^"]*\)".*/\1/p' | head -1)")" || \
+reenumerated="$(sh "$SCRIPT" inventory-json)"
+printf '%s\n' "$reenumerated" | grep -q '"evidence_tier":"weak-vidpid"' || \
+	fail 'a re-enumeration trusted an IMEI that was not proved for the returning modem'
+printf '%s\n' "$reenumerated" | grep -q '"model":"FM350-GL"' || \
+	fail 'a re-enumeration discarded safe persistent display evidence'
+port="$(sh "$SCRIPT" at-port --modem "$stamp_modem")" || \
 	fail 'the port did not resolve again after a re-enumeration'
 [ "$port" = /dev/ttyUSB96 ] || fail "after re-enumeration the port resolved to $port"
+sh "$SCRIPT" at-identity --modem "$stamp_modem" >/dev/null 2>&1 || \
+	fail 'the returning modem could not re-prove its identity'
+sh "$SCRIPT" inventory-json | grep -q '"evidence_tier":"imei"' || \
+	fail 'fresh identity proof did not restore the strong tier'
 
 printf '%s\n' 'TEST an interface already in the zone is not added twice'
 reset_sysfs

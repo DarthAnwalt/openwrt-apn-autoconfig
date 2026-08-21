@@ -32,6 +32,47 @@ and validation state:
 - `roaming_policy_read` and `roaming_policy_write` describe policy support
   separately, so a consumer never infers it from a backend name. They are an
   additive extension: the existing `roaming_policy` string keeps its meaning.
+  `roaming_policy_write` is also what the engine's own gate for
+  `roaming-policy-set` tests. Requiring `profile_write` there refused every
+  backend that owns no profile fields of its own — `atdial` among them — although
+  its capability record advertised the policy correctly;
+- `managed` says whether automatic operations act on this target. In automatic
+  mode that is every enabled target with `profile_apply`; with an explicit
+  `interface`, only that one. It is an
+  additive v2 field, and a frontend must not recompute it from capabilities: a
+  staged section has `profile_apply` and is deliberately not managed.
+
+## Automatic target selection
+
+`interface=auto` means *every* target the engine can write a profile to, not
+"the only one". A router with two modems is the ordinary case, and up to 0.15.1
+it was a fatal one: every command, `status` included, exited 4 with `multiple
+writable cellular targets found`, so the suite stopped working at the moment it
+had more to do.
+
+- `reconcile` and `apply` run once per managed target,
+  sequentially. Each run is an ordinary single-target run — it selects, locks,
+  verifies and rolls back its own target — so the lock order is unchanged and
+  two targets are never mutated at once.
+- The aggregate exit class is the worst one that matters. A retryable result
+  (3) wins, so a boot worker retries; these operations are idempotent, so the
+  targets that already succeeded cost nothing on the next attempt. A hard
+  failure is reported even when another target succeeded: one target must never
+  be able to hide another. A target the roaming policy deliberately refused (2)
+  is also the aggregate result even when another target succeeded, because an
+  overall success would hide an attached modem that remains unavailable.
+- `status`, `detect`, `modem-reset` and the JSON forms act on the first managed
+  target: the lowest netifd route metric, section name breaking a tie. Route
+  metric is the administrator's own statement of which uplink matters.
+  Enumeration order decides nothing.
+- `apply-manual`, `reset`, and roaming-policy changes refuse with exit 4 when
+  several targets are managed and none was named. A profile the user typed, a
+  rollback, and permission to spend roaming data are not operations to spread
+  over targets nobody chose.
+- A background APN reconciliation started without a target records the target
+  `auto`, and the worker invokes the engine without `--target` so LuCI gets the
+  same fan-out. Single-target actions such as modem reset and roaming policy do
+  not accept `auto`.
 
 An installed parser is not hardware support. A missing runtime command such as
 `mmcli`, `uqmi` or the core dependency `sms_tool` makes the corresponding capability false without hiding the

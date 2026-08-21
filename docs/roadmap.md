@@ -115,6 +115,9 @@ where the assignment never reached the parent.
 
 ## 0.14.0 — AT identity backend and bounded AT transport
 
+Released. Added bounded AT identity, role-based port resolution and owner-aware
+reset selection; FM350 hardware evidence is recorded with the release.
+
 Add the third and last identity backend. A modem that answers 3GPP AT but
 exposes neither QMI nor MBIM becomes identifiable, matchable against the
 provider database and displayable. This is the precondition for the Fibocom
@@ -154,6 +157,10 @@ QMI and MBIM. Manual APN remains an APN-engine operation using the same
 baseline, verification and rollback discipline as database profiles.
 
 ## 0.15.0 — AT-dialed connection path
+
+Released, with the packaging-only 0.15.1 follow-up. Added the `apn_atdial`
+netifd path and validated the Fibocom FM350-GL path on the reference router;
+the Intel XMM tail remains explicitly `alpha`/`synthetic`.
 
 Add `apn-autoconfig-proto-atdial`, a netifd protocol (`apn_atdial`) for modems
 that expose no control channel at all. Their data path is an ordinary usbnet

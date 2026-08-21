@@ -13,6 +13,8 @@ CONFIG="apn-autoconfig-modem"
 
 SYSFS_ROOT="${APN_AUTOCONFIG_MODEM_SYSFS_ROOT:-/sys}"
 STATE_DIR="/var/run/apn-autoconfig-modem"
+# Identity evidence outlives the boot that learned it; see at_identity_dir.
+IDENTITY_DIR="/etc/apn-autoconfig-modem/identity"
 LOCK_ROOT="/var/lock/apn-autoconfig-modem"
 APN_LOCK_DIR="/var/lock/apn-autoconfig.lock"
 ACTION_STATE_DIR="/tmp/apn-autoconfig-modem-action"
@@ -277,6 +279,7 @@ load_config() {
 	command_exists uci || die "uci is required"
 	value="$(uci -q get "${CONFIG}.main.sysfs_root")" && [ -n "$value" ] && SYSFS_ROOT="$value"
 	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.identity_dir")" && [ -n "$value" ] && IDENTITY_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_root")" && [ -n "$value" ] && LOCK_ROOT="$value"
 	value="$(uci -q get apn-autoconfig.main.lock_dir)" && [ -n "$value" ] && APN_LOCK_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
@@ -318,6 +321,7 @@ hardware_integration_name() {
 validate_config() {
 	case "$SYSFS_ROOT" in /|*/../*|*/..) die "unsafe sysfs_root" ;; /*) : ;; *) die "sysfs_root must be absolute" ;; esac
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+	case "$IDENTITY_DIR" in /|*/../*|*/..) die "unsafe identity_dir" ;; /*) : ;; *) die "identity_dir must be absolute" ;; esac
 	case "$LOCK_ROOT" in /|*/../*|*/..) die "unsafe lock_root" ;; /*) : ;; *) die "lock_root must be absolute" ;; esac
 	case "$APN_LOCK_DIR" in /|*/../*|*/..) die "unsafe APN lock_dir" ;; /*) : ;; *) die "APN lock_dir must be absolute" ;; esac
 	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
@@ -880,17 +884,116 @@ at_selection_file() {
 	printf '%s/selected.%s\n' "$(at_cache_dir)" "$1"
 }
 
+# Identity evidence lives where a reboot cannot take it.
+#
+# The IMEI and the manufacturer/model strings are properties of the modem
+# itself, not of this enumeration and not of this boot. Keeping them beside the
+# port verdicts in tmpfs meant that every reboot silently demoted a modem with
+# no USB serial from `imei:...` back to `weak-vidpid:...`, while the section
+# this package had provisioned for it still recorded the strong id. The modem
+# the package set up itself was then reported as belonging to an interface the
+# user created, with no model to show for it, and nothing about it looked
+# broken. Observed on the reference hardware after an ordinary reboot.
+#
+# Port verdicts deliberately do *not* move here: they are true only for the
+# enumeration that produced them, and a persistent `dead` would make a working
+# port permanently invisible. See at_enumeration_stamp.
+#
+# Display evidence can safely survive a reboot, but an IMEI used as identity
+# cannot: a different modem of the same model may be put in the same socket.
+# The persistent IMEI is therefore accepted only after an explicit AT read has
+# corroborated it for the current USB enumeration. Until then inventory keeps
+# weak VID:PID identity, displays the cached model, and recovers project-owned
+# section ownership independently by its recorded physical path.
+at_identity_dir() {
+	printf '%s\n' "$IDENTITY_DIR"
+}
+
 at_imei_file() {
-	printf '%s/imei.%s\n' "$(at_cache_dir)" "$1"
+	printf '%s/imei.%s\n' "$(at_identity_dir)" "$1"
+}
+
+at_verified_imei_file() {
+	printf '%s/verified-imei.%s\n' "$(at_cache_dir)" "$1"
+}
+
+# Where identity was written before it was made persistent. Read as a fallback
+# so an upgrade over a running system keeps what it already knows instead of
+# losing it until the next explicit identity read.
+at_legacy_identity_file() {
+	printf '%s/%s\n' "$(at_cache_dir)" "${1##*/}"
+}
+
+at_identity_read() {
+	identity_read_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	[ -n "$identity_read_value" ] || \
+		identity_read_value="$(sed -n '1p' "$(at_legacy_identity_file "$1")" 2>/dev/null || :)"
+	[ -n "$identity_read_value" ] || return 1
+	printf '%s\n' "$identity_read_value"
+}
+
+# Persistent storage is flash. An identity read that learned nothing new must
+# not cost an erase cycle, so an unchanged value is not rewritten.
+at_identity_write() {
+	identity_write_file="$1"
+	identity_write_value="$2"
+	[ "$(sed -n '1p' "$identity_write_file" 2>/dev/null || :)" = "$identity_write_value" ] && return 0
+	mkdir -p "$(at_identity_dir)" 2>/dev/null || return 1
+	printf '%s\n' "$identity_write_value" >"$identity_write_file.$$" 2>/dev/null || return 1
+	mv -f "$identity_write_file.$$" "$identity_write_file" 2>/dev/null || {
+		rm -f "$identity_write_file.$$" 2>/dev/null || :
+		return 1
+	}
+}
+
+# 0.15.1 stored the same two records under volatile /var/run state. Upgrade
+# while the router is running is the one chance to preserve that already
+# proven evidence before a reboot removes tmpfs, so postinst invokes this
+# command synchronously. Discovery itself remains strictly read-only.
+migrate_identity_cache_cmd() {
+	legacy_dir="$(at_cache_dir)"
+	[ -d "$legacy_dir" ] || { printf 'ok\n'; return 0; }
+	mkdir -p "$(at_identity_dir)" 2>/dev/null || \
+		die "cannot create persistent identity directory"
+	for legacy_file in "$legacy_dir"/imei.* "$legacy_dir"/identity.*; do
+		[ -f "$legacy_file" ] || continue
+		[ ! -L "$legacy_file" ] || continue
+		legacy_name="${legacy_file##*/}"
+		legacy_scope="${legacy_name#*.}"
+		safe_token "$legacy_scope" || continue
+		persistent_file="$(at_identity_dir)/$legacy_name"
+		# New evidence always wins. Re-running the migration is therefore
+		# idempotent and cannot roll a current identity back to an old one.
+		[ -e "$persistent_file" ] && continue
+		legacy_value="$(sed -n '1p' "$legacy_file" 2>/dev/null || :)"
+		case "$legacy_name" in
+			imei.*)
+				valid_imei "$legacy_value" || continue
+			;;
+			identity.*)
+				# manufacturer<TAB>model<TAB>firmware, one bounded record.
+				awk -F '\t' 'NR != 1 || NF != 3 || length($0) > 386 { bad = 1 }
+					END { exit !(NR == 1 && !bad) }' "$legacy_file" 2>/dev/null || continue
+			;;
+			*) continue ;;
+		esac
+		at_identity_write "$persistent_file" "$legacy_value" || \
+			die "cannot migrate identity evidence to persistent storage"
+	done
+	printf 'ok\n'
 }
 
 at_cached_imei() {
-	# Read on the discovery path, so it must never probe. An IMEI learned by an
-	# earlier explicit identity read is what lets a modem with no USB serial
-	# reach a strong evidence tier without one.
+	# Read on the discovery path, so it must never probe. Persistent display
+	# evidence alone is not proof that the same physical modem is still in this
+	# socket; require the IMEI to have been corroborated for this enumeration.
 	cached_scope="$(at_cache_scope "$1")" || return 1
-	cached_imei_value="$(sed -n '1p' "$(at_imei_file "$cached_scope")" 2>/dev/null || :)"
+	cached_imei_value="$(at_identity_read "$(at_imei_file "$cached_scope")" 2>/dev/null || :)"
 	valid_imei "$cached_imei_value" || return 1
+	cached_stamp="$(at_enumeration_stamp "$1")"
+	verified_imei_value="$(at_cache_read_stamped \
+		"$(at_verified_imei_file "$cached_scope")" "$cached_stamp" 2>/dev/null || :)"
+	[ "$verified_imei_value" = "$cached_imei_value" ] || return 1
 	printf '%s\n' "$cached_imei_value"
 }
 
@@ -1062,7 +1165,7 @@ at_probe_port() {
 # for the field mapping and why operator_id is deliberately left empty.
 
 at_identity_cache_file() {
-	printf '%s/identity.%s\n' "$(at_cache_dir)" "$(sanitize_token "$1")"
+	printf '%s/identity.%s\n' "$(at_identity_dir)" "$(sanitize_token "$1")"
 }
 
 at_single_line() {
@@ -1899,7 +2002,7 @@ print_modem_json() {
 	if [ -z "$record_identity" ]; then
 		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
 		[ -z "$record_scope" ] || \
-			record_identity="$(sed -n '1p' "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
+			record_identity="$(at_identity_read "$(at_identity_cache_file "$record_scope")" 2>/dev/null || :)"
 	else
 		record_scope="$(at_cache_scope "$usb_path" 2>/dev/null || :)"
 	fi
@@ -2288,6 +2391,44 @@ provision_existing_section() {
 	return 1
 }
 
+# The same question asked the other way round: the record already resolved to a
+# netifd section by physical path, so is that section one of ours whose recorded
+# identity has gone stale?
+#
+# A modem_id is evidence, and evidence can be upgraded or lost while the device
+# does not move an inch. The AT-supplied IMEI that makes a serial-less modem
+# strong is learned by an explicit read, so anything that clears it — a cold
+# cache, a reset before the first read — turns `imei:...` back into
+# `weak-vidpid:...`. The section still records the id it was provisioned with,
+# the identity lookup misses, and the package reports its own interface as one
+# the user created and refuses to touch it. That is exactly backwards, and it is
+# what a reboot produced on the reference hardware.
+#
+# The section is bound by path *and* identity, which is why the path half can
+# answer here — the same recovery the AT-dial handler already performs for a
+# live dial. It stays fail-closed: the section must be ours, its recorded id
+# must not belong to some other modem that is present right now, and the record
+# itself must be unambiguous, which the caller has already established.
+provision_section_by_path() {
+	path_section="$1"
+	[ -n "$path_section" ] || return 1
+	case "$path_section" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	path_owner="$(uci -q get "network.${path_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+	[ "$path_owner" = "$PROVISION_OWNER" ] || return 1
+	path_recorded="$(uci -q get "network.${path_section}.apn_autoconfig_modem_id" 2>/dev/null || :)"
+	# A recorded id that still names a modem present on this bus belongs to that
+	# modem, not to this one, and claiming the section anyway would hand one
+	# modem the section of another. Answering that needs the current inventory,
+	# so no inventory means no claim rather than an unchecked one.
+	[ -s "$INVENTORY_FILE" ] || return 1
+	if [ -n "$path_recorded" ] && \
+		awk -F '\t' -v id="$path_recorded" '$1 == id { found = 1 } END { exit found ? 0 : 1 }' \
+			"$INVENTORY_FILE" 2>/dev/null; then
+		return 1
+	fi
+	printf '%s\n' "$path_section"
+}
+
 provision_free_section_name() {
 	existing_names="$(network_section_names)"
 	index=1
@@ -2310,6 +2451,7 @@ provision_evaluate() {
 	PROVISION_EXISTING=""
 	PROVISION_PROTOCOL=""
 	PROVISION_DEVICE=""
+	PROVISION_REBOUND=0
 
 	provision_line="$(find_inventory_record "$1" 2>/dev/null || :)"
 	PROVISION_RECORD="$provision_line"
@@ -2333,6 +2475,13 @@ provision_evaluate() {
 	if [ "$provision_owner_state" = conflicting ]; then
 		PROVISION_REASON="conflicting_owner"
 		return 4
+	fi
+	if [ -z "$PROVISION_EXISTING" ] && [ -n "$provision_interface" ]; then
+		PROVISION_EXISTING="$(provision_section_by_path "$provision_interface" 2>/dev/null || :)"
+		if [ -n "$PROVISION_EXISTING" ]; then
+			PROVISION_REBOUND=1
+			log notice "section $PROVISION_EXISTING was provisioned as $(uci -q get "network.${PROVISION_EXISTING}.apn_autoconfig_modem_id" 2>/dev/null || printf '?'); the modem on its path is now $1"
+		fi
 	fi
 	if [ -n "$PROVISION_EXISTING" ]; then
 		# Already provisioned by this package for this exact modem: report it
@@ -2673,6 +2822,11 @@ connection_resolve_section() {
 	fi
 
 	conn_owned_section="$(provision_existing_section "$conn_resolve_modem" 2>/dev/null || :)"
+	# Same recovery as provision_evaluate, and for the same reason: a section
+	# whose recorded identity went stale is still ours, and bearer control must
+	# not decide otherwise — the staging guard below depends on knowing it.
+	[ -n "$conn_owned_section" ] || \
+		conn_owned_section="$(provision_section_by_path "$(field "$conn_record" 9)" 2>/dev/null || :)"
 	if [ -n "$conn_owned_section" ]; then
 		CONNECTION_SECTION="$conn_owned_section"
 		CONNECTION_OWNED=1
@@ -2936,12 +3090,18 @@ at_identity_cmd() {
 	# never identity: nothing here distinguishes two identical modems.
 	identity_scope="$(at_cache_scope "$AT_TARGET_USB_PATH")" || identity_scope=""
 	if [ -n "$identity_scope" ]; then
-		at_cache_write "$(at_identity_cache_file "$identity_scope")" \
+		at_identity_write "$(at_identity_cache_file "$identity_scope")" \
 			"$(printf '%s\t%s\t%s' "$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE")" || :
 		# The IMEI is cached separately because discovery reads it to upgrade a
 		# serial-less modem from weak-vidpid to the imei tier, and discovery is
 		# not allowed to probe for it.
-		[ -z "$AT_IMEI" ] || at_cache_write "$(at_imei_file "$identity_scope")" "$AT_IMEI" || :
+		if [ -n "$AT_IMEI" ]; then
+			at_identity_write "$(at_imei_file "$identity_scope")" "$AT_IMEI" || :
+			# Current-enumeration proof is volatile on purpose. It prevents a
+			# same-model replacement in the same socket inheriting this IMEI.
+			at_cache_write_stamped "$(at_verified_imei_file "$identity_scope")" \
+				"$AT_IMEI" "$(at_enumeration_stamp "$AT_TARGET_USB_PATH")" || :
+		fi
 	fi
 
 	# The same v1 identity TSV the QMI and MBIM adapters emit, so a consumer
@@ -3469,6 +3629,7 @@ Commands:
                     correlated ports by role. Refused under ModemManager
   at-identity       Read SIM and registration identity for --modem over AT and
                     print the v1 identity contract. Read-only
+  migrate-identity-cache  Preserve pre-0.15.2 volatile AT identity evidence
   inhibit-targets   List the ModemManager inhibitions this package owns, as
                     <device-uid><TAB><modem_id>. Read-only
   register-proto    Register this package's netifd protocol by restarting the
@@ -3528,6 +3689,7 @@ main() {
 		resolve) resolve_cmd ;;
 		at-port) at_port_cmd ;;
 		at-identity) at_identity_cmd ;;
+		migrate-identity-cache) migrate_identity_cache_cmd ;;
 		provision-plan) provision_plan_cmd ;;
 		inhibit-targets) inhibit_targets_cmd ;;
 		provision) provision_cmd ;;

@@ -621,10 +621,16 @@ return view.extend({
 		var label = _('Restart modem');
 		if (modem && modem.reset_method === 'gpio')
 			label = _('Power-cycle modem');
+		/* The button sits on one modem's card, so it names that modem's own
+		 * interface. Without it the engine would resolve whichever target it
+		 * manages first, and on a router with two modems the card for one could
+		 * power-cycle the other. */
+		var resetTarget = modem && modem.netifd_interface
+			? 'network:' + modem.netifd_interface : null;
 		var button = E('button', {
 			'class': 'btn cbi-button cbi-button-negative',
 			'type': 'button',
-			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset'); }
+			'click': function(ev) { ev.preventDefault(); self.confirmAction('modem-reset', resetTarget); }
 		}, [ label ]);
 		button.disabled = !!self.busy;
 		/* Tracked as a list because a board could pin more than one modem, and
@@ -717,6 +723,12 @@ return view.extend({
 			self.modemPollPending = anyBusy;
 			if (self.modemBox)
 				dom.content(self.modemBox, self.modemAreaNodes(inventory, self.currentStatus));
+			/* Provisioning and deprovisioning change the netifd target list. Keep
+			 * the target selector in step without requiring a page reload. */
+			return call(queryCommand, [ 'targets' ]).then(function(targets) {
+				self.setTargetInventory(targets);
+				self.updatePolicyForView(self.currentStatus);
+			});
 		}).catch(function() {
 			/* A lost poll never invents a result; the next tick tries again. */
 		});
@@ -769,22 +781,40 @@ return view.extend({
 	statusWarnings: function(status) {
 		var nodes = [];
 		if (!status || status.error) {
-			var alternatives = this.targetInventory && Array.isArray(this.targetInventory.targets)
-				? this.targetInventory.targets.filter(function(target) {
+			/* Whatever is wrong here is wrong with one modem. Several modems
+			 * are no longer a reason for anything to be unavailable, so the
+			 * others are offered as somewhere else to look rather than as a
+			 * choice the user must make before the program will work again. */
+			var shown = this.viewTarget ||
+				(this.targetInventory && this.targetInventory.configured_target) || '';
+			var others = ((this.targetInventory && Array.isArray(this.targetInventory.targets))
+				? this.targetInventory.targets : []).filter(function(target) {
 					return target.capabilities && target.capabilities.identity === true &&
-						target.id !== (this.targetInventory.configured_target || '');
-				}, this).map(function(target) {
+						target.id !== shown;
+				}).map(function(target) {
 					return '%s (%s)'.format(target.interface, target.protocol);
-				}) : [];
+				});
 			var messages = [
 				_('Status is temporarily unavailable: %s').format(status && status.error || _('unknown error'))
 			];
-			if (alternatives.length)
-				messages.push(_('Other cellular targets were discovered: %s. To inspect or control one of them, select it under Settings → Mobile target and save. APN Auto-Config will not switch targets silently.').format(alternatives.join(', ')));
+			if (others.length)
+				messages.push(_('This is about one target. Others were discovered and can be inspected with the selector above: %s.').format(others.join(', ')));
 			return [ E('div', { 'class': 'alert-message warning' }, messages.map(function(message) {
 				return E('p', {}, [ message ]);
 			})) ];
 		}
+
+		/* Said once, where the APN is: the panel shows one target while the
+		 * program looks after several. */
+		var managed = this.managedTargets();
+		if (managed.length > 1)
+			nodes.push(E('p', {}, [
+				this.viewTarget
+					? _('Showing %s. %d cellular targets are configured automatically; the buttons below act on this one.')
+						.format(status.interface, managed.length)
+					: _('%d cellular targets are configured automatically. This panel shows %s; APN re-detection acts on all of them, while roaming policy requires selecting one target.')
+						.format(managed.length, status.interface)
+			]));
 
 		if (status.roaming === true)
 			nodes.push(E('div', { 'class': status.roaming_allowed ? 'alert-message notice' : 'alert-message warning' }, [
@@ -969,22 +999,106 @@ return view.extend({
 		});
 	},
 
+	/* Which target the page is looking at. Empty means the engine's own
+	 * choice, which is also what every automatic operation covers: several
+	 * managed targets are the normal case, not a configuration error. */
+	statusArgs: function() {
+		return this.viewTarget ? [ 'status', this.viewTarget ] : [ 'status' ];
+	},
+
+	/* The target an action started from this page acts on. Nothing while the
+	 * page is on "automatic" — the engine then runs the operation against every
+	 * managed target, which is what the dialog says it will do. */
+	actionTarget: function() {
+		return this.viewTarget || null;
+	},
+
+	managedTargets: function() {
+		var inventory = this.targetInventory;
+		if (!inventory || !Array.isArray(inventory.targets))
+			return [];
+		return inventory.targets.filter(function(target) { return target.managed === true; });
+	},
+
+	policyAvailableForView: function(status) {
+		return roamingPolicySupported(status) &&
+			(!!this.viewTarget || this.managedTargets().length <= 1);
+	},
+
+	policyDescriptionForView: function(status) {
+		if (!this.viewTarget && this.managedTargets().length > 1)
+			return _('Select one mobile target above before changing roaming data permission. APN automation covers all managed targets, but roaming permission is deliberately per modem.');
+		return roamingPolicyDescription(status);
+	},
+
+	updatePolicyForView: function(status) {
+		this.policySupported = this.policyAvailableForView(status);
+		if (this.policySelect && this.policySupported) {
+			this.setPolicyOptions(status);
+			this.policyDirty = false;
+		}
+		if (this.policyDescription)
+			dom.content(this.policyDescription, [ this.policyDescriptionForView(status) ]);
+		this.updatePolicyControls();
+	},
+
+	buildTargetSelector: function() {
+		var self = this;
+		var inventory = self.targetInventory;
+		var targets = inventory && Array.isArray(inventory.targets) ? inventory.targets : [];
+		var options = [ E('option', { 'value': '' }, [ _('Automatic — all managed targets') ]) ].concat(
+			targets.map(function(target) {
+				return E('option', { 'value': target.id }, [
+					target.managed
+						? '%s (%s)'.format(target.interface, target.protocol)
+						: _('%s (%s) — not managed').format(target.interface, target.protocol)
+				]);
+			}));
+		var selector = E('select', {
+			'class': 'cbi-input-select',
+			'change': function() {
+				self.viewTarget = selector.value;
+				self.updatePolicyForView(self.currentStatus);
+				self.refreshPanels();
+			}
+		}, options);
+		selector.value = self.viewTarget;
+		return selector;
+	},
+
+	refreshTargetSelector: function() {
+		if (!this.targetBox)
+			return;
+		this.targetSelect = this.buildTargetSelector();
+		var targets = this.targetInventory && Array.isArray(this.targetInventory.targets)
+			? this.targetInventory.targets : [];
+		dom.content(this.targetBox, targets.length > 1
+			? [ E('label', {}, [ _('Showing') ]), this.targetSelect ] : []);
+	},
+
+	setTargetInventory: function(inventory) {
+		this.targetInventory = inventory;
+		var targets = inventory && Array.isArray(inventory.targets) ? inventory.targets : [];
+		if (this.viewTarget && !targets.some(function(target) { return target.id === this.viewTarget; }, this))
+			this.viewTarget = '';
+		this.refreshTargetSelector();
+	},
+
 	refreshPanels: function() {
 		var self = this;
-		return Promise.all([
-			call(queryCommand, [ 'status' ]).catch(function(error) { return { error: error.message }; }),
-			call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
-		]).then(function(values) {
+		return call(queryCommand, [ 'targets' ]).catch(function() {
+			return self.targetInventory;
+		}).then(function(inventory) {
+			self.setTargetInventory(inventory);
+			return Promise.all([
+				call(queryCommand, self.statusArgs()).catch(function(error) { return { error: error.message }; }),
+				call(queryCommand, [ 'database-status' ]).catch(function(error) { return { error: error.message }; })
+			]);
+		}).then(function(values) {
 			var status = values[0];
 			self.currentStatus = status;
 			self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
-			self.policySupported = roamingPolicySupported(status);
-			if (self.policySelect && self.policySupported) {
-				self.setPolicyOptions(status);
-				self.policyDirty = false;
-			}
-			if (self.policyDescription)
-				dom.content(self.policyDescription, [ roamingPolicyDescription(status) ]);
+			self.updatePolicyForView(status);
 			if (self.apnBox)
 				dom.content(self.apnBox, self.apnAreaNodes(status));
 			if (self.simBox)
@@ -992,7 +1106,6 @@ return view.extend({
 			if (self.modemBox)
 				dom.content(self.modemBox, self.modemAreaNodes(self.modemInventory, status));
 			self.setDatabaseStatus(values[1]);
-			self.updatePolicyControls();
 			self.refreshStrip();
 		});
 	},
@@ -1054,11 +1167,13 @@ return view.extend({
 		]);
 	},
 
-	startAction: function(action) {
+	startAction: function(action, targetOverride) {
 		var self = this;
 		self.setBusy(true, { state: 'starting', action: action });
 
-		return call(controlCommand, [ action ]).then(function(result) {
+		var target = targetOverride || self.actionTarget();
+		var args = target ? [ action, target ] : [ action ];
+		return call(controlCommand, args).then(function(result) {
 			self.setBusy(result.busy, result);
 			if (!result.accepted && !result.busy)
 				throw new Error(result.message || _('The operation could not be started'));
@@ -1072,16 +1187,26 @@ return view.extend({
 		});
 	},
 
-	confirmAction: function(action) {
+	confirmAction: function(action, targetOverride) {
 		var self = this;
 		if (self.busy || !self.profileApplySupported)
 			return;
 		var reset = action === 'modem-reset';
+		var managed = self.managedTargets();
+		var effective = targetOverride || self.actionTarget();
+		var scope = null;
+		if (!effective && managed.length > 1)
+			scope = _('This runs against every managed target: %s.').format(managed.map(function(target) {
+				return target.interface;
+			}).join(', '));
+		else if (effective)
+			scope = _('This runs against %s only.').format(effective.replace(/^network:/, ''));
 		ui.showModal(reset ? _('Power-cycle modem') : _('Re-detect APN'), [
 			E('p', {}, [ reset
 				? _('This stops only the mobile interface, power-cycles the modem, waits for the SIM and then verifies or corrects the APN. Mobile connectivity will be interrupted temporarily.')
 				: _('This verifies the current SIM, APN and real Internet access. If necessary, it changes the APN and restarts only the mobile interface.')
-			]),
+			])
+		].concat(scope ? [ E('p', {}, [ scope ]) ] : []).concat([
 			E('div', { 'class': 'right' }, [
 				E('button', { 'class': 'btn', 'click': ui.hideModal }, [ _('Cancel') ]),
 				' ',
@@ -1089,11 +1214,11 @@ return view.extend({
 					'class': 'btn cbi-button-action important',
 					'click': function() {
 						ui.hideModal();
-						self.startAction(action);
+						self.startAction(action, targetOverride);
 					}
 				}, [ reset ? _('Power-cycle modem') : _('Re-detect APN') ])
 			])
-		]);
+		]));
 	},
 
 	confirmDatabaseInstall: function() {
@@ -1297,12 +1422,13 @@ return view.extend({
 		var s = m.section(form.NamedSection, 'main', 'apn_autoconfig', _('Configuration'));
 		var o;
 		self.profileApplySupported = status && !status.error && targetCapability(status, 'profile_apply');
-		self.policySupported = roamingPolicySupported(status);
 		self.policyDirty = false;
 		self.databaseStatus = database;
 		self.currentStatus = status;
 		self.currentAction = action;
 		self.targetInventory = targets;
+		self.viewTarget = '';
+		self.policySupported = self.policyAvailableForView(status);
 		self.hardwareIntegration = status && status.hardware_integration || '';
 		self.modemInventory = modemInventory;
 
@@ -1322,7 +1448,7 @@ return view.extend({
 		}
 
 		o = s.taboption('general', form.ListValue, 'interface', _('Mobile target'));
-		o.value('auto', _('Automatic (only one writable target)'));
+		o.value('auto', _('Automatic (every writable target)'));
 		var configuredTarget = typeof uci.get === 'function'
 			? uci.get('apn-autoconfig', 'main', 'interface') : 'auto';
 		var configuredTargetListed = configuredTarget === 'auto';
@@ -1341,7 +1467,7 @@ return view.extend({
 			o.value(configuredTarget, _('%s — currently configured, not discovered').format(configuredTarget));
 		o.default = 'auto';
 		o.rmempty = false;
-		o.description = _('Automatic mode refuses to choose when more than one writable cellular target exists.');
+		o.description = _('Automatic mode looks after every cellular target it can write an APN profile to, which is normally what you want with more than one modem. Choosing one target restricts the program to it, and the others are then left entirely alone.');
 
 		o = s.taboption('general', form.Value, 'device', _('Mobile data device'));
 		o.default = 'wwan0';
@@ -1438,7 +1564,15 @@ return view.extend({
 			'type': 'button',
 			'click': function(ev) { ev.preventDefault(); self.confirmRoamingPolicy(); }
 		}, [ _('Apply roaming policy') ]);
-		self.policyDescription = E('p', {}, [ roamingPolicyDescription(status) ]);
+		self.policyDescription = E('p', {}, [ self.policyDescriptionForView(status) ]);
+
+		/* One page, several managed targets. The selector chooses what is
+		 * displayed and what the buttons on the APN and SIM panels act on; it
+		 * changes nothing on the router and saves nothing. Which targets are
+		 * managed is the engine's answer, not a guess from capabilities. */
+		self.targetSelect = null;
+		self.targetBox = E('div', { 'class': 'apn-target-picker' }, []);
+		self.refreshTargetSelector();
 
 		self.modemBox = E('div', {}, self.modemAreaNodes(modemInventory, status));
 		self.apnBox = E('div', {}, self.apnAreaNodes(status));
@@ -1509,6 +1643,8 @@ return view.extend({
 					'.apn-autoconfig-page .apn-strip-warn .apn-strip-value{color:#b58100}' +
 					'.apn-autoconfig-page .apn-strip-bad .apn-strip-value{color:#b11}' +
 					'.apn-autoconfig-page .apn-tabs{display:flex;flex-wrap:wrap;gap:.5rem;margin-bottom:1rem}' +
+					'.apn-autoconfig-page .apn-target-picker{display:flex;align-items:center;gap:.5rem;margin-bottom:1rem}' +
+					'.apn-autoconfig-page .apn-target-picker label{opacity:.7}' +
 					'.apn-autoconfig-page .apn-label strong{font-weight:600}' +
 					'.apn-autoconfig-page .apn-help-label{display:inline-flex;align-items:center;gap:.4em}' +
 					'.apn-autoconfig-page .apn-help-toggle{padding:0 .5em;line-height:1.4;min-width:1.8em}' +
@@ -1529,6 +1665,7 @@ return view.extend({
 				]),
 				E('h2', {}, [ _('APN Auto-Config') ]),
 				self.stripBox,
+				self.targetBox,
 				E('div', { 'class': 'apn-tabs', 'role': 'tablist' }, buttons)
 			].concat(panels));
 

@@ -116,11 +116,18 @@ get:network.apnmodem1.device)
 	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' "${TEST_QMI_DEVICE:-/dev/cdc-wdm0}"
 ;;
 get:network.apnmodem1.apn_autoconfig_owner)
-	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && printf '%s\n' apn-autoconfig-modem
+	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && [ "${TEST_STAGING_OWNER:-1}" = 1 ] && \
+		printf '%s\n' apn-autoconfig-modem
 ;;
 get:network.apnmodem1.disabled)
 	[ "${TEST_STAGING_SECTION:-0}" = 1 ] && [ "${TEST_STAGING_PROMOTED:-0}" = 0 ] && printf '%s\n' 1
 ;;
+# Route metrics, which is how automatic mode orders the targets it manages: the
+# administrator has already said which uplink matters. apnmodem1 sorts before
+# wwan by name and after it by metric, so an assertion about the order means
+# something.
+get:network.wwan.metric) printf '%s\n' "${TEST_WWAN_METRIC:-200}" ;;
+get:network.apnmodem1.metric) printf '%s\n' "${TEST_APNMODEM_METRIC:-1024}" ;;
 get:apn-autoconfig.main.interface) printf '%s\n' "${TEST_INTERFACE:-wwan}" ;;
 get:apn-autoconfig.main.sim_index) printf '%s\n' 0 ;;
 get:apn-autoconfig.main.device) printf '%s\n' wwan0 ;;
@@ -186,6 +193,14 @@ get:network.mbimtwin.device)
 ;;
 get:network.wwan.apn) cat "$TEST_STATE/apn" ;;
 get:network.wwan2.apn) cat "$TEST_STATE/apn-wwan2" ;;
+# The promoted project-owned section is a QMI target in its own right, with its
+# own profile state: automatic mode has to be seen configuring *both*, not the
+# same one twice.
+get:network.apnmodem1.apn) cat "$TEST_STATE/qmi2-apn" 2>/dev/null || exit 1 ;;
+get:network.apnmodem1.username) cat "$TEST_STATE/qmi2-username" 2>/dev/null || exit 1 ;;
+get:network.apnmodem1.password) cat "$TEST_STATE/qmi2-password" 2>/dev/null || exit 1 ;;
+get:network.apnmodem1.auth) cat "$TEST_STATE/qmi2-auth" 2>/dev/null || exit 1 ;;
+get:network.apnmodem1.pdptype) cat "$TEST_STATE/qmi2-pdptype" 2>/dev/null || exit 1 ;;
 get:network.wwan.username) cat "$TEST_STATE/username" ;;
 get:network.wwan.password) cat "$TEST_STATE/password" ;;
 get:network.wwan.allowedauth) cat "$TEST_STATE/allowedauth" ;;
@@ -201,6 +216,12 @@ set:*)
 			case "$option" in apn|username|password|allowedauth|iptype|allow_roaming) printf '%s\n' "$value" >"$TEST_STATE/$option" ;; *) exit 1 ;; esac
 		;;
 		network.wwan2.apn=*) printf '%s\n' "${2#network.wwan2.apn=}" >"$TEST_STATE/apn-wwan2" ;;
+		network.apnmodem1.*=*)
+			option="${2#network.apnmodem1.}"
+			value="${option#*=}"
+			option="${option%%=*}"
+			case "$option" in apn|username|password|auth|pdptype) printf '%s\n' "$value" >"$TEST_STATE/qmi2-$option" ;; *) exit 1 ;; esac
+		;;
 		network.cellatdial.*=*)
 			option="${2#network.cellatdial.}"
 			value="${option#*=}"
@@ -239,6 +260,11 @@ delete:network.wwan.allowedauth) rm -f "$TEST_STATE/allowedauth" ;;
 delete:network.wwan.iptype) rm -f "$TEST_STATE/iptype" ;;
 delete:network.wwan.allow_roaming) rm -f "$TEST_STATE/allow_roaming" ;;
 delete:network.wwan2.apn) rm -f "$TEST_STATE/apn-wwan2" ;;
+delete:network.apnmodem1.apn) rm -f "$TEST_STATE/qmi2-apn" ;;
+delete:network.apnmodem1.username) rm -f "$TEST_STATE/qmi2-username" ;;
+delete:network.apnmodem1.password) rm -f "$TEST_STATE/qmi2-password" ;;
+delete:network.apnmodem1.auth) rm -f "$TEST_STATE/qmi2-auth" ;;
+delete:network.apnmodem1.pdptype) rm -f "$TEST_STATE/qmi2-pdptype" ;;
 delete:network.cellmbim.apn) rm -f "$TEST_STATE/mbim-apn" ;;
 delete:network.cellmbim.username) rm -f "$TEST_STATE/mbim-username" ;;
 delete:network.cellmbim.password) rm -f "$TEST_STATE/mbim-password" ;;
@@ -1243,12 +1269,12 @@ else
 	[ "$?" -eq 4 ] || fail 'unsafe target ID did not use the target-contract exit code'
 fi
 : >"$STATE/events"
-if TEST_INTERFACE=auto sh "$SCRIPT" apply >/dev/null 2>&1; then
-	fail 'ambiguous automatic target selection was accepted'
+if TEST_INTERFACE=auto sh "$SCRIPT" reset >/dev/null 2>&1; then
+	fail 'reset restored a baseline for a target nobody named'
 else
-	[ "$?" -eq 4 ] || fail 'ambiguous target did not use the target-contract exit code'
+	[ "$?" -eq 4 ] || fail 'an unnamed target for reset did not use the target-contract exit code'
 fi
-[ ! -s "$STATE/events" ] || fail 'ambiguous selection changed network state'
+[ ! -s "$STATE/events" ] || fail 'a refused reset changed network state'
 
 printf '%s\n' 'TEST QMI refuses legacy baselines that have no backend identity'
 mkdir -p "$PERSIST/targets/network_cellqmi"
@@ -2151,23 +2177,135 @@ auto_out="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
 python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:wwan", json.loads(sys.argv[1])' \
 	"$auto_out" || fail 'a disabled staging section made automatic target selection ambiguous'
 
+printf '%s\n' 'TEST an administratively disabled user section never joins automatic target selection'
+TEST_STAGING_OWNER=0
+export TEST_STAGING_OWNER
+auto_out="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)"
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:wwan", json.loads(sys.argv[1])' \
+	"$auto_out" || fail 'a disabled user section joined automatic target selection'
+targets_out="$(TEST_INTERFACE=auto sh "$SCRIPT" targets-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+t = next(t for t in d["targets"] if t["id"] == "network:apnmodem1")
+assert t["managed"] is False, d
+' "$targets_out" || fail 'a disabled user section was reported as managed'
+TEST_STAGING_OWNER=1
+export TEST_STAGING_OWNER
+
 printf '%s\n' 'TEST an explicit target still selects a disabled staging section'
 staged_out="$(sh "$SCRIPT" status-json --target network:apnmodem1)"
 python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:apnmodem1", json.loads(sys.argv[1])' \
 	"$staged_out" || fail 'an explicit --target did not select the staging section'
 
 printf '%s\n' 'TEST a promoted project-owned section participates in automatic selection again'
+# Two writable targets used to be a fatal condition: every command, including
+# status, exited 4 with "select one explicitly", so a router stopped being
+# managed at the moment a second modem was set up. A second modem is a modem the
+# administrator wants to use, so automatic mode manages both.
 TEST_STAGING_PROMOTED=1
 export TEST_STAGING_PROMOTED
-if TEST_INTERFACE=auto sh "$SCRIPT" status-json >/dev/null 2>&1; then
-	fail 'a promoted second writable target did not make automatic selection ambiguous'
-else
-	[ "$?" -eq 4 ] || fail 'ambiguous automatic selection after promotion used the wrong exit code'
-fi
+auto_out="$(TEST_INTERFACE=auto sh "$SCRIPT" status-json)" || \
+	fail 'a second writable target made status unavailable'
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:wwan", json.loads(sys.argv[1])' \
+	"$auto_out" || fail 'the reported target was not the one with the lowest route metric'
+
+printf '%s\n' 'TEST the target order is the route metric, not the section name'
+auto_out="$(TEST_INTERFACE=auto TEST_WWAN_METRIC=2000 sh "$SCRIPT" status-json)" || \
+	fail 'status failed with a reordered metric'
+python3 -c 'import json,sys; assert json.loads(sys.argv[1])["target_id"] == "network:apnmodem1", json.loads(sys.argv[1])' \
+	"$auto_out" || fail 'a lower route metric did not win the automatic selection'
+
+printf '%s\n' 'TEST every managed target is listed as managed, and a staged one is not'
+targets_out="$(TEST_INTERFACE=auto sh "$SCRIPT" targets-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+managed = sorted(t["id"] for t in d["targets"] if t["managed"])
+assert managed == ["network:apnmodem1", "network:wwan"], d
+' "$targets_out" || fail 'the managed targets were not reported'
+TEST_STAGING_PROMOTED=0
+targets_out="$(TEST_INTERFACE=auto TEST_STAGING_PROMOTED=0 sh "$SCRIPT" targets-json)"
+python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+managed = sorted(t["id"] for t in d["targets"] if t["managed"])
+assert managed == ["network:wwan"], d
+' "$targets_out" || fail 'a staged section was reported as managed'
+TEST_STAGING_PROMOTED=1
+
+printf '%s\n' 'TEST automatic mode applies a profile to every managed target'
+: >"$STATE/events"
+# Restored afterwards: this block is the only one that mutates two targets, and
+# the tests after it read the first target's state.
+multi_apn_before="$(cat "$STATE/apn" 2>/dev/null || :)"
+multi_roaming_before="$(cat "$STATE/allow_roaming" 2>/dev/null || :)"
+printf '%s\n' 'no.apn.yet' >"$STATE/apn"
+printf '%s\n' 'no.apn.yet' >"$STATE/qmi2-apn"
+CURL_SUCCESS_APN=internet.telekom
+export CURL_SUCCESS_APN
+TEST_INTERFACE=auto sh "$SCRIPT" apply >"$STATE/multi-apply.log" 2>&1 || \
+	{ cat "$STATE/multi-apply.log" >&2; fail 'applying to every managed target failed'; }
+[ "$(cat "$STATE/apn")" = internet.telekom ] || \
+	fail 'the first managed target was not configured'
+[ "$(cat "$STATE/qmi2-apn")" = internet.telekom ] || \
+	fail 'the second managed target was left unconfigured'
+
+printf '%s\n' 'TEST a roaming-blocked target is not hidden by another target succeeding'
+printf '%s\n' 0 >"$STATE/allow_roaming"
+printf '%s\n' internet.telekom >"$STATE/apn"
+printf '%s\n' no.apn.yet >"$STATE/qmi2-apn"
+multi_status=0
+MM_REGISTRATION_STATE=roaming TEST_INTERFACE=auto sh "$SCRIPT" apply \
+	>"$STATE/multi-blocked.log" 2>&1 || multi_status=$?
+[ "$multi_status" -eq 2 ] || {
+	cat "$STATE/multi-blocked.log" >&2
+	fail "a mixed success/roaming-blocked run exited $multi_status instead of 2"
+}
+[ "$(cat "$STATE/qmi2-apn")" = internet.telekom ] || \
+	fail 'the unblocked target was not processed after another target was blocked'
+
+printf '%s\n' 'TEST roaming policy requires one deliberate target when several are managed'
+# APN reconciliation is safe to fan out, but permission to spend roaming data
+# is not. In particular, allowing a capped SIM in one modem must not silently
+# enable roaming on another modem as well.
+: >"$STATE/events"
+rm -f "$STATE/allow_roaming"
+multi_status=0
+TEST_INTERFACE=auto sh "$SCRIPT" roaming-policy-set allow >/dev/null 2>&1 || multi_status=$?
+[ "$multi_status" -eq 4 ] || \
+	fail "an unscoped roaming-policy change exited $multi_status instead of the blocked class 4"
+[ ! -e "$STATE/allow_roaming" ] || \
+	fail 'an unscoped roaming-policy change modified a target before refusing'
+TEST_INTERFACE=auto sh "$SCRIPT" roaming-policy-set allow --target network:wwan >/dev/null 2>&1 || \
+	fail 'an explicitly targeted roaming-policy change was refused'
+[ "$(cat "$STATE/allow_roaming" 2>/dev/null || :)" = 1 ] || \
+	fail 'the explicitly targeted roaming-policy change did not reach its target'
+
+printf '%s\n' 'TEST a profile the user typed is never spread over targets they did not name'
+manual_status=0
+TEST_INTERFACE=auto sh "$SCRIPT" apply-manual --apn manual.example >/dev/null 2>&1 || manual_status=$?
+[ "$manual_status" -eq 4 ] || \
+	fail "apply-manual with several managed targets exited $manual_status instead of the blocked class 4"
+
 TEST_STAGING_PROMOTED=0
 TEST_STAGING_SECTION=0
 TEST_SINGLE_TARGET=0
-export TEST_STAGING_PROMOTED TEST_STAGING_SECTION TEST_SINGLE_TARGET
+TEST_STAGING_OWNER=1
+unset CURL_SUCCESS_APN
+export TEST_STAGING_PROMOTED TEST_STAGING_SECTION TEST_SINGLE_TARGET TEST_STAGING_OWNER
+rm -rf "$PERSIST/targets/network_apnmodem1"
+rm -f "$STATE"/qmi2-*
+if [ -n "$multi_apn_before" ]; then
+	printf '%s\n' "$multi_apn_before" >"$STATE/apn"
+else
+	rm -f "$STATE/apn"
+fi
+if [ -n "$multi_roaming_before" ]; then
+	printf '%s\n' "$multi_roaming_before" >"$STATE/allow_roaming"
+else
+	rm -f "$STATE/allow_roaming"
+fi
 
 printf '%s\n' 'TEST boot worker is inert while autostart is disabled'
 rm -f "$STATE/boot-calls"

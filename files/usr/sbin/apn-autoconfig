@@ -95,6 +95,8 @@ MODEM_POWER_OFF_ARMED=0
 INTERFACE_RESTORE_ARMED=0
 LEAVE_INTERFACE_DOWN=0
 SETTLE_SLEEP_PID=""
+# The per-target child of a run that covers every managed target.
+FANOUT_CHILD_PID=""
 BOUNDED_CHILD_PID=""
 BOUNDED_WATCHDOG_PID=""
 MODEM_COORDINATOR_ID=""
@@ -517,6 +519,15 @@ on_exit() {
 		wait "$SETTLE_SLEEP_PID" 2>/dev/null || :
 		SETTLE_SLEEP_PID=""
 	fi
+	# A run covering every managed target owns no state of its own, but it does
+	# own the child that is mutating one right now. Terminating and reaping it
+	# is what lets that child roll its own target back; leaving it would put a
+	# signalled operation beyond anyone's reach.
+	if [ -n "$FANOUT_CHILD_PID" ]; then
+		kill -TERM "$FANOUT_CHILD_PID" 2>/dev/null || :
+		wait "$FANOUT_CHILD_PID" 2>/dev/null || :
+		FANOUT_CHILD_PID=""
+	fi
 	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
 		printf '%s\n' "$MODEM_POWER_ON_VALUE" >"$MODEM_POWER_PATH" 2>/dev/null || \
 			log err "failed to restore modem power after interruption"
@@ -739,16 +750,64 @@ discover_targets() {
 	done >"$TARGETS_DATA"
 }
 
-# A section is project-owned staging only when apn-autoconfig-modem marked it
-# and it is still administratively disabled. A section that merely looks like
-# one is never treated as ours; see docs/provisioning-contract-v1.md.
-is_disabled_staging_section() {
-	staging_section="$1"
-	staging_owner="$(uci -q get "network.${staging_section}.apn_autoconfig_owner" 2>/dev/null || :)"
-	[ "$staging_owner" = apn-autoconfig-modem ] || return 1
-	staging_disabled="$(uci -q get "network.${staging_section}.disabled" 2>/dev/null || :)"
-	case "$staging_disabled" in 1|on|true|yes|enabled) return 0 ;; esac
+# An administratively disabled netifd section is never an automatic target,
+# regardless of who created it. Explicit --target remains available for
+# inspection and deliberate recovery, but automatic mode must not turn a
+# disabled user-owned uplink back on as a side effect of APN reconciliation.
+section_is_disabled() {
+	disabled_section="$1"
+	disabled_value="$(uci -q get "network.${disabled_section}.disabled" 2>/dev/null || :)"
+	case "$disabled_value" in 1|on|true|yes|enabled) return 0 ;; esac
 	return 1
+}
+
+# Every target automatic mode manages, in priority order, one section per line.
+#
+# A modem the administrator attached is a modem they want to use, so "automatic"
+# means all of them rather than none of them. It used to mean "the only one":
+# a second writable target made every command fail with "select one explicitly",
+# including status, the boot reconciliation and the hardware button — the suite
+# stopped working at the moment it had more to do, and the user was asked to
+# make a choice that automation exists to avoid. Commands that can only act on
+# one target take the first line; the rest run against all of them.
+#
+# Order is the route metric netifd was given, which is the administrator's own
+# statement of which uplink matters, with the section name breaking a tie.
+# Enumeration order decides nothing: it is not evidence of anything.
+auto_targets() {
+	discover_targets
+	while IFS="$(printf '\t')" read -r auto_section auto_proto; do
+		[ -n "$auto_section" ] || continue
+		target_protocol_capabilities "$auto_proto"
+		[ "$TARGET_PROFILE_APPLY" = true ] || continue
+		# A disabled section is not a working target. Starting it would override
+		# an administrator's explicit choice; for project-owned staging it would
+		# also dial with a vendor-default profile. An explicit --target still
+		# selects it, and an enabled section participates normally.
+		section_is_disabled "$auto_section" && continue
+		auto_metric="$(uci -q get "network.${auto_section}.metric" 2>/dev/null || :)"
+		case "$auto_metric" in ''|*[!0-9]*) auto_metric=0 ;; esac
+		# Zero-padded so a plain sort orders numerically, without depending on
+		# how BusyBox sort splits fields.
+		printf '%010d\t%s\n' "$auto_metric" "$auto_section"
+	done <"$TARGETS_DATA" | sort | cut -f2
+}
+
+auto_target_count() {
+	count=0
+	for count_section in $1; do
+		[ -n "$count_section" ] || continue
+		count=$((count + 1))
+	done
+	printf '%s\n' "$count"
+}
+
+# The engine's own path, for a command that runs itself once per target.
+engine_self_path() {
+	self="$0"
+	case "$self" in /*) : ;; *) self="$(command -v "$self" 2>/dev/null || :)" ;; esac
+	[ -r "$self" ] || die "cannot resolve the APN engine path"
+	printf '%s\n' "$self"
 }
 
 select_target() {
@@ -758,25 +817,21 @@ select_target() {
 	fi
 	case "$configured" in
 		auto)
-			discover_targets
-			selected=""
-			count=0
-			while IFS="$(printf '\t')" read -r section proto; do
-				target_protocol_capabilities "$proto"
-				[ "$TARGET_PROFILE_APPLY" = true ] || continue
-				# A disabled section created by apn-autoconfig-modem is staged,
-				# not yet a working target. Counting it here would make "auto"
-				# ambiguous the moment a second modem is provisioned and would
-				# break APN operations on a modem that already works. An
-				# explicit --target still selects it, and a promoted section
-				# participates normally.
-				is_disabled_staging_section "$section" && continue
-				selected="$section"
-				count=$((count + 1))
-			done <"$TARGETS_DATA"
-			[ "$count" -gt 0 ] || die_code 4 "no cellular target with an implemented APN backend was found"
-			[ "$count" -eq 1 ] || die_code 4 "multiple writable cellular targets found; select one explicitly"
-			INTERFACE="$selected"
+			AUTO_TARGETS="$(auto_targets)"
+			AUTO_TARGET_COUNT="$(auto_target_count "$AUTO_TARGETS")"
+			[ "$AUTO_TARGET_COUNT" -gt 0 ] || \
+				die_code 4 "no cellular target with an implemented APN backend was found"
+			# One target is chosen for the commands that can only mean one.
+			# A profile the user typed, a rollback, and permission to spend
+			# roaming data are not operations to spread over unnamed targets.
+			case "$COMMAND_NAME:$command_argument" in
+				apply-manual:*|reset:*|roaming-policy-set:*|action-start:roaming-default|action-start:roaming-allow|action-start:roaming-block)
+					[ "$AUTO_TARGET_COUNT" -eq 1 ] || \
+						die_code 4 "$COMMAND_NAME acts on one target; several are managed, so name one with --target"
+				;;
+			esac
+			INTERFACE="$(printf '%s\n' "$AUTO_TARGETS" | sed -n '1p')"
+			[ -n "$INTERFACE" ] || die_code 4 "no cellular target with an implemented APN backend was found"
 		;;
 		''|*[!A-Za-z0-9_]*) die_code 4 "invalid target interface" ;;
 		*) INTERFACE="$configured" ;;
@@ -848,6 +903,7 @@ require_target_capability() {
 		profile-read) available="$TARGET_PROFILE_READ" ;;
 		profile-write) available="$TARGET_PROFILE_WRITE" ;;
 		profile-apply) available="$TARGET_PROFILE_APPLY" ;;
+		roaming-policy-write) available="$TARGET_ROAMING_POLICY_WRITE" ;;
 		*) die "internal error: unknown target capability" ;;
 	esac
 	[ "$available" = true ] || die_code 4 "target $TARGET_ID ($TARGET_PROTOCOL) does not implement $capability in this release"
@@ -1691,9 +1747,7 @@ forget_target_cmd() {
 
 reset_all_cmd() {
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
-	self="$0"
-	case "$self" in /*) : ;; *) self="$(command -v "$self" 2>/dev/null || :)" ;; esac
-	[ -r "$self" ] || die "cannot resolve the APN engine path for reset-all"
+	self="$(engine_self_path)"
 	found=0
 	for target_dir in "$STATE_DIR"/targets/network_*; do
 		[ -d "$target_dir" ] || continue
@@ -1743,6 +1797,14 @@ status_cmd() {
 	read_sim
 	read_database_metadata
 	print_identity
+	printf 'Engine target:   %s\n' "$TARGET_ID"
+	# Which target this is one of. Reporting a single target's SIM and APN
+	# without saying that another one is also being looked after would read as
+	# if the other did not exist.
+	if [ "${AUTO_TARGET_COUNT:-1}" -gt 1 ]; then
+		printf 'Managed targets: %s\n' \
+			"$(printf '%s\n' "$AUTO_TARGETS" | sed 's/^/network:/' | tr '\n' ' ' | sed 's/ $//')"
+	fi
 	printf 'APN database:    %s (format v%s)\n' "${DATABASE_VERSION:--}" "${DATABASE_FORMAT:--}"
 	printf 'Database path:   %s\n' "$DATABASE"
 	apn="$(current_apn 2>/dev/null || :)"
@@ -1825,6 +1887,19 @@ targets_json_cmd() {
 		json_key_string implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
 		json_key_string validation_state "$TARGET_VALIDATION_STATE"; printf ','
 		printf '"hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
+		# Whether automatic operations act on this target. In automatic mode
+		# that is every enabled writable target — a frontend needs to say which
+		# modems are being looked after, and deriving it from capabilities alone
+		# would silently include disabled and staged sections.
+		targets_managed=false
+		if [ "$CONFIGURED_INTERFACE" = auto ]; then
+			if [ "$TARGET_PROFILE_APPLY" = true ] && ! section_is_disabled "$section"; then
+				targets_managed=true
+			fi
+		elif [ "$section" = "$CONFIGURED_INTERFACE" ]; then
+			targets_managed=true
+		fi
+		printf '"managed":%s,' "$targets_managed"
 		json_key_string unavailable_reason "$TARGET_REASON"
 		printf '}'
 		separator=','
@@ -2994,6 +3069,81 @@ modem_reset_cmd() {
 	modem_reset_inline_cmd
 }
 
+# Runs one command once per managed target, and says whether it did.
+#
+# Returns 0 when it handled the command — the aggregate status is in
+# AUTO_MULTI_STATUS — and 1 when the caller should carry on with a single
+# target. Each child selects, locks and rolls back its own target exactly as a
+# single-target run does; this parent holds no lock and owns no state, so the
+# lock order is unchanged and two targets are never mutated at once.
+auto_multi_dispatch() {
+	AUTO_MULTI_STATUS=0
+	[ -z "$REQUESTED_TARGET" ] || return 1
+	[ "$CONFIGURED_INTERFACE" = auto ] || return 1
+	case "$COMMAND_NAME" in
+		reconcile|apply) : ;;
+		*) return 1 ;;
+	esac
+	multi_list="$(auto_targets)"
+	[ "$(auto_target_count "$multi_list")" -gt 1 ] || return 1
+
+	multi_self="$(engine_self_path)"
+	multi_succeeded=0
+	multi_blocked=0
+	multi_retryable=0
+	multi_failed=0
+	log notice "$COMMAND_NAME: running against every managed target"
+	for multi_section in $multi_list; do
+		multi_child=0
+		# Backgrounded and waited for so an interruption of this parent can
+		# terminate the target it is in the middle of. Killing the parent alone
+		# would otherwise leave a child mutating a live interface with nobody
+		# left to notice.
+		if [ -n "${1:-}" ]; then
+			sh "$multi_self" "$COMMAND_NAME" "$1" --target "network:$multi_section" &
+		else
+			sh "$multi_self" "$COMMAND_NAME" --target "network:$multi_section" &
+		fi
+		FANOUT_CHILD_PID=$!
+		wait "$FANOUT_CHILD_PID" || multi_child=$?
+		FANOUT_CHILD_PID=""
+		case "$multi_child" in
+			0)
+				multi_succeeded=$((multi_succeeded + 1))
+				log notice "target network:$multi_section: $COMMAND_NAME succeeded"
+			;;
+			2)
+				multi_blocked=$((multi_blocked + 1))
+				log notice "target network:$multi_section: skipped, mobile data roaming is blocked by policy"
+			;;
+			3)
+				multi_retryable=$((multi_retryable + 1))
+				log warning "target network:$multi_section: $COMMAND_NAME may be retried"
+			;;
+			*)
+				[ "$multi_failed" -ne 0 ] || multi_failed="$multi_child"
+				log err "target network:$multi_section: $COMMAND_NAME failed with exit $multi_child"
+			;;
+		esac
+	done
+
+	# One target must not be able to hide another. A retryable result wins so
+	# that the boot worker tries again — reconcile is idempotent, so the targets
+	# that already succeeded cost nothing on the next attempt — and a hard
+	# failure is reported even when another target succeeded. A target the
+	# roaming policy deliberately refused is also a meaningful aggregate result:
+	# reporting success would hide that one attached modem remains unavailable.
+	if [ "$multi_retryable" -gt 0 ]; then
+		AUTO_MULTI_STATUS=3
+	elif [ "$multi_failed" -ne 0 ]; then
+		AUTO_MULTI_STATUS="$multi_failed"
+	elif [ "$multi_blocked" -gt 0 ]; then
+		AUTO_MULTI_STATUS=2
+	fi
+	log notice "$COMMAND_NAME: $multi_succeeded succeeded, $multi_blocked blocked, $multi_retryable retryable, $((multi_failed != 0)) failed"
+	return 0
+}
+
 usage() {
 	cat <<EOF
 Usage: $PROG <command> [argument] [--target network:<uci-section>]
@@ -3122,18 +3272,39 @@ main() {
 			;;
 		esac
 	fi
+	# Automatic mode covers every managed target, so a command that can act on
+	# all of them does, before one is selected.
+	if auto_multi_dispatch "$command_argument"; then
+		return "$AUTO_MULTI_STATUS"
+	fi
 	select_target
 	case "$COMMAND_NAME:$command_argument" in
 		modem-reset:*|action-start:modem-reset) require_hardware_integration ;;
 	esac
+	# An operation that covers every managed target records "auto" rather than
+	# the one target it happened to select for its capability check. Without
+	# this, the button and LuCI's own "reconcile now" would each have gone to a
+	# single target while the same command from the CLI covered all of them.
+	case "$COMMAND_NAME:$command_argument" in
+		action-start:reconcile)
+			[ -n "$REQUESTED_TARGET" ] || [ "$CONFIGURED_INTERFACE" != auto ] || \
+				[ "${AUTO_TARGET_COUNT:-1}" -le 1 ] || TARGET_ID="auto"
+		;;
+	esac
 	case "$COMMAND_NAME" in
 		detect|detect-json|status|status-json) require_target_capability identity ;;
 		apply|reconcile|modem-reset|apply-manual) require_target_capability profile-apply ;;
-		roaming-policy-set) require_target_capability profile-write ;;
+		# Not profile-write: the roaming policy is a netifd option the handler
+		# reads, not a field in the modem's own profile. Gating it on
+		# profile-write refused every backend that owns no profile fields —
+		# atdial among them — although its capability record advertises
+		# roaming_policy_write, and both LuCI's roaming controls and the CLI
+		# failed on such a target with a message about the wrong capability.
+		roaming-policy-set) require_target_capability roaming-policy-write ;;
 		action-start)
 			case "$command_argument" in
 				reconcile|modem-reset|apply-manual) require_target_capability profile-apply ;;
-				roaming-default|roaming-allow|roaming-block) require_target_capability profile-write ;;
+				roaming-default|roaming-allow|roaming-block) require_target_capability roaming-policy-write ;;
 			esac
 		;;
 	esac

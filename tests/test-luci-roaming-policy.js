@@ -101,7 +101,7 @@ function loadView() {
 	var app = Function('view', 'form', 'fs', 'uci', 'ui', 'poll', 'dom', 'E', '_', source)(
 		view,
 		makeForm(),
-		{},
+		{ exec: function() { return Promise.resolve({ code: 0, stdout: '{}' }); } },
 		{},
 		ui,
 		{ add: function() {} },
@@ -493,11 +493,79 @@ async function verifyUnavailableConfiguredTargetGuidance() {
 		{ state: 'idle', busy: false }, {}, targets ]);
 	var content = nodeText(page);
 	assert.match(content, /qmitest \(qmi\)/i,
-		'unavailable configured target must name discovered cellular alternatives');
-	assert.match(content, /Settings.*Mobile target/i,
-		'unavailable configured target must explain how to select an alternative');
-	assert.match(content, /not switch targets silently/i,
-		'target guidance must make the fail-closed behavior explicit');
+		'unavailable target must name the other discovered cellular targets');
+	/* The page used to tell the user to go to Settings and choose a target
+	 * before anything would work. Several targets are now managed at once, so
+	 * an unavailable status is a fact about one of them and the others are
+	 * offered as somewhere else to look. */
+	assert.doesNotMatch(content, /Settings.*Mobile target/i,
+		'an unavailable target must not send the user off to choose one');
+	assert.doesNotMatch(content, /not switch targets silently/i,
+		'the fail-closed single-target wording must be gone');
+}
+
+/* Several managed targets: a selector, scoped queries, and no dead end. */
+async function verifyMultiTargetSelector() {
+	var app = loadView();
+	var status = {
+		version: 'v2',
+		interface: 'wwan',
+		target_id: 'network:wwan',
+		target_backend: 'modemmanager',
+		target_capabilities: { profile_write: true, profile_apply: true, roaming_policy_write: true },
+		roaming_policy: 'default-allow'
+	};
+	var targets = {
+		configured_target: 'auto',
+		targets: [
+			{ id: 'network:wwan', interface: 'wwan', protocol: 'modemmanager', managed: true,
+			  capabilities: { identity: true, profile_apply: true } },
+			{ id: 'network:apnmodem1', interface: 'apnmodem1', protocol: 'apn_atdial', managed: true,
+			  capabilities: { identity: true, profile_apply: true } }
+		]
+	};
+	var page = await app.render([ {}, status, { state: 'idle', busy: false }, {}, targets ]);
+	var content = nodeText(page);
+	assert.doesNotMatch(content, /Status is temporarily unavailable/i,
+		'two managed targets must not make the APN status unavailable');
+	assert.doesNotMatch(content, /select one explicitly/i,
+		'two managed targets must not be reported as an ambiguity to resolve');
+	assert.ok(app.targetSelect, 'a second target must offer a selector');
+	assert.strictEqual(app.targetSelect.options.length, 3,
+		'the selector must offer the automatic entry and every discovered target');
+	assert.match(content, /apnmodem1/,
+		'the page must name the other managed target');
+
+	/* Automatic: the engine is asked without a target, and an operation
+	 * started here covers all of them. */
+	assert.deepStrictEqual(app.statusArgs(), [ 'status' ],
+		'the automatic view must ask the engine for its own target');
+	assert.strictEqual(app.actionTarget(), null,
+		'an action started from the automatic view must not name a target');
+	assert.strictEqual(app.policySelect.disabled, true,
+		'automatic multi-target view must not offer an unscoped roaming-policy change');
+	assert.match(nodeText(app.policyDescription), /Select one mobile target/i,
+		'automatic multi-target view must explain how to change roaming permission safely');
+
+	app.targetSelect.value = 'network:apnmodem1';
+	app.targetSelect.change();
+	assert.deepStrictEqual(app.statusArgs(), [ 'status', 'network:apnmodem1' ],
+		'a selected target must scope the status query');
+	assert.strictEqual(app.actionTarget(), 'network:apnmodem1',
+		'a selected target must scope the operations started from the page');
+	assert.strictEqual(app.policySelect.disabled, false,
+		'a selected target must enable its supported roaming-policy control');
+
+	/* A provisioning result changes the selector in place; the user must not
+	 * need to reload the page to see the new target. */
+	app.setTargetInventory({ configured_target: 'auto', targets: targets.targets.concat([
+		{ id: 'network:apnmodem2', interface: 'apnmodem2', protocol: 'qmi', managed: true,
+		  capabilities: { identity: true, profile_apply: true } }
+	]) });
+	assert.strictEqual(app.targetSelect.options.length, 4,
+		'a refreshed inventory must rebuild the selector with newly provisioned targets');
+	assert.strictEqual(app.viewTarget, 'network:apnmodem1',
+		'refreshing the target inventory must preserve a target that still exists');
 }
 
 Promise.all([
@@ -507,7 +575,8 @@ Promise.all([
 	verifyLayout(),
 	verifyBackendSpecificPolicy(),
 	verifyMbimPolicy(),
-	verifyUnavailableConfiguredTargetGuidance()
+	verifyUnavailableConfiguredTargetGuidance(),
+	verifyMultiTargetSelector()
 ]).then(function() {
 	process.stdout.write('LuCI layout and roaming policy regression tests passed.\n');
 }).catch(function(error) {

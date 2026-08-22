@@ -1,7 +1,8 @@
 # 0.15.2 corrective test and release plan
 
-Status: **all pre-publication gates passed; ready for release.** The signed-feed
-smoke remains a post-publication gate. Detailed router evidence is in
+Status: **complete; v0.15.2 is published and every release gate passed.** The
+post-publication signed-feed smoke included a fresh installation of all six
+packages on the reference router. Detailed router evidence is in
 [`router-test-0.15.2.md`](router-test-0.15.2.md). 0.15.2 is a defect release
 against the published 0.15.1 packages. Every defect below was found on the
 reference hardware after an ordinary reboot, not by review.
@@ -135,3 +136,12 @@ the FM350-GL on `apn_atdial` — against installed packages:
 lifecycle suite, the hardware gate above, and the signed-feed smoke after
 publication. Nothing here promotes an implementation state: no backend's
 maturity changes in 0.15.2.
+
+All gates passed. Tag `v0.15.2` resolves to main commit `5b4fc5b`; GitHub Actions
+run [32552652875](https://github.com/DarthAnwalt/openwrt-apn-autoconfig/actions/runs/32552652875)
+successfully rebuilt the packages, published the Release and deployed the
+signed repository. The router then accepted the public index without
+`--allow-untrusted`, fetched all six published APKs with matching release
+checksums, and installed them from the feed. The final router state preserved
+both managed targets, the persistent FM350 identity, explicit roaming block and
+the exact pre-smoke UCI configuration.

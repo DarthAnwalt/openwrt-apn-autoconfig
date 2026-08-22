@@ -2,7 +2,7 @@
 
 Date: 2026-08-22
 
-Status: **all pre-publication hardware, CLI and LuCI gates passed.**
+Status: **complete; the published release and signed-feed smoke passed.**
 
 Reference system: Huasifei WH3000 on OpenWrt 25.12.5, with a Quectel
 RM520N-GL managed by ModemManager and a Fibocom FM350-GL on the project-owned
@@ -108,3 +108,62 @@ the 5 MB test budget and the SIM's 100 MB allowance.
   `network.apnmodem1`; returning to Automatic restored the two-modem view.
   Settings showed `Automatic (every writable target)`. No browser console
   errors were recorded and no setting was saved or changed during the pass.
+
+## Publication and signed-feed smoke
+
+PR [#43](https://github.com/DarthAnwalt/openwrt-apn-autoconfig/pull/43)
+passed its required official-SDK build and was squash-merged to main commit
+`5b4fc5b`. Annotated tag `v0.15.2` names that exact commit. Release workflow
+[32552652875](https://github.com/DarthAnwalt/openwrt-apn-autoconfig/actions/runs/32552652875)
+completed all three jobs successfully: `test-and-build`, `publish-release` and
+`publish-repository`.
+
+The public GitHub Release contains six APKs and `SHA256SUMS`. A fresh download
+of every asset passed `sha256sum -c`; the modem and AT-dial packages are `r2`,
+the other code packages are `r1`, and the provider database is
+`2026.08.10-r1`.
+
+Before changing the router, its UCI configuration, APK world, installed package
+set, target inventory and both interface states were saved under
+`/mnt/storage/recovery/openwrt-25.12.5-pre-alpha/snapshots/` with a checksum
+manifest. The smoke then established all of the following without enabling the
+FM350 or using its roaming allowance:
+
+- `apk update` accepted the project `packages.adb` with the pinned public key
+  and no `--allow-untrusted` option;
+- package policy exposed the exact published version of all six packages from
+  the public project repository;
+- an uncached repository fetch downloaded all six APKs, and every payload
+  matched the GitHub Release checksum;
+- the six checksum-bound entries left by local test installations were
+  normalized to bare names in `/etc/apk/world`;
+- a controlled removal and fresh `apk add` installed exactly the six project
+  packages from the signed feed. A preflight simulation showed that no system
+  package would be removed, and the prepared recovery fallback was not used.
+
+An attempted same-version `--force-reinstall` was deliberately not counted as
+evidence: APK reported `APK unavailable, skipped` for the locally built package
+identities even though it exited zero. Removing only the six project packages
+first made repository selection unambiguous and produced real install and
+post-install events for each package.
+
+The lifecycle removal correctly restored the saved pre-package profile, which
+removed the project-selected `network.apnmodem1.apn`. Because roaming was still
+explicitly blocked, the subsequent automatic reconcile intentionally refused
+to modify that target's profile: it returned one success plus one blocked target
+with exit code 2. The single APN option was therefore restored from the recovery
+snapshot without starting the FM350. After that restoration, both `network`
+and application UCI exports matched their pre-smoke snapshots byte-for-byte and
+`uci changes` was empty.
+
+Final state:
+
+- all six exact release versions are installed and APK world contains only bare
+  project package names;
+- `network:wwan` and `network:apnmodem1` both report `managed:true`;
+- the RM520N-GL remains up under ModemManager;
+- the Fibocom FM350-GL remains recognised as the package-owned `netifd-direct`
+  target, down, with `allow_roaming=0`;
+- both persistent modem identity records remain present.
+
+The post-publication signed-feed gate passed.

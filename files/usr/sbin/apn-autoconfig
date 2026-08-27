@@ -1,0 +1,2297 @@
+#!/bin/sh
+
+# APN auto-configuration engine for OpenWrt cellular interfaces.
+# POSIX shell; intended for OpenWrt 25.12 and BusyBox ash.
+
+umask 077
+
+PROG="apn-autoconfig"
+CONFIG="apn-autoconfig"
+
+INTERFACE="wwan"
+CONFIGURED_INTERFACE="auto"
+REQUESTED_TARGET=""
+TARGET_ID=""
+TARGET_PROTOCOL=""
+TARGET_BACKEND=""
+TARGET_IDENTITY=false
+TARGET_PROFILE_READ=false
+TARGET_PROFILE_WRITE=false
+TARGET_PROFILE_APPLY=false
+TARGET_REASON=""
+TARGET_IMPLEMENTATION_STATE="unimplemented"
+TARGET_VALIDATION_STATE="none"
+TARGET_HARDWARE_VALIDATED=false
+COMMAND_NAME=""
+SIM_INDEX_FALLBACK="0"
+SIM_INDEX=""
+MODEM_INDEX=""
+DEVICE="wwan0"
+L3_DEVICE=""
+NETWORK_DEVICE=""
+NETWORK_DEVPATH=""
+DATABASE="/usr/share/apn-autoconfig/providers.tsv"
+CACHE_DIR="/etc/apn-autoconfig/cache"
+STATE_DIR="/etc/apn-autoconfig"
+TARGET_STATE_DIR="/etc/apn-autoconfig/targets/network_wwan"
+BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
+ACTIVE_FILE="/etc/apn-autoconfig/active.tsv"
+LEGACY_BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
+LEGACY_ACTIVE_FILE="/etc/apn-autoconfig/active.tsv"
+TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
+WAIT_SECONDS="35"
+REGISTRATION_WAIT_SECONDS="30"
+TRY_EMPTY="0"
+USE_MWAN3="auto"
+MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
+MODEM_POWER_OFF_VALUE="1"
+MODEM_POWER_ON_VALUE="0"
+MODEM_POWER_OFF_SECONDS="5"
+MODEM_WAIT_SECONDS="90"
+MODEM_POLL_SECONDS="2"
+SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
+QMI_ADAPTER="${APN_AUTOCONFIG_QMI_ADAPTER:-/usr/libexec/apn-autoconfig-qmi}"
+HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn-autoconfig/integrations/huasifei-wh3000}"
+
+LOCK_DIR="/var/lock/apn-autoconfig.lock"
+ACTION_STATE_DIR="/tmp/apn-autoconfig-action"
+ACTION_WORKER="${APN_AUTOCONFIG_ACTION_WORKER:-/usr/libexec/apn-autoconfig-action}"
+TMP_BASE="/tmp/apn-autoconfig.$$"
+SIM_DATA="${TMP_BASE}.sim"
+MODEM_DATA="${TMP_BASE}.modem"
+MODEM_LIST="${TMP_BASE}.modems"
+CANDIDATES="${TMP_BASE}.candidates"
+SEEN_APNS="${TMP_BASE}.seen"
+TARGETS_DATA="${TMP_BASE}.targets"
+
+ROLLBACK_ARMED=0
+OLD_APN_SET=0
+OLD_APN=""
+OLD_USERNAME_SET=0
+OLD_USERNAME=""
+OLD_PASSWORD_SET=0
+OLD_PASSWORD=""
+OLD_ALLOWEDAUTH_SET=0
+OLD_ALLOWEDAUTH=""
+OLD_IPTYPE_SET=0
+OLD_IPTYPE=""
+LOCK_HELD=0
+MODEM_POWER_OFF_ARMED=0
+INTERFACE_RESTORE_ARMED=0
+LEAVE_INTERFACE_DOWN=0
+SETTLE_SLEEP_PID=""
+
+MODEM_STATE="unknown"
+REGISTRATION_STATE="unknown"
+ROAMING_STATUS="unknown"
+SERVING_OPERATOR_ID=""
+SERVING_OPERATOR_NAME=""
+ACCESS_TECHNOLOGIES=""
+SIGNAL_QUALITY=""
+ROAMING_POLICY="default-allow"
+ROAMING_ALLOWED=true
+CONFIGURED_PLMN=""
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+die() {
+	log err "$*"
+	exit 1
+}
+
+die_code() {
+	code="$1"
+	shift
+	log err "$*"
+	exit "$code"
+}
+
+cleanup_files() {
+	rm -f "$SIM_DATA" "$MODEM_DATA" "$MODEM_LIST" \
+		"$CANDIDATES" "${CANDIDATES}.apply" "$SEEN_APNS" "$TARGETS_DATA"
+	if [ "$LOCK_HELD" -eq 1 ]; then
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || :
+		LOCK_HELD=0
+	fi
+}
+
+state_value_is_safe() {
+	value="$1"
+	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
+}
+
+set_or_delete_option() {
+	option="$1"
+	set_flag="$2"
+	value="$3"
+	if [ "$set_flag" -eq 1 ]; then
+		uci set "network.${INTERFACE}.${option}=$value" >/dev/null 2>&1
+	else
+		uci -q delete "network.${INTERFACE}.${option}" >/dev/null 2>&1 || :
+	fi
+}
+
+capture_owned_profile() {
+	auth_option="$1"
+	ip_option="$2"
+	if uci -q get "network.${INTERFACE}.apn" >/dev/null 2>&1; then
+		OLD_APN_SET=1
+		OLD_APN="$(uci -q get "network.${INTERFACE}.apn")"
+	fi
+	if uci -q get "network.${INTERFACE}.username" >/dev/null 2>&1; then
+		OLD_USERNAME_SET=1
+		OLD_USERNAME="$(uci -q get "network.${INTERFACE}.username")"
+	fi
+	if uci -q get "network.${INTERFACE}.password" >/dev/null 2>&1; then
+		OLD_PASSWORD_SET=1
+		OLD_PASSWORD="$(uci -q get "network.${INTERFACE}.password")"
+	fi
+	if uci -q get "network.${INTERFACE}.${auth_option}" >/dev/null 2>&1; then
+		OLD_ALLOWEDAUTH_SET=1
+		OLD_ALLOWEDAUTH="$(uci -q get "network.${INTERFACE}.${auth_option}")"
+	fi
+	if uci -q get "network.${INTERFACE}.${ip_option}" >/dev/null 2>&1; then
+		OLD_IPTYPE_SET=1
+		OLD_IPTYPE="$(uci -q get "network.${INTERFACE}.${ip_option}")"
+	fi
+}
+
+capture_old_profile() {
+	case "$TARGET_BACKEND" in
+		modemmanager) capture_owned_profile allowedauth iptype ;;
+		qmi) capture_owned_profile auth pdptype ;;
+		*) die_code 4 "backend $TARGET_BACKEND cannot read APN profiles" ;;
+	esac
+}
+
+restore_owned_profile() {
+	auth_option="$1"
+	ip_option="$2"
+	set_or_delete_option apn "$OLD_APN_SET" "$OLD_APN" || return 1
+	set_or_delete_option username "$OLD_USERNAME_SET" "$OLD_USERNAME" || return 1
+	set_or_delete_option password "$OLD_PASSWORD_SET" "$OLD_PASSWORD" || return 1
+	set_or_delete_option "$auth_option" "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
+	set_or_delete_option "$ip_option" "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
+	uci commit network >/dev/null 2>&1 || return 1
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
+	settle_after_ifdown
+	ifup "$INTERFACE" >/dev/null 2>&1 || :
+}
+
+restore_old_profile() {
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			log warning "restoring previous mobile profile for interface $INTERFACE"
+			restore_owned_profile allowedauth iptype
+		;;
+		qmi)
+			log warning "restoring previous QMI profile for interface $INTERFACE"
+			restore_owned_profile auth pdptype
+		;;
+		*) return 1 ;;
+	esac
+}
+
+set_owned_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth_option="$4"
+	auth_value="$5"
+	ip_option="$6"
+	ip_value="$7"
+
+	case "$apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 1 ;; esac
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
+	state_value_is_safe "$auth_value" || return 1
+	state_value_is_safe "$ip_value" || return 1
+
+	uci set "network.${INTERFACE}.apn=$apn" >/dev/null 2>&1 || return 1
+	if [ "$username" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.username" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.username=$username" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$password" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.password" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.password=$password" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$auth_value" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.${auth_option}" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.${auth_option}=$auth_value" >/dev/null 2>&1 || return 1
+	fi
+	if [ "$ip_value" = "-" ]; then
+		uci -q delete "network.${INTERFACE}.${ip_option}" >/dev/null 2>&1 || :
+	else
+		uci set "network.${INTERFACE}.${ip_option}=$ip_value" >/dev/null 2>&1 || return 1
+	fi
+	uci commit network >/dev/null 2>&1
+}
+
+modemmanager_set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+	[ "$auth" != pap-or-chap ] || auth="pap chap"
+	set_owned_profile "$apn" "$username" "$password" allowedauth "$auth" iptype "$ip_type"
+}
+
+qmi_set_profile() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 1 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 1 ;; esac
+	[ "$auth" != pap-or-chap ] || auth=both
+	[ "$ip_type" != ipv4 ] || ip_type=ip
+	set_owned_profile "$apn" "$username" "$password" auth "$auth" pdptype "$ip_type"
+}
+
+set_profile() {
+	case "$TARGET_BACKEND" in
+		modemmanager) modemmanager_set_profile "$@" ;;
+		qmi) qmi_set_profile "$@" ;;
+		*) return 1 ;;
+	esac
+}
+
+on_exit() {
+	on_exit_status=$?
+	trap - 0 HUP INT TERM
+	if [ -n "$SETTLE_SLEEP_PID" ]; then
+		kill -TERM "$SETTLE_SLEEP_PID" 2>/dev/null || :
+		wait "$SETTLE_SLEEP_PID" 2>/dev/null || :
+		SETTLE_SLEEP_PID=""
+	fi
+	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
+		printf '%s\n' "$MODEM_POWER_ON_VALUE" >"$MODEM_POWER_PATH" 2>/dev/null || \
+			log err "failed to restore modem power after interruption"
+		MODEM_POWER_OFF_ARMED=0
+	fi
+	if [ "$ROLLBACK_ARMED" -eq 1 ]; then
+		restore_old_profile || log err "automatic rollback failed; restore the mobile profile in LuCI"
+	elif [ "$INTERFACE_RESTORE_ARMED" -eq 1 ]; then
+		ifup "$INTERFACE" >/dev/null 2>&1 || \
+			log err "failed to restart interface $INTERFACE after modem reset failure"
+	fi
+	cleanup_files
+	exit "$on_exit_status"
+}
+
+on_signal() {
+	exit 143
+}
+
+trap on_exit 0
+trap on_signal HUP INT TERM
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+load_config() {
+	if ! command_exists uci; then
+		die "uci is required"
+	fi
+	value="$(uci -q get "${CONFIG}.main.interface")" && [ -n "$value" ] && CONFIGURED_INTERFACE="$value"
+	value="$(uci -q get "${CONFIG}.main.sim_index")" && [ -n "$value" ] && SIM_INDEX_FALLBACK="$value"
+	value="$(uci -q get "${CONFIG}.main.device")" && [ -n "$value" ] && DEVICE="$value"
+	value="$(uci -q get "${CONFIG}.main.database")" && [ -n "$value" ] && DATABASE="$value"
+	value="$(uci -q get "${CONFIG}.main.cache_dir")" && [ -n "$value" ] && CACHE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.test_url")" && [ -n "$value" ] && TEST_URL="$value"
+	value="$(uci -q get "${CONFIG}.main.wait_seconds")" && [ -n "$value" ] && WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.registration_wait_seconds")" && [ -n "$value" ] && REGISTRATION_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.try_empty")" && [ -n "$value" ] && TRY_EMPTY="$value"
+	value="$(uci -q get "${CONFIG}.main.use_mwan3")" && [ -n "$value" ] && USE_MWAN3="$value"
+	value="$(uci -q get "${CONFIG}.main.lock_dir")" && [ -n "$value" ] && LOCK_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_path")" && [ -n "$value" ] && MODEM_POWER_PATH="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_value")" && [ -n "$value" ] && MODEM_POWER_OFF_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
+}
+
+target_protocol_capabilities() {
+	protocol="$1"
+	TARGET_PROTOCOL="$protocol"
+	TARGET_IDENTITY=false
+	TARGET_PROFILE_READ=false
+	TARGET_PROFILE_WRITE=false
+	TARGET_PROFILE_APPLY=false
+	TARGET_REASON="backend-not-implemented"
+	TARGET_IMPLEMENTATION_STATE="unimplemented"
+	TARGET_VALIDATION_STATE="none"
+	TARGET_HARDWARE_VALIDATED=false
+	case "$protocol" in
+		modemmanager)
+			TARGET_BACKEND="modemmanager"
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
+			if command_exists mmcli; then
+				TARGET_IDENTITY=true
+				TARGET_PROFILE_READ=true
+				TARGET_PROFILE_WRITE=true
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
+			else
+				TARGET_REASON="backend-command-unavailable"
+			fi
+		;;
+		qmi|uqmi)
+			TARGET_BACKEND="qmi"
+			TARGET_IMPLEMENTATION_STATE="stable"
+			TARGET_VALIDATION_STATE="hardware"
+			TARGET_HARDWARE_VALIDATED=true
+			if [ ! -x "$QMI_ADAPTER" ]; then
+				TARGET_REASON="adapter-unavailable"
+			elif "$QMI_ADAPTER" capabilities >/dev/null 2>&1; then
+				TARGET_IDENTITY=true
+				TARGET_PROFILE_READ=true
+				TARGET_PROFILE_WRITE=true
+				TARGET_PROFILE_APPLY=true
+				TARGET_REASON=""
+			else
+				TARGET_REASON="backend-command-unavailable"
+			fi
+		;;
+		mbim|umbim) TARGET_BACKEND="mbim" ;;
+		fibocom) TARGET_BACKEND="fibocom" ;;
+		atc|xmm|ncm|wwan|3g) TARGET_BACKEND="at" ;;
+		*) TARGET_BACKEND=""; TARGET_REASON="unsupported-protocol" ;;
+	esac
+}
+
+protocol_is_cellular() {
+	case "$1" in
+		modemmanager|qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+discover_targets() {
+	: >"$TARGETS_DATA"
+	uci -q show network 2>/dev/null | while IFS= read -r line; do
+		case "$line" in network.*.proto=*) : ;; *) continue ;; esac
+		section="${line#network.}"
+		section="${section%%.proto=*}"
+		proto="${line#*=}"
+		case "$proto" in "'"*"'") proto="${proto#\'}"; proto="${proto%\'}" ;; esac
+		case "$section" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+		case "$proto" in ''|*[!A-Za-z0-9_-]*) continue ;; esac
+		protocol_is_cellular "$proto" || continue
+		printf '%s\t%s\n' "$section" "$proto"
+	done >"$TARGETS_DATA"
+}
+
+select_target() {
+	configured="$CONFIGURED_INTERFACE"
+	if [ -n "$REQUESTED_TARGET" ]; then
+		case "$REQUESTED_TARGET" in network:*) configured="${REQUESTED_TARGET#network:}" ;; *) die_code 4 "invalid target ID" ;; esac
+	fi
+	case "$configured" in
+		auto)
+			discover_targets
+			selected=""
+			count=0
+			while IFS="$(printf '\t')" read -r section proto; do
+				target_protocol_capabilities "$proto"
+				[ "$TARGET_PROFILE_APPLY" = true ] || continue
+				selected="$section"
+				count=$((count + 1))
+			done <"$TARGETS_DATA"
+			[ "$count" -gt 0 ] || die_code 4 "no cellular target with an implemented APN backend was found"
+			[ "$count" -eq 1 ] || die_code 4 "multiple writable cellular targets found; select one explicitly"
+			INTERFACE="$selected"
+		;;
+		''|*[!A-Za-z0-9_]*) die_code 4 "invalid target interface" ;;
+		*) INTERFACE="$configured" ;;
+	esac
+	TARGET_ID="network:$INTERFACE"
+	protocol="$(uci -q get "network.${INTERFACE}.proto" 2>/dev/null || :)"
+	case "$protocol" in
+		'')
+			[ "$COMMAND_NAME" = reset ] || die_code 4 "cannot determine a protocol for target $TARGET_ID"
+			protocol="unknown"
+		;;
+		*[!A-Za-z0-9_-]*) die_code 4 "cannot determine a safe protocol for target $TARGET_ID" ;;
+	esac
+	target_protocol_capabilities "$protocol"
+	if [ -z "$TARGET_BACKEND" ]; then
+		[ "$COMMAND_NAME" = reset ] || die_code 4 "target $TARGET_ID uses unsupported protocol $protocol"
+		TARGET_BACKEND="unknown"
+	fi
+	value="$(uci -q get "network.${INTERFACE}.device" 2>/dev/null || :)"
+	[ -n "$value" ] && NETWORK_DEVICE="$value"
+	value="$(uci -q get "network.${INTERFACE}.devpath" 2>/dev/null || :)"
+	[ -n "$value" ] && NETWORK_DEVPATH="$value"
+	TARGET_STATE_DIR="$STATE_DIR/targets/network_${INTERFACE}"
+	BASELINE_FILE="$TARGET_STATE_DIR/baseline.tsv"
+	ACTIVE_FILE="$TARGET_STATE_DIR/active.tsv"
+	LEGACY_BASELINE_FILE="$STATE_DIR/baseline.tsv"
+	LEGACY_ACTIVE_FILE="$STATE_DIR/active.tsv"
+}
+
+migrate_target_state() {
+	legacy_owner=""
+	legacy_owned=0
+	if [ -r "$LEGACY_BASELINE_FILE" ]; then
+		legacy_owner="$(awk -F '\t' 'NR == 1 { print $2; exit }' "$LEGACY_BASELINE_FILE")"
+		if [ "$legacy_owner" = "$INTERFACE" ]; then
+			legacy_owned=1
+		elif [ ! -e "$BASELINE_FILE" ]; then
+			die "legacy baseline belongs to interface $legacy_owner; refusing cross-target migration"
+		fi
+	fi
+	if [ "$legacy_owned" -eq 1 ] && [ ! -e "$BASELINE_FILE" ]; then
+		mkdir -p "$TARGET_STATE_DIR" || die "cannot create target state directory: $TARGET_STATE_DIR"
+		mv "$LEGACY_BASELINE_FILE" "$BASELINE_FILE" || die "cannot migrate target baseline"
+		log notice "migrated baseline into state namespace for $TARGET_ID"
+	fi
+	if [ -r "$LEGACY_ACTIVE_FILE" ] && [ ! -e "$ACTIVE_FILE" ]; then
+		if [ "$legacy_owned" -eq 1 ] || { [ -z "$REQUESTED_TARGET" ] && [ "$CONFIGURED_INTERFACE" = "$INTERFACE" ]; }; then
+			mkdir -p "$TARGET_STATE_DIR" || die "cannot create target state directory: $TARGET_STATE_DIR"
+			mv "$LEGACY_ACTIVE_FILE" "$ACTIVE_FILE" || die "cannot migrate active target state"
+			log notice "migrated active state into namespace for $TARGET_ID"
+		fi
+	fi
+}
+
+active_file_for_read() {
+	if [ -r "$ACTIVE_FILE" ]; then
+		printf '%s\n' "$ACTIVE_FILE"
+	elif [ -r "$LEGACY_ACTIVE_FILE" ] && [ -z "$REQUESTED_TARGET" ] && [ "$CONFIGURED_INTERFACE" = "$INTERFACE" ]; then
+		printf '%s\n' "$LEGACY_ACTIVE_FILE"
+	else
+		return 1
+	fi
+}
+
+require_target_capability() {
+	capability="$1"
+	case "$capability" in
+		identity) available="$TARGET_IDENTITY" ;;
+		profile-read) available="$TARGET_PROFILE_READ" ;;
+		profile-write) available="$TARGET_PROFILE_WRITE" ;;
+		profile-apply) available="$TARGET_PROFILE_APPLY" ;;
+		*) die "internal error: unknown target capability" ;;
+	esac
+	[ "$available" = true ] || die_code 4 "target $TARGET_ID ($TARGET_PROTOCOL) does not implement $capability in this release"
+}
+
+hardware_integration_name() {
+	[ -r "$HARDWARE_INTEGRATION_FILE" ] || return 1
+	name="$(sed -n '1p' "$HARDWARE_INTEGRATION_FILE")"
+	case "$name" in huasifei-wh3000-gpio-v1) printf '%s\n' "$name" ;; *) return 1 ;; esac
+}
+
+require_hardware_integration() {
+	hardware_integration_name >/dev/null 2>&1 || \
+		die_code 4 "modem-reset requires an installed, supported board integration"
+}
+
+validate_config() {
+	case "$INTERFACE" in *[!A-Za-z0-9_]*) die "invalid interface name: $INTERFACE" ;; esac
+	case "$SIM_INDEX_FALLBACK" in auto) : ;; ''|*[!0-9]*) die "sim_index must be auto or numeric" ;; esac
+	case "$DEVICE" in ''|*[!A-Za-z0-9_.:-]*) die "invalid device name: $DEVICE" ;; esac
+	case "$WAIT_SECONDS" in ''|*[!0-9]*) die "wait_seconds must be numeric" ;; esac
+	case "$REGISTRATION_WAIT_SECONDS" in ''|*[!0-9]*) die "registration_wait_seconds must be numeric" ;; esac
+	case "$TRY_EMPTY" in 0|1) : ;; *) die "try_empty must be 0 or 1" ;; esac
+	case "$USE_MWAN3" in auto|always|never) : ;; *) die "use_mwan3 must be auto, always or never" ;; esac
+	case "$TEST_URL" in http://*|https://*) : ;; *) die "test_url must be an http(s) URL" ;; esac
+	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
+	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
+	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
+	[ "$MODEM_POWER_OFF_VALUE" != "$MODEM_POWER_ON_VALUE" ] || die "modem power on/off values must differ"
+	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
+	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
+	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
+	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
+	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
+	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+	case "$CACHE_DIR" in /|*/../*|*/..) die "unsafe cache_dir" ;; /*) : ;; *) die "cache_dir must be absolute" ;; esac
+	case "$CACHE_DIR" in "$STATE_DIR"/?*) : ;; *) die "cache_dir must be inside state_dir" ;; esac
+	case "$LOCK_DIR" in /|*/../*|*/..) die "unsafe lock_dir" ;; /*) : ;; *) die "lock_dir must be absolute" ;; esac
+	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
+	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
+	case "$COMMAND_NAME" in
+		detect|detect-json|apply|reconcile|modem-reset|status|status-json)
+			[ -r "$DATABASE" ] || die "database not readable: $DATABASE"
+			database_format="$(database_declared_format)"
+			case "$database_format" in
+				''|2) : ;;
+				*) die "unsupported provider database format: $database_format" ;;
+			esac
+			case "$TARGET_BACKEND" in
+				modemmanager) command_exists mmcli || die "mmcli is required" ;;
+				qmi) [ -x "$QMI_ADAPTER" ] || die "QMI identity adapter is not executable" ;;
+			esac
+		;;
+	esac
+	case "$COMMAND_NAME" in apply|reconcile|modem-reset) command_exists curl || die "curl is required" ;; esac
+	case "$COMMAND_NAME" in
+		apply|reconcile|modem-reset|roaming-policy-set|reset)
+			command_exists ifup || die "ifup is required"
+			command_exists ifdown || die "ifdown is required"
+		;;
+	esac
+}
+
+database_metadata_value() {
+	key="$1"
+	awk -v prefix="# ${key}: " '
+		index($0, prefix) == 1 {
+			print substr($0, length(prefix) + 1)
+			exit
+		}
+	' "$DATABASE"
+}
+
+database_declared_format() {
+	declared_format="$(database_metadata_value database-format)"
+	if [ -z "$declared_format" ]; then
+		declared_format="$(sed -n 's/^# apn-autoconfig generated provider database v\([0-9][0-9]*\)$/\1/p' \
+			"$DATABASE" | sed -n '1p')"
+	fi
+	printf '%s\n' "$declared_format"
+}
+
+read_database_metadata() {
+	DATABASE_VERSION="$(database_metadata_value database-version)"
+	DATABASE_FORMAT="$(database_declared_format)"
+	DATABASE_SOURCES="$(database_metadata_value sources)"
+	DATABASE_REVISIONS="$(database_metadata_value revisions)"
+}
+
+kv_value_from() {
+	file="$1"
+	keys="$2"
+	awk -F ':' -v wanted="$keys" '
+		BEGIN { n=split(wanted, a, " ") }
+		{
+			key=$1
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			for (i=1; i<=n; i++) if (key == a[i]) {
+				$1=""
+				sub(/^:[[:space:]]*/, "", $0)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+				if ($0 != "--" && $0 != "unknown") { print $0; exit }
+			}
+		}
+	' "$file"
+}
+
+kv_value() {
+	kv_value_from "$SIM_DATA" "$1"
+}
+
+resolve_sim_index() {
+	: >"$MODEM_LIST"
+	mmcli -L 2>/dev/null | \
+		sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' >"$MODEM_LIST" || :
+
+	selected_sim=""
+	selected_modem=""
+	first_sim=""
+	first_modem=""
+	modem_count=0
+	while IFS= read -r modem_index; do
+		case "$modem_index" in ''|*[!0-9]*) continue ;; esac
+		mmcli -m "$modem_index" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || continue
+		modem_count=$((modem_count + 1))
+		modem_device="$(kv_value_from "$MODEM_DATA" 'modem.generic.device')"
+		modem_physdev="$(kv_value_from "$MODEM_DATA" 'modem.generic.physdev')"
+		sim_path="$(kv_value_from "$MODEM_DATA" 'modem.generic.sim')"
+		sim_index="${sim_path##*/}"
+		case "$sim_index" in ''|*[!0-9]*) continue ;; esac
+		[ -n "$first_sim" ] || first_sim="$sim_index"
+		[ -n "$first_modem" ] || first_modem="$modem_index"
+
+		if [ -z "$NETWORK_DEVICE" ] || \
+			[ "$modem_device" = "$NETWORK_DEVICE" ] || \
+			[ "$modem_physdev" = "$NETWORK_DEVICE" ]; then
+			selected_sim="$sim_index"
+			selected_modem="$modem_index"
+			break
+		fi
+	done <"$MODEM_LIST"
+
+	if [ -z "$selected_sim" ] && [ "$modem_count" -eq 1 ]; then
+		selected_sim="$first_sim"
+		selected_modem="$first_modem"
+	fi
+	if [ -n "$selected_sim" ]; then
+		SIM_INDEX="$selected_sim"
+		MODEM_INDEX="$selected_modem"
+		return 0
+	fi
+
+	if [ "$SIM_INDEX_FALLBACK" != "auto" ]; then
+		SIM_INDEX="$SIM_INDEX_FALLBACK"
+		[ "$modem_count" -eq 1 ] && MODEM_INDEX="$first_modem"
+		log warning "primary SIM could not be resolved; falling back to configured SIM $SIM_INDEX"
+		return 0
+	fi
+	return 1
+}
+
+read_roaming_policy() {
+	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	if [ "$TARGET_BACKEND" != modemmanager ]; then
+		# Roaming policy belongs to the connection manager. Only OpenWrt's
+		# ModemManager protocol has a tested allow_roaming contract here.
+		ROAMING_POLICY="unsupported"
+		ROAMING_ALLOWED=true
+		return 0
+	fi
+	if value="$(uci -q get "network.${INTERFACE}.allow_roaming" 2>/dev/null)"; then
+		case "$value" in
+			0)
+				ROAMING_POLICY="explicit-block"
+				ROAMING_ALLOWED=false
+			;;
+			1)
+				ROAMING_POLICY="explicit-allow"
+				ROAMING_ALLOWED=true
+			;;
+			*)
+				ROAMING_POLICY="invalid"
+				ROAMING_ALLOWED=false
+			;;
+		esac
+	else
+		# OpenWrt's ModemManager protocol handler explicitly defaults to yes.
+		ROAMING_POLICY="default-allow"
+		ROAMING_ALLOWED=true
+	fi
+}
+
+read_access_technologies() {
+	awk -F ':' '
+		/^modem\.generic\.access-technologies\.value\[[0-9]+\]/ {
+			value=$2
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			if (value != "" && value != "--" && value != "unknown") {
+				if (out != "") out=out ","
+				out=out value
+			}
+		}
+		END { print out }
+	' "$MODEM_DATA"
+}
+
+modemmanager_refresh_modem_status() {
+	MODEM_STATE="unknown"
+	REGISTRATION_STATE="unknown"
+	ROAMING_STATUS="unknown"
+	SERVING_OPERATOR_ID=""
+	SERVING_OPERATOR_NAME=""
+	ACCESS_TECHNOLOGIES=""
+	SIGNAL_QUALITY=""
+	read_roaming_policy
+
+	[ -n "$MODEM_INDEX" ] || return 1
+	mmcli -m "$MODEM_INDEX" --output-keyvalue >"$MODEM_DATA" 2>/dev/null || return 1
+	MODEM_STATE="$(kv_value_from "$MODEM_DATA" 'modem.generic.state')"
+	REGISTRATION_STATE="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.registration-state')"
+	SERVING_OPERATOR_ID="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.operator-code')"
+	SERVING_OPERATOR_NAME="$(kv_value_from "$MODEM_DATA" 'modem.3gpp.operator-name')"
+	SIGNAL_QUALITY="$(kv_value_from "$MODEM_DATA" 'modem.generic.signal-quality.value')"
+	ACCESS_TECHNOLOGIES="$(read_access_technologies)"
+	[ -n "$MODEM_STATE" ] || MODEM_STATE="unknown"
+	[ -n "$REGISTRATION_STATE" ] || REGISTRATION_STATE="unknown"
+	case "$REGISTRATION_STATE" in
+		roaming|roaming-sms-only) ROAMING_STATUS=true ;;
+		home|home-sms-only) ROAMING_STATUS=false ;;
+		*) ROAMING_STATUS=unknown ;;
+	esac
+	return 0
+}
+
+refresh_modem_status() {
+	case "$TARGET_BACKEND" in
+		modemmanager) modemmanager_refresh_modem_status ;;
+		*) return 1 ;;
+	esac
+}
+
+modemmanager_read_sim() {
+	resolve_sim_index || die_code 3 "cannot yet resolve the primary SIM for interface $INTERFACE"
+	mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null || \
+		die_code 3 "cannot yet read SIM $SIM_INDEX with mmcli"
+	IMSI="$(kv_value 'sim.properties.imsi')"
+	ICCID="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
+	EID="$(kv_value 'sim.properties.eid')"
+	OPERATOR_ID="$(kv_value 'sim.properties.operator-id sim.properties.operator-code')"
+	OPERATOR_NAME="$(kv_value 'sim.properties.operator-name')"
+	GID1="$(kv_value 'sim.properties.gid1')"
+	GID2="$(kv_value 'sim.properties.gid2')"
+	[ -n "$ICCID" ] || die_code 3 "SIM ICCID is not available yet"
+	case "$ICCID" in *[!0-9]*) die "unexpected ICCID format" ;; esac
+	refresh_modem_status || :
+}
+
+qmi_identity_value() {
+	key="$1"
+	awk -F '\t' -v wanted="$key" '
+		NR == 1 { next }
+		$1 == wanted { print substr($0, length($1) + 2); exit }
+	' "$SIM_DATA"
+}
+
+qmi_control_device_is_safe() {
+	device="$1"
+	case "$device" in /dev/*) : ;; *) return 1 ;; esac
+	device_name="${device#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$device_name" in
+		cdc-wdm*)
+			index="${device_name#cdc-wdm}"
+			case "$index" in ''|*[!0-9]*) return 1 ;; esac
+		;;
+		wwan*qmi*)
+			wwan_index="${device_name#wwan}"
+			wwan_index="${wwan_index%%qmi*}"
+			qmi_index="${device_name##*qmi}"
+			case "$wwan_index:$qmi_index" in *[!0-9:]*) return 1 ;; esac
+			[ -n "$wwan_index" ] && [ -n "$qmi_index" ] || return 1
+			[ "$device_name" = "wwan${wwan_index}qmi${qmi_index}" ] || return 1
+		;;
+		*) return 1 ;;
+	esac
+}
+
+qmi_resolve_control_device() {
+	if [ -n "$NETWORK_DEVICE" ]; then
+		qmi_control_device_is_safe "$NETWORK_DEVICE"
+		return $?
+	fi
+	resolved_sysfs="$(readlink -f "$SYSFS_ROOT" 2>/dev/null)" || return 1
+	resolved_devpath="$(readlink -f "$NETWORK_DEVPATH" 2>/dev/null)" || return 1
+	case "$resolved_devpath" in "$resolved_sysfs"/devices/*) : ;; *) return 1 ;; esac
+	NETWORK_DEVPATH="$resolved_devpath"
+
+	resolved=""
+	count=0
+	for candidate in \
+		"$NETWORK_DEVPATH"/usbmisc/cdc-wdm* \
+		"$NETWORK_DEVPATH"/*/usbmisc/cdc-wdm* \
+		"$NETWORK_DEVPATH"/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]* \
+		"$NETWORK_DEVPATH"/*/*/wwan[0-9]*/wwan[0-9]*qmi[0-9]*
+	do
+		[ -e "$candidate" ] || continue
+		device="/dev/${candidate##*/}"
+		qmi_control_device_is_safe "$device" || continue
+		[ "$device" = "$resolved" ] && continue
+		resolved="$device"
+		count=$((count + 1))
+	done
+	[ "$count" -eq 1 ] || return 1
+	NETWORK_DEVICE="$resolved"
+}
+
+qmi_read_sim() {
+	qmi_resolve_control_device || \
+		die_code 4 "QMI target $TARGET_ID requires a safe control device path"
+
+	if "$QMI_ADAPTER" identity "$NETWORK_DEVICE" >"$SIM_DATA"; then
+		:
+	else
+		status=$?
+		case "$status" in
+			3) die_code 3 "cannot yet read QMI SIM identity for $TARGET_ID" ;;
+			*) die "QMI identity adapter returned invalid or incomplete data" ;;
+		esac
+	fi
+	[ "$(sed -n '1p' "$SIM_DATA")" = "v1" ] || die "unsupported QMI identity contract"
+
+	SIM_INDEX="$(qmi_identity_value sim_index)"
+	MODEM_INDEX="$(qmi_identity_value modem_index)"
+	ICCID="$(qmi_identity_value iccid)"
+	IMSI="$(qmi_identity_value imsi)"
+	EID="$(qmi_identity_value eid)"
+	OPERATOR_ID="$(qmi_identity_value operator_id)"
+	OPERATOR_NAME="$(qmi_identity_value operator_name)"
+	GID1="$(qmi_identity_value gid1)"
+	GID2="$(qmi_identity_value gid2)"
+	MODEM_STATE="$(qmi_identity_value modem_state)"
+	REGISTRATION_STATE="$(qmi_identity_value registration_state)"
+	ROAMING_STATUS="$(qmi_identity_value roaming)"
+	SERVING_OPERATOR_ID="$(qmi_identity_value serving_operator_id)"
+	SERVING_OPERATOR_NAME="$(qmi_identity_value serving_operator_name)"
+	ACCESS_TECHNOLOGIES="$(qmi_identity_value access_technologies)"
+	SIGNAL_QUALITY="$(qmi_identity_value signal_quality)"
+	CONFIGURED_PLMN="$(uci -q get "network.${INTERFACE}.plmn" 2>/dev/null || :)"
+	read_roaming_policy
+
+	case "$SIM_INDEX" in ''|*[!0-9]*) die "invalid QMI SIM index" ;; esac
+	case "$ICCID" in ''|*[!0-9]*) die "unexpected QMI ICCID format" ;; esac
+	case "$IMSI" in ''|*[!0-9]*) [ -z "$IMSI" ] || die "unexpected QMI IMSI format" ;; esac
+	case "$OPERATOR_ID" in ''|*[!0-9]*) [ -z "$OPERATOR_ID" ] || die "unexpected QMI operator ID format" ;; esac
+	case "$ROAMING_STATUS" in true|false|unknown) : ;; *) die "unexpected QMI roaming status" ;; esac
+	for value in "$MODEM_INDEX" "$EID" "$OPERATOR_NAME" "$GID1" "$GID2" \
+		"$MODEM_STATE" "$REGISTRATION_STATE" "$SERVING_OPERATOR_ID" \
+		"$SERVING_OPERATOR_NAME" "$ACCESS_TECHNOLOGIES" "$SIGNAL_QUALITY"; do
+		state_value_is_safe "$value" || die "unsafe value returned by QMI identity adapter"
+	done
+}
+
+read_sim() {
+	case "$TARGET_BACKEND" in
+		modemmanager) modemmanager_read_sim ;;
+		qmi) qmi_read_sim ;;
+		*) die_code 4 "backend $TARGET_BACKEND cannot read SIM identity" ;;
+	esac
+	for value in "$SIM_INDEX" "$MODEM_INDEX" "$ICCID" "$IMSI" "$EID" \
+		"$OPERATOR_ID" "$OPERATOR_NAME" "$GID1" "$GID2" "$MODEM_STATE" \
+		"$REGISTRATION_STATE" "$SERVING_OPERATOR_ID" "$SERVING_OPERATOR_NAME" \
+		"$ACCESS_TECHNOLOGIES" "$SIGNAL_QUALITY" "$CONFIGURED_PLMN"; do
+		state_value_is_safe "$value" || die "unsafe multiline value returned by identity backend"
+	done
+}
+
+cache_file() {
+	printf '%s/%s.tsv\n' "$CACHE_DIR" "$ICCID"
+}
+
+cached_apn() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $2; exit }' "$file"
+}
+
+cached_provider() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $3; exit }' "$file"
+}
+
+cached_version() {
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $1; exit }' "$file"
+}
+
+cached_profile_field() {
+	column="$1"
+	file="$(cache_file)"
+	[ -r "$file" ] || return 1
+	awk -F '\t' -v column="$column" '
+		NR == 1 && $1 == "v2" {
+			result=$column
+			if (result == "") print "-"; else print result
+			exit
+		}
+		NR == 1 && $1 == "v1" { print "-"; exit }
+	' "$file"
+}
+
+find_candidates() {
+	: >"$CANDIDATES"
+	awk -F '\t' \
+		-v operator_id="$OPERATOR_ID" \
+		-v imsi="$IMSI" \
+		-v iccid="$ICCID" \
+		-v gid1="$GID1" \
+		-v spn="$OPERATOR_NAME" '
+		function wildcard(v) { return v == "" || v == "-" || v == "*" }
+		function starts(value, prefix) { return substr(value, 1, length(prefix)) == prefix }
+		function digit_pattern(value, pattern, i, expected, actual) {
+			if (length(value) < length(pattern)) return 0
+			pattern=tolower(pattern)
+			for (i=1; i<=length(pattern); i++) {
+				expected=substr(pattern, i, 1)
+				actual=substr(value, i, 1)
+				if (expected != "x" && expected != actual) return 0
+			}
+			return 1
+		}
+		BEGIN { OFS="\t"; spn_l=tolower(spn); gid1_l=tolower(gid1) }
+		/^[[:space:]]*#/ || NF < 8 { next }
+		{
+			mccmnc=$1; imsi_pattern=$2; iccid_pattern=$3; row_gid1=$4
+			row_spn=$5; provider=$6; apn=$7; priority=$8
+			username=NF >= 9 && $9 != "" ? $9 : "-"
+			password=NF >= 10 && $10 != "" ? $10 : "-"
+			auth=NF >= 11 && $11 != "" ? $11 : "-"
+			ip_type=NF >= 12 && $12 != "" ? $12 : "-"
+			if (!wildcard(mccmnc) && operator_id != mccmnc &&
+			    !(operator_id == "" && starts(imsi, mccmnc))) next
+			if (!wildcard(imsi_pattern) && !digit_pattern(imsi, imsi_pattern)) next
+			if (!wildcard(iccid_pattern) && !digit_pattern(iccid, iccid_pattern)) next
+			if (!wildcard(row_gid1) && tolower(row_gid1) != gid1_l) next
+			if (!wildcard(row_spn) && spn_l != tolower(row_spn)) next
+			score=0
+			if (!wildcard(mccmnc)) score += 100 + length(mccmnc)
+			if (!wildcard(imsi_pattern)) score += 200 + length(imsi_pattern)
+			if (!wildcard(iccid_pattern)) score += 200 + length(iccid_pattern)
+			if (!wildcard(row_gid1)) score += 50
+			if (!wildcard(row_spn)) score += 40
+			if (priority !~ /^[0-9]+$/) priority=100
+			# Fixed-width inverse score makes the required order portable even on
+			# BusyBox sort variants that handle per-key reverse modifiers differently.
+			rank=999999-score
+			printf "%06d\t%06d\t%s\t%s\t%s\t%s\t%s\t%s\n", \
+				rank, priority, apn, provider, username, password, auth, ip_type
+		}
+	' "$DATABASE" | sort | awk -F '\t' '!seen[$3 SUBSEP $5 SUBSEP $6 SUBSEP $7 SUBSEP $8]++' >"$CANDIDATES"
+}
+
+print_identity() {
+	printf 'SIM index:       %s\n' "$SIM_INDEX"
+	printf 'Modem index:     %s\n' "${MODEM_INDEX:--}"
+	printf 'ICCID:           %s\n' "$ICCID"
+	printf 'IMSI:            %s\n' "${IMSI:--}"
+	printf 'EID:             %s\n' "${EID:--}"
+	printf 'Home operator:   %s\n' "${OPERATOR_ID:--}"
+	printf 'Provider/SPN:    %s\n' "${OPERATOR_NAME:--}"
+	printf 'GID1 / GID2:     %s / %s\n' "${GID1:--}" "${GID2:--}"
+	printf 'Registration:    %s\n' "$REGISTRATION_STATE"
+	printf 'Serving network: %s (%s)\n' "${SERVING_OPERATOR_NAME:--}" "${SERVING_OPERATOR_ID:--}"
+	printf 'Roaming policy:  %s\n' "$ROAMING_POLICY"
+	printf 'Access / signal: %s / %s%%\n' "${ACCESS_TECHNOLOGIES:--}" "${SIGNAL_QUALITY:--}"
+	[ -n "$CONFIGURED_PLMN" ] && printf 'Manual PLMN:     %s\n' "$CONFIGURED_PLMN"
+}
+
+detect_cmd() {
+	read_sim
+	find_candidates
+	print_identity
+	cache="$(cached_apn 2>/dev/null || :)"
+	if [ -n "$cache" ]; then
+		printf 'Cached APN:      %s\n' "$cache"
+	else
+		printf 'Cached APN:      -\n'
+	fi
+	printf '\nCandidates from %s:\n' "$DATABASE"
+	if [ -s "$CANDIDATES" ]; then
+		awk -F '\t' '{ printf "  %d. %-28s %s\n", NR, $3, $4 }' "$CANDIDATES"
+	else
+		printf '  none (no matching profile is present in the provider database)\n'
+	fi
+}
+
+current_apn() {
+	uci -q get "network.${INTERFACE}.apn"
+}
+
+write_baseline_option() {
+	file="$1"
+	option="$2"
+	set_flag="$3"
+	value="$4"
+	state_value_is_safe "$value" || die "refusing to save an unsafe $option value"
+	printf 'option\t%s\t%s\t%s\n' "$option" "$set_flag" "$value" >>"$file" || \
+		die "cannot write baseline option $option"
+}
+
+migrate_legacy_baseline() {
+	[ -r "$BASELINE_FILE" ] || return 0
+	[ "$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")" = "v1" ] || return 0
+	[ "$TARGET_BACKEND" = modemmanager ] || \
+		die "a legacy ModemManager baseline cannot be migrated to backend $TARGET_BACKEND"
+	legacy_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
+	legacy_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+	legacy_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+	[ "$legacy_interface" = "$INTERFACE" ] || \
+		die "legacy baseline belongs to interface $legacy_interface; run reset before changing interfaces"
+	case "$legacy_set" in 0|1) : ;; *) die "invalid legacy baseline set flag" ;; esac
+	[ "$legacy_apn" = "<empty>" ] && legacy_apn=""
+	state_value_is_safe "$legacy_apn" || die "unsafe APN in legacy baseline"
+
+	mkdir -p "$TARGET_STATE_DIR" || die "cannot create target state directory: $TARGET_STATE_DIR"
+	tmp="$TARGET_STATE_DIR/.baseline.migrate.$$"
+	printf 'v3\t%s\t%s\t%s\t%s\n' "$legacy_interface" "$TARGET_ID" "$TARGET_BACKEND" "$TARGET_PROTOCOL" >"$tmp" || die "cannot migrate legacy baseline"
+	write_baseline_option "$tmp" apn "$legacy_set" "$legacy_apn"
+	# v0.5 changed only APN, so the current optional values are still the
+	# original values and can safely complete the old baseline.
+	write_baseline_option "$tmp" username "$OLD_USERNAME_SET" "$OLD_USERNAME"
+	write_baseline_option "$tmp" password "$OLD_PASSWORD_SET" "$OLD_PASSWORD"
+	write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+	write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+	mv "$tmp" "$BASELINE_FILE" || die "cannot install migrated baseline"
+	log notice "migrated v1 APN baseline to a complete v3 target profile baseline"
+}
+
+save_baseline() {
+	[ -e "$BASELINE_FILE" ] && return 0
+	mkdir -p "$TARGET_STATE_DIR" || die "cannot create target state directory: $TARGET_STATE_DIR"
+	tmp="$TARGET_STATE_DIR/.baseline.tmp.$$"
+	printf 'v3\t%s\t%s\t%s\t%s\n' "$INTERFACE" "$TARGET_ID" "$TARGET_BACKEND" "$TARGET_PROTOCOL" >"$tmp" || die "cannot write baseline"
+	write_baseline_option "$tmp" apn "$OLD_APN_SET" "$OLD_APN"
+	write_baseline_option "$tmp" username "$OLD_USERNAME_SET" "$OLD_USERNAME"
+	write_baseline_option "$tmp" password "$OLD_PASSWORD_SET" "$OLD_PASSWORD"
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			write_baseline_option "$tmp" allowedauth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+			write_baseline_option "$tmp" iptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+		;;
+		qmi)
+			write_baseline_option "$tmp" auth "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH"
+			write_baseline_option "$tmp" pdptype "$OLD_IPTYPE_SET" "$OLD_IPTYPE"
+		;;
+		*) die "cannot save a baseline for backend $TARGET_BACKEND" ;;
+	esac
+	mv "$tmp" "$BASELINE_FILE" || die "cannot install baseline"
+	log notice "saved original mobile profile for interface $INTERFACE"
+}
+
+reset_cmd() {
+	acquire_lock
+	migrate_target_state
+	if [ ! -r "$BASELINE_FILE" ]; then
+		rm -rf "$CACHE_DIR"
+		rm -f "$ACTIVE_FILE"
+		rmdir "$TARGET_STATE_DIR" 2>/dev/null || :
+		log notice "no saved APN baseline; cache cleared, network unchanged"
+		return 0
+	fi
+	baseline_version="$(awk -F '\t' 'NR == 1 { print $1 }' "$BASELINE_FILE")"
+	baseline_interface="$(awk -F '\t' 'NR == 1 { print $2 }' "$BASELINE_FILE")"
+	baseline_backend=""
+	case "$baseline_interface" in ''|*[!A-Za-z0-9_]*) die "invalid interface in baseline" ;; esac
+	[ "$baseline_interface" = "$INTERFACE" ] || \
+		die "baseline belongs to interface $baseline_interface, not selected interface $INTERFACE"
+	case "$baseline_version" in
+		v1|v2) [ "$TARGET_BACKEND" = modemmanager ] || die "legacy baseline is only valid for a ModemManager target" ;;
+	esac
+	if [ "$baseline_version" = v3 ]; then
+		baseline_target="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+		baseline_backend="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+		[ "$baseline_target" = "network:$baseline_interface" ] || die "v3 baseline target does not match its interface"
+		[ "$baseline_target" = "$TARGET_ID" ] || die "v3 baseline belongs to another target"
+		case "$baseline_backend" in modemmanager|qmi) : ;; *) die "unsupported backend in v3 baseline" ;; esac
+		[ "$baseline_backend" = "$TARGET_BACKEND" ] || die "v3 baseline backend does not match the selected target"
+	fi
+
+	INTERFACE="$baseline_interface"
+	case "$baseline_version" in
+		v1)
+			baseline_set="$(awk -F '\t' 'NR == 1 { print $3 }' "$BASELINE_FILE")"
+			baseline_apn="$(awk -F '\t' 'NR == 1 { print $4 }' "$BASELINE_FILE")"
+			case "$baseline_set" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
+			[ "$baseline_apn" = "<empty>" ] && baseline_apn=""
+			case "$baseline_apn" in ''|*[!A-Za-z0-9._-]*) [ -z "$baseline_apn" ] || die "invalid APN in baseline" ;; esac
+			set_or_delete_option apn "$baseline_set" "$baseline_apn" || die "cannot restore baseline APN"
+		;;
+		v2|v3)
+			while IFS="$(printf '\t')" read -r kind option set_flag value; do
+				[ "$kind" = "option" ] || continue
+				case "$baseline_version:$baseline_backend:$option" in
+					v2::apn|v2::username|v2::password|v2::allowedauth|v2::iptype) : ;;
+					v3:modemmanager:apn|v3:modemmanager:username|v3:modemmanager:password|v3:modemmanager:allowedauth|v3:modemmanager:iptype) : ;;
+					v3:qmi:apn|v3:qmi:username|v3:qmi:password|v3:qmi:auth|v3:qmi:pdptype) : ;;
+					*) die "invalid option in baseline" ;;
+				esac
+				case "$set_flag" in 0|1) : ;; *) die "invalid set flag in baseline" ;; esac
+				state_value_is_safe "$value" || die "unsafe value in baseline"
+			done <"$BASELINE_FILE"
+			# Validate the complete file before the first UCI write so a malformed
+			# trailing record can never cause a partial baseline restore.
+			while IFS="$(printf '\t')" read -r kind option set_flag value; do
+				[ "$kind" = "option" ] || continue
+				set_or_delete_option "$option" "$set_flag" "$value" || die "cannot restore baseline $option"
+			done <"$BASELINE_FILE"
+		;;
+		*) die "unknown baseline format" ;;
+	esac
+	uci commit network >/dev/null 2>&1 || die "cannot commit restored mobile profile"
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	settle_after_ifdown
+	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
+	rm -rf "$CACHE_DIR"
+	rm -f "$ACTIVE_FILE"
+	rm -f "$BASELINE_FILE"
+	rmdir "$TARGET_STATE_DIR" 2>/dev/null || :
+	log notice "restored original mobile profile; cache and baseline removed"
+}
+
+reset_all_cmd() {
+	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+	self="$0"
+	case "$self" in /*) : ;; *) self="$(command -v "$self" 2>/dev/null || :)" ;; esac
+	[ -r "$self" ] || die "cannot resolve the APN engine path for reset-all"
+	found=0
+	for target_dir in "$STATE_DIR"/targets/network_*; do
+		[ -d "$target_dir" ] || continue
+		section="${target_dir##*/network_}"
+		case "$section" in ''|*[!A-Za-z0-9_]*) die "unsafe target state directory: $target_dir" ;; esac
+		found=1
+		sh "$self" reset --target "network:$section" || return $?
+	done
+	if [ -r "$STATE_DIR/baseline.tsv" ]; then
+		section="$(awk -F '\t' 'NR == 1 { print $2; exit }' "$STATE_DIR/baseline.tsv")"
+		case "$section" in ''|*[!A-Za-z0-9_]*) die "invalid interface in legacy baseline" ;; esac
+		found=1
+		sh "$self" reset --target "network:$section" || return $?
+	fi
+	if [ "$found" -eq 0 ]; then
+		rm -rf "$CACHE_DIR"
+		log notice "no saved target baselines; cache cleared, network unchanged"
+	fi
+}
+
+interface_is_up() {
+	if command_exists ubus; then
+		ubus call "network.interface.${INTERFACE}" status 2>/dev/null | \
+			grep -q '"up"[[:space:]]*:[[:space:]]*true'
+	else
+		return 1
+	fi
+}
+
+refresh_l3_device() {
+	L3_DEVICE=""
+	command_exists ubus || return 1
+	status="$(ubus call "network.interface.${INTERFACE}" status 2>/dev/null || :)"
+	value="$(printf '%s\n' "$status" | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+	[ -n "$value" ] || value="$(printf '%s\n' "$status" | sed -n 's/.*"device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
+	case "$value" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+	L3_DEVICE="$value"
+	return 0
+}
+
+connectivity_device() {
+	refresh_l3_device || :
+	printf '%s\n' "${L3_DEVICE:-$DEVICE}"
+}
+
+status_cmd() {
+	read_sim
+	read_database_metadata
+	print_identity
+	printf 'APN database:    %s (format v%s)\n' "${DATABASE_VERSION:--}" "${DATABASE_FORMAT:--}"
+	printf 'Database path:   %s\n' "$DATABASE"
+	apn="$(current_apn 2>/dev/null || :)"
+	printf 'Configured APN:  %s\n' "${apn:-<empty>}"
+	cache="$(cached_apn 2>/dev/null || :)"
+	printf 'Cached APN:      %s\n' "${cache:--}"
+	if interface_is_up; then
+		printf 'Interface %s:   up\n' "$INTERFACE"
+	else
+		printf 'Interface %s:   down or pending\n' "$INTERFACE"
+	fi
+	printf 'Last result:     '
+	if [ -r "$CACHE_DIR/last-result" ]; then
+		cat "$CACHE_DIR/last-result"
+	else
+		printf -- '-\n'
+	fi
+	printf 'Reconciled SIM:  '
+	if active_state_file="$(active_file_for_read 2>/dev/null)"; then
+		awk -F '\t' 'NR == 1 && ($1 == "v1" || $1 == "v2" || $1 == "v3") { printf "%s (%s)\n", $2, $3; found=1 } END { if (!found) print "invalid state" }' "$active_state_file"
+	else
+		printf -- '-\n'
+	fi
+}
+
+json_escape() {
+	awk 'BEGIN { ORS="" }
+	{
+		if (NR > 1) printf "\\n"
+		gsub(/\\/, "\\\\")
+		gsub(/\"/, "\\\"")
+		gsub(/\t/, "\\t")
+		gsub(/\r/, "\\r")
+		printf "%s", $0
+	}'
+}
+
+json_string() {
+	printf '"'
+	printf '%s' "$1" | json_escape
+	printf '"'
+}
+
+json_key_string() {
+	printf '"%s":' "$1"
+	json_string "$2"
+}
+
+json_key_boolean_or_null() {
+	printf '"%s":' "$1"
+	case "$2" in true|false) printf '%s' "$2" ;; *) printf 'null' ;; esac
+}
+
+targets_json_cmd() {
+	discover_targets
+	printf '{'
+	json_key_string version "v2"; printf ','
+	json_key_string configured_target "$([ "$CONFIGURED_INTERFACE" = auto ] && printf auto || printf 'network:%s' "$CONFIGURED_INTERFACE")"; printf ','
+	printf '"targets":['
+	separator=""
+	while IFS="$(printf '\t')" read -r section proto; do
+		[ -n "$section" ] || continue
+		target_protocol_capabilities "$proto"
+		printf '%s{' "$separator"
+		json_key_string id "network:$section"; printf ','
+		json_key_string interface "$section"; printf ','
+		json_key_string protocol "$proto"; printf ','
+		json_key_string backend "$TARGET_BACKEND"; printf ','
+		printf '"capabilities":{'
+		printf '"discover":true,'
+		printf '"identity":%s,' "$TARGET_IDENTITY"
+		printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
+		printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
+		printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+		printf '},'
+		json_key_string implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+		json_key_string validation_state "$TARGET_VALIDATION_STATE"; printf ','
+		printf '"hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
+		json_key_string unavailable_reason "$TARGET_REASON"
+		printf '}'
+		separator=','
+	done <"$TARGETS_DATA"
+	printf ']}'
+	printf '\n'
+}
+
+read_last_result() {
+	if [ -r "$CACHE_DIR/last-result" ]; then
+		sed -n '1p' "$CACHE_DIR/last-result"
+	fi
+}
+
+read_last_result_code() {
+	if [ -r "$CACHE_DIR/last-result-code" ]; then
+		sed -n '1p' "$CACHE_DIR/last-result-code"
+	fi
+}
+
+status_json_cmd() {
+	read_sim
+	read_database_metadata
+	apn="$(current_apn 2>/dev/null || :)"
+	cache="$(cached_apn 2>/dev/null || :)"
+	last_result="$(read_last_result)"
+	result_code="$(read_last_result_code)"
+	reconciled_iccid="$(active_iccid 2>/dev/null || :)"
+	reconciled_apn="$(active_apn 2>/dev/null || :)"
+	interface_up=false
+	interface_is_up && interface_up=true
+	refresh_l3_device || :
+	autostart="$(uci -q get "${CONFIG}.main.autostart" 2>/dev/null || printf '0')"
+	button_enabled="$(uci -q get "${CONFIG}.main.button_enabled" 2>/dev/null || printf '0')"
+	hardware_integration="$(hardware_integration_name 2>/dev/null || :)"
+
+	printf '{'
+	json_key_string version "v2"; printf ','
+	json_key_string engine_api "v1"; printf ','
+	json_key_string target_id "$TARGET_ID"; printf ','
+	json_key_string target_protocol "$TARGET_PROTOCOL"; printf ','
+	json_key_string target_backend "$TARGET_BACKEND"; printf ','
+	printf '"target_capabilities":{'
+	printf '"identity":%s,' "$TARGET_IDENTITY"
+	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
+	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
+	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '},'
+	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
+	printf '"target_hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
+	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string modem_index "$MODEM_INDEX"; printf ','
+	json_key_string iccid "$ICCID"; printf ','
+	json_key_string imsi "$IMSI"; printf ','
+	json_key_string eid "$EID"; printf ','
+	json_key_string operator_id "$OPERATOR_ID"; printf ','
+	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string home_operator_id "$OPERATOR_ID"; printf ','
+	json_key_string home_operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string modem_state "$MODEM_STATE"; printf ','
+	json_key_string registration_state "$REGISTRATION_STATE"; printf ','
+	json_key_boolean_or_null roaming "$ROAMING_STATUS"; printf ','
+	json_key_string roaming_policy "$ROAMING_POLICY"; printf ','
+	printf '"roaming_allowed":%s,' "$ROAMING_ALLOWED"
+	json_key_string serving_operator_id "$SERVING_OPERATOR_ID"; printf ','
+	json_key_string serving_operator_name "$SERVING_OPERATOR_NAME"; printf ','
+	json_key_string access_technologies "$ACCESS_TECHNOLOGIES"; printf ','
+	json_key_string signal_quality "$SIGNAL_QUALITY"; printf ','
+	json_key_string configured_plmn "$CONFIGURED_PLMN"; printf ','
+	json_key_string gid1 "$GID1"; printf ','
+	json_key_string gid2 "$GID2"; printf ','
+	json_key_string interface "$INTERFACE"; printf ','
+	json_key_string device "$DEVICE"; printf ','
+	json_key_string l3_device "$L3_DEVICE"; printf ','
+	json_key_string database_path "$DATABASE"; printf ','
+	json_key_string database_version "$DATABASE_VERSION"; printf ','
+	json_key_string database_format "$DATABASE_FORMAT"; printf ','
+	json_key_string database_sources "$DATABASE_SOURCES"; printf ','
+	json_key_string database_revisions "$DATABASE_REVISIONS"; printf ','
+	json_key_string configured_apn "$apn"; printf ','
+	json_key_string cached_apn "$cache"; printf ','
+	printf '"interface_up":%s,' "$interface_up"
+	json_key_string last_result "$last_result"; printf ','
+	json_key_string result_code "$result_code"; printf ','
+	json_key_string reconciled_iccid "$reconciled_iccid"; printf ','
+	json_key_string reconciled_apn "$reconciled_apn"; printf ','
+	printf '"autostart":%s,' "$([ "$autostart" = 1 ] && printf true || printf false)"
+	printf '"button_enabled":%s,' "$([ "$button_enabled" = 1 ] && printf true || printf false)"
+	json_key_string hardware_integration "$hardware_integration"
+	printf '}\n'
+}
+
+detect_json_cmd() {
+	read_sim
+	read_database_metadata
+	find_candidates
+	cache="$(cached_apn 2>/dev/null || :)"
+	printf '{'
+	json_key_string version "v2"; printf ','
+	json_key_string engine_api "v1"; printf ','
+	json_key_string target_id "$TARGET_ID"; printf ','
+	json_key_string target_protocol "$TARGET_PROTOCOL"; printf ','
+	json_key_string target_backend "$TARGET_BACKEND"; printf ','
+	printf '"target_capabilities":{'
+	printf '"identity":%s,' "$TARGET_IDENTITY"
+	printf '"profile_read":%s,' "$TARGET_PROFILE_READ"
+	printf '"profile_write":%s,' "$TARGET_PROFILE_WRITE"
+	printf '"profile_apply":%s' "$TARGET_PROFILE_APPLY"
+	printf '},'
+	json_key_string target_implementation_state "$TARGET_IMPLEMENTATION_STATE"; printf ','
+	json_key_string target_validation_state "$TARGET_VALIDATION_STATE"; printf ','
+	printf '"target_hardware_validated":%s,' "$TARGET_HARDWARE_VALIDATED"
+	json_key_string sim_index "$SIM_INDEX"; printf ','
+	json_key_string modem_index "$MODEM_INDEX"; printf ','
+	json_key_string iccid "$ICCID"; printf ','
+	json_key_string imsi "$IMSI"; printf ','
+	json_key_string eid "$EID"; printf ','
+	json_key_string operator_id "$OPERATOR_ID"; printf ','
+	json_key_string operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string home_operator_id "$OPERATOR_ID"; printf ','
+	json_key_string home_operator_name "$OPERATOR_NAME"; printf ','
+	json_key_string registration_state "$REGISTRATION_STATE"; printf ','
+	json_key_boolean_or_null roaming "$ROAMING_STATUS"; printf ','
+	json_key_string roaming_policy "$ROAMING_POLICY"; printf ','
+	printf '"roaming_allowed":%s,' "$ROAMING_ALLOWED"
+	json_key_string serving_operator_id "$SERVING_OPERATOR_ID"; printf ','
+	json_key_string serving_operator_name "$SERVING_OPERATOR_NAME"; printf ','
+	json_key_string configured_plmn "$CONFIGURED_PLMN"; printf ','
+	json_key_string gid1 "$GID1"; printf ','
+	json_key_string gid2 "$GID2"; printf ','
+	json_key_string database_path "$DATABASE"; printf ','
+	json_key_string database_version "$DATABASE_VERSION"; printf ','
+	json_key_string database_format "$DATABASE_FORMAT"; printf ','
+	json_key_string database_sources "$DATABASE_SOURCES"; printf ','
+	json_key_string database_revisions "$DATABASE_REVISIONS"; printf ','
+	json_key_string cached_apn "$cache"; printf ',"candidates":['
+	separator=""
+	while IFS="$(printf '\t')" read -r score priority apn provider username password auth ip_type; do
+		[ -n "$apn" ] || continue
+		priority="$(printf '%s\n' "$priority" | awk '{ print $1 + 0 }')"
+		printf '%s{' "$separator"
+		json_key_string apn "$apn"; printf ','
+		json_key_string provider "$provider"; printf ','
+		printf '"username_required":%s,' "$([ "$username" != - ] && printf true || printf false)"
+		json_key_string authentication "$([ "$auth" = - ] && printf '' || printf '%s' "$auth")"; printf ','
+		json_key_string ip_type "$([ "$ip_type" = - ] && printf '' || printf '%s' "$ip_type")"; printf ','
+		printf '"priority":%s' "$priority"
+		printf '}'
+		separator=','
+	done <"$CANDIDATES"
+	printf ']}\n'
+}
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+operation_lock_pid() {
+	pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+	process_is_alive "$pid" || return 1
+	printf '%s\n' "$pid"
+}
+
+action_state_field() {
+	field="$1"
+	[ -r "$ACTION_STATE_DIR/state.tsv" ] || return 1
+	awk -F '\t' -v field="$field" 'NR == 1 && ($1 == "v1" || $1 == "v2") { print $field; exit }' \
+		"$ACTION_STATE_DIR/state.tsv"
+}
+
+action_status_values() {
+	ACTION_STATUS="idle"
+	ACTION_NAME=""
+	ACTION_PID=""
+	ACTION_STARTED=""
+	ACTION_FINISHED=""
+	ACTION_EXIT_CODE=""
+	ACTION_MESSAGE=""
+	ACTION_TARGET=""
+	ACTION_BUSY=false
+
+	if [ -r "$ACTION_STATE_DIR/state.tsv" ]; then
+		ACTION_STATUS="$(action_state_field 2)"
+		ACTION_NAME="$(action_state_field 3)"
+		ACTION_PID="$(action_state_field 4)"
+		ACTION_STARTED="$(action_state_field 5)"
+		ACTION_FINISHED="$(action_state_field 6)"
+		ACTION_EXIT_CODE="$(action_state_field 7)"
+		ACTION_MESSAGE="$(action_state_field 8)"
+		ACTION_TARGET="$(action_state_field 9)"
+		case "$ACTION_STATUS" in
+			starting|queued|running)
+				if process_is_alive "$ACTION_PID"; then
+					ACTION_BUSY=true
+				else
+					ACTION_STATUS="failed"
+					ACTION_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+					ACTION_EXIT_CODE="1"
+					ACTION_MESSAGE="background worker stopped unexpectedly"
+				fi
+			;;
+		esac
+	fi
+
+	lock_pid="$(operation_lock_pid 2>/dev/null || :)"
+	if [ -n "$lock_pid" ] && [ "$ACTION_BUSY" != true ]; then
+		ACTION_STATUS="external"
+		ACTION_NAME="operation"
+		ACTION_PID="$lock_pid"
+		ACTION_STARTED=""
+		ACTION_FINISHED=""
+		ACTION_EXIT_CODE=""
+		ACTION_MESSAGE="operation started outside the job API"
+		ACTION_TARGET=""
+		ACTION_BUSY=true
+	fi
+}
+
+print_action_json() {
+	accepted="$1"
+	action_status_values
+	printf '{'
+	json_key_string version "v2"; printf ','
+	printf '"accepted":%s,' "$accepted"
+	printf '"busy":%s,' "$ACTION_BUSY"
+	json_key_string state "$ACTION_STATUS"; printf ','
+	json_key_string action "$ACTION_NAME"; printf ','
+	json_key_string target_id "$ACTION_TARGET"; printf ','
+	json_key_string pid "$ACTION_PID"; printf ','
+	json_key_string started_at "$ACTION_STARTED"; printf ','
+	json_key_string finished_at "$ACTION_FINISHED"; printf ','
+	json_key_string exit_code "$ACTION_EXIT_CODE"; printf ','
+	json_key_string message "$ACTION_MESSAGE"
+	printf '}\n'
+}
+
+action_status_cmd() {
+	print_action_json false
+}
+
+action_start_cmd() {
+	action="${1:-}"
+	case "$action" in
+		reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install) : ;;
+		*) die "unsupported background action: $action" ;;
+	esac
+	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
+
+	start_lock="${ACTION_STATE_DIR}.start-lock"
+	mkdir -p "$(dirname "$ACTION_STATE_DIR")" || die "cannot create action state parent"
+	if ! mkdir "$start_lock" 2>/dev/null; then
+		start_pid="$(cat "$start_lock/pid" 2>/dev/null || :)"
+		if process_is_alive "$start_pid"; then
+			print_action_json false
+			return 0
+		fi
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || {
+			print_action_json false
+			return 0
+		}
+		mkdir "$start_lock" 2>/dev/null || {
+			print_action_json false
+			return 0
+		}
+	fi
+	printf '%s\n' "$$" >"$start_lock/pid" || {
+		rmdir "$start_lock" 2>/dev/null || :
+		die "cannot record action launch lock"
+	}
+
+	action_status_values
+	if [ "$ACTION_BUSY" = true ]; then
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || :
+		print_action_json false
+		return 0
+	fi
+
+	mkdir -p "$ACTION_STATE_DIR" || {
+		rm -f "$start_lock/pid"
+		rmdir "$start_lock" 2>/dev/null || :
+		die "cannot create action state directory"
+	}
+	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\t%s\n' \
+		"$action" "$$" "$started" "$TARGET_ID" >"$ACTION_STATE_DIR/state.tsv"
+	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" "$TARGET_ID" \
+		</dev/null >/dev/null 2>&1 &
+	rm -f "$start_lock/pid"
+	rmdir "$start_lock" 2>/dev/null || :
+	print_action_json true
+}
+
+acquire_lock() {
+	[ "$LOCK_HELD" -eq 1 ] && return 0
+	mkdir -p "$(dirname "$LOCK_DIR")" || die "cannot create lock parent"
+	if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+		old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || :)"
+		case "$old_pid" in
+			''|*[!0-9]*) die "lock exists without a valid PID: $LOCK_DIR" ;;
+		esac
+		if kill -0 "$old_pid" 2>/dev/null; then
+			die_code 3 "another operation is already running (PID $old_pid); retry later"
+		fi
+		log warning "removing stale lock left by PID $old_pid"
+		rm -f "$LOCK_DIR/pid"
+		rmdir "$LOCK_DIR" 2>/dev/null || die "cannot remove stale lock: $LOCK_DIR"
+		mkdir "$LOCK_DIR" 2>/dev/null || die "cannot acquire lock: $LOCK_DIR"
+	fi
+	printf '%s\n' "$$" >"$LOCK_DIR/pid" || {
+		rmdir "$LOCK_DIR" 2>/dev/null || :
+		die "cannot write lock PID"
+	}
+	LOCK_HELD=1
+}
+
+add_candidate() {
+	apn="$1"
+	provider="$2"
+	username="${3:--}"
+	password="${4:--}"
+	auth="${5:--}"
+	ip_type="${6:--}"
+	case "$apn" in
+		''|*[!A-Za-z0-9._-]*) [ -z "$apn" ] || return 0 ;;
+	esac
+	state_value_is_safe "$username" || return 0
+	state_value_is_safe "$password" || return 0
+	case "$auth" in -|none|pap|chap|pap-or-chap) : ;; *) return 0 ;; esac
+	case "$ip_type" in -|ipv4|ipv6|ipv4v6) : ;; *) return 0 ;; esac
+	key="${apn:-<empty>}$(printf '\t')${username}$(printf '\t')${password}$(printf '\t')${auth}$(printf '\t')${ip_type}"
+	grep -F -x -q -- "$key" "$SEEN_APNS" 2>/dev/null && return 0
+	printf '%s\n' "$key" >>"$SEEN_APNS"
+	printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${apn:-<empty>}" "$provider" \
+		"$username" "$password" "$auth" "$ip_type" >>"${CANDIDATES}.apply"
+}
+
+matching_database_provider() {
+	wanted_apn="$1"
+	wanted_username="$2"
+	wanted_password="$3"
+	wanted_auth="$4"
+	wanted_ip_type="$5"
+	awk -F '\t' \
+		-v wanted_apn="$wanted_apn" \
+		-v wanted_username="$wanted_username" \
+		-v wanted_password="$wanted_password" \
+		-v wanted_auth="$wanted_auth" \
+		-v wanted_ip_type="$wanted_ip_type" '
+		$3 == wanted_apn &&
+		$5 == wanted_username &&
+		$6 == wanted_password &&
+		$7 == wanted_auth &&
+		$8 == wanted_ip_type {
+			print $4
+			exit
+		}
+	' "$CANDIDATES"
+}
+
+build_apply_candidates() {
+	: >"$SEEN_APNS"
+	: >"${CANDIDATES}.apply"
+	cache="$(cached_apn 2>/dev/null || :)"
+	provider="$(cached_provider 2>/dev/null || :)"
+	if [ "$(cached_version 2>/dev/null || :)" = "v1" ]; then
+		# v0.5 cached only the APN. Preserve the optional values that belong to
+		# that known-working configuration instead of deleting them on upgrade.
+		username="$(uci -q get "network.${INTERFACE}.username" 2>/dev/null || printf '%s' -)"
+		password="$(uci -q get "network.${INTERFACE}.password" 2>/dev/null || printf '%s' -)"
+		allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
+		case "$allowedauth" in
+			'pap chap'|'chap pap') auth="pap-or-chap" ;;
+			none|pap|chap) auth="$allowedauth" ;;
+			*) auth="-" ;;
+		esac
+		ip_type="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+		case "$ip_type" in ipv4|ipv6|ipv4v6) : ;; *) ip_type="-" ;; esac
+	else
+		username="$(cached_profile_field 5 2>/dev/null || printf '%s' -)"
+		password="$(cached_profile_field 6 2>/dev/null || printf '%s' -)"
+		auth="$(cached_profile_field 7 2>/dev/null || printf '%s' -)"
+		ip_type="$(cached_profile_field 8 2>/dev/null || printf '%s' -)"
+	fi
+	if [ -n "$cache" ] && [ "$cache" != "<empty>" ]; then
+		current_provider="$(matching_database_provider "$cache" "$username" \
+			"$password" "$auth" "$ip_type" 2>/dev/null || :)"
+		[ -n "$current_provider" ] && provider="$current_provider"
+	fi
+	if [ "$cache" = "<empty>" ]; then
+		add_candidate "" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
+	elif [ -n "$cache" ]; then
+		add_candidate "$cache" "${provider:-cache}" "$username" "$password" "$auth" "$ip_type"
+	fi
+	while IFS="$(printf '\t')" read -r _ priority apn provider username password auth ip_type; do
+		[ -n "$apn" ] && add_candidate "$apn" "$provider" "$username" "$password" "$auth" "$ip_type"
+	done <"$CANDIDATES"
+	[ "$TRY_EMPTY" = "1" ] && add_candidate "" "empty APN fallback" - - - -
+}
+
+restart_interface() {
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	settle_after_ifdown
+	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
+	return 0
+}
+
+settle_after_ifdown() {
+	# netifd's QMI handler releases client IDs asynchronously. RM520N hardware
+	# needs this bounded quiet period; a two-second delay can race SIM queries
+	# and make qmi.sh power-cycle an otherwise healthy SIM.
+	[ "$TARGET_BACKEND" != qmi ] && return 0
+	sleep 6 &
+	SETTLE_SLEEP_PID=$!
+	settle_status=0
+	wait "$SETTLE_SLEEP_PID" || settle_status=$?
+	SETTLE_SLEEP_PID=""
+	return "$settle_status"
+}
+
+wait_for_interface() {
+	remaining="$WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		interface_is_up && return 0
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 1
+}
+
+qmi_data_interface_is_ready() {
+	command_exists ubus || return 1
+	for data_interface in "$INTERFACE" "${INTERFACE}_4" "${INTERFACE}_6"; do
+		status="$(ubus call "network.interface.${data_interface}" status 2>/dev/null || :)"
+		printf '%s\n' "$status" | grep -q '"up"[[:space:]]*:[[:space:]]*true' || continue
+		printf '%s\n' "$status" | grep -q '"address"[[:space:]]*:[[:space:]]*"' && return 0
+	done
+	return 1
+}
+
+wait_for_qmi_data_interface() {
+	remaining="$WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		qmi_data_interface_is_ready && return 0
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+	return 1
+}
+
+mwan3_available() {
+	command_exists mwan3 || return 1
+	case "$USE_MWAN3" in
+		never) return 1 ;;
+		always) return 0 ;;
+		auto)
+			mwan3 interfaces 2>/dev/null | grep -q "interface ${INTERFACE} is"
+			return $?
+		;;
+	esac
+}
+
+test_connectivity_family() {
+	family="$1"
+	bind_device="$(connectivity_device)"
+	if mwan3_available; then
+		mwan3 use "$INTERFACE" curl "$family" --interface "$bind_device" \
+			--connect-timeout 10 --max-time 15 -fsS -o /dev/null "$TEST_URL"
+	else
+		curl "$family" --interface "$bind_device" --connect-timeout 10 --max-time 15 \
+			-fsS -o /dev/null "$TEST_URL"
+	fi
+}
+
+test_connectivity() {
+	case "${1:--}" in
+		ipv4) test_connectivity_family -4 ;;
+		ipv6) test_connectivity_family -6 ;;
+		*) test_connectivity_family -4 || test_connectivity_family -6 ;;
+	esac
+}
+
+save_cache() {
+	apn="$1"
+	provider="$2"
+	username="$3"
+	password="$4"
+	auth="$5"
+	ip_type="$6"
+	mkdir -p "$CACHE_DIR" || return 1
+	tmp="$CACHE_DIR/.${ICCID}.tmp.$$"
+	# Provider labels are informational; profile values must remain exact.
+	provider="$(printf '%s' "$provider" | tr '\t\r\n' '   ')"
+	state_value_is_safe "$username" || return 1
+	state_value_is_safe "$password" || return 1
+	cache_apn="${apn:-<empty>}"
+	printf 'v2\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$cache_apn" "$provider" \
+		"$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)" \
+		"$username" "$password" "$auth" "$ip_type" >"$tmp" || return 1
+	mv "$tmp" "$(cache_file)"
+}
+
+write_last_result() {
+	result_code="$1"
+	shift
+	mkdir -p "$CACHE_DIR" || return 0
+	printf '%s\n' "$*" >"$CACHE_DIR/last-result"
+	printf '%s\n' "$result_code" >"$CACHE_DIR/last-result-code"
+}
+
+registration_is_pending() {
+	case "$REGISTRATION_STATE" in
+		unknown|idle|searching|registering|'') return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+registration_preflight() {
+	read_roaming_policy
+	[ "$ROAMING_POLICY" != "invalid" ] || {
+		write_last_result invalid-roaming-policy \
+			"failed: network.${INTERFACE}.allow_roaming must be 0, 1 or absent"
+		log err "network.${INTERFACE}.allow_roaming must be 0, 1 or absent"
+		return 1
+	}
+
+	remaining="$REGISTRATION_WAIT_SECONDS"
+	registration_start_attempted=0
+	while :; do
+		refresh_modem_status || :
+		registration_is_pending || break
+		if [ "$registration_start_attempted" -eq 0 ] && ! interface_is_up; then
+			ifup "$INTERFACE" >/dev/null 2>&1 || :
+			registration_start_attempted=1
+			log notice "started interface $INTERFACE once to obtain mobile registration state"
+		fi
+		[ "$remaining" -gt 0 ] || {
+			write_last_result registration-pending \
+				"pending: modem registration state is ${REGISTRATION_STATE:-unknown}"
+			log warning "mobile registration is still ${REGISTRATION_STATE:-unknown}; APN profiles were not changed"
+			return 3
+		}
+		sleep 1
+		remaining=$((remaining - 1))
+	done
+
+	case "$REGISTRATION_STATE" in
+		roaming)
+			if [ "$ROAMING_ALLOWED" != true ]; then
+				if interface_is_up; then
+					ifdown "$INTERFACE" >/dev/null 2>&1 || :
+					log notice "stopped interface $INTERFACE to enforce the roaming-data block"
+				fi
+				write_last_result blocked-roaming-policy \
+					"blocked: registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network}, but mobile data roaming is disabled"
+				log notice "registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network} (${SERVING_OPERATOR_ID:--}); data roaming is explicitly blocked; APN profiles were not changed"
+				return 2
+			fi
+			log notice "registered in roaming via ${SERVING_OPERATOR_NAME:-unknown network} (${SERVING_OPERATOR_ID:--}); policy is $ROAMING_POLICY"
+		;;
+		home)
+			log notice "registered on the home network ${SERVING_OPERATOR_NAME:-unknown} (${SERVING_OPERATOR_ID:--})"
+		;;
+		denied)
+			write_last_result registration-denied \
+				"failed: mobile network registration was denied before APN testing"
+			log err "mobile network registration was denied; APN profiles were not changed"
+			return 1
+		;;
+		emergency-only)
+			write_last_result emergency-only \
+				"failed: only emergency service is available; APN profiles were not changed"
+			log err "only emergency service is available; APN profiles were not changed"
+			return 1
+		;;
+		home-sms-only|roaming-sms-only)
+			write_last_result data-service-unavailable \
+				"failed: registered for messaging only; packet data is unavailable"
+			log err "registration state is $REGISTRATION_STATE; packet data is unavailable"
+			return 1
+		;;
+		*)
+			write_last_result registration-unusable \
+				"failed: registration state '$REGISTRATION_STATE' does not allow APN testing"
+			log err "registration state '$REGISTRATION_STATE' does not allow APN testing"
+			return 1
+		;;
+	esac
+	return 0
+}
+
+save_active_state() {
+	apn="$1"
+	username="$2"
+	password="$3"
+	auth="$4"
+	ip_type="$5"
+	mkdir -p "$TARGET_STATE_DIR" || return 1
+	tmp="$TARGET_STATE_DIR/.active.tmp.$$"
+	active_apn="${apn:-<empty>}"
+	case "$TARGET_BACKEND:$auth" in
+		*:-) allowedauth="-" ;;
+		modemmanager:pap-or-chap) allowedauth="pap chap" ;;
+		qmi:pap-or-chap) allowedauth="both" ;;
+		*) allowedauth="$auth" ;;
+	esac
+	case "$TARGET_BACKEND:$ip_type" in
+		qmi:ipv4) configured_iptype="ip" ;;
+		*) configured_iptype="$ip_type" ;;
+	esac
+	printf 'v3\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$ICCID" "$active_apn" \
+		"$username" "$password" "$allowedauth" "$configured_iptype" "$TARGET_ID" "$TARGET_BACKEND" >"$tmp" || return 1
+	mv "$tmp" "$ACTIVE_FILE"
+}
+
+active_iccid() {
+	file="$(active_file_for_read)" || return 1
+	awk -F '\t' -v target="$TARGET_ID" 'NR == 1 && ($1 == "v1" || $1 == "v2" || ($1 == "v3" && $8 == target)) { print $2; exit }' "$file"
+}
+
+active_apn() {
+	file="$(active_file_for_read)" || return 1
+	awk -F '\t' -v target="$TARGET_ID" 'NR == 1 && ($1 == "v1" || $1 == "v2" || ($1 == "v3" && $8 == target)) { print $3; exit }' "$file"
+}
+
+configured_profile_matches_active() {
+	file="$(active_file_for_read)" || return 1
+	version="$(awk -F '\t' 'NR == 1 { print $1 }' "$file")"
+	active_value="$(active_apn 2>/dev/null || :)"
+	[ "$active_value" = "<empty>" ] && active_value=""
+	[ "$(current_apn 2>/dev/null || :)" = "$active_value" ] || return 1
+	[ "$version" = "v1" ] && return 0
+	[ "$version" = "v2" ] || [ "$version" = "v3" ] || return 1
+	[ "$version" != "v3" ] || [ "$(awk -F '\t' 'NR == 1 { print $8 }' "$file")" = "$TARGET_ID" ] || return 1
+
+	active_username="$(awk -F '\t' 'NR == 1 { print $4 }' "$file")"
+	active_password="$(awk -F '\t' 'NR == 1 { print $5 }' "$file")"
+	active_allowedauth="$(awk -F '\t' 'NR == 1 { print $6 }' "$file")"
+	active_iptype="$(awk -F '\t' 'NR == 1 { print $7 }' "$file")"
+	configured_username="$(uci -q get "network.${INTERFACE}.username" 2>/dev/null || printf '%s' -)"
+	configured_password="$(uci -q get "network.${INTERFACE}.password" 2>/dev/null || printf '%s' -)"
+	case "$TARGET_BACKEND" in
+		modemmanager)
+			configured_allowedauth="$(uci -q get "network.${INTERFACE}.allowedauth" 2>/dev/null || printf '%s' -)"
+			configured_iptype="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)"
+		;;
+		qmi)
+			configured_allowedauth="$(uci -q get "network.${INTERFACE}.auth" 2>/dev/null || printf '%s' -)"
+			configured_iptype="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' -)"
+		;;
+		*) return 1 ;;
+	esac
+	[ "$configured_username" = "$active_username" ] && \
+		[ "$configured_password" = "$active_password" ] && \
+		[ "$configured_allowedauth" = "$active_allowedauth" ] && \
+		[ "$configured_iptype" = "$active_iptype" ]
+}
+
+configured_connectivity_ip_type() {
+	case "$TARGET_BACKEND" in
+		modemmanager) value="$(uci -q get "network.${INTERFACE}.iptype" 2>/dev/null || printf '%s' -)" ;;
+		qmi) value="$(uci -q get "network.${INTERFACE}.pdptype" 2>/dev/null || printf '%s' ip)" ;;
+		*) value="-" ;;
+	esac
+	case "$value" in ip|ipv4) printf '%s\n' ipv4 ;; ipv6|ipv4v6) printf '%s\n' "$value" ;; *) printf '%s\n' - ;; esac
+}
+
+apply_cmd() {
+	read_sim
+	acquire_lock
+	migrate_target_state
+	registration_preflight || return $?
+	find_candidates
+	build_apply_candidates
+	[ -s "${CANDIDATES}.apply" ] || die "no APN candidates for this SIM; extend the TSV database or set APN manually"
+	capture_old_profile
+	migrate_legacy_baseline
+	save_baseline
+	ROLLBACK_ARMED=1
+	log notice "starting APN detection for ICCID $ICCID on $INTERFACE"
+	saw_bearer_up=0
+
+	while IFS="$(printf '\t')" read -r apn provider username password auth ip_type; do
+		[ "$apn" = "<empty>" ] && apn=""
+		display_apn="${apn:-<empty>}"
+		log notice "trying APN '$display_apn' ($provider)"
+		attempt_types="$ip_type"
+		[ "$TARGET_BACKEND:$ip_type" != qmi:ipv4v6 ] || attempt_types="ipv4v6 ipv4"
+		bearer_ready=0
+		effective_ip_type="$ip_type"
+		for attempt_ip_type in $attempt_types; do
+			effective_ip_type="$attempt_ip_type"
+			if [ "$TARGET_BACKEND:$ip_type:$attempt_ip_type" = qmi:ipv4v6:ipv4 ]; then
+				log warning "QMI dual-stack bearer was rejected; retrying APN '$display_apn' with IPv4 only"
+			fi
+			if ! set_profile "$apn" "$username" "$password" "$auth" "$attempt_ip_type"; then
+				log err "failed to write mobile profile for APN '$display_apn'"
+				break
+			fi
+			if ! restart_interface; then
+				log warning "interface $INTERFACE did not restart for APN '$display_apn'"
+				continue
+			fi
+			if wait_for_interface; then
+				bearer_ready=1
+				break
+			fi
+			log warning "mobile data session did not become ready within ${WAIT_SECONDS}s for profile '$display_apn' ($attempt_ip_type)"
+		done
+		if [ "$bearer_ready" -ne 1 ]; then
+			refresh_modem_status || :
+			case "$REGISTRATION_STATE" in
+				roaming)
+					if [ "$ROAMING_ALLOWED" != true ]; then
+						LEAVE_INTERFACE_DOWN=1
+						write_last_result blocked-roaming-policy \
+							"blocked: registration changed to roaming while data roaming is disabled"
+						die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
+					fi
+				;;
+				denied|emergency-only|home-sms-only|roaming-sms-only)
+					write_last_result data-service-unavailable \
+						"failed: registration state became $REGISTRATION_STATE during profile testing"
+					die "registration state became $REGISTRATION_STATE; stopping profile testing"
+				;;
+			esac
+			continue
+		fi
+		saw_bearer_up=1
+		refresh_modem_status || :
+		if [ "$REGISTRATION_STATE" = roaming ] && [ "$ROAMING_ALLOWED" != true ]; then
+			LEAVE_INTERFACE_DOWN=1
+			write_last_result blocked-roaming-policy \
+				"blocked: registration changed to roaming while data roaming is disabled"
+			die_code 2 "registration changed to roaming; stopping profile testing and leaving $INTERFACE down"
+		fi
+		if test_connectivity "$effective_ip_type"; then
+			save_cache "$apn" "$provider" "$username" "$password" "$auth" "$effective_ip_type" || \
+				log warning "APN worked, but cache could not be written"
+			save_active_state "$apn" "$username" "$password" "$auth" "$effective_ip_type" || \
+				log warning "APN worked, but reconciled SIM state could not be written"
+			write_last_result success "success: $display_apn ($provider)"
+			ROLLBACK_ARMED=0
+			log notice "APN '$display_apn' is working; configuration kept"
+			return 0
+		fi
+		log warning "real Internet check failed for APN '$display_apn'"
+	done <"${CANDIDATES}.apply"
+
+	if [ "$saw_bearer_up" -eq 1 ]; then
+		write_last_result connectivity-failed \
+			"failed: a mobile session came up, but real Internet checks failed for every profile"
+	else
+		write_last_result bearer-rejected \
+			"failed: no tested mobile profile produced a usable data session"
+	fi
+	die "all mobile profiles failed; previous profile will be restored"
+}
+
+reconcile_cmd() {
+	read_sim
+	acquire_lock
+	migrate_target_state
+	registration_preflight || return $?
+	previous_iccid="$(active_iccid 2>/dev/null || :)"
+	previous_apn="$(active_apn 2>/dev/null || :)"
+	configured_apn="$(current_apn 2>/dev/null || :)"
+	[ "$previous_apn" = "<empty>" ] && previous_apn=""
+
+	if [ -n "$previous_iccid" ] && \
+	   [ "$previous_iccid" = "$ICCID" ] && \
+	   configured_profile_matches_active && \
+	   interface_is_up && \
+	   test_connectivity "$(configured_connectivity_ip_type)"; then
+		write_last_result success "success: ${configured_apn:-<empty>} (reconciled connectivity verified)"
+		log notice "SIM $ICCID is already reconciled with APN '${configured_apn:-<empty>}'; no changes"
+		return 0
+	fi
+
+	if [ -n "$previous_iccid" ] && [ "$previous_iccid" != "$ICCID" ]; then
+		log notice "SIM change detected: $previous_iccid -> $ICCID"
+	elif [ -z "$previous_iccid" ]; then
+		log notice "no reconciled SIM state found; applying APN for ICCID $ICCID"
+	elif ! configured_profile_matches_active; then
+		log notice "configured mobile profile differs from the reconciled profile for ICCID $ICCID"
+	else
+		log notice "reconciled WWAN connectivity is unavailable; retrying APN for ICCID $ICCID"
+	fi
+
+	apply_cmd
+}
+
+roaming_policy_set_cmd() {
+	requested="${1:-}"
+	case "$requested" in default|allow|block) : ;; *) die "roaming policy must be default, allow or block" ;; esac
+	[ "$TARGET_BACKEND" = modemmanager ] || \
+		die_code 4 "roaming policy control is not implemented for backend $TARGET_BACKEND"
+	acquire_lock
+	migrate_target_state
+	was_up=0
+	interface_is_up && was_up=1
+	was_roaming=unknown
+	sim_available=0
+	SIM_INDEX=""
+	MODEM_INDEX=""
+	if resolve_sim_index && mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+		sim_available=1
+		refresh_modem_status || :
+		was_roaming="$ROAMING_STATUS"
+	fi
+
+	case "$requested" in
+		default) uci -q delete "network.${INTERFACE}.allow_roaming" >/dev/null 2>&1 || : ;;
+		allow) uci set "network.${INTERFACE}.allow_roaming=1" >/dev/null 2>&1 || die "cannot allow data roaming" ;;
+		block) uci set "network.${INTERFACE}.allow_roaming=0" >/dev/null 2>&1 || die "cannot block data roaming" ;;
+	esac
+	uci commit network >/dev/null 2>&1 || die "cannot commit roaming policy"
+	read_roaming_policy
+	log notice "roaming policy for $INTERFACE changed to $ROAMING_POLICY"
+
+	if [ "$requested" = block ] && [ "$was_roaming" = true ]; then
+		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		log notice "mobile interface $INTERFACE stopped because the modem is registered in roaming"
+		return 0
+	fi
+	if [ "$requested" = block ] && [ "$was_roaming" = unknown ] && [ "$was_up" -eq 1 ]; then
+		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		log warning "mobile interface $INTERFACE stopped because roaming state could not be verified while applying the block"
+		return 0
+	fi
+
+	if [ "$requested" != block ] && [ "$was_up" -eq 0 ] && [ "$sim_available" -eq 1 ]; then
+		ifup "$INTERFACE" >/dev/null 2>&1 || die "roaming policy was saved, but interface $INTERFACE did not start"
+		wait_for_interface || :
+		reconcile_cmd
+		return $?
+	fi
+	return 0
+}
+
+write_modem_power() {
+	value="$1"
+	printf '%s\n' "$value" >"$MODEM_POWER_PATH" 2>/dev/null
+}
+
+wait_for_modem() {
+	remaining="$MODEM_WAIT_SECONDS"
+	while [ "$remaining" -gt 0 ]; do
+		case "$TARGET_BACKEND" in
+			modemmanager)
+				SIM_INDEX=""
+				if resolve_sim_index && \
+				   mmcli -i "$SIM_INDEX" --output-keyvalue >"$SIM_DATA" 2>/dev/null; then
+					ready_iccid="$(kv_value 'sim.properties.iccid sim.properties.sim-identifier sim.properties.identifier')"
+					case "$ready_iccid" in ''|*[!0-9]*) : ;; *) return 0 ;; esac
+				fi
+			;;
+			qmi)
+				if qmi_resolve_control_device && \
+				   "$QMI_ADAPTER" identity "$NETWORK_DEVICE" >"$SIM_DATA" 2>/dev/null; then
+					ready_iccid="$(qmi_identity_value iccid)"
+					case "$ready_iccid" in ''|*[!0-9]*) : ;; *) return 0 ;; esac
+				fi
+			;;
+		esac
+		sleep "$MODEM_POLL_SECONDS"
+		remaining=$((remaining - MODEM_POLL_SECONDS))
+	done
+	return 1
+}
+
+modem_reset_cmd() {
+	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+	acquire_lock
+	migrate_target_state
+	log notice "hardware modem reset requested; stopping interface $INTERFACE"
+	INTERFACE_RESTORE_ARMED=1
+	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+
+	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
+	MODEM_POWER_OFF_ARMED=1
+	write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
+	sleep "$MODEM_POWER_OFF_SECONDS"
+	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
+	MODEM_POWER_OFF_ARMED=0
+
+	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for the modem backend and SIM"
+	if ! wait_for_modem; then
+		die "modem or SIM did not return within ${MODEM_WAIT_SECONDS}s"
+	fi
+	if [ "$TARGET_BACKEND" = qmi ]; then
+		# wait_for_modem ends with a direct identity transaction. Let that QMI
+		# client close before handing the control device back to netifd, then
+		# wait for qmi.sh to own initialization before reconcile queries status.
+		settle_after_ifdown
+		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_qmi_data_interface; then
+			INTERFACE_RESTORE_ARMED=0
+			log notice "QMI data interface $INTERFACE is ready after modem power return"
+		else
+			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
+			ifdown "$INTERFACE" >/dev/null 2>&1 || :
+			settle_after_ifdown
+			return 3
+		fi
+	fi
+	log notice "modem and SIM are available again; reconciling APN"
+	reconcile_cmd
+	status=$?
+	if [ "$status" -ne 0 ]; then
+		if [ "$status" -eq 2 ] || interface_is_up; then
+			INTERFACE_RESTORE_ARMED=0
+		fi
+		return "$status"
+	fi
+	INTERFACE_RESTORE_ARMED=0
+	log notice "hardware modem reset and APN reconciliation completed successfully"
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG <command> [argument] [--target network:<uci-section>]
+
+Commands:
+  targets-json  Inventory cellular netifd targets and exact capabilities
+  detect   Read SIM identity and list matching APN candidates; no changes
+  detect-json  Machine-readable detect output for LuCI and integrations
+  apply    Try candidates, verify Internet through $DEVICE, cache success
+  reconcile  Apply only when SIM/APN changed or verified connectivity failed
+  modem-reset  Power-cycle the modem GPIO, wait for SIM, then reconcile APN
+  status   Show SIM identity, configured/cached APN and last result
+  status-json  Machine-readable status output for LuCI and integrations
+  action-start <reconcile|modem-reset|roaming-default|roaming-allow|roaming-block|database-check|database-install>
+           Start one operation in background
+  action-status  Show background/external operation state as JSON
+  roaming-policy-set <default|allow|block>  Change OpenWrt's canonical policy
+  reset    Restore the APN state saved before the first apply; clear cache
+  reset-all  Restore every target baseline; intended for safe package removal
+EOF
+}
+
+main() {
+	COMMAND_NAME="${1:-}"
+	case "$COMMAND_NAME" in -h|--help|help|'') usage; return 0 ;; esac
+	shift
+	command_argument=""
+	case "$COMMAND_NAME" in
+		action-start|roaming-policy-set)
+			command_argument="${1:-}"
+			[ "$#" -eq 0 ] || shift
+		;;
+	esac
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--target)
+				[ "$#" -ge 2 ] || die_code 4 "--target requires a target ID"
+				[ -z "$REQUESTED_TARGET" ] || die_code 4 "--target was specified more than once"
+				REQUESTED_TARGET="$2"
+				shift 2
+			;;
+			*) die_code 4 "unexpected argument: $1" ;;
+		esac
+	done
+	load_config
+	if [ "$COMMAND_NAME" = targets-json ]; then
+		[ -z "$REQUESTED_TARGET" ] || die_code 4 "targets-json does not accept --target"
+		targets_json_cmd
+		return 0
+	fi
+	if [ "$COMMAND_NAME" = action-status ]; then
+		[ -z "$REQUESTED_TARGET" ] || die_code 4 "action-status does not accept --target"
+		INTERFACE="wwan"
+		validate_config
+		action_status_cmd
+		return 0
+	fi
+	if [ "$COMMAND_NAME" = reset-all ]; then
+		INTERFACE="wwan"
+		validate_config
+		reset_all_cmd
+		return $?
+	fi
+	if [ "$COMMAND_NAME" = action-start ]; then
+		case "$command_argument" in
+			database-check|database-install)
+				[ -z "$REQUESTED_TARGET" ] || die_code 4 "database actions do not accept --target"
+				INTERFACE="wwan"
+				validate_config
+				action_start_cmd "$command_argument"
+				return 0
+			;;
+		esac
+	fi
+	select_target
+	case "$COMMAND_NAME:$command_argument" in
+		modem-reset:*|action-start:modem-reset) require_hardware_integration ;;
+	esac
+	case "$COMMAND_NAME" in
+		detect|detect-json|status|status-json) require_target_capability identity ;;
+		apply|reconcile|modem-reset) require_target_capability profile-apply ;;
+		roaming-policy-set) require_target_capability profile-write ;;
+		action-start)
+			case "$command_argument" in
+				reconcile|modem-reset) require_target_capability profile-apply ;;
+				roaming-default|roaming-allow|roaming-block) require_target_capability profile-write ;;
+			esac
+		;;
+	esac
+	validate_config
+	case "$COMMAND_NAME" in
+		detect) detect_cmd ;;
+		detect-json) detect_json_cmd ;;
+		apply) apply_cmd ;;
+		reconcile) reconcile_cmd ;;
+		modem-reset) modem_reset_cmd ;;
+		status) status_cmd ;;
+		status-json) status_json_cmd ;;
+		action-start) action_start_cmd "$command_argument" ;;
+		action-status) action_status_cmd ;;
+		roaming-policy-set) roaming_policy_set_cmd "$command_argument" ;;
+		reset) reset_cmd ;;
+		reset-all) reset_all_cmd ;;
+		*) usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Konstantin=20Sch=C3=B6ning?= <konstantin@lukianov.pp.ua>
+Date: Wed, 26 Aug 2026 16:40:00 +0200
+Subject: [PATCH] driver/stdio: treat a sent request as success, not as failure
+
+The stdio APDU backend cannot work at all as written. json_request returns
+what json_print returns, and json_print returns true when it has written the
+message; every caller then treats that true as an error:
+
+    if (json_request("connect", NULL, 0)) {
+        return -1;
+    }
+
+So connect returns -1 the moment it succeeds in sending its request, and
+euicc_init fails before a single reply is read. logic_channel_open and
+transmit carry the same inversion, and would fail the same way if execution
+ever reached them.
+
+Confirmed on hardware rather than by reading: with a bridge answering
+{"type":"apdu","payload":{"ecode":0}} to the connect request -- a valid,
+well-formed success -- lpac still reported euicc_init failure and never
+asked for a logical channel. The reply was not the problem; the request
+having been sent was.
+
+The HTTP stdio backend is unaffected: it ignores json_request's return
+value entirely.
+
+This matters here because this project builds no other APDU backend for the
+bridge. lpac's native QMI and MBIM backends open the device themselves,
+with no owner discovery, no lock and no bound, which is why they are not
+built; the stdio backend is what lets the transport be arbitrated by code
+that already does those things. Without this fix that backend is dead on
+arrival and the bridge cannot exist.
+
+No upstream pull request covers this.
+
+--- a/driver/apdu/stdio.c
++++ b/driver/apdu/stdio.c
+@@ -155,7 +155,7 @@ exit:
+ static int apdu_interface_connect(struct euicc_ctx *ctx) {
+     int ecode;
+ 
+-    if (json_request("connect", NULL, 0)) {
++    if (!json_request("connect", NULL, 0)) {
+         return -1;
+     }
+ 
+@@ -180,7 +180,7 @@ static void apdu_interface_disconnect(struct euicc_ctx *ctx) {
+ static int apdu_interface_logic_channel_open(struct euicc_ctx *ctx, const uint8_t *aid, uint8_t aid_len) {
+     int ecode;
+ 
+-    if (json_request("logic_channel_open", aid, aid_len)) {
++    if (!json_request("logic_channel_open", aid, aid_len)) {
+         return -1;
+     }
+ 
+@@ -211,7 +211,7 @@ static int apdu_interface_transmit(struct euicc_ctx *ctx, uint8_t **rx, uint32_t
+                                    uint32_t tx_len) {
+     int ecode;
+ 
+-    if (json_request("transmit", tx, tx_len)) {
++    if (!json_request("transmit", tx, tx_len)) {
+         return -1;
+     }
+ 

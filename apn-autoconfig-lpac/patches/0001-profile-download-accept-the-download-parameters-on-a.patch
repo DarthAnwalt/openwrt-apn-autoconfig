@@ -1,0 +1,233 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Konstantin=20Sch=C3=B6ning?= <konstantin@lukianov.pp.ua>
+Date: Tue, 25 Aug 2026 23:54:42 +0200
+Subject: [PATCH] profile/download: accept the download parameters on an
+ inherited descriptor
+
+/proc/<pid>/cmdline is world-readable on Linux, so an activation code, a
+confirmation code or a matching ID passed as -a, -c or -m is readable by
+any local user for as long as the download runs, and by anything sampling
+the process list at any point during it.
+
+Add -R <fd>, which reads the same parameters as a small key=value document
+from an already-open file descriptor. An inherited descriptor appears
+nowhere in /proc that a non-root reader can follow, and unlike a temporary
+file it leaves nothing at rest.
+
+A key supplied both on the command line and on the descriptor is an error
+rather than an override, so the two cannot silently disagree; an
+over-long document is refused rather than truncated, because a truncated
+activation code is a different activation code that would fail much later
+and much less clearly; and the buffer is wiped before it is freed.
+
+The existing options are unchanged.
+---
+ src/applet/profile/download.c | 153 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 152 insertions(+), 1 deletion(-)
+
+diff --git a/src/applet/profile/download.c b/src/applet/profile/download.c
+index 62f4f2e..6a79e37 100644
+--- a/src/applet/profile/download.c
++++ b/src/applet/profile/download.c
+@@ -9,6 +9,8 @@
+ #include <lpac/utils.h>
+ 
+ #include <ctype.h>
++#include <errno.h>
++#include <limits.h>
+ #include <getopt.h>
+ #include <signal.h>
+ #include <stdbool.h>
+@@ -17,7 +19,7 @@
+ #include <string.h>
+ #include <unistd.h>
+ 
+-static const char *opt_string = "s:m:i:c:a:ph?";
++static const char *opt_string = "s:m:i:c:a:R:ph?";
+ 
+ static volatile int cancelled = 0;
+ 
+@@ -51,6 +53,130 @@ static bool is_strict_matching_id(const char *token) {
+     return true;
+ }
+ 
++// Read the download parameters from an already-open file descriptor instead of
++// from the command line. The activation code, the confirmation code and the
++// matching ID are secrets, and /proc/<pid>/cmdline is world-readable on Linux
++// while an inherited descriptor is not visible there at all.
++//
++// The descriptor carries a small key=value document, one pair per line, and is
++// read to end-of-file:
++//
++//     activation_code=LPA:1$smdp.example$MATCHING-ID
++//     confirmation_code=1234
++//     matching_id=MATCHING-ID
++//     imei=000000000000000
++//     smdp=smdp.example
++//
++// A key that was also given on the command line is an error rather than an
++// override: the two ways of supplying one value must not silently disagree.
++#define SECRET_FD_MAX 8192
++
++static int assign_once(char **slot, const char *key, const char *value, const char **error_key) {
++    if (*slot != NULL) {
++        *error_key = key;
++        return -1;
++    }
++    *slot = strdup(value);
++    return *slot == NULL ? -1 : 0;
++}
++
++static int read_params_from_fd(int fd, char **smdp, char **matchingId, char **imei, char **confirmation_code,
++                               char **activation_code, const char **error_key) {
++    char *buffer;
++    size_t used = 0;
++    ssize_t got;
++    char *cursor;
++    int fret = -1;
++
++    buffer = malloc(SECRET_FD_MAX + 1);
++    if (buffer == NULL) {
++        return -1;
++    }
++
++    while (used < SECRET_FD_MAX) {
++        got = read(fd, buffer + used, SECRET_FD_MAX - used);
++        if (got < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            goto exit;
++        }
++        if (got == 0) {
++            break;
++        }
++        used += (size_t)got;
++    }
++    if (used >= SECRET_FD_MAX) {
++        // Refuse rather than truncate: a truncated activation code is a
++        // different activation code, and it would fail far from here.
++        goto exit;
++    }
++    buffer[used] = '\0';
++
++    cursor = buffer;
++    while (*cursor != '\0') {
++        char *line = cursor;
++        char *newline = strchr(cursor, '\n');
++        char *separator;
++
++        if (newline != NULL) {
++            *newline = '\0';
++            cursor = newline + 1;
++        } else {
++            cursor = line + strlen(line);
++        }
++
++        // Tolerate CRLF, ignore blank lines.
++        if (line[0] != '\0' && line[strlen(line) - 1] == '\r') {
++            line[strlen(line) - 1] = '\0';
++        }
++        if (line[0] == '\0') {
++            continue;
++        }
++
++        separator = strchr(line, '=');
++        if (separator == NULL) {
++            goto exit;
++        }
++        *separator = '\0';
++
++        if (strcmp(line, "activation_code") == 0) {
++            if (assign_once(activation_code, "activation_code", separator + 1, error_key)) {
++                goto exit;
++            }
++            if (strncmp(*activation_code, "LPA:", 4) == 0) {
++                memmove(*activation_code, *activation_code + 4, strlen(*activation_code) - 3);
++            }
++        } else if (strcmp(line, "confirmation_code") == 0) {
++            if (assign_once(confirmation_code, "confirmation_code", separator + 1, error_key)) {
++                goto exit;
++            }
++        } else if (strcmp(line, "matching_id") == 0) {
++            if (assign_once(matchingId, "matching_id", separator + 1, error_key)) {
++                goto exit;
++            }
++        } else if (strcmp(line, "imei") == 0) {
++            if (assign_once(imei, "imei", separator + 1, error_key)) {
++                goto exit;
++            }
++        } else if (strcmp(line, "smdp") == 0) {
++            if (assign_once(smdp, "smdp", separator + 1, error_key)) {
++                goto exit;
++            }
++        } else {
++            goto exit;
++        }
++    }
++
++    fret = 0;
++
++exit:
++    // The buffer held the secrets; do not leave them in freed heap.
++    memset(buffer, 0, SECRET_FD_MAX + 1);
++    free(buffer);
++    return fret;
++}
++
+ static void sigint_handler(int x) { cancelled = 1; }
+ 
+ static cJSON *build_download_result_json(const struct es10b_load_bound_profile_package_result *result) {
+@@ -78,6 +204,8 @@ static int applet_main(int argc, char **argv) {
+     char *confirmation_code = NULL;
+     char *activation_code = NULL;
+     int interactive_preview = 0;
++    int params_fd = -1;
++    const char *duplicate_key = NULL;
+ 
+     _cleanup_(es10a_euicc_configured_addresses_free) struct es10a_euicc_configured_addresses configured_addresses = {0};
+     struct es10b_load_bound_profile_package_result download_result = {0};
+@@ -105,6 +233,17 @@ static int applet_main(int argc, char **argv) {
+                 activation_code += 4; // ignore uri scheme
+             }
+             break;
++        case 'R': {
++            char *end = NULL;
++            long parsed = strtol(optarg, &end, 10);
++            if (end == optarg || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
++                error_function_name = "params_fd";
++                error_detail = strdup("invalid");
++                goto err;
++            }
++            params_fd = (int)parsed;
++            break;
++        }
+         case 'p':
+             interactive_preview = 1;
+             break;
+@@ -116,6 +255,7 @@ static int applet_main(int argc, char **argv) {
+             printf("\t -i IMEI\n");
+             printf("\t -c Confirmation Code (Password)\n");
+             printf("\t -a Activation Code (e.g: 'LPA:***')\n");
++            printf("\t -R Read parameters from an inherited file descriptor\n");
+             printf("\t -p Interactive preview profile\n");
+             printf("\t -h This help info\n");
+             return -1;
+@@ -124,6 +264,17 @@ static int applet_main(int argc, char **argv) {
+         }
+     }
+ 
++    if (params_fd >= 0) {
++        int rc = read_params_from_fd(params_fd, &smdp, &matchingId, &imei, &confirmation_code, &activation_code,
++                                     &duplicate_key);
++        close(params_fd);
++        if (rc) {
++            error_function_name = duplicate_key != NULL ? duplicate_key : "params_fd";
++            error_detail = strdup(duplicate_key != NULL ? "given twice" : "invalid");
++            goto err;
++        }
++    }
++
+     if (activation_code != NULL) {
+         // SGP.22 v2.2.2; Page 111
+         // Section: 4.1 (Activation Code)

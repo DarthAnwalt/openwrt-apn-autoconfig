@@ -1,0 +1,115 @@
+name: Update public provider database
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: Rebuild and republish the current provider package
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: public-provider-database-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    # This file is also the source from which the public projection is made.
+    # Its scheduled copy in the private development repository receives no
+    # runner and therefore consumes no private-repository Actions minutes.
+    if: github.repository == 'DarthAnwalt/openwrt-apn-autoconfig'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          fetch-depth: 0
+      - name: Install provider build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y binutils zstd
+      - name: Refresh trusted public sources
+        run: sh scripts/refresh-providers.sh
+      - name: Decide whether publication is needed
+        id: changes
+        env:
+          FORCE_PUBLISH: ${{ inputs.force_publish || false }}
+        run: |
+          if test "$FORCE_PUBLISH" = true; then
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          elif git diff --quiet -- \
+            data/provider-sources.json \
+            data/providers-report.json \
+            apn-autoconfig-providers/VERSION \
+            apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv; then
+            echo "Provider database is already current."
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Verify reproducible public provider input
+        if: steps.changes.outputs.publish == 'true'
+        run: sh scripts/verify-provider-pipeline.sh
+      - name: Build only the provider package
+        if: steps.changes.outputs.publish == 'true'
+        run: sh scripts/build-provider-with-sdk.sh
+      - name: Preserve verified released packages and replace only the provider package
+        if: steps.changes.outputs.publish == 'true'
+        run: |
+          python3 scripts/fetch-published-packages.py \
+            --output dist/feed-input \
+            --exclude apn-autoconfig-providers
+          cp dist/provider/apn-autoconfig-providers-*.apk dist/feed-input/
+          test "$(find dist/feed-input -name '*.apk' | wc -l)" -gt 1
+      - name: Restore the protected signing key
+        if: steps.changes.outputs.publish == 'true'
+        env:
+          APK_SIGNING_KEY_BASE64: ${{ secrets.APK_SIGNING_KEY_BASE64 }}
+        run: |
+          test -n "$APK_SIGNING_KEY_BASE64"
+          umask 077
+          printf '%s' "$APK_SIGNING_KEY_BASE64" |
+            base64 --decode >"$RUNNER_TEMP/apn-autoconfig-private-key.pem"
+          echo "APK_SIGNING_KEY_FILE=$RUNNER_TEMP/apn-autoconfig-private-key.pem" >>"$GITHUB_ENV"
+          apk_tool="$(find "$GITHUB_WORKSPACE/.build/provider/sdk" \
+            -path '*/staging_dir/host/bin/apk' -type f | head -n 1)"
+          test -x "$apk_tool"
+          echo "APK_TOOL=$apk_tool" >>"$GITHUB_ENV"
+      - name: Build and verify the complete signed feed
+        if: steps.changes.outputs.publish == 'true'
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/dist/feed-input
+        run: sh scripts/build-repository.sh
+      - name: Commit public provider source update
+        if: steps.changes.outputs.publish == 'true'
+        run: |
+          if git diff --quiet -- \
+            data/provider-sources.json \
+            data/providers-report.json \
+            apn-autoconfig-providers/VERSION \
+            apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv; then
+            echo "No source commit is needed."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add \
+              data/provider-sources.json \
+              data/providers-report.json \
+              apn-autoconfig-providers/VERSION \
+              apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv
+            git commit -m "Update provider database"
+            git push origin HEAD:main
+          fi
+      - name: Publish the signed feed
+        if: steps.changes.outputs.publish == 'true'
+        env:
+          PUBLIC_FEED_TOKEN: ${{ github.token }}
+          FEED_SOURCE_DESCRIPTION: public provider database update
+        run: sh scripts/publish-feed.sh
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/apn-autoconfig-private-key.pem"

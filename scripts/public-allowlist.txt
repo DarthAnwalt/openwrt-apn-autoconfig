@@ -1,0 +1,81 @@
+# What may be published, and nothing else.
+#
+# One path prefix per line. A file is publishable only if it is, or lives
+# under, an entry here. Everything else stays in the private repository --
+# development documents, work-item packets, hardware records, contracts, test
+# suites and private build tooling. The one exception is the provider-data
+# workflow below: its public-source inputs, generator, checks and package-only
+# builder are published because that package is maintained in public.
+#
+# The rule this file exists to enforce is the maintainer's, recorded after
+# real subscriber identifiers were found published in test fixtures: what goes
+# out is what a user or a licence needs, not the development record.
+#
+# Adding a line here is a decision to publish. It is not a formality: run
+# `sh scripts/check-public-safe.sh` afterwards, because a path being allowed
+# says nothing about what is inside it.
+
+# The packages themselves -- the code that is actually installed.
+Makefile
+files/
+apn-autoconfig-modem/Makefile
+apn-autoconfig-modem/files/
+apn-autoconfig-modem/LICENSE
+apn-autoconfig-esim/Makefile
+apn-autoconfig-esim/files/
+apn-autoconfig-esim/LICENSE
+apn-autoconfig-proto-atdial/Makefile
+apn-autoconfig-proto-atdial/files/
+apn-autoconfig-proto-atdial/LICENSE
+apn-autoconfig-providers/Makefile
+apn-autoconfig-providers/files/
+apn-autoconfig-providers/NOTICE
+apn-autoconfig-providers/VERSION
+luci-app-apn-autoconfig/Makefile
+luci-app-apn-autoconfig/htdocs/
+luci-app-apn-autoconfig/root/
+luci-app-apn-autoconfig/LICENSE
+
+# The vendored LPA. Its source archive and every patch applied to it are an
+# AGPL obligation discharged by the package itself, so they are not optional
+# and not negotiable.
+apn-autoconfig-lpac/Makefile
+apn-autoconfig-lpac/files/
+apn-autoconfig-lpac/patches/
+apn-autoconfig-lpac/NOTICE
+
+# Licence texts for the provider data.
+data/licenses/
+
+# Public provider-database inputs and reproducible automation. This workflow
+# builds only apn-autoconfig-providers; it neither receives nor runs the private
+# repository's tests or hardware records.
+data/provider-sources.json
+data/providers-report.json
+data/providers-overrides.tsv
+.github/workflows/update-provider-database.yml
+scripts/build-provider-with-sdk.sh
+scripts/build-repository.sh
+scripts/check-provider-update.py
+scripts/check-public-safe.sh
+scripts/check-release-artifacts.sh
+scripts/fetch-published-packages.py
+scripts/generate-providers.py
+scripts/openwrt-sdk-config.sh
+scripts/publish-feed.sh
+scripts/refresh-provider-sources.py
+scripts/refresh-providers.sh
+scripts/update-providers.sh
+scripts/verify-provider-pipeline.sh
+scripts/verify-provider-source-licenses.py
+
+# What a user needs to install and to verify what they installed.
+scripts/install.sh
+repository/public-key.pem
+
+# What a reader needs.
+README.md
+CHANGELOG.md
+LICENSE
+LICENSING.md
+THIRD_PARTY_NOTICES.md

@@ -1,0 +1,32 @@
+# apn-autoconfig-modem quirk table v1
+#
+# Capabilities that are NOT portable across modems, keyed by what the modem
+# reports about itself. Identity does not belong here and never will: the 3GPP
+# core reads are uniform across vendors, and the one genuinely divergent read
+# (ICCID) is handled by an ordered attempt list in the adapter rather than by a
+# table lookup, because that works without knowing the vendor at all.
+#
+# Format, tab-separated:
+#
+#   <manufacturer>	<model>	<firmware>	<key>	<value>
+#
+# `manufacturer` and `model` match the reply to AT+CGMI and AT+CGMM exactly.
+# `firmware` matches AT+CGMR and is `*` unless an entry genuinely depends on a
+# firmware revision. `manufacturer` and `model` may not be `*`: a quirk that
+# applies to every modem is not a quirk.
+#
+# **An absent entry means "not tested here", never "probably behaves like the
+# others".** A modem gets no capability from this table until someone has
+# watched it work on real hardware and recorded what they saw. That is the same
+# rule the backend contract applies to capability reporting, for the same
+# reason: guessing produces a control that fails at the worst moment instead of
+# one that is honestly absent.
+#
+# Every entry must carry a comment naming the command that was run and the
+# response that was observed, so a later reader can tell a measured entry from
+# an inherited assumption.
+#
+# The table is deliberately empty. 0.14.0 needs no vendor-specific capability:
+# everything it does — port resolution, identity, registration, signal, soft
+# reset — is standard. The first entries are expected in 0.15.0, where the
+# Fibocom connection path needs behaviour that genuinely differs by device.

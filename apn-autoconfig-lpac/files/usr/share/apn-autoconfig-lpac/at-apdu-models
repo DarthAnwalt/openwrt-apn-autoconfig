@@ -1,0 +1,37 @@
+# apn-autoconfig-lpac AT APDU allow list v1
+#
+# Which modems may be given an AT APDU channel at all.
+#
+# This file exists because of one upstream incident and one property of the LPA.
+#
+# The incident: a generic AT `CCHO` probe wedged a Sierra SIM until physical
+# intervention. APDU probing is a capability and a quirk, never a harmless scan
+# — the reasoning is in docs/plan-1.0.md and the rule is in the C1 gate.
+#
+# The property: lpac's AT backend sends `AT+CCHO=?`, `AT+CCHC=?` and `AT+CGLA=?`
+# to whatever device it is handed, on connect, before it parses its own
+# subcommand. It cannot be configured out of doing so. The refusal therefore
+# cannot live in the LPA; it lives in `lpac-run`, which decides whether to start
+# the LPA at all, and this file is what it decides against.
+#
+# Format, tab-separated:
+#
+#   <vendor_id>	<product_id>	<model>	<state>
+#
+# `vendor_id` and `product_id` are the USB identifiers as they appear in sysfs,
+# lowercase hex without the `0x`.
+#
+# **No wildcard is accepted in either identifier, by design.** Every other quirk
+# table in this project allows `*` so a rule can be widened; widening this one
+# would reinstate exactly the generic probe it exists to prevent. A device that
+# is not named here is refused, and "unknown" and "generic" are the same answer.
+#
+# `state` is evidence about this entry and nothing else. `candidate` means the
+# entry is here because the model is documented to support the commands and this
+# project intends to drive it; `hardware-validated` is written only after an AT
+# APDU exchange has been observed on that model, on real hardware, and recorded
+# in a router-test document. A `candidate` entry is permitted to be tried — that
+# is what naming it is for — but it may not be reported as validated.
+#
+0e8d	7127	Fibocom FM350-GL	candidate
+2c7c	0801	Quectel RM520N-GL	candidate

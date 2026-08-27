@@ -1,0 +1,59 @@
+#!/bin/sh
+
+# Narrow read-only entry point for rpcd/LuCI ACLs.
+#
+# LuCI never receives permission to invoke apn-autoconfig-esim directly, and
+# never to invoke an LPA binary at all. Every verb here writes nothing, opens
+# no channel it does not release, and changes no slot, profile, bearer or
+# control owner.
+
+COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
+VERB="${1:-}"
+MODEM_ID="${2:-}"
+ENDPOINT_ID="${3:-}"
+[ "$#" -le 3 ] || exit 2
+
+# The same character class the existing wrappers use. A value that is not a
+# plain token is refused rather than quoted: nothing downstream needs one.
+for wrapper_argument in "$MODEM_ID" "$ENDPOINT_ID"; do
+	[ -n "$wrapper_argument" ] || continue
+	case "$wrapper_argument" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+	[ "${#wrapper_argument}" -le 200 ] || exit 2
+done
+
+# A secret is refused, never sanitised, and never accepted here at all: this
+# wrapper reaches no verb that takes one. By the time it could be stripped the
+# value has already been in this process's world-readable command line.
+case "$MODEM_ID$ENDPOINT_ID" in
+	LPA:*|*'$'*) exit 2 ;;
+esac
+
+case "$VERB" in
+	capabilities)
+		[ -z "$MODEM_ID" ] && [ -z "$ENDPOINT_ID" ] || exit 2
+		exec "$COMMAND" capabilities-json
+	;;
+	inventory)
+		[ -z "$ENDPOINT_ID" ] || exit 2
+		if [ -n "$MODEM_ID" ]; then
+			exec "$COMMAND" esim-inventory-json --modem "$MODEM_ID"
+		fi
+		exec "$COMMAND" esim-inventory-json
+	;;
+	status|profiles|notifications|read-takeover-plan)
+		[ -n "$MODEM_ID" ] && [ -n "$ENDPOINT_ID" ] || exit 2
+		case "$VERB" in
+			status) wrapper_verb=esim-status-json ;;
+			profiles) wrapper_verb=profiles-json ;;
+			notifications) wrapper_verb=notifications-json ;;
+			*) wrapper_verb=read-takeover-plan ;;
+		esac
+		exec "$COMMAND" "$wrapper_verb" --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID"
+	;;
+	action-status)
+		[ -n "$MODEM_ID" ] || exit 2
+		[ -z "$ENDPOINT_ID" ] || exit 2
+		exec "$COMMAND" action-status --modem "$MODEM_ID"
+	;;
+	*) exit 2 ;;
+esac

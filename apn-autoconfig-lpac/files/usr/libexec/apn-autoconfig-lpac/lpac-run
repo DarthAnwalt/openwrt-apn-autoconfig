@@ -1,0 +1,423 @@
+#!/bin/sh
+
+# Starts the pinned LPA, and carries every refusal the LPA cannot.
+#
+# lpac is a card tool. It has no concept of who owns a modem, it takes no lock
+# on the port it uses, and it connects to the card *before* it parses its own
+# subcommand — so there is no way to ask it a question without opening a
+# channel. On 2026-08-25 six `lpac --help` invocations on the reference router
+# opened a ModemManager-owned `cdc-wdm0` and took the modem out of service for
+# three minutes; the record is in docs/router-test-0.16.0.md and the source-level
+# reasons are in docs/upstream-esim-review.md.
+#
+# Everything below follows from that. This wrapper decides whether the LPA runs
+# at all, and it decides before the process exists, because afterwards is too
+# late.
+#
+# It does not discover anything. A caller that has already resolved exactly one
+# target, and proved who owns it, passes what it found; this wrapper checks the
+# claims against each other and refuses when they do not add up. Refusing is the
+# behaviour under uncertainty — an unreadable, unparseable or absent answer is
+# never read as permission.
+#
+# Exit classes, as docs/esim-contract-v1.md defines them:
+#   0 success   2 usage   3 retryable   4 blocked   5 partial
+
+set -u
+
+LOG_TAG=apn-autoconfig-lpac
+LPAC_BIN="${APN_AUTOCONFIG_LPAC_BIN:-/usr/libexec/apn-autoconfig-lpac/lpac}"
+# Resolved through overrides so a fixture can supply a bounding `timeout` and a
+# real `sleep`. A watchdog that calls `sleep` directly is disarmed by any test
+# harness that stubs it, and then the bound it claims to prove is never taken.
+TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
+SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
+MODEL_TABLE="${APN_AUTOCONFIG_LPAC_MODELS:-/usr/share/apn-autoconfig-lpac/at-apdu-models}"
+RUNTIME_DIR="${APN_AUTOCONFIG_LPAC_RUNTIME:-/var/run/apn-autoconfig-lpac}"
+DEFAULT_TIMEOUT=120
+
+EXIT_USAGE=2
+EXIT_RETRYABLE=3
+EXIT_BLOCKED=4
+
+log() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t "$LOG_TAG" "$*"
+	else
+		printf '%s: %s\n' "$LOG_TAG" "$*" >&2
+	fi
+}
+
+fail() {
+	code="$1"
+	shift
+	log "$*"
+	printf '%s: %s\n' "$LOG_TAG" "$*" >&2
+	exit "$code"
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup, armed before anything is created or started.
+#
+# The order matters and it is the reverse of the order things were made: kill
+# and reap the child first, because it is holding the modem, and only then
+# remove the channel it was reading from. Removing the secret path while the LPA
+# still has it open would leave a process alive with a channel nothing can
+# reach.
+# ---------------------------------------------------------------------------
+CHILD_PID=
+WATCHDOG_PID=
+WRITER_PID=
+RUN_DIR=
+
+reap() {
+	# $1 pid, $2 signal. A pid that is already gone is not an error: it is the
+	# ordinary case on a clean exit, and treating it as one would turn every
+	# successful run into a failed cleanup.
+	[ -n "$1" ] || return 0
+	kill -0 "$1" 2>/dev/null || return 0
+	kill "-$2" "$1" 2>/dev/null
+	return 0
+}
+
+cleanup() {
+	reap "$CHILD_PID" TERM
+	reap "$WATCHDOG_PID" TERM
+	reap "$WRITER_PID" TERM
+
+	# Give the LPA a moment to put the card down, then insist. A logical channel
+	# left open is the one piece of state this wrapper cannot repair afterwards.
+	if [ -n "$CHILD_PID" ]; then
+		"$SLEEP" 1 2>/dev/null || :
+		reap "$CHILD_PID" KILL
+		wait "$CHILD_PID" 2>/dev/null
+	fi
+	[ -n "$WATCHDOG_PID" ] && wait "$WATCHDOG_PID" 2>/dev/null
+	[ -n "$WRITER_PID" ] && wait "$WRITER_PID" 2>/dev/null
+
+	# Exact paths only. Never a wildcard and never a recursive delete of a root
+	# this process did not create in this run.
+	if [ -n "$RUN_DIR" ] && [ -d "$RUN_DIR" ]; then
+		rm -f "$RUN_DIR/params" 2>/dev/null
+		rm -f "$RUN_DIR/bound-exceeded" 2>/dev/null
+		rmdir "$RUN_DIR" 2>/dev/null
+	fi
+	return 0
+}
+
+on_signal() {
+	cleanup
+	# Report the signal as a signal rather than as a plain failure: a caller
+	# distinguishing "interrupted" from "refused" is the whole reason the exit
+	# classes exist.
+	exit "$EXIT_RETRYABLE"
+}
+
+trap 'cleanup' EXIT
+trap 'on_signal' HUP INT TERM
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+transport=
+owner=
+device=
+bearer_device=
+model=
+timeout_s="$DEFAULT_TIMEOUT"
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--transport) transport="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--transport needs a value' ;;
+		--owner) owner="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--owner needs a value' ;;
+		--device) device="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--device needs a value' ;;
+		--bearer-device) bearer_device="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--bearer-device needs a value' ;;
+		--model) model="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--model needs a value' ;;
+		--timeout) timeout_s="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--timeout needs a value' ;;
+		--) shift; break ;;
+		*) fail "$EXIT_USAGE" "unknown option: $1" ;;
+	esac
+done
+
+[ $# -gt 0 ] || fail "$EXIT_USAGE" 'no LPA command was given'
+
+case "$timeout_s" in
+	''|*[!0-9]*) fail "$EXIT_USAGE" 'timeout must be a whole number of seconds' ;;
+esac
+[ "$timeout_s" -gt 0 ] || fail "$EXIT_USAGE" 'timeout must be greater than zero'
+
+# ---------------------------------------------------------------------------
+# A secret given as an argument is refused, never sanitised.
+#
+# By the time this wrapper could strip one, the value has already been in
+# /proc/<pid>/cmdline of *this* process, which is world-readable. Removing it
+# afterwards would hide the leak rather than prevent it, and would leave the
+# caller believing it had been handled.
+# ---------------------------------------------------------------------------
+for argument do
+	case "$argument" in
+		-a|--activation-code|-c|-m|-R)
+			fail "$EXIT_USAGE" \
+				'a secret was passed as an argument; pass it in the environment instead'
+		;;
+		-a*|-c*|-m*|-R*)
+			fail "$EXIT_USAGE" \
+				'a secret was passed as an argument; pass it in the environment instead'
+		;;
+		LPA:*|*'$'*'$'*)
+			fail "$EXIT_USAGE" \
+				'an activation code was passed as an argument; pass it in the environment instead'
+		;;
+	esac
+done
+
+# ---------------------------------------------------------------------------
+# Ownership
+#
+# The caller states who owns the modem. This wrapper accepts two answers and
+# refuses everything else, including every way of not knowing. `modemmanager`
+# is refused here rather than inhibited: taking an inhibition is an operation
+# with a visible outage, it belongs to the caller that can report it, and it is
+# not something a launcher may do on its own.
+# ---------------------------------------------------------------------------
+case "$owner" in
+	none) : ;;
+	netifd-direct)
+		# A netifd-owned bearer may be read only over a control port that is not
+		# the one carrying it. The caller has to name both so the claim can be
+		# checked; naming one and asserting the other is not evidence.
+		[ -n "$bearer_device" ] || fail "$EXIT_BLOCKED" \
+			'owner netifd-direct requires --bearer-device so the separate-port rule can be checked'
+		[ "$bearer_device" != "$device" ] || fail "$EXIT_BLOCKED" \
+			'refusing to open the control port the bearer is using'
+	;;
+	modemmanager)
+		fail "$EXIT_BLOCKED" 'the modem is claimed by ModemManager; an inhibit is the caller decision, not this one'
+	;;
+	'')
+		fail "$EXIT_BLOCKED" 'no control owner was stated; absence of an answer is not permission'
+	;;
+	*)
+		fail "$EXIT_BLOCKED" "control owner is $owner; refusing"
+	;;
+esac
+
+# ---------------------------------------------------------------------------
+# Transport
+# ---------------------------------------------------------------------------
+case "$transport" in
+	at)
+		[ -n "$device" ] || fail "$EXIT_USAGE" 'transport at requires --device'
+		[ -c "$device" ] || fail "$EXIT_BLOCKED" "not a character device: $device"
+
+		# The allow list. A model that is not named is refused, and "unknown" and
+		# "generic" are the same answer, because the probe lpac performs on
+		# connect is the one that wedged a SIM upstream.
+		[ -n "$model" ] || fail "$EXIT_BLOCKED" \
+			'transport at requires --model; an unidentified modem receives no APDU probe'
+		case "$model" in
+			*[!0-9a-f:]*|*:*:*|:*|*:) fail "$EXIT_USAGE" 'model must be vendor:product in lowercase hex' ;;
+			*:*) : ;;
+			*) fail "$EXIT_USAGE" 'model must be vendor:product in lowercase hex' ;;
+		esac
+		[ -r "$MODEL_TABLE" ] || fail "$EXIT_BLOCKED" \
+			'the AT APDU allow list is unreadable; refusing rather than probing'
+
+		model_vendor="${model%%:*}"
+		model_product="${model#*:}"
+		matched=
+		while IFS='	' read -r table_vendor table_product table_model table_state; do
+			case "$table_vendor" in ''|\#*) continue ;; esac
+			[ "$table_vendor" = "$model_vendor" ] || continue
+			[ "$table_product" = "$model_product" ] || continue
+			matched="${table_model:-$model}"
+			break
+		done <"$MODEL_TABLE"
+		[ -n "$matched" ] || fail "$EXIT_BLOCKED" \
+			"$model is not on the AT APDU allow list; refusing to probe an unlisted modem"
+
+		LPAC_APDU=at
+		LPAC_APDU_AT_DEVICE="$device"
+		export LPAC_APDU LPAC_APDU_AT_DEVICE
+	;;
+	stdio)
+		# The caller owns the card channel and speaks the bridge protocol on this
+		# process's standard input and output. lpac opens no device at all, which
+		# is why this transport needs neither a device nor an allow-list entry.
+		[ -z "$device" ] || fail "$EXIT_USAGE" 'transport stdio takes no --device'
+		LPAC_APDU=stdio
+		export LPAC_APDU
+	;;
+	'')
+		fail "$EXIT_USAGE" '--transport is required'
+	;;
+	*)
+		fail "$EXIT_USAGE" "unsupported transport: $transport"
+	;;
+esac
+
+# The HTTP side is never the LPA's. The build ships no curl backend — it
+# disabled certificate verification unconditionally and could not be told not to
+# — so the request travels out over the bridge and the caller makes it, with
+# verification on. Setting this explicitly means a build that somehow regained a
+# curl backend still would not use it.
+LPAC_HTTP=stdio
+export LPAC_HTTP
+
+[ -x "$LPAC_BIN" ] || fail "$EXIT_BLOCKED" "the pinned LPA is not installed at $LPAC_BIN"
+
+# ---------------------------------------------------------------------------
+# The secret channel
+#
+# In: the request environment, which is how the frontend leg already works and
+# why /proc/<pid>/environ is not world-readable while /proc/<pid>/cmdline is.
+# Out: a descriptor the LPA inherits. The argument it sees is the number 3.
+#
+# A POSIX shell cannot conjure a descriptor with content in it, so the pipe is
+# named — created under umask 077 in a root-only directory, written by a
+# background writer, and unlinked by the traps armed above. A FIFO stores
+# nothing: what passes through it is never on a filesystem, and the name is not
+# the secret. The LPA is handed the descriptor, never the path, so no part of
+# this appears in anyone's command line.
+#
+# The variables are unset before the LPA is executed, so they are not inherited
+# by it, by an APDU plugin, or by anything else it spawns.
+# ---------------------------------------------------------------------------
+secret_document=
+add_secret() {
+	[ -n "$2" ] || return 0
+	# A literal newline in the pattern. `$(printf '\n')` cannot be used here:
+	# command substitution strips trailing newlines, so the pattern would be the
+	# empty string and would match every value.
+	case "$2" in
+		*"
+"*) fail "$EXIT_USAGE" "$1 contains a newline, and the document is newline-delimited" ;;
+	esac
+	secret_document="${secret_document}$1=$2
+"
+	return 0
+}
+
+add_secret activation_code "${APN_ESIM_ACTIVATION_CODE:-}"
+add_secret confirmation_code "${APN_ESIM_CONFIRMATION_CODE:-}"
+add_secret matching_id "${APN_ESIM_MATCHING_ID:-}"
+
+unset APN_ESIM_ACTIVATION_CODE APN_ESIM_CONFIRMATION_CODE APN_ESIM_MATCHING_ID
+
+# One directory per invocation, created whether or not there is a secret to
+# carry: the watchdog needs somewhere to leave its verdict, and having one place
+# for everything this run owns means cleanup has one thing to remove rather than
+# a set that depends on which paths were taken.
+( umask 077 && mkdir -p "$RUNTIME_DIR" ) ||
+	fail "$EXIT_RETRYABLE" 'could not create the runtime directory'
+RUN_DIR="$RUNTIME_DIR/$$"
+( umask 077 && mkdir "$RUN_DIR" ) ||
+	fail "$EXIT_RETRYABLE" 'could not create the run directory'
+
+if [ -n "$secret_document" ]; then
+	( umask 077 && mkfifo "$RUN_DIR/params" ) ||
+		fail "$EXIT_RETRYABLE" 'could not create the secret channel'
+
+	printf '%s' "$secret_document" >"$RUN_DIR/params" &
+	WRITER_PID=$!
+	secret_document=
+
+	set -- "$@" -R 3
+fi
+
+# ---------------------------------------------------------------------------
+# Run it, bounded from outside.
+#
+# `timeout` is not assumed: a minimal image may not have it, and this wrapper is
+# the outer bound for a program whose own reads used to have none. When it is
+# absent a watchdog process does the same job. Either way the child is killed
+# and reaped by the traps, not left behind.
+# ---------------------------------------------------------------------------
+# Standard input is handed to the LPA explicitly, and that is not a tidiness
+# measure.
+#
+# POSIX says that when job control is disabled -- which it is in every script --
+# the standard input of an asynchronous command is assigned to /dev/null before
+# any explicit redirection. So `"$LPAC_BIN" "$@" &` gives the LPA an empty
+# standard input, and with `LPAC_APDU=stdio` the LPA reads end-of-file on its
+# first APDU reply and exits. C1 could not see this: it never ran a stdio
+# exchange, so every transport row was undriven and the bug shipped intact.
+#
+# The dup through a saved descriptor is the portable form. A bare `<&0` looks
+# equivalent and works under bash, but BusyBox ash still substitutes /dev/null
+# for it -- checked on the reference router on 2026-08-26 -- which would have
+# left this fixed on the development machine and broken on the target.
+#
+# The saved descriptor is closed in the child: the LPA has its standard input
+# and has no use for a second copy of it.
+exec 9<&0
+if [ -p "$RUN_DIR/params" ]; then
+	"$LPAC_BIN" "$@" <&9 9<&- 3<"$RUN_DIR/params" &
+else
+	"$LPAC_BIN" "$@" <&9 9<&- &
+fi
+CHILD_PID=$!
+exec 9<&-
+
+# `timeout` is the outer bound where the image has one; BusyBox provides the
+# applet, so a router normally does. A minimal image may not, and this wrapper is
+# the only bound for a program whose own reads had none until the patches this
+# package carries — so the fallback is a real watchdog rather than a warning in a
+# comment. Both paths are the same watchdog with a different sleeper, which is
+# one behaviour to reason about instead of two.
+#
+# The sleeper is the watchdog's own background child with a TERM trap, so
+# retiring the watchdog once the LPA has answered also retires the sleeper.
+# Killing the subshell alone leaves the sleeper to run out the whole budget and
+# charges every fast call its entire deadline.
+(
+	watchdog_sleep_pid=""
+	trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+
+	if command -v "$TIMEOUT" >/dev/null 2>&1; then
+		"$TIMEOUT" "$timeout_s" "$SLEEP" "$timeout_s" &
+	else
+		"$SLEEP" "$timeout_s" &
+	fi
+	watchdog_sleep_pid=$!
+	wait "$watchdog_sleep_pid" 2>/dev/null || :
+
+	kill -0 "$CHILD_PID" 2>/dev/null || exit 0
+
+	# Record the verdict before acting on it. The parent learns that the bound
+	# was taken by reading this, not by reading the watchdog's exit status:
+	# `wait` on the LPA returns the moment it is signalled, and the parent then
+	# retires a watchdog that is still in its grace period, which would discard
+	# the status precisely when it had something to say.
+	: >"$RUN_DIR/bound-exceeded" 2>/dev/null || :
+
+	kill -TERM "$CHILD_PID" 2>/dev/null || exit 0
+	"$SLEEP" 2 &
+	watchdog_sleep_pid=$!
+	wait "$watchdog_sleep_pid" 2>/dev/null || :
+	kill -KILL "$CHILD_PID" 2>/dev/null || :
+	exit 1
+) 2>/dev/null &
+WATCHDOG_PID=$!
+
+status=0
+wait "$CHILD_PID" || status=$?
+CHILD_PID=
+
+# Retire the watchdog. A watchdog that is still counting has concluded nothing,
+# and waiting for it would charge every fast call the whole budget.
+if kill -0 "$WATCHDOG_PID" 2>/dev/null; then
+	kill -TERM "$WATCHDOG_PID" 2>/dev/null || :
+fi
+wait "$WATCHDOG_PID" 2>/dev/null || :
+WATCHDOG_PID=
+
+# Report "we stopped it" as retryable rather than as whatever exit status a
+# killed child happened to produce. The two are different answers: 143 says the
+# LPA was terminated, and only this marker says it was terminated by us, for
+# taking too long.
+if [ -e "$RUN_DIR/bound-exceeded" ]; then
+	fail "$EXIT_RETRYABLE" "the LPA exceeded its ${timeout_s}s bound"
+fi
+
+exit "$status"

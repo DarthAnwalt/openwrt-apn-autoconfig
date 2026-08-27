@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Konstantin=20Sch=C3=B6ning?= <konstantin@lukianov.pp.ua>
+Date: Tue, 25 Aug 2026 23:56:33 +0200
+Subject: [PATCH] driver/at: bound every read with a deadline, and notice end
+ of file
+
+at_expect() read with fgets() in a while(1) and never checked the result.
+On a silent port that blocks forever. At end of file fgets() returns NULL
+and the loop re-examines the previous buffer contents, which spins.
+Neither is recoverable from inside the process, so a caller's only remedy
+was to kill it - a poor contract for a driver that may be holding a modem
+which is also carrying the uplink.
+
+Read a byte at a time behind poll(), with a deadline of 30 s per line by
+default and LPAC_APDU_AT_TIMEOUT_MS to override it. The stream is
+unbuffered - connect() calls setbuf(fuart, NULL) - so nothing can be
+sitting in stdio where poll() cannot see it, and EINTR is retried so a
+signal does not look like a failed read.
+
+An outer bound imposed by the caller is still right and still necessary.
+This is about not requiring one for the process to terminate at all.
+
+Upstream: https://github.com/estkme-group/lpac/pull/446
+          https://github.com/estkme-group/lpac/pull/448
+---
+ driver/apdu/at.c        | 75 ++++++++++++++++++++++++++++++++++++++++-
+ driver/apdu/at_common.h |  5 +++
+ 2 files changed, 79 insertions(+), 1 deletion(-)
+
+diff --git a/driver/apdu/at.c b/driver/apdu/at.c
+index 5dfa43d..35fe086 100644
+--- a/driver/apdu/at.c
++++ b/driver/apdu/at.c
+@@ -6,7 +6,9 @@
+ #include <lpac/utils.h>
+ 
+ #include <dirent.h>
++#include <errno.h>
+ #include <inttypes.h>
++#include <poll.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -55,7 +57,76 @@ static bool is_decimal_channel(const char *line) {
+     return true;
+ }
+ 
++// Read one line from the modem, or give up.
++//
++// fgets() on a serial port has no deadline and no way to be interrupted, and
++// its return value was not checked here: a silent port blocked this process
++// forever, and a port at end-of-file span on the previous buffer contents. A
++// caller cannot recover from either from the outside except by killing us,
++// which is a poor contract for a driver that may be holding a modem that is
++// also carrying the uplink.
++//
++// Read a byte at a time behind poll(). The stream is unbuffered - connect()
++// calls setbuf(fuart, NULL) - so no data can be sitting in stdio where poll
++// cannot see it.
++static int at_read_line(char *out, size_t out_size, int timeout_ms) {
++    const int fd = fileno(fuart);
++    size_t used = 0;
++
++    while (used + 1 < out_size) {
++        struct pollfd pfd = {.fd = fd, .events = POLLIN};
++        char c;
++        ssize_t got;
++        int ready = poll(&pfd, 1, timeout_ms);
++
++        if (ready < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (ready == 0) {
++            return -1; // deadline
++        }
++
++        got = read(fd, &c, 1);
++        if (got < 0) {
++            if (errno == EINTR) {
++                continue;
++            }
++            return -1;
++        }
++        if (got == 0) {
++            return -1; // end of file
++        }
++        if (c == '\n') {
++            break;
++        }
++        out[used++] = c;
++    }
++
++    out[used] = '\0';
++    return 0;
++}
++
++static int at_timeout_ms(void) {
++    const char *configured = getenv(ENV_AT_TIMEOUT_MS);
++    long parsed;
++    char *end = NULL;
++
++    if (configured == NULL || configured[0] == '\0') {
++        return AT_DEFAULT_TIMEOUT_MS;
++    }
++    parsed = strtol(configured, &end, 10);
++    if (end == configured || *end != '\0' || parsed <= 0 || parsed > 600000) {
++        return AT_DEFAULT_TIMEOUT_MS;
++    }
++    return (int)parsed;
++}
++
+ static int at_expect(char **response, const char *expected) {
++    const int timeout_ms = at_timeout_ms();
++
+     memset(buffer, 0, AT_BUFFER_SIZE);
+     last_unmatched[0] = '\0';
+ 
+@@ -63,7 +134,9 @@ static int at_expect(char **response, const char *expected) {
+         *response = NULL;
+ 
+     while (1) {
+-        fgets(buffer, AT_BUFFER_SIZE, fuart);
++        if (at_read_line(buffer, AT_BUFFER_SIZE, timeout_ms)) {
++            return -1;
++        }
+         buffer[strcspn(buffer, "\r\n")] = 0;
+         if (getenv_or_default(ENV_AT_DEBUG, false))
+             printf("AT_DEBUG: %s\n", buffer);
+diff --git a/driver/apdu/at_common.h b/driver/apdu/at_common.h
+index cb3c3f8..7e54e79 100644
+--- a/driver/apdu/at_common.h
++++ b/driver/apdu/at_common.h
+@@ -5,8 +5,13 @@
+ #define AT_BUFFER_SIZE 20480
+ #define AT_READ_BUFFER_SIZE 4096
+ 
++// Generous enough for a slow AT+CGLA during a profile download, short enough
++// that a wedged port is reported rather than waited on forever.
++#define AT_DEFAULT_TIMEOUT_MS 30000
++
+ #define ENV_AT_DEBUG APDU_ENV_NAME(AT, DEBUG)
+ #define ENV_AT_DEVICE APDU_ENV_NAME(AT, DEVICE)
+ #define ENV_AT_RESET_CHANNELS APDU_ENV_NAME(AT, RESET_CHANNELS)
++#define ENV_AT_TIMEOUT_MS APDU_ENV_NAME(AT, TIMEOUT_MS)
+ 
+ bool jprint_enumerate_devices(cJSON *data);

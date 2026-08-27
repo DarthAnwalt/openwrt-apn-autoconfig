@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# Narrow mutating entry point for rpcd/LuCI ACLs.
+#
+# One verb exists in this release: the read takeover, which is the consented,
+# bounded ModemManager inhibit that makes an otherwise unreachable eUICC
+# readable. Every profile operation is refused here as well as by the backend,
+# so a frontend that learns a verb name early cannot reach one.
+#
+# `--refresh` is deliberately absent from the read wrapper and present here:
+# bypassing the cache is a deliberate user action, never a poll.
+
+COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
+VERB="${1:-}"
+MODEM_ID="${2:-}"
+ENDPOINT_ID="${3:-}"
+[ "$#" -le 3 ] || exit 2
+
+for wrapper_argument in "$MODEM_ID" "$ENDPOINT_ID"; do
+	[ -n "$wrapper_argument" ] || exit 2
+	case "$wrapper_argument" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+	[ "${#wrapper_argument}" -le 200 ] || exit 2
+done
+
+case "$MODEM_ID$ENDPOINT_ID" in
+	LPA:*|*'$'*) exit 2 ;;
+esac
+
+case "$VERB" in
+	read-takeover)
+		exec "$COMMAND" action-start read-takeover --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID"
+	;;
+	*) exit 2 ;;
+esac

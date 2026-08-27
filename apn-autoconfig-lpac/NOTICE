@@ -1,0 +1,81 @@
+apn-autoconfig-lpac
+===================
+
+This package contains a build of lpac, an eUICC LPA written in C, together with
+a launcher written for this project.
+
+Upstream
+--------
+
+  lpac, by ESTKME TECHNOLOGY LIMITED, Hong Kong, and contributors
+  https://github.com/estkme-group/lpac
+
+  Pinned to tag v2.3.0, commit c2fcf5e4b21c712d54e35a11da2ad9ad134fb821,
+  source archive sha256
+  661dffbd1e9e5732dab4a0bb0a9837d4906c8c66bd748bda262fe3e8d3e420f6.
+
+  The pinned archive and every patch applied to it are installed under
+  /usr/share/apn-autoconfig-lpac/source, so the corresponding source for the
+  binary in this package is present on the device that runs it.
+
+Licences
+--------
+
+The lpac tree is not under a single licence, and describing it as "GPLv3" or as
+"AGPL-3.0-only LGPL-2.0-only" is inaccurate in both directions. REUSE.toml in
+the source archive is authoritative; inline SPDX headers override it per file.
+Both are installed beside this notice.
+
+  src/**, driver/**, utils/**   AGPL-3.0-only
+                                Copyright 2023-2025 ESTKME TECHNOLOGY LIMITED
+
+  driver/apdu/qmi*.[ch],        MIT, by inline SPDX header
+  driver/apdu/mbim*.[ch]
+
+  euicc/**                      LGPL-2.1-only OR LicenseRef-ESTKME-Commercial
+                                Copyright 2023-2025 ESTKME TECHNOLOGY LIMITED
+
+  cjson/**                      MIT
+                                Copyright 2009-2017 Dave Gamble and cJSON
+                                contributors
+
+  dlfcn-win32/**                MIT
+                                Copyright 2007 Ramiro Polla
+
+  CMakeLists.txt, cmake/**,     MIT
+  docs/**, README.md            Copyright 2023-2025 ESTKME TECHNOLOGY LIMITED
+
+CC0-1.0.txt is reproduced because it is present in the upstream LICENSES
+directory. At the pinned commit no annotation and no inline header refers to it.
+
+Downstream changes
+------------------
+
+Four patches, one per fix, each against the pinned commit:
+
+  0001  profile/download: accept the download parameters on an inherited
+        descriptor. No upstream counterpart.
+  0002  driver/at: accept a bare-decimal AT+CCHO response.
+        Upstream: https://github.com/estkme-group/lpac/pull/449
+  0003  driver/at: stop closing logical channels this process does not own.
+        No upstream counterpart.
+  0004  driver/at: bound every read with a deadline, and notice end of file.
+        Upstream: https://github.com/estkme-group/lpac/pull/446
+                  https://github.com/estkme-group/lpac/pull/448
+
+The build enables the AT and stdio APDU backends and the stdio HTTP backend.
+The curl HTTP backend and the uqmi APDU backend are not built.
+
+This project's own files
+------------------------
+
+  /usr/libexec/apn-autoconfig-lpac/lpac-run
+  /usr/share/apn-autoconfig-lpac/at-apdu-models
+
+  Copyright the apn-autoconfig contributors, MIT.
+  https://github.com/DarthAnwalt/openwrt-apn-autoconfig
+
+  These are aggregated with the AGPL runtime, not derived from it: the launcher
+  speaks to the LPA as a separate process, across the documented command line
+  and the stdio bridge protocol, which is the same arm's-length relationship the
+  official package's own /usr/bin/lpac wrapper has.

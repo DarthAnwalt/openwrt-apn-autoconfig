@@ -1,0 +1,39 @@
+#!/bin/sh
+
+# The background worker for one eSIM operation.
+#
+# It exists as its own file rather than as a subshell of the launcher for the
+# reason the modem coordinator's worker does: the launcher must return promptly
+# with an accepted/rejected answer, and the operation must outlive it. The
+# handoff is the start lock, whose ownership the launcher moves to this process
+# before it exits, so a status read in between still sees a live owner rather
+# than an abandoned operation.
+#
+# It carries no policy of its own. Every decision -- whether the takeover is
+# permitted, which endpoint it targets, what it may touch and what it must put
+# back -- belongs to the package binary, which this process re-enters. A worker
+# that decided anything would be a second place those rules lived.
+
+set -u
+
+COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
+
+MODEM_ID="${1:-}"
+ENDPOINT_ID="${2:-}"
+OPERATION_ID="${3:-}"
+STARTED="${4:-}"
+START_LOCK="${5:-}"
+
+[ -n "$MODEM_ID" ] || exit 2
+[ -n "$ENDPOINT_ID" ] || exit 2
+[ -n "$OPERATION_ID" ] || exit 2
+
+# The started timestamp and the start lock travel in the environment rather
+# than in arguments, because they are bookkeeping the operation publishes about
+# itself and neither is a target the command needs validated.
+APN_AUTOCONFIG_ESIM_STARTED="$STARTED"
+APN_AUTOCONFIG_ESIM_START_LOCK="$START_LOCK"
+export APN_AUTOCONFIG_ESIM_STARTED APN_AUTOCONFIG_ESIM_START_LOCK
+
+exec "$COMMAND" takeover-run \
+	--modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" --operation "$OPERATION_ID"

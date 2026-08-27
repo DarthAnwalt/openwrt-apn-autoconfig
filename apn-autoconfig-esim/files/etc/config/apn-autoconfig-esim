@@ -1,0 +1,33 @@
+config apn_autoconfig_esim 'main'
+	option state_dir '/var/run/apn-autoconfig-esim'
+	option lock_root '/var/lock/apn-autoconfig-esim'
+	option action_state_dir '/tmp/apn-autoconfig-esim-action'
+	# How long a read of an eUICC may be reused. Sixty seconds is chosen
+	# against the only thing that can invalidate an entry without this package
+	# seeing it: a change the operator pushed over RSP. Everything this package
+	# performs invalidates the entry itself, immediately and by name. Accepted
+	# only within 0 and 900; a value outside that range is a configuration
+	# error and the command fails rather than running with an unbounded cache.
+	# Zero disables reuse without disabling the cache's bookkeeping.
+	option esim_cache_ttl_seconds '60'
+	# The outer bound on a read takeover — the consented ModemManager inhibit.
+	# It is a watchdog, not a schedule: the inhibit lasts as long as the process
+	# holding it, and this is how long that process may live before it is
+	# terminated and the modem returned to ModemManager.
+	option esim_inhibit_max_seconds '180'
+	# Per-exchange bound on the AT transport under the bridge. One APDU is a
+	# single command and a single reply; a card that has not answered in this
+	# long is not going to.
+	option apdu_timeout_seconds '10'
+	# The whole of one LPA invocation, including every APDU exchange inside it.
+	option lpa_timeout_seconds '120'
+	# HTTPS to an SM-DP+, on behalf of the LPA. Certificate verification is not
+	# configurable here and there is no option that disables it.
+	option http_timeout_seconds '60'
+	# How long to wait for a lock before refusing. Contention is normal and
+	# brief: another component of this suite is reading identity over the same
+	# port, or the AT-dial protocol handler is holding it for a bring-up.
+	# Waiting is what keeps an ordinary overlap from surfacing as a failure.
+	# Zero refuses immediately. Failing to acquire is always a refusal and
+	# never a licence to use the port anyway.
+	option lock_wait_seconds '15'

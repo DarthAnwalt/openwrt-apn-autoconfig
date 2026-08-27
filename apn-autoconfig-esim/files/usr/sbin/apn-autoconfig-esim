@@ -1,0 +1,3522 @@
+#!/bin/sh
+
+# Read-only eUICC and slot inventory, and the transport that makes it real.
+# POSIX shell; intended for OpenWrt 25.12 and BusyBox ash.
+#
+# See docs/esim-contract-v1.md for the schema, the endpoint identity model, the
+# cache rules, the lock order and the matrix of what may be read while a bearer
+# is up. This script implements that document and settles nothing on its own.
+#
+# What it is not: it is not an LPA, and it is not a card tool. It resolves one
+# unambiguous target, decides whether that target may be spoken to at all, takes
+# the locks, and then drives a pinned LPA across a bridge it owns. Every refusal
+# lives above the LPA, because the LPA connects to the card before it parses its
+# own subcommand and therefore cannot carry one.
+
+umask 077
+
+PROG="apn-autoconfig-esim"
+CONFIG="apn-autoconfig-esim"
+
+TAB="$(printf '\t')"
+CR="$(printf '\r')"
+NEWLINE='
+'
+
+STATE_DIR="/var/run/apn-autoconfig-esim"
+LOCK_ROOT="/var/lock/apn-autoconfig-esim"
+ACTION_STATE_DIR="/tmp/apn-autoconfig-esim-action"
+# Levels 1, 2 and 4 of the lock order already exist and keep their exact
+# meanings and their exact paths. A fourth implementation of the same protocol
+# at a different path would exclude nothing, which is the whole point of
+# naming them here rather than inventing a namespace.
+APN_LOCK_DIR="/var/lock/apn-autoconfig.lock"
+MODEM_LOCK_ROOT="/var/lock/apn-autoconfig-modem"
+AT_PORT_LOCK_ROOT="/var/lock/apn-autoconfig-at-port"
+QMI_IDENTITY_LOCK_ROOT="/var/lock/apn-autoconfig-qmi-identity"
+
+MODEM_BIN="${APN_AUTOCONFIG_ESIM_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
+ACTION_WORKER="${APN_AUTOCONFIG_ESIM_ACTION_WORKER:-/usr/libexec/apn-autoconfig-esim-action}"
+LPAC_RUN="${APN_AUTOCONFIG_ESIM_LPAC_RUN:-/usr/libexec/apn-autoconfig-lpac/lpac-run}"
+LPAC_MODELS="${APN_AUTOCONFIG_LPAC_MODELS:-/usr/share/apn-autoconfig-lpac/at-apdu-models}"
+MMCLI="${APN_AUTOCONFIG_ESIM_MMCLI:-mmcli}"
+UBUS="${APN_AUTOCONFIG_ESIM_UBUS:-ubus}"
+CURL="${APN_AUTOCONFIG_ESIM_CURL:-curl}"
+SHA256="${APN_AUTOCONFIG_ESIM_SHA256:-sha256sum}"
+TIMEOUT="${APN_AUTOCONFIG_ESIM_TIMEOUT:-timeout}"
+# Resolved through an override so a fixture can give the watchdog a real sleep
+# while the rest of the suite keeps an instant mock. A watchdog that calls
+# `sleep` directly is disarmed by any harness that stubs it, and the bound it
+# claims to prove is then never taken. The reference router has no `timeout`
+# executable at all, so this is the only bound there is.
+SLEEP="${APN_AUTOCONFIG_ESIM_SLEEP:-sleep}"
+
+ESIM_CACHE_TTL_SECONDS="60"
+ESIM_INHIBIT_MAX_SECONDS="180"
+APDU_TIMEOUT_SECONDS="10"
+LPA_TIMEOUT_SECONDS="120"
+HTTP_TIMEOUT_SECONDS="60"
+# How long to wait for a lock before refusing. Contention is normal and brief --
+# another component of this suite is reading identity, or the AT-dial handler
+# holds the port for a bring-up -- and waiting is what keeps an ordinary overlap
+# from surfacing as a failure. Zero refuses immediately. Failing to acquire is
+# always a refusal and never a licence to proceed without the lock.
+LOCK_WAIT_SECONDS="15"
+
+# The same total the APN engine observes, for the same reason: rpcd SIGKILLs a
+# helper that outlives its exec budget, no trap covers that, and the page then
+# gets nothing at all instead of a document that says what is missing.
+READ_DEADLINE_SECONDS="${APN_AUTOCONFIG_READ_DEADLINE_SECONDS:-20}"
+RPCD_EXEC_BUDGET_SECONDS="${APN_AUTOCONFIG_RPCD_EXEC_BUDGET_SECONDS:-30}"
+READ_DEADLINE_AT=""
+READ_INCOMPLETE=0
+READ_INCOMPLETE_READS=""
+
+EXIT_USAGE=2
+EXIT_RETRYABLE=3
+EXIT_BLOCKED=4
+EXIT_PARTIAL=5
+
+COMMAND_NAME=""
+REQUESTED_MODEM=""
+REQUESTED_ENDPOINT=""
+REQUESTED_PROFILE=""
+REQUESTED_OPERATION=""
+REQUESTED_REFRESH=0
+REQUESTED_ACTION=""
+TARGET_LINE=""
+
+TMP_DIR="${APN_AUTOCONFIG_ESIM_TMP_DIR:-/tmp}"
+TMP_BASE="$TMP_DIR/$PROG.$$"
+SLOTS_FILE="$TMP_BASE.slots"
+LPA_OUTPUT_FILE="$TMP_BASE.lpa-output"
+BOUNDED_OUTPUT_FILE="$TMP_BASE.bounded"
+BOUNDED_TIMEOUT_MARKER="$TMP_BASE.bounded-timeout"
+HTTP_BODY_FILE="$TMP_BASE.http-body"
+HTTP_REPLY_FILE="$TMP_BASE.http-reply"
+HTTP_HEADER_FILE="$TMP_BASE.http-headers"
+# Every scratch suffix this process can create, in one list, because the exit
+# trap removes them by exact name and the sweep recognises a dead predecessor's
+# files by the same names. A suffix added to only one of the two leaks again.
+TMP_SUFFIXES="slots lpa-output bounded bounded-timeout http-body http-reply http-headers endpoints modem-lines slot-lines lpa-data lpa-profiles slots-indexed"
+
+BOUNDED_CHILD_PID=""
+BOUNDED_WATCHDOG_PID=""
+BOUNDED_TIMED_OUT=0
+
+# Locks held by this process, innermost last. Released in reverse.
+APN_LOCK_HELD=0
+APN_LOCK_BORROWED=0
+MODEM_LOCK_HELD=0
+MODEM_LOCK_PATH=""
+ENDPOINT_LOCK_HELD=0
+ENDPOINT_LOCK_PATH=""
+TRANSPORT_LOCK_HELD=0
+TRANSPORT_LOCK_PATH=""
+# The order in which they were actually acquired, so a fixture can assert the
+# order rather than grep the source for it.
+LOCK_TRACE_FILE="${APN_AUTOCONFIG_ESIM_LOCK_TRACE:-}"
+
+BRIDGE_RUN_DIR=""
+BRIDGE_CHILD_PID=""
+BRIDGE_AT_FD_OPEN=0
+BRIDGE_FIFO_FD_OPEN=0
+BRIDGE_CHANNEL=""
+
+# ---- logging and masking ----
+#
+# Masked to the last four characters, which is the convention `maskedIdentifier`
+# renders in LuCI and the one the contract publishes as `eid_suffix`. The
+# helper is duplicated rather than sourced because these packages ship
+# separately and share no library, exactly as `log` already is.
+
+mask_identifier() {
+	mask_value="${1:-}"
+	if [ -z "$mask_value" ]; then
+		printf '<unknown>'
+	elif [ "${#mask_value}" -le 4 ]; then
+		printf '...'
+	else
+		printf '...%s' "${mask_value#"${mask_value%????}"}"
+	fi
+}
+
+mask_modem_id() {
+	case "${1:-}" in
+		imei:*) printf 'imei:%s' "$(mask_identifier "${1#imei:}")" ;;
+		usb-serial:*) printf 'usb-serial:%s' "$(mask_identifier "${1#usb-serial:}")" ;;
+		'') printf '<unknown>' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+die() {
+	log err "$*"
+	exit 1
+}
+
+die_code() {
+	code="$1"
+	shift
+	log err "$*"
+	exit "$code"
+}
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+# ---- cleanup, armed before anything is created ----
+#
+# Order is the reverse of creation, and it is not a matter of taste. The LPA is
+# killed and reaped first because it is the thing holding a logical channel open
+# on the card; then the bridge's own descriptors and run directory; then the
+# locks, outermost last. A logical channel left open is the one piece of state
+# this script cannot repair afterwards.
+
+reap_child() {
+	[ -n "$1" ] || return 0
+	kill -0 "$1" 2>/dev/null || return 0
+	kill "-$2" "$1" 2>/dev/null || :
+	return 0
+}
+
+cleanup_bridge() {
+	if [ -n "$BRIDGE_CHILD_PID" ]; then
+		reap_child "$BRIDGE_CHILD_PID" TERM
+		"$SLEEP" 1 2>/dev/null || :
+		reap_child "$BRIDGE_CHILD_PID" KILL
+		wait "$BRIDGE_CHILD_PID" 2>/dev/null || :
+		BRIDGE_CHILD_PID=""
+	fi
+	# Closed after the LPA is gone: the LPA is the process on the other end, and
+	# closing underneath it turns an orderly disconnect into a broken pipe.
+	#
+	# Only when they were opened, and only inside a group. Both halves matter
+	# and both were learned the hard way. `exec 6>&-` on a descriptor that was
+	# never opened is an error, and an `exec` whose redirection fails ends a
+	# non-interactive shell -- so a cleanup that closed unconditionally died on
+	# its first step whenever the bridge had not started, leaving the inhibit
+	# taken and every lock held. And `exec 6>&- 2>/dev/null` applies *both*
+	# redirections to the shell, permanently, so the process loses its standard
+	# error for good and the failure is invisible while it happens.
+	if [ "$BRIDGE_FIFO_FD_OPEN" -eq 1 ]; then
+		{ exec 6>&-; } 2>/dev/null || :
+		{ exec 7<&-; } 2>/dev/null || :
+		BRIDGE_FIFO_FD_OPEN=0
+	fi
+	at_close_port
+	# Exact paths only. Never a wildcard, and never a recursive delete of a root
+	# this process did not create in this run.
+	if [ -n "$BRIDGE_RUN_DIR" ] && [ -d "$BRIDGE_RUN_DIR" ]; then
+		rm -f "$BRIDGE_RUN_DIR/to-lpa" 2>/dev/null || :
+		rm -f "$BRIDGE_RUN_DIR/from-lpa" 2>/dev/null || :
+		rmdir "$BRIDGE_RUN_DIR" 2>/dev/null || :
+		BRIDGE_RUN_DIR=""
+	fi
+}
+
+# Levels 4 and 3 only, in that order. A read-only transaction takes exactly
+# these, and an operation that took 1 and 2 before it is still standing on them
+# when the transaction inside it ends -- so the transaction may not release
+# them on its way out.
+release_read_locks() {
+	if [ -n "$TRANSPORT_LOCK_PATH" ]; then
+		[ "$TRANSPORT_LOCK_HELD" -eq 1 ] && lock_trace "release" "4-transport" "$TRANSPORT_LOCK_PATH"
+		lock_release_if_ours "$TRANSPORT_LOCK_PATH"
+		TRANSPORT_LOCK_HELD=0
+		TRANSPORT_LOCK_PATH=""
+	fi
+	if [ -n "$ENDPOINT_LOCK_PATH" ]; then
+		[ "$ENDPOINT_LOCK_HELD" -eq 1 ] && lock_trace "release" "3-endpoint" "$ENDPOINT_LOCK_PATH"
+		lock_release_if_ours "$ENDPOINT_LOCK_PATH"
+		ENDPOINT_LOCK_HELD=0
+		ENDPOINT_LOCK_PATH=""
+	fi
+	return 0
+}
+
+release_all_locks() {
+	# 4 -> 3 -> 2 -> 1, always.
+	release_read_locks
+	if [ -n "$MODEM_LOCK_PATH" ]; then
+		[ "$MODEM_LOCK_HELD" -eq 1 ] && lock_trace "release" "2-modem" "$MODEM_LOCK_PATH"
+		lock_release_if_ours "$MODEM_LOCK_PATH"
+		MODEM_LOCK_HELD=0
+		MODEM_LOCK_PATH=""
+	fi
+	# A borrower never releases what it borrowed, and the ownership check says
+	# so on its own: a borrowed lock records the lender's PID, not ours.
+	if [ "$APN_LOCK_BORROWED" -eq 0 ]; then
+		[ "$APN_LOCK_HELD" -eq 1 ] && lock_trace "release" "1-global" "$APN_LOCK_DIR"
+		lock_release_if_ours "$APN_LOCK_DIR"
+	fi
+	APN_LOCK_HELD=0
+	APN_LOCK_BORROWED=0
+}
+
+cleanup_files() {
+	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
+		reap_child "$BOUNDED_WATCHDOG_PID" TERM
+		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		BOUNDED_WATCHDOG_PID=""
+	fi
+	if [ -n "$BOUNDED_CHILD_PID" ]; then
+		reap_child "$BOUNDED_CHILD_PID" TERM
+		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		BOUNDED_CHILD_PID=""
+	fi
+	cleanup_bridge
+	takeover_rollback
+	for tmp_suffix in $TMP_SUFFIXES; do
+		rm -f "$TMP_BASE.$tmp_suffix"
+	done
+	release_all_locks
+}
+
+# No trap covers SIGKILL, so a scratch file can outlive the process that made
+# it: rpcd SIGKILLs a helper that exceeds its exec timeout and the OOM killer
+# asks nobody. Every path removed here is one this function rebuilt itself from
+# a validated PID and a known suffix; the glob only finds candidates, because
+# /tmp is shared and a wildcard removal there is what this project forbids.
+sweep_dead_scratch_files() {
+	case "$TMP_DIR" in /*) : ;; *) return 0 ;; esac
+	[ -d "$TMP_DIR" ] || return 0
+	sweep_count=0
+	for sweep_suffix in $TMP_SUFFIXES; do
+		for sweep_path in "$TMP_DIR/$PROG."[0-9]*".$sweep_suffix"; do
+			[ -e "$sweep_path" ] || continue
+			sweep_pid="${sweep_path##*/}"
+			sweep_pid="${sweep_pid#"$PROG."}"
+			sweep_pid="${sweep_pid%".$sweep_suffix"}"
+			case "$sweep_pid" in ''|*[!0-9]*) continue ;; esac
+			if [ "$sweep_pid" != "$$" ] && kill -0 "$sweep_pid" 2>/dev/null; then
+				continue
+			fi
+			[ -L "$sweep_path" ] && continue
+			[ -f "$sweep_path" ] || continue
+			rm -f "$TMP_DIR/$PROG.$sweep_pid.$sweep_suffix" || continue
+			sweep_count=$((sweep_count + 1))
+		done
+	done
+	[ "$sweep_count" -eq 0 ] || \
+		log notice "removed $sweep_count scratch file(s) left by an interrupted earlier run"
+}
+
+on_exit() {
+	on_exit_status=$?
+	# Kept where the cleanup can reach it. An operation that did not publish a
+	# result of its own has one written for it, and it must say how the process
+	# actually ended rather than assume a signal: "interrupted" with a hardcoded
+	# 143 hid a failure that was not a signal at all, and cost a hardware run to
+	# notice.
+	EXIT_STATUS_OBSERVED="$on_exit_status"
+	trap - 0 HUP INT TERM
+	# PIPE is ignored for the duration of the cleanup rather than restored: the
+	# reader that went away may have been reading standard error too, and a
+	# cleanup that logs its way back through an inhibit release must not be
+	# killed halfway by a second SIGPIPE.
+	trap '' PIPE
+	cleanup_files
+	exit "$on_exit_status"
+}
+
+# Which signal ended an operation is worth saying. An interrupted takeover
+# otherwise reports only that it was interrupted, and on a router the next
+# question is always "by what" -- a service stop, a reboot, an operator, or
+# something this process did to itself.
+on_signal() {
+	log warning "interrupted by SIG${1:-unknown}"
+	exit 143
+}
+
+# Every read gathers its whole answer before it writes the first byte, so a
+# reader that has already gone away kills this process at exactly the moment
+# when there is the most to put down. 141 is the status the default action
+# already produced, so no caller sees a new one; what changes is that the exit
+# trap runs.
+on_pipe() {
+	exit 141
+}
+
+trap on_exit 0
+trap 'on_signal HUP' HUP
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+trap on_pipe PIPE
+
+# ---- configuration ----
+
+load_config() {
+	command_exists uci || die "uci is required"
+	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.lock_root")" && [ -n "$value" ] && LOCK_ROOT="$value"
+	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.esim_cache_ttl_seconds")" && [ -n "$value" ] && ESIM_CACHE_TTL_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.esim_inhibit_max_seconds")" && [ -n "$value" ] && ESIM_INHIBIT_MAX_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.apdu_timeout_seconds")" && [ -n "$value" ] && APDU_TIMEOUT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.lpa_timeout_seconds")" && [ -n "$value" ] && LPA_TIMEOUT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.http_timeout_seconds")" && [ -n "$value" ] && HTTP_TIMEOUT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.lock_wait_seconds")" && [ -n "$value" ] && LOCK_WAIT_SECONDS="$value"
+	# The lock namespaces are shared with the other packages, so all of them
+	# must resolve identically or the lock silently stops excluding anything.
+	# Env, then UCI, then the built-in default, in that order, in every package.
+	value="$(uci -q get apn-autoconfig.main.lock_dir)" && [ -n "$value" ] && APN_LOCK_DIR="$value"
+	value="$(uci -q get apn-autoconfig-modem.main.lock_root)" && [ -n "$value" ] && MODEM_LOCK_ROOT="$value"
+	value="$(uci -q get apn-autoconfig.main.qmi_identity_lock_root)" && [ -n "$value" ] && QMI_IDENTITY_LOCK_ROOT="$value"
+	[ -n "${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-}" ] || {
+		value="$(uci -q get apn-autoconfig-modem.main.at_port_lock_root)" && [ -n "$value" ] && AT_PORT_LOCK_ROOT="$value"
+	}
+	[ -z "${APN_AUTOCONFIG_AT_PORT_LOCK_ROOT:-}" ] || AT_PORT_LOCK_ROOT="$APN_AUTOCONFIG_AT_PORT_LOCK_ROOT"
+	[ -n "${APN_AUTOCONFIG_READ_DEADLINE_SECONDS:-}" ] || {
+		value="$(uci -q get apn-autoconfig.main.read_deadline_seconds)" && [ -n "$value" ] && READ_DEADLINE_SECONDS="$value"
+	}
+}
+
+validate_config() {
+	for config_path in "$STATE_DIR" "$LOCK_ROOT" "$APN_LOCK_DIR" "$MODEM_LOCK_ROOT" \
+		"$AT_PORT_LOCK_ROOT" "$QMI_IDENTITY_LOCK_ROOT"; do
+		case "$config_path" in
+			/|*/../*|*/..) die "unsafe path in configuration: $config_path" ;;
+			/*) : ;;
+			*) die "configuration paths must be absolute: $config_path" ;;
+		esac
+	done
+	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
+	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
+	# Rejected rather than clamped. A cache lifetime outside the contract's
+	# range is a configuration that says the cache may do something it may not,
+	# and running anyway would be obeying it.
+	case "$ESIM_CACHE_TTL_SECONDS" in
+		''|*[!0-9]*) die_code "$EXIT_USAGE" "esim_cache_ttl_seconds must be a whole number of seconds" ;;
+	esac
+	[ "$ESIM_CACHE_TTL_SECONDS" -le 900 ] || \
+		die_code "$EXIT_USAGE" "esim_cache_ttl_seconds must be between 0 and 900"
+	case "$LOCK_WAIT_SECONDS" in
+		''|*[!0-9]*) die_code "$EXIT_USAGE" "lock_wait_seconds must be a non-negative integer" ;;
+	esac
+	for config_seconds in "$ESIM_INHIBIT_MAX_SECONDS" "$APDU_TIMEOUT_SECONDS" \
+		"$LPA_TIMEOUT_SECONDS" "$HTTP_TIMEOUT_SECONDS"; do
+		case "$config_seconds" in
+			''|*[!0-9]*) die_code "$EXIT_USAGE" "every timeout must be a whole number of seconds" ;;
+		esac
+		[ "$config_seconds" -gt 0 ] || \
+			die_code "$EXIT_USAGE" "every timeout must be greater than zero"
+	done
+}
+
+# ---- process and lock primitives ----
+#
+# A lock is a regular file whose first line is the owner PID. `ln` publishes the
+# name and the owner together in one atomic step, so a competitor can never
+# observe a created-but-unowned lock. This is the protocol in
+# docs/modem-contract-v1.md, unchanged and deliberately not reimplemented: a
+# fourth implementation is a fourth chance to get it wrong.
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+lock_owner_pid() {
+	if [ -d "$1" ]; then
+		lock_owner_value="$(sed -n '1p' "$1/pid" 2>/dev/null || :)"
+	else
+		lock_owner_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	fi
+	case "$lock_owner_value" in ''|*[!0-9]*|0) return 1 ;; esac
+	printf '%s\n' "$lock_owner_value"
+}
+
+# 0 acquired, 1 unusable path, 2 already present
+lock_try_acquire() {
+	acquire_path="$1"
+	[ -d "$acquire_path" ] && return 2
+	acquire_tmp="${acquire_path}.tmp.$$"
+	printf '%s\n' "$$" >"$acquire_tmp" 2>/dev/null || return 1
+	if ln "$acquire_tmp" "$acquire_path" 2>/dev/null; then
+		if [ -f "$acquire_path" ] && [ "$(sed -n '1p' "$acquire_path" 2>/dev/null)" = "$$" ]; then
+			rm -f "$acquire_tmp"
+			return 0
+		fi
+		rm -f "$acquire_path/${acquire_tmp##*/}" 2>/dev/null || :
+		rm -f "$acquire_tmp"
+		return 2
+	fi
+	rm -f "$acquire_tmp"
+	return 2
+}
+
+lock_release() {
+	[ -n "$1" ] || return 0
+	rm -f "$1" 2>/dev/null || :
+}
+
+# Hands an already-held lock to another process. rename(2) replaces the whole
+# file, so a concurrent reader sees either the old owner or the new one and
+# never an empty lock it could mistake for a crashed one. This is what makes
+# the launcher/worker handoff observable: the launcher exits, and a status read
+# in the gap before the worker writes its own state still finds a live owner.
+lock_set_owner() {
+	set_owner_path="$1"
+	set_owner_tmp="${set_owner_path}.own.$$"
+	printf '%s\n' "$2" >"$set_owner_tmp" 2>/dev/null || return 1
+	mv "$set_owner_tmp" "$set_owner_path" 2>/dev/null || {
+		rm -f "$set_owner_tmp"
+		return 1
+	}
+}
+
+# Releases a lock this process actually owns, judged by what the lock says
+# rather than by a variable this process set afterwards.
+#
+# The distinction is a real window, not a hypothetical one: acquiring records
+# the owner inside the lock and *then* returns, and the caller sets its "held"
+# flag after that. A signal arriving in between leaves a lock owned by this
+# process that no flag admits to holding, and cleanup keyed on the flag walks
+# past it. Keying on the recorded owner closes that window, and refusing to
+# remove a lock owned by anyone else is what keeps it from opening a worse one.
+lock_release_if_ours() {
+	[ -n "${1:-}" ] || return 0
+	release_owner="$(lock_owner_pid "$1" 2>/dev/null || :)"
+	[ "$release_owner" = "$$" ] || return 0
+	lock_release "$1"
+	return 0
+}
+
+lock_reclaim_if_stale() {
+	reclaim_path="$1"
+	reclaim_guard="${reclaim_path}.reclaim"
+	reclaim_guard_owner="$(lock_owner_pid "$reclaim_guard" 2>/dev/null || :)"
+	if [ -n "$reclaim_guard_owner" ] && ! process_is_alive "$reclaim_guard_owner"; then
+		rm -f "$reclaim_guard" 2>/dev/null || :
+	fi
+	lock_try_acquire "$reclaim_guard" || return 1
+	reclaim_result=1
+	reclaim_owner="$(lock_owner_pid "$reclaim_path" 2>/dev/null || :)"
+	if [ -n "$reclaim_owner" ] && process_is_alive "$reclaim_owner"; then
+		reclaim_result=1
+	elif [ -d "$reclaim_path" ]; then
+		rm -f "$reclaim_path/pid" 2>/dev/null || :
+		rmdir "$reclaim_path" 2>/dev/null && reclaim_result=0
+	else
+		rm -f "$reclaim_path" 2>/dev/null && reclaim_result=0
+	fi
+	rm -f "$reclaim_guard" 2>/dev/null || :
+	return "$reclaim_result"
+}
+
+# 0 acquired, 1 unusable path, 3 held by a live owner.
+lock_try_acquire_or_reclaim() {
+	attempt_path="$1"
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	attempt_owner="$(lock_owner_pid "$attempt_path" 2>/dev/null || :)"
+	if [ -n "$attempt_owner" ] && process_is_alive "$attempt_owner"; then
+		return 3
+	fi
+	lock_reclaim_if_stale "$attempt_path" || return 3
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	return 3
+}
+
+# Bounded wait, in whole seconds, for one lock. Failing to acquire is a refusal
+# and never a licence to proceed without it.
+lock_acquire_waiting() {
+	waiting_path="$1"
+	waiting_seconds="${2:-0}"
+	waiting_elapsed=0
+	while :; do
+		lock_try_acquire_or_reclaim "$waiting_path"
+		waiting_status=$?
+		[ "$waiting_status" -eq 0 ] && return 0
+		[ "$waiting_status" -eq 3 ] || return 1
+		[ "$waiting_elapsed" -lt "$waiting_seconds" ] || return 3
+		"$SLEEP" 1 2>/dev/null || return 3
+		waiting_elapsed=$((waiting_elapsed + 1))
+	done
+}
+
+# The acquisition and release order, recorded when a fixture asks for it. The
+# test plan requires the order to be asserted by order rather than by grepping
+# the source, and a claim about lock ordering that is checked by reading the
+# code is not checked at all.
+lock_trace() {
+	[ -n "$LOCK_TRACE_FILE" ] || return 0
+	printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >>"$LOCK_TRACE_FILE" 2>/dev/null || :
+}
+
+sanitize_token() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+safe_token() {
+	case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+	[ "${#1}" -le 200 ] || return 1
+	return 0
+}
+
+safe_single_line() {
+	case "$1" in *"$TAB"*) return 1 ;; esac
+	case "$1" in *"$CR"*) return 1 ;; esac
+	case "${1%"$NEWLINE"}" in *"$NEWLINE"*) return 1 ;; esac
+	return 0
+}
+
+# ---- the lock order ----
+#
+#   1. global APN/suite operation lock
+#   2. selected per-modem_id lock
+#   3. selected eUICC logical lock       (per endpoint_id)
+#   4. canonical control-transport lock  (the AT port lock, or the QMI/MBIM
+#                                         per-control-device identity lock)
+#
+# Level 3 is the only new one, and it sits between two adjacent existing levels
+# on purpose: every path in the tree today takes 1 -> 2 -> 4, or 4 alone, so
+# there is no pair that becomes acquirable in two orders. Do not move it.
+#
+# A read-only transaction that starts no operation and needs no ownership or
+# slot change takes levels 3 and 4 only, exactly as a read-only AT identity
+# transaction already takes the port lock alone. The global lock is still
+# system-wide, so requiring it for a read would report the eSIM area of one
+# modem busy whenever anything at all was running on the other.
+
+acquire_global_lock() {
+	# Borrowed on exactly the terms the existing packages use: the variable
+	# names a PID, the lock's recorded owner is exactly that PID, and that
+	# process is alive. The presence of the variable is not ownership and the
+	# presence of the lock file is not ownership.
+	if [ -n "${APN_AUTOCONFIG_LOCK_OWNER_PID:-}" ]; then
+		case "$APN_AUTOCONFIG_LOCK_OWNER_PID" in
+			''|*[!0-9]*|0) : ;;
+			*)
+				borrowed_owner="$(lock_owner_pid "$APN_LOCK_DIR" 2>/dev/null || :)"
+				if [ "$borrowed_owner" = "$APN_AUTOCONFIG_LOCK_OWNER_PID" ] && \
+					process_is_alive "$borrowed_owner"; then
+					APN_LOCK_HELD=1
+					APN_LOCK_BORROWED=1
+					lock_trace "borrow" "1-global" "$APN_LOCK_DIR"
+					return 0
+				fi
+			;;
+		esac
+		return 3
+	fi
+	mkdir -p "$(dirname "$APN_LOCK_DIR")" 2>/dev/null || :
+	lock_acquire_waiting "$APN_LOCK_DIR" "${1:-0}" || return 3
+	APN_LOCK_HELD=1
+	APN_LOCK_BORROWED=0
+	lock_trace "acquire" "1-global" "$APN_LOCK_DIR"
+	return 0
+}
+
+acquire_modem_lock() {
+	# The coordinator's own namespace and its own key derivation, so this lock
+	# and the coordinator's are the same lock rather than two names for one
+	# modem.
+	MODEM_LOCK_PATH="${MODEM_LOCK_ROOT}.$(sanitize_token "$1")"
+	mkdir -p "$(dirname "$MODEM_LOCK_ROOT")" 2>/dev/null || :
+	lock_acquire_waiting "$MODEM_LOCK_PATH" "${2:-0}" || { MODEM_LOCK_PATH=""; return 3; }
+	MODEM_LOCK_HELD=1
+	lock_trace "acquire" "2-modem" "$MODEM_LOCK_PATH"
+	return 0
+}
+
+acquire_endpoint_lock() {
+	# Keyed by the chip, not by the slot: one eUICC moved between two modems is
+	# one lock wherever it is, and two modems each holding their own eUICC do
+	# not serialise against each other. A slot-weak endpoint still takes a lock,
+	# under its `slot:` handle, because a read of it is still an exclusive
+	# transaction — a lock on a position, which is honest about what it is.
+	ENDPOINT_LOCK_PATH="${LOCK_ROOT}.endpoint.$(sanitize_token "$1")"
+	mkdir -p "$(dirname "$LOCK_ROOT")" 2>/dev/null || :
+	lock_acquire_waiting "$ENDPOINT_LOCK_PATH" "${2:-0}" || { ENDPOINT_LOCK_PATH=""; return 3; }
+	ENDPOINT_LOCK_HELD=1
+	lock_trace "acquire" "3-endpoint" "$ENDPOINT_LOCK_PATH"
+	return 0
+}
+
+acquire_transport_lock() {
+	# Shared, not merely equivalent. An APDU exchange on /dev/ttyUSB2 must
+	# exclude the AT identity reader on the same node, so this is the namespace
+	# that reader already uses, resolved the same way. A second namespace at the
+	# same path would exclude nothing at all.
+	transport_kind="$1"
+	transport_device="$2"
+	case "$transport_kind" in
+		at)
+			transport_name="${transport_device#/dev/}"
+			# The property being enforced is that the lock name is one simple
+			# path component under a device root, so a name can never build a
+			# path anywhere else. It is deliberately not the list of names the
+			# modem package discovers: which ports exist is that package's
+			# decision, taken from sysfs, and this one's job is to lock the port
+			# it was handed -- in the namespace the AT identity reader already
+			# uses, derived the same way, or the lock excludes nothing.
+			case "$transport_name" in
+				*/*|*..*|'') return 1 ;;
+				tty*) : ;;
+				*) return 1 ;;
+			esac
+			TRANSPORT_LOCK_PATH="${AT_PORT_LOCK_ROOT}.${transport_name}"
+		;;
+		qmi|mbim)
+			transport_name="${transport_device#/dev/}"
+			case "$transport_name" in
+				cdc-wdm[0-9]*) : ;;
+				*) return 1 ;;
+			esac
+			TRANSPORT_LOCK_PATH="${QMI_IDENTITY_LOCK_ROOT}.${transport_name}"
+		;;
+		*) return 1 ;;
+	esac
+	mkdir -p "$(dirname "$TRANSPORT_LOCK_PATH")" 2>/dev/null || :
+	lock_acquire_waiting "$TRANSPORT_LOCK_PATH" "${3:-0}" || { TRANSPORT_LOCK_PATH=""; return 3; }
+	TRANSPORT_LOCK_HELD=1
+	lock_trace "acquire" "4-transport" "$TRANSPORT_LOCK_PATH"
+	return 0
+}
+
+# ---- JSON and record helpers ----
+
+json_escape() {
+	awk 'BEGIN { ORS="" }
+	{
+		if (NR > 1) printf "\\n"
+		gsub(/\\/, "\\\\")
+		gsub(/"/, "\\\"")
+		gsub(/\t/, "\\t")
+		gsub(/\r/, "\\r")
+		printf "%s", $0
+	}'
+}
+
+json_string() {
+	case "$1" in
+		*\\*|*\"*|*"$TAB"*|*"$CR"*|*"$NEWLINE"*)
+			printf '"'
+			printf '%s' "$1" | json_escape
+			printf '"'
+		;;
+		*) printf '"%s"' "$1" ;;
+	esac
+}
+
+json_key_string() {
+	printf '"%s":' "$1"
+	json_string "$2"
+}
+
+json_key_boolean() {
+	printf '"%s":%s' "$1" "$([ "$2" = 1 ] || [ "$2" = true ] && printf true || printf false)"
+}
+
+json_key_number() {
+	case "$2" in
+		''|*[!0-9-]*) printf '"%s":null' "$1" ;;
+		*) printf '"%s":%s' "$1" "$2" ;;
+	esac
+}
+
+# Tab-delimited records legitimately contain empty fields, and POSIX `read`
+# collapses runs of IFS whitespace, so a multi-variable read would silently
+# misalign them. Everything here splits on the separator explicitly.
+field() {
+	field_rest="$1"
+	field_index="$2"
+	while [ "$field_index" -gt 1 ]; do
+		case "$field_rest" in
+			*"$TAB"*) field_rest="${field_rest#*"$TAB"}" ;;
+			*) printf '\n'; return 0 ;;
+		esac
+		field_index=$((field_index - 1))
+	done
+	printf '%s\n' "${field_rest%%"$TAB"*}"
+}
+
+# ---- bounded external commands ----
+#
+# A backend's own timeout option is not proof that its process cannot hang, and
+# the reference router has no `timeout` executable at all — not in PATH and not
+# as a BusyBox applet. On that board this watchdog is the only bound there is,
+# so it gets the same care as the branch that has one.
+
+run_bounded_to_file() {
+	seconds="$1"
+	output_file="$2"
+	shift 2
+	BOUNDED_TIMED_OUT=0
+	if command_exists "$TIMEOUT"; then
+		bounded_status=0
+		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null || bounded_status=$?
+		[ "$bounded_status" -ne 124 ] || BOUNDED_TIMED_OUT=1
+		return "$bounded_status"
+	fi
+	# The verdict travels in a marker file rather than in the child's exit
+	# status, because a child killed by the watchdog reports 143 exactly like a
+	# child killed by an external TERM, and a caller that must tell "it hung"
+	# from "it answered with an error" cannot work from 143.
+	rm -f "$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
+	"$@" >"$output_file" 2>/dev/null &
+	BOUNDED_CHILD_PID=$!
+	# The sleeper is the watchdog's own background child with a TERM trap, so
+	# retiring the watchdog once the call has answered also retires the sleeper.
+	# Killing the subshell alone leaves the sleeper to run out the whole budget
+	# and charges every fast call its entire deadline.
+	(
+		watchdog_sleep_pid=""
+		trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		"$SLEEP" "$seconds" &
+		watchdog_sleep_pid=$!
+		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
+		: >"$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
+		"$SLEEP" 1 &
+		watchdog_sleep_pid=$!
+		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
+		kill -9 "$BOUNDED_CHILD_PID" 2>/dev/null || :
+	) >/dev/null 2>&1 &
+	BOUNDED_WATCHDOG_PID=$!
+	bounded_status=0
+	wait "$BOUNDED_CHILD_PID" 2>/dev/null || bounded_status=$?
+	BOUNDED_CHILD_PID=""
+	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	BOUNDED_WATCHDOG_PID=""
+	if [ -e "$BOUNDED_TIMEOUT_MARKER" ]; then
+		rm -f "$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
+		BOUNDED_TIMED_OUT=1
+		return 124
+	fi
+	return "$bounded_status"
+}
+
+# ---- the read-path deadline ----
+#
+# The same total the APN engine observes, on the same terms: a call gets the
+# lesser of its own bound and the time remaining, a call with no time remaining
+# is not attempted at all, and the command still returns a well-formed document
+# saying what it abandoned.
+
+read_deadline_arm() {
+	case "$READ_DEADLINE_SECONDS" in
+		''|*[!0-9]*) die "read_deadline_seconds must be a whole number of seconds" ;;
+	esac
+	case "$RPCD_EXEC_BUDGET_SECONDS" in
+		''|*[!0-9]*) die "the rpcd exec budget must be a whole number of seconds" ;;
+	esac
+	[ "$READ_DEADLINE_SECONDS" -gt 0 ] || die "read_deadline_seconds must be greater than zero"
+	[ "$READ_DEADLINE_SECONDS" -lt "$RPCD_EXEC_BUDGET_SECONDS" ] || \
+		die "read_deadline_seconds ${READ_DEADLINE_SECONDS} must stay below the ${RPCD_EXEC_BUDGET_SECONDS}s rpcd exec budget it exists to fit inside"
+	READ_DEADLINE_AT=$(($(date +%s) + READ_DEADLINE_SECONDS))
+}
+
+read_deadline_remaining() {
+	deadline_remaining=$((READ_DEADLINE_AT - $(date +%s)))
+	[ "$deadline_remaining" -gt 0 ] || deadline_remaining=0
+	printf '%s\n' "$deadline_remaining"
+}
+
+# Named once however often the same reading is retried: the document lists what
+# could not be read, not how many times it was attempted.
+read_abandon() {
+	case " $READ_INCOMPLETE_READS " in *" $1 "*) return 0 ;; esac
+	READ_INCOMPLETE_READS="${READ_INCOMPLETE_READS:+$READ_INCOMPLETE_READS }$1"
+	READ_INCOMPLETE=1
+	case "${2:-deadline}" in
+		deadline) log warning "the read deadline of ${READ_DEADLINE_SECONDS}s was reached; abandoned $1" ;;
+		*) log warning "$1 ran out of its own time budget and was abandoned" ;;
+	esac
+}
+
+read_was_abandoned() {
+	case " $READ_INCOMPLETE_READS " in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+run_read_bounded() {
+	read_label="$1"
+	read_budget="$2"
+	read_output="$3"
+	shift 3
+	read_clipped=0
+	if [ -n "$READ_DEADLINE_AT" ]; then
+		read_remaining="$(read_deadline_remaining)"
+		if [ "$read_remaining" -le 0 ]; then
+			read_abandon "$read_label"
+			return 124
+		fi
+		if [ -z "$read_budget" ] || [ "$read_remaining" -lt "$read_budget" ]; then
+			read_budget="$read_remaining"
+			read_clipped=1
+		fi
+	fi
+	if [ -z "$read_budget" ]; then
+		"$@" >"$read_output" 2>/dev/null
+		return
+	fi
+	read_status=0
+	run_bounded_to_file "$read_budget" "$read_output" "$@" || read_status=$?
+	if [ -n "$READ_DEADLINE_AT" ] && [ "$read_status" -ne 0 ]; then
+		case "$read_status" in
+			124|137|143)
+				if [ "$read_clipped" -eq 1 ]; then
+					read_abandon "$read_label" deadline
+				else
+					read_abandon "$read_label" budget
+				fi
+			;;
+		esac
+	fi
+	return "$read_status"
+}
+
+# Printed only when something was abandoned, so a document from a backend that
+# answered is byte-for-byte what the same version produced with no deadline
+# armed.
+print_incomplete_fields() {
+	[ "$READ_INCOMPLETE" -eq 1 ] || return 0
+	printf ',"incomplete":true,"incomplete_reads":['
+	incomplete_separator=""
+	for incomplete_name in $READ_INCOMPLETE_READS; do
+		printf '%s' "$incomplete_separator"
+		json_string "$incomplete_name"
+		incomplete_separator=','
+	done
+	printf ']'
+}
+
+# ---- endpoint identity ----
+#
+# Two evidence tiers, strongest first, in the same shape as the modem
+# contract's three:
+#
+#   eid        the EID was read from the eUICC during the current attachment
+#              generation and normalises to exactly 32 decimal digits. An eUICC
+#              carries the same EID in any slot of any modem, so a removable
+#              card that moved is recognised as the same endpoint.
+#   slot-weak  a slot reports an eUICC and no EID has been read from it. This is
+#              a position, not a chip, and no mutation may target one.
+#
+# Normalisation is exact and is part of the contract, because two spellings of
+# one identifier would be two endpoints. A value that does not normalise is not
+# evidence and does not downgrade to a guess.
+
+normalise_eid() {
+	normalise_value="$(printf '%s' "${1:-}" | tr -d ' \t\r\n')"
+	case "$normalise_value" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#normalise_value}" -eq 32 ] || return 1
+	printf '%s\n' "$normalise_value"
+}
+
+normalise_iccid() {
+	normalise_value="$(printf '%s' "${1:-}" | tr -d ' \t\r\n')"
+	# A single trailing F is padding, and exactly one is dropped.
+	case "$normalise_value" in *[Ff]) normalise_value="${normalise_value%?}" ;; esac
+	case "$normalise_value" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#normalise_value}" -ge 18 ] && [ "${#normalise_value}" -le 20 ] || return 1
+	printf '%s\n' "$normalise_value"
+}
+
+# The handle, and why it is not the identifier.
+#
+# An operation must name its endpoint on a command line and /proc/<pid>/cmdline
+# is world-readable, so a handle that contained the EID would put it there on
+# every read the page performs, and then in every operation state file, every
+# diagnostic bundle and every log line naming an operation. The first 64 bits of
+# the SHA-256 carry none of it and are otherwise as good: deterministic, stable
+# for as long as the eUICC exists, and recomputable by anyone holding the EID.
+#
+# There is deliberately no per-router salt. A salt would resist an offline
+# search and would add a persistent file whose loss silently renames every
+# endpoint and orphans every per-endpoint override — a worse failure than the
+# one it prevents, against an attacker who does not need to attack.
+handle_for_identifier() {
+	# The value reaches sha256sum on standard input, never in an argument.
+	handle_digest="$(printf '%s' "$1" | "$SHA256" 2>/dev/null | sed -n '1s/^\([0-9a-f]*\).*/\1/p')"
+	case "$handle_digest" in
+		''|*[!0-9a-f]*) return 1 ;;
+	esac
+	[ "${#handle_digest}" -ge 16 ] || return 1
+	printf '%s\n' "$(printf '%s' "$handle_digest" | cut -c1-16)"
+}
+
+endpoint_handle_from_eid() {
+	handle_value="$(handle_for_identifier "$1")" || return 1
+	printf 'eid:%s\n' "$handle_value"
+}
+
+profile_handle_from_iccid() {
+	handle_value="$(handle_for_identifier "$1")" || return 1
+	printf 'iccid:%s\n' "$handle_value"
+}
+
+slot_weak_handle() {
+	printf 'slot:%s:%s\n' "$1" "$2"
+}
+
+suffix_of() {
+	suffix_value="${1:-}"
+	[ "${#suffix_value}" -gt 4 ] || { printf ''; return 0; }
+	printf '%s' "${suffix_value#"${suffix_value%????}"}"
+}
+
+# ---- the modem record this package consumes ----
+#
+# Identity, ownership, transport candidates and the slot table all come from
+# `apn-autoconfig-modem sim-slots`, which is a v1 key/value document in the
+# same shape as `attachment` and `at-identity`. Reading a sibling package's
+# JSON from a shell script would need a JSON parser; reading its key/value
+# document needs the field extractor that is already here.
+#
+# What it deliberately does not carry is a raw EID. The modem package publishes
+# `eid_known` and a four-character suffix, and every raw read of the identifier
+# happens here, in the one package that is allowed to hold it.
+
+load_modem_records() {
+	: >"$SLOTS_FILE"
+	command_exists "$MODEM_BIN" || {
+		[ -x "$MODEM_BIN" ] || return 1
+	}
+	slots_status=0
+	if [ -n "${1:-}" ]; then
+		run_read_bounded slot-status 10 "$SLOTS_FILE" "$MODEM_BIN" sim-slots --modem "$1" || slots_status=$?
+	else
+		run_read_bounded slot-status 10 "$SLOTS_FILE" "$MODEM_BIN" sim-slots || slots_status=$?
+	fi
+	[ "$slots_status" -eq 0 ] || return 1
+	[ -s "$SLOTS_FILE" ] || return 1
+	case "$(sed -n '1p' "$SLOTS_FILE")" in
+		v1) : ;;
+		*) return 1 ;;
+	esac
+	index_modem_sections
+	return 0
+}
+
+# Sections are addressed by position, not by `modem_id`, and that is the whole
+# point of this indexing step.
+#
+# Two modems can legitimately carry the same identity -- that is precisely what
+# `weak-vidpid` ambiguity is -- and a lookup keyed by the identity then returns
+# both sections joined together. The endpoints of one modem would be attributed
+# to the other, and every slot would be enumerated once per modem sharing the
+# id. Position is unique by construction.
+SLOTS_INDEXED_FILE=""
+
+index_modem_sections() {
+	SLOTS_INDEXED_FILE="$TMP_BASE.slots-indexed"
+	awk -F '\t' -v OFS='\t' '
+		$1 == "modem" { index_number++ }
+		{ print index_number, $0 }
+	' "$SLOTS_FILE" >"$SLOTS_INDEXED_FILE" 2>/dev/null || :
+}
+
+# Every `modem` line, prefixed with its section index, in document order.
+modem_record_lines() {
+	awk -F '\t' '$2 == "modem" { print }' "$SLOTS_INDEXED_FILE" 2>/dev/null || :
+}
+
+# The lines belonging to the section at one position: its `modem` line and
+# everything up to the next one, with the index prefix removed.
+modem_section_at() {
+	awk -F '\t' -v want="$1" '
+		$1 != want { next }
+		{ sub(/^[0-9]*\t/, ""); print }
+	' "$SLOTS_INDEXED_FILE" 2>/dev/null || :
+}
+
+# Field <3> of the first line of section <1> whose first field is <2>.
+#
+# Pure shell, with no pipeline, and that is not a micro-optimisation. The form
+# this replaces was `printf '%s\n' "$section" | awk '... { print; exit }'`, and
+# an awk that exits on the first match closes the pipe while the shell is still
+# writing the rest of the section -- so the writing side takes an EPIPE, which
+# with a PIPE trap installed becomes a "write error: Broken pipe" on standard
+# error in the middle of an otherwise correct read. A section is a dozen short
+# lines, so walking it costs less than the two forks it removes anyway.
+section_field() {
+	section_rest="$1"
+	section_key="$2"
+	section_index="$3"
+	while [ -n "$section_rest" ]; do
+		section_line="${section_rest%%"$NEWLINE"*}"
+		case "$section_rest" in
+			*"$NEWLINE"*) section_rest="${section_rest#*"$NEWLINE"}" ;;
+			*) section_rest="" ;;
+		esac
+		[ -n "$section_line" ] || continue
+		[ "${section_line%%"$TAB"*}" = "$section_key" ] || continue
+		field "$section_line" "$section_index"
+		return 0
+	done
+	printf '\n'
+	return 0
+}
+
+section_value() {
+	section_field "$1" "$2" 2
+}
+
+# The `device` line for one role, which needs a match on two fields rather than
+# one.
+section_device() {
+	section_rest="$1"
+	section_role="$2"
+	while [ -n "$section_rest" ]; do
+		section_line="${section_rest%%"$NEWLINE"*}"
+		case "$section_rest" in
+			*"$NEWLINE"*) section_rest="${section_rest#*"$NEWLINE"}" ;;
+			*) section_rest="" ;;
+		esac
+		[ -n "$section_line" ] || continue
+		[ "${section_line%%"$TAB"*}" = device ] || continue
+		[ "$(field "$section_line" 2)" = "$section_role" ] || continue
+		field "$section_line" 3
+		return 0
+	done
+	printf '\n'
+	return 0
+}
+
+# ---- the AT transport under the bridge ----
+#
+# The five APDU operations the LPA asks for, carried over a modem's AT control
+# port by this package rather than by the LPA. lpac's own AT backend opens the
+# device itself, holds no lock and probes `AT+CCHO=?` on whatever node it was
+# handed, which is the probe that wedged a SIM upstream; with `LPAC_APDU=stdio`
+# it opens nothing at all and the choice of how those operations reach the card
+# becomes ours — made by code that has already done owner discovery, already
+# holds the right lock and already bounds every exchange.
+#
+# The port is opened read/write on one descriptor and held for the whole
+# session. `sms_tool` is deliberately not used: it re-opens the port per
+# command, which cannot hold a logical channel open across the many exchanges
+# one ES10 read takes.
+
+AT_TRANSPORT_DEVICE=""
+AT_REPLY=""
+AT_STATUS_LINE=""
+
+# `read -t` is the per-exchange bound, so a shell without it has no bound at
+# all. That is a refusal rather than an unbounded read.
+at_read_timeout_supported() {
+	printf 'x\n' | { IFS= read -t 1 -r at_probe_line; } 2>/dev/null
+}
+
+at_open_port() {
+	AT_TRANSPORT_DEVICE="$1"
+	# A regular file or a pipe is not a control port. The check stays here
+	# rather than in the caller because this is the only place that opens one.
+	[ -c "$AT_TRANSPORT_DEVICE" ] || return 1
+	# The braces are load-bearing. `exec 8<>dev 2>/dev/null` applies *both*
+	# redirections to the shell itself and permanently: every later diagnostic,
+	# every `log` line and every message from a failing command would go to
+	# /dev/null for the rest of the process, silently. Grouping scopes the
+	# stderr redirection to the group while fd 8 still lands on the shell,
+	# which is the asymmetry that makes this work.
+	{ exec 8<>"$AT_TRANSPORT_DEVICE"; } 2>/dev/null || return 1
+	BRIDGE_AT_FD_OPEN=1
+	return 0
+}
+
+at_close_port() {
+	[ "$BRIDGE_AT_FD_OPEN" -eq 1 ] || return 0
+	{ exec 8<&-; } 2>/dev/null || :
+	BRIDGE_AT_FD_OPEN=0
+	AT_TRANSPORT_DEVICE=""
+	return 0
+}
+
+# Is the port that is open on descriptor 8 this modem's command channel?
+#
+# Two questions, in the order the modem contract asks them: does the node speak
+# AT at all, and is it the control channel rather than a GNSS, debug or
+# diagnostic port that also answers. A port that returns OK to a bare AT and
+# nothing resembling a model is the second kind.
+at_probe_control_port() {
+	at_drain
+	at_exchange 'ATE0' >/dev/null 2>&1 || :
+	at_exchange 'AT' || return 1
+	at_exchange 'AT+CGMM' || return 1
+	probe_model="$(at_reply_line 1)"
+	[ -n "$probe_model" ] || return 1
+	case "$probe_model" in *[A-Za-z0-9]*) return 0 ;; esac
+	return 1
+}
+
+at_drain() {
+	# Whatever the port had to say before we asked. A reply stream that starts
+	# with somebody else's unsolicited notification is a reply stream that is
+	# already one message out of step.
+	while IFS= read -t 1 -r at_drain_line <&8; do
+		[ -n "$at_drain_line" ] || continue
+	done 2>/dev/null || :
+	return 0
+}
+
+# Sends one command and collects the reply up to its final result code.
+#
+# Returns 0 with AT_REPLY holding the informational lines and AT_STATUS_LINE the
+# final code, 124 when the bound expired, and 1 when the port gave a final code
+# that is not OK.
+at_exchange() {
+	at_command="$1"
+	AT_REPLY=""
+	AT_STATUS_LINE=""
+	printf '%s\r' "$at_command" >&8 2>/dev/null || return 1
+	at_deadline_seconds="$APDU_TIMEOUT_SECONDS"
+	while IFS= read -t "$at_deadline_seconds" -r at_line <&8; do
+		at_line="$(printf '%s' "$at_line" | tr -d '\r')"
+		# The echo of the command itself, which a port whose echo is still on
+		# returns first. Echo is a per-port property, not a per-modem one, so it
+		# cannot be decided once for the device and then assumed.
+		[ "$at_line" = "$at_command" ] && continue
+		[ -z "$at_line" ] && continue
+		case "$at_line" in
+			OK)
+				AT_STATUS_LINE="$at_line"
+				return 0
+			;;
+			ERROR|+CME\ ERROR:*|+CMS\ ERROR:*)
+				AT_STATUS_LINE="$at_line"
+				return 1
+			;;
+		esac
+		AT_REPLY="${AT_REPLY}${AT_REPLY:+$NEWLINE}${at_line}"
+	done
+	return 124
+}
+
+at_reply_line() {
+	printf '%s\n' "$AT_REPLY" | sed -n "${1}p"
+}
+
+# `AT+CCHO="<AID>"` answers with the session id of the channel it opened.
+# Upstream accepts only a `+CCHO: `-prefixed reply; the FM350-GL answers with a
+# bare decimal, which is one of the two reasons the pinned LPA carries patches.
+# The bridge parses both, because it is the side that reads the port now.
+at_parse_channel() {
+	parse_value="$(printf '%s' "$1" | tr -d ' \t\r')"
+	case "$parse_value" in
+		+CCHO:*) parse_value="${parse_value#+CCHO:}" ;;
+	esac
+	case "$parse_value" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$parse_value" -ge 1 ] && [ "$parse_value" -le 19 ] || return 1
+	printf '%s\n' "$parse_value"
+}
+
+# `+CGLA: <length>,"<hex>"`. The length is the count of hex characters, and a
+# reply whose declared length disagrees with what arrived is a truncated read
+# rather than a short answer.
+at_parse_cgla() {
+	parse_line="$(printf '%s' "$1" | tr -d ' \t\r')"
+	case "$parse_line" in
+		+CGLA:*) parse_line="${parse_line#+CGLA:}" ;;
+		*) return 1 ;;
+	esac
+	parse_length="${parse_line%%,*}"
+	case "$parse_length" in ''|*[!0-9]*) return 1 ;; esac
+	parse_data="${parse_line#*,}"
+	# The payload is normally quoted; some firmware omits the quotes.
+	parse_data="${parse_data#\"}"
+	parse_data="${parse_data%\"}"
+	case "$parse_data" in ''|*[!0-9A-Fa-f]*) return 1 ;; esac
+	[ "${#parse_data}" -eq "$parse_length" ] || return 1
+	printf '%s\n' "$parse_data"
+}
+
+# ---- the stdio bridge ----
+#
+# Both of lpac's stdio backends share one channel — this process's pipe to the
+# LPA's standard input and output — dispatched on the JSON `type` field, one
+# object per line. There is no second pipe to separate them, which is why the
+# secret channel is a *separate* inherited descriptor and why nothing here may
+# assume standard input is free.
+#
+# Message shapes, from lpac 2.3.0 `driver/apdu/stdio.c` and
+# `driver/http/stdio.c`:
+#
+#   out  {"type":"apdu","payload":{"func":"connect","param":null}}
+#   in   {"type":"apdu","payload":{"ecode":0,"data":"9000"}}
+#   out  {"type":"http","payload":{"url":"...","tx":"...","headers":[...]}}
+#   in   {"type":"http","payload":{"rcode":200,"rx":"..."}}
+#   out  {"type":"lpa","payload":{"code":0,"message":"success","data":...}}
+#
+# The parser below is exact rather than general. lpac serialises with cJSON in
+# a fixed field order, so a request either matches its shape exactly or it is
+# malformed — and a malformed line fails the read instead of being guessed at.
+
+BRIDGE_TYPE=""
+BRIDGE_FUNC=""
+BRIDGE_PARAM=""
+BRIDGE_URL=""
+BRIDGE_TX=""
+BRIDGE_HEADERS=""
+BRIDGE_RESULT=""
+BRIDGE_RESULT_CODE=""
+
+bridge_parse_line() {
+	bridge_line="$1"
+	BRIDGE_TYPE=""
+	BRIDGE_FUNC=""
+	BRIDGE_PARAM=""
+	BRIDGE_URL=""
+	BRIDGE_TX=""
+	BRIDGE_HEADERS=""
+	case "$bridge_line" in
+		'{"type":"apdu","payload":{"func":"'*)
+			bridge_rest="${bridge_line#\{\"type\":\"apdu\",\"payload\":\{\"func\":\"}"
+			BRIDGE_FUNC="${bridge_rest%%\"*}"
+			bridge_rest="${bridge_rest#*\"}"
+			case "$bridge_rest" in
+				',"param":null}}') BRIDGE_PARAM="" ;;
+				',"param":"'*)
+					bridge_rest="${bridge_rest#,\"param\":\"}"
+					BRIDGE_PARAM="${bridge_rest%%\"*}"
+				;;
+				*) return 1 ;;
+			esac
+			case "$BRIDGE_PARAM" in *[!0-9A-Fa-f]*) return 1 ;; esac
+			BRIDGE_TYPE=apdu
+			return 0
+		;;
+		'{"type":"http","payload":{"url":"'*)
+			bridge_rest="${bridge_line#\{\"type\":\"http\",\"payload\":\{\"url\":\"}"
+			BRIDGE_URL="${bridge_rest%%\"*}"
+			bridge_rest="${bridge_rest#*\",\"tx\":}"
+			case "$bridge_rest" in
+				'"'*)
+					bridge_rest="${bridge_rest#\"}"
+					BRIDGE_TX="${bridge_rest%%\"*}"
+					bridge_rest="${bridge_rest#*\"}"
+				;;
+				'null'*) BRIDGE_TX=""; bridge_rest="${bridge_rest#null}" ;;
+				*) return 1 ;;
+			esac
+			case "$BRIDGE_TX" in *[!0-9A-Fa-f]*) return 1 ;; esac
+			case "$bridge_rest" in
+				',"headers":['*) BRIDGE_HEADERS="${bridge_rest#,\"headers\":\[}" ;;
+				*) return 1 ;;
+			esac
+			BRIDGE_HEADERS="${BRIDGE_HEADERS%\]\}\}}"
+			BRIDGE_TYPE=http
+			return 0
+		;;
+		'{"type":"lpa","payload":{"code":'*)
+			bridge_rest="${bridge_line#\{\"type\":\"lpa\",\"payload\":\{\"code\":}"
+			BRIDGE_RESULT_CODE="${bridge_rest%%,*}"
+			case "$BRIDGE_RESULT_CODE" in ''|*[!0-9-]*) return 1 ;; esac
+			BRIDGE_RESULT="$bridge_line"
+			BRIDGE_TYPE=lpa
+			return 0
+		;;
+		'{"type":"progress",'*|'{"type":"driver",'*)
+			# Informational, and never forwarded to a consumer: the contract
+			# withholds the LPA's raw output, so these are dropped rather than
+			# logged verbatim.
+			BRIDGE_TYPE=ignore
+			return 0
+		;;
+	esac
+	return 1
+}
+
+# One APDU operation, answered on the AT transport.
+bridge_answer_apdu() {
+	case "$BRIDGE_FUNC" in
+		connect)
+			# Deliberately no `AT+CCHO=?`, `AT+CCHC=?` or `AT+CGLA=?` probe. The
+			# allow list has already decided that this model supports the command
+			# set, and a test-form probe of exactly that kind wedged a SIM
+			# upstream until physical intervention. The port is proved to be a
+			# command channel and nothing more is asked of the card.
+			at_drain
+			if at_exchange 'ATE0'; then :; fi
+			if at_exchange 'AT'; then
+				printf '{"type":"apdu","payload":{"ecode":0}}\n'
+			else
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+			fi
+			return 0
+		;;
+		disconnect)
+			printf '{"type":"apdu","payload":{"ecode":0}}\n'
+			return 0
+		;;
+		logic_channel_open)
+			[ -n "$BRIDGE_PARAM" ] || { printf '{"type":"apdu","payload":{"ecode":-1}}\n'; return 0; }
+			at_status=0
+			at_exchange "AT+CCHO=\"$BRIDGE_PARAM\"" || at_status=$?
+			if [ "$at_status" -ne 0 ]; then
+				# `+CME ERROR: 100` here is not a fault. On a modem whose eUICC
+				# sits in an inactive slot there is no ISD-R applet on the card
+				# the modem is talking to, and refusing is the correct answer.
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+				return 0
+			fi
+			bridge_channel="$(at_parse_channel "$(at_reply_line 1)")" || {
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+				return 0
+			}
+			BRIDGE_CHANNEL="$bridge_channel"
+			printf '{"type":"apdu","payload":{"ecode":%s}}\n' "$bridge_channel"
+			return 0
+		;;
+		logic_channel_close)
+			# The parameter is one byte: the channel number, in hex.
+			case "$BRIDGE_PARAM" in
+				[0-9A-Fa-f][0-9A-Fa-f]) : ;;
+				*) printf '{"type":"apdu","payload":{"ecode":-1}}\n'; return 0 ;;
+			esac
+			bridge_channel="$(printf '%d' "0x$BRIDGE_PARAM" 2>/dev/null || printf '')"
+			case "$bridge_channel" in ''|*[!0-9]*) printf '{"type":"apdu","payload":{"ecode":-1}}\n'; return 0 ;; esac
+			if at_exchange "AT+CCHC=$bridge_channel"; then
+				BRIDGE_CHANNEL=""
+				printf '{"type":"apdu","payload":{"ecode":0}}\n'
+			else
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+			fi
+			return 0
+		;;
+		transmit)
+			[ -n "$BRIDGE_PARAM" ] || { printf '{"type":"apdu","payload":{"ecode":-1}}\n'; return 0; }
+			[ -n "$BRIDGE_CHANNEL" ] || { printf '{"type":"apdu","payload":{"ecode":-1}}\n'; return 0; }
+			at_status=0
+			at_exchange "AT+CGLA=$BRIDGE_CHANNEL,${#BRIDGE_PARAM},\"$BRIDGE_PARAM\"" || at_status=$?
+			if [ "$at_status" -ne 0 ]; then
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+				return 0
+			fi
+			bridge_data="$(at_parse_cgla "$(at_reply_line 1)")" || {
+				printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+				return 0
+			}
+			printf '{"type":"apdu","payload":{"ecode":0,"data":"%s"}}\n' "$bridge_data"
+			return 0
+		;;
+	esac
+	printf '{"type":"apdu","payload":{"ecode":-1}}\n'
+	return 0
+}
+
+# ---- the HTTP side of the bridge ----
+#
+# The HTTPS request to an SM-DP+ is this project's, not the LPA's. lpac's own
+# curl backend set CURLOPT_SSL_VERIFYPEER and CURLOPT_SSL_VERIFYHOST to zero on
+# every request with no way to re-enable them, so it is not built at all — and
+# the contract's "verification is never disabled, by any option, in any code
+# path" now describes the code below. There is no option here that turns it off
+# and adding one is out of scope for 1.0.
+#
+# RSP is not naked without TLS — the eUICC authenticates the SM-DP+ against the
+# GSMA CI chain and the profile package is bound to that eUICC — but the ES9+
+# request bodies carry the activation code, the matching ID and the confirmation
+# code. Fixing the argv leak while leaving the transport unverified would move
+# the secret out of the process list and hand it to the network.
+
+# Hex to bytes, in chunks, appended to a file. Chunked because a Bound Profile
+# Package is tens of kilobytes and the escaped form of one whole is far past
+# what an argument list will hold — which is a C3 problem written into C2's
+# code because the alternative is discovering it during a download.
+hex_to_file() {
+	hex_rest="$1"
+	hex_target="$2"
+	: >"$hex_target" || return 1
+	case "$hex_rest" in *[!0-9A-Fa-f]*) return 1 ;; esac
+	[ $(( ${#hex_rest} % 2 )) -eq 0 ] || return 1
+	while [ -n "$hex_rest" ]; do
+		hex_chunk="$(printf '%s' "$hex_rest" | cut -c1-2048)"
+		hex_rest="$(printf '%s' "$hex_rest" | cut -c2049-)"
+		printf '%b' "$(printf '%s' "$hex_chunk" | sed 's/../\\x&/g')" >>"$hex_target" || return 1
+	done
+	return 0
+}
+
+file_to_hex() {
+	[ -f "$1" ] || { printf ''; return 0; }
+	hexdump -v -e '/1 "%02x"' "$1" 2>/dev/null || return 1
+}
+
+# One header string out of the JSON array lpac sends. The array is a list of
+# complete `Name: value` strings, so each is passed to curl as one -H argument
+# and nothing here composes a header out of parts.
+bridge_answer_http() {
+	# https only, and the scheme is checked before anything is spent on the
+	# request. A plain-http SM-DP+ address is not a downgrade to tolerate.
+	case "$BRIDGE_URL" in
+		https://*) : ;;
+		*)
+			log err 'refusing a bridge HTTP request that is not https'
+			printf '{"type":"http","payload":{"rcode":0,"rx":""}}\n'
+			return 0
+		;;
+	esac
+	command_exists "$CURL" || {
+		log err 'no HTTP client is installed; the bridge cannot make the request'
+		printf '{"type":"http","payload":{"rcode":0,"rx":""}}\n'
+		return 0
+	}
+	hex_to_file "$BRIDGE_TX" "$HTTP_BODY_FILE" || {
+		printf '{"type":"http","payload":{"rcode":0,"rx":""}}\n'
+		return 0
+	}
+	# Headers, one -H each, rebuilt from the JSON array by splitting on the
+	# separator between quoted strings. A header carrying an escaped quote or a
+	# backslash is refused rather than unescaped by hand.
+	set --
+	headers_rest="$BRIDGE_HEADERS"
+	while [ -n "$headers_rest" ]; do
+		case "$headers_rest" in
+			'"'*) headers_rest="${headers_rest#\"}" ;;
+			,*) headers_rest="${headers_rest#,}"; continue ;;
+			*) break ;;
+		esac
+		header_value="${headers_rest%%\"*}"
+		headers_rest="${headers_rest#*\"}"
+		case "$header_value" in
+			*\\*)
+				log err 'refusing a bridge HTTP header this parser will not reproduce exactly'
+				printf '{"type":"http","payload":{"rcode":0,"rx":""}}\n'
+				return 0
+			;;
+		esac
+		set -- "$@" -H "$header_value"
+	done
+	http_status=0
+	# --proto '=https' refuses a redirect to any other scheme; redirects are not
+	# followed at all, because an SM-DP+ that answers with one is not a server
+	# this exchange should chase.
+	run_bounded_to_file "$HTTP_TIMEOUT_SECONDS" "$HTTP_HEADER_FILE" \
+		"$CURL" --silent --show-error --proto '=https' --tlsv1.2 \
+		--max-time "$HTTP_TIMEOUT_SECONDS" \
+		--output "$HTTP_REPLY_FILE" --write-out '%{http_code}' \
+		"$@" --data-binary "@$HTTP_BODY_FILE" -- "$BRIDGE_URL" || http_status=$?
+	if [ "$http_status" -ne 0 ]; then
+		# A verification failure fails the read. There is no fallback, and a
+		# retry without verification does not exist as a code path.
+		log err "the bridge HTTP request failed with status $http_status"
+		printf '{"type":"http","payload":{"rcode":0,"rx":""}}\n'
+		rm -f "$HTTP_BODY_FILE" "$HTTP_REPLY_FILE" "$HTTP_HEADER_FILE"
+		return 0
+	fi
+	http_code="$(tr -dc '0-9' <"$HTTP_HEADER_FILE" 2>/dev/null || :)"
+	case "$http_code" in ''|*[!0-9]*) http_code=0 ;; esac
+	http_hex="$(file_to_hex "$HTTP_REPLY_FILE" || printf '')"
+	rm -f "$HTTP_BODY_FILE" "$HTTP_REPLY_FILE" "$HTTP_HEADER_FILE"
+	printf '{"type":"http","payload":{"rcode":%s,"rx":"%s"}}\n' "$http_code" "$http_hex"
+	return 0
+}
+
+# ---- driving the LPA across the bridge ----
+#
+# The LPA is started by `lpac-run`, never directly: every refusal C1 established
+# lives in that launcher, and calling the binary would walk around all of them.
+# lpac connects to the card before it parses its own subcommand, so by the time
+# the process exists it is too late to decide anything.
+#
+# Two FIFOs rather than one pipe pair, because a POSIX shell has no coprocess.
+# The open order matters: the child is started first and blocks opening its
+# standard input, this process opening the write end releases it, the child then
+# blocks opening its standard output, and this process opening the read end
+# releases that. Reversing the order deadlocks both.
+#
+# LPA_RESULT holds the one `lpa` line the LPA finished with. Its raw text never
+# reaches a consumer: the contract withholds the LPA's own output, and what is
+# published is built from allowlisted fields.
+LPA_RESULT=""
+LPA_EXIT_STATUS=0
+
+bridge_run() {
+	# $1 endpoint, $2 owner, $3 the candidate control ports in preference
+	# order, $4 the device the bearer holds, then the LPA's own arguments.
+	#
+	# The bearer device is passed on even though this transport opens nothing:
+	# `lpac-run` refuses a `netifd-direct` caller that has not named it, so that
+	# the separate-port rule can be checked rather than asserted. Leaving it out
+	# would make every netifd-direct read fail at the launcher.
+	bridge_endpoint="$1"
+	bridge_owner="$2"
+	bridge_candidates="$3"
+	bridge_bearer="$4"
+	shift 4
+	bridge_device=""
+	LPA_RESULT=""
+	LPA_EXIT_STATUS=0
+	BRIDGE_CHANNEL=""
+
+	[ -x "$LPAC_RUN" ] || {
+		log err "the pinned LPA launcher is not installed at $LPAC_RUN"
+		return 4
+	}
+	# Levels 3 and 4, in that order, and nothing above them. A read-only eUICC
+	# transaction that starts no coordinator operation and needs no ownership
+	# or slot change takes exactly these, as a read-only AT identity
+	# transaction already takes the port lock alone. Requiring the system-wide
+	# global lock for a read would report the eSIM area of one modem busy
+	# whenever anything at all was running on the other.
+	acquire_endpoint_lock "$bridge_endpoint" "$LOCK_WAIT_SECONDS" || {
+		log err "another operation holds endpoint $bridge_endpoint"
+		return 3
+	}
+	at_read_timeout_supported || {
+		log err 'this shell cannot bound a read; refusing to open a card channel without one'
+		release_read_locks
+		return 4
+	}
+	# Which of the candidate ports is actually the control channel.
+	#
+	# A modem presents several ttys and only some of them answer: the RM520N-GL
+	# on the reference router offers four and replies on two. The read path may
+	# not probe -- it publishes a candidate, not a verdict -- so the choice is
+	# made here, where a lock is held and a bound is armed, and it is made by
+	# asking rather than by taking the lowest port number.
+	bridge_found=0
+	for bridge_try in $bridge_candidates; do
+		acquire_transport_lock at "$bridge_try" "$LOCK_WAIT_SECONDS" || {
+			# A tty is effectively exclusive: a reader that waits, fails and
+			# proceeds anyway corrupts both its own reply stream and the
+			# holder's. Another component holding this one is not a reason to
+			# skip to the next: it is a reason to stop.
+			log err "another component holds $bridge_try"
+			release_read_locks
+			return 3
+		}
+		if at_open_port "$bridge_try" && at_probe_control_port; then
+			bridge_device="$bridge_try"
+			bridge_found=1
+			break
+		fi
+		at_close_port
+		release_read_locks
+		acquire_endpoint_lock "$bridge_endpoint" "$LOCK_WAIT_SECONDS" || {
+			log err "another operation holds endpoint $bridge_endpoint"
+			return 3
+		}
+	done
+	if [ "$bridge_found" -ne 1 ]; then
+		log err 'no candidate control port answered'
+		release_read_locks
+		return 3
+	fi
+	( umask 077 && mkdir -p "$STATE_DIR/bridge" ) || { cleanup_bridge; release_read_locks; return 3; }
+	BRIDGE_RUN_DIR="$STATE_DIR/bridge/$$"
+	( umask 077 && mkdir "$BRIDGE_RUN_DIR" ) || {
+		BRIDGE_RUN_DIR=""; cleanup_bridge; release_read_locks; return 3
+	}
+	( umask 077 && mkfifo "$BRIDGE_RUN_DIR/to-lpa" ) || { cleanup_bridge; release_read_locks; return 3; }
+	( umask 077 && mkfifo "$BRIDGE_RUN_DIR/from-lpa" ) || { cleanup_bridge; release_read_locks; return 3; }
+
+	# Descriptor 8 is this process's card channel and is closed in the child:
+	# the LPA has no business holding the port, and inheriting it would leave a
+	# second writer on a tty whose whole protocol is one exchange at a time.
+	# Two branches rather than an argument list assembled by hand: a launcher
+	# invocation is the one place where getting the arguments subtly wrong
+	# silently disables a refusal, so each shape is written out in full.
+	if [ "$bridge_owner" = netifd-direct ]; then
+		[ -n "$bridge_bearer" ] || {
+			# The launcher refuses this too. Refusing here says why: a bearer
+			# whose control port is unknown cannot be shown to be a different
+			# port from the one we are about to open, and "probably different"
+			# is not evidence.
+			log err 'the bearer device is unknown; refusing to open a channel beside it'
+			cleanup_bridge
+			release_read_locks
+			return 4
+		}
+		"$LPAC_RUN" --transport stdio --owner "$bridge_owner" \
+			--bearer-device "$bridge_bearer" --timeout "$LPA_TIMEOUT_SECONDS" -- "$@" \
+			<"$BRIDGE_RUN_DIR/to-lpa" >"$BRIDGE_RUN_DIR/from-lpa" 2>/dev/null 8<&- &
+	else
+		"$LPAC_RUN" --transport stdio --owner "$bridge_owner" \
+			--timeout "$LPA_TIMEOUT_SECONDS" -- "$@" \
+			<"$BRIDGE_RUN_DIR/to-lpa" >"$BRIDGE_RUN_DIR/from-lpa" 2>/dev/null 8<&- &
+	fi
+	BRIDGE_CHILD_PID=$!
+	# Armed before the first open, not after both: a signal between the two
+	# would otherwise leave a descriptor nothing admits to holding.
+	BRIDGE_FIFO_FD_OPEN=1
+	exec 6>"$BRIDGE_RUN_DIR/to-lpa" || { cleanup_bridge; release_read_locks; return 3; }
+	exec 7<"$BRIDGE_RUN_DIR/from-lpa" || { cleanup_bridge; release_read_locks; return 3; }
+
+	bridge_status=0
+	while IFS= read -t "$LPA_TIMEOUT_SECONDS" -r bridge_message <&7; do
+		if ! bridge_parse_line "$bridge_message"; then
+			# A malformed or truncated line is a failed read, never a guess.
+			# There is no recovery that does not involve inventing what the LPA
+			# meant, and an APDU exchange invented from a damaged message is
+			# sent to a card.
+			log err 'the LPA sent a message this bridge will not interpret'
+			bridge_status=3
+			break
+		fi
+		case "$BRIDGE_TYPE" in
+			apdu) bridge_answer_apdu >&6 || { bridge_status=3; break ;} ;;
+			http) bridge_answer_http >&6 || { bridge_status=3; break ;} ;;
+			lpa) LPA_RESULT="$BRIDGE_RESULT" ;;
+			ignore) : ;;
+		esac
+	done
+	bridge_read_status=$?
+	# A `read` that ends because the child went away is an ordinary end of
+	# exchange; one that ends on its own bound is not.
+	if [ "$bridge_status" -eq 0 ] && [ "$bridge_read_status" -gt 128 ]; then
+		log err 'the LPA stopped answering within its bound'
+		bridge_status=3
+	fi
+
+	# Closing the write end is the LPA's end-of-file, and a well-behaved one
+	# exits on it. Then the child is reaped on a bound rather than waited for:
+	# an LPA that has already sent a malformed line, or that is sitting in a
+	# sleep, would otherwise hold this process for as long as it liked, and
+	# "cleanup must terminate and reap the active child" is the rule that
+	# exists for exactly that.
+	{ exec 6>&-; } 2>/dev/null || :
+	bridge_reap_child "$bridge_status"
+	{ exec 7<&-; } 2>/dev/null || :
+	BRIDGE_FIFO_FD_OPEN=0
+	cleanup_bridge
+	# Transport, then endpoint: the reverse of the order they were taken in.
+	release_read_locks
+
+	[ "$bridge_status" -eq 0 ] || return "$bridge_status"
+	# The launcher's exit classes are the contract's, so they pass through
+	# rather than being flattened into "it did not work".
+	[ "$LPA_EXIT_STATUS" -eq 0 ] || return "$LPA_EXIT_STATUS"
+	[ -n "$LPA_RESULT" ] || return 3
+	[ "$BRIDGE_RESULT_CODE" = 0 ] || return 3
+	return 0
+}
+
+# Reaps the LPA, bounded. `$1` is the bridge's own verdict: an exchange that
+# already went wrong gets no grace period, because the LPA has stopped speaking
+# the protocol and waiting for it to think better of that is waiting for
+# nothing.
+bridge_reap_child() {
+	[ -n "$BRIDGE_CHILD_PID" ] || return 0
+	if [ "${1:-0}" -eq 0 ]; then
+		bridge_waited=0
+		while kill -0 "$BRIDGE_CHILD_PID" 2>/dev/null && [ "$bridge_waited" -lt 1 ]; do
+			"$SLEEP" 1 2>/dev/null || break
+			bridge_waited=$((bridge_waited + 1))
+		done
+	fi
+	if kill -0 "$BRIDGE_CHILD_PID" 2>/dev/null; then
+		reap_child "$BRIDGE_CHILD_PID" TERM
+		"$SLEEP" 1 2>/dev/null || :
+		reap_child "$BRIDGE_CHILD_PID" KILL
+	fi
+	wait "$BRIDGE_CHILD_PID" 2>/dev/null || LPA_EXIT_STATUS=$?
+	BRIDGE_CHILD_PID=""
+	return 0
+}
+
+# The `data` member of the LPA's final result, as raw JSON. It is the one part
+# of the LPA's output this script reads, and every field taken out of it is
+# named explicitly below rather than passed through.
+lpa_result_data() {
+	lpa_rest="${LPA_RESULT#*\"data\":}"
+	[ "$lpa_rest" != "$LPA_RESULT" ] || return 1
+	# The trailing "}}" closes the payload and the root object.
+	printf '%s\n' "${lpa_rest%\}\}}"
+}
+
+# ---- reachability ----
+#
+# Which combinations of control owner and transport permit an eUICC read
+# without disturbing a live bearer. This is the contract's matrix, and the two
+# rows worth restating are the two that look like maturity gaps and are not:
+#
+#   netifd-direct over the bearer's own control device is refused because the
+#   MBIM contract already forbids disturbing a control session netifd opened
+#   for a live bearer, and an APDU exchange is not gentler than an identity
+#   query; and
+#
+#   modemmanager is refused for the same reason the modem contract refuses to
+#   probe an AT port under it. Ownership is of the modem, not of one node, and
+#   for eSIM the cost of being wrong is higher: an APDU exchange holds a logical
+#   channel open across many commands, and a foreign reader landing inside it
+#   breaks the channel rather than losing a reply.
+#
+# Two token values are additive to the contract's published lists and are named
+# here so a reader can find them: `owner-transitioning`, because an operation
+# already running is not the same answer as conflicting ownership; and
+# `requires-bearer-stop`, because a netifd bearer holding the only control
+# device is reachable by an operation this release does not implement, and
+# saying `no` would claim that no operation would ever change it.
+
+REACHABLE=""
+REACHABLE_REASON=""
+ESIM_TRANSPORT=""
+ESIM_TRANSPORT_DEVICE=""
+
+# Is this vendor:product allowed to receive an AT APDU channel at all?
+#
+# The same allow list `lpac-run` consults, for the same reason and with the same
+# rule: no wildcard, and "unknown" and "generic" are the same answer. The list
+# lives in the LPA package because that is where the refusal had to live for the
+# native backend; it is honoured here too, because a bridge that sent APDUs to
+# an unlisted modem would walk straight around it.
+at_apdu_model_allowed() {
+	allow_vendor="$1"
+	allow_product="$2"
+	[ -n "$allow_vendor" ] && [ -n "$allow_product" ] || return 1
+	[ -r "$LPAC_MODELS" ] || return 1
+	while IFS="$TAB" read -r table_vendor table_product table_model table_state; do
+		case "$table_vendor" in ''|\#*) continue ;; esac
+		[ "$table_vendor" = "$allow_vendor" ] || continue
+		[ "$table_product" = "$allow_product" ] || continue
+		printf '%s\n' "${table_state:-candidate}"
+		return 0
+	done <"$LPAC_MODELS"
+	return 1
+}
+
+# Every AT candidate port of this modem that is not the one the bearer holds.
+at_free_candidate_ports() {
+	transport_section="$1"
+	transport_bearer="$2"
+	printf '%s\n' "$transport_section" | awk -F '\t' -v bearer="$transport_bearer" '
+		$1 == "at-port" && $3 != "" && $3 != bearer { print $3 }
+	'
+}
+
+# Decides REACHABLE, REACHABLE_REASON, ESIM_TRANSPORT and ESIM_TRANSPORT_DEVICE
+# for one endpoint. Fails closed at every step: an unanswerable question is
+# `unknown`, never permission.
+resolve_reachability() {
+	reach_section="$1"
+	reach_slot_active="$2"
+	reach_ambiguous="$3"
+	REACHABLE=unknown
+	REACHABLE_REASON=""
+	ESIM_TRANSPORT=""
+	ESIM_TRANSPORT_DEVICE=""
+
+	if [ "$reach_ambiguous" = 1 ]; then
+		REACHABLE=unknown
+		REACHABLE_REASON=endpoint-ambiguous
+		return 0
+	fi
+	reach_owner="$(section_field "$reach_section" modem 3)"
+	case "$reach_owner" in
+		conflicting) REACHABLE=unknown; REACHABLE_REASON=owner-conflicting; return 0 ;;
+		transitioning) REACHABLE=unknown; REACHABLE_REASON=owner-transitioning; return 0 ;;
+		'') REACHABLE=unknown; REACHABLE_REASON=owner-conflicting; return 0 ;;
+	esac
+	# An endpoint in an inactive slot is `requires-slot-change` regardless of
+	# owner, and this step's whole answer to it is that sentence. No read
+	# changes a slot: not to reach an endpoint, not to identify one, not to
+	# check one.
+	if [ "$reach_slot_active" != 1 ]; then
+		REACHABLE=requires-slot-change
+		REACHABLE_REASON=slot-inactive
+		return 0
+	fi
+	# Before the owner, deliberately. A modem that no transport in this release
+	# could read is `not-supported` whoever owns it, and answering
+	# `requires-inhibit` for one would offer the user an outage that buys
+	# nothing: the inhibit would be taken, the connection interrupted, and the
+	# read refused on the far side of it.
+	if [ ! -x "$LPAC_RUN" ]; then
+		REACHABLE=no
+		REACHABLE_REASON=lpa-unavailable
+		return 0
+	fi
+	reach_vendor="$(section_field "$reach_section" usb 2)"
+	reach_product="$(section_field "$reach_section" usb 3)"
+	if ! at_apdu_model_allowed "$reach_vendor" "$reach_product" >/dev/null; then
+		REACHABLE=no
+		REACHABLE_REASON=not-supported
+		return 0
+	fi
+	if [ "$reach_owner" = modemmanager ]; then
+		REACHABLE=requires-inhibit
+		REACHABLE_REASON=owner-modemmanager
+		return 0
+	fi
+	reach_bearer="$(section_device "$reach_section" bearer)"
+	reach_free="$(at_free_candidate_ports "$reach_section" "$reach_bearer" | sed -n '1p')"
+	if [ -z "$reach_free" ]; then
+		reach_any="$(section_field "$reach_section" at-port 3)"
+		if [ -n "$reach_any" ] && [ -n "$reach_bearer" ]; then
+			# The bearer holds the only control channel there is. An ifdown,
+			# read, ifup under consent would reach it; this release does not
+			# implement that operation, and saying `no` would claim none exists.
+			REACHABLE=requires-bearer-stop
+			REACHABLE_REASON=transport-unavailable
+		else
+			REACHABLE=no
+			REACHABLE_REASON=transport-unavailable
+		fi
+		return 0
+	fi
+	ESIM_TRANSPORT=at
+	ESIM_TRANSPORT_DEVICE="$reach_free"
+	REACHABLE=yes
+	REACHABLE_REASON=""
+	return 0
+}
+
+# ---- reading the EID ----
+#
+# The raw EID is held only here, in the one package allowed to hold it, and only
+# for as long as it takes to derive a handle and a four-character suffix from
+# it. It is never published, never logged, never written to state and never
+# passed as an argument to anything.
+#
+# Two sources, and they are different situations rather than a preference:
+# ModemManager's own API answers for a modem ModemManager owns, which is the one
+# way to learn anything about such a modem without violating the single-owner
+# rule; the LPA answers over the bridge once a takeover has made the modem ours.
+
+ENDPOINT_EID=""
+ENDPOINT_EID_SOURCE=none
+
+read_eid_from_modemmanager() {
+	ENDPOINT_EID=""
+	ENDPOINT_EID_SOURCE=none
+	eid_mm_index="$1"
+	eid_sim_index="$2"
+	case "$eid_mm_index" in ''|*[!0-9]*) return 1 ;; esac
+	case "$eid_sim_index" in ''|*[!0-9]*) return 1 ;; esac
+	command_exists "$MMCLI" || return 1
+	eid_file="$STATE_DIR/.mmcli-sim.$$"
+	eid_status=0
+	run_read_bounded euicc-eid 8 "$eid_file" \
+		"$MMCLI" -m "$eid_mm_index" --sim "$eid_sim_index" --output-keyvalue || eid_status=$?
+	if [ "$eid_status" -ne 0 ]; then
+		rm -f "$eid_file"
+		return 1
+	fi
+	eid_raw="$(awk -F ':' '
+		{
+			key = $1
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			if (key != "sim.properties.eid") next
+			$1 = ""
+			sub(/^:[[:space:]]*/, "", $0)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+			if ($0 == "--" || $0 == "unknown") next
+			print $0
+			exit
+		}
+	' "$eid_file" 2>/dev/null || :)"
+	rm -f "$eid_file"
+	ENDPOINT_EID="$(normalise_eid "$eid_raw" 2>/dev/null || :)"
+	[ -n "$ENDPOINT_EID" ] || return 1
+	ENDPOINT_EID_SOURCE=modemmanager
+	return 0
+}
+
+# ---- endpoint enumeration ----
+#
+# One endpoint per slot that is evidenced to hold an eUICC. A slot whose class
+# is `unknown` produces no endpoint, because an endpoint is a claim that a chip
+# is there and `unknown` is the absence of that claim — never its negation. The
+# modem it belongs to still appears in the `modems` list with its slot source,
+# so a page can say "this modem's slots could not be determined" rather than
+# "this modem has no eSIM".
+
+ENDPOINT_FILE=""
+MODEM_LINES_FILE=""
+SLOT_LINES_FILE=""
+
+# Nothing below loops through a pipeline, and that is not a style preference.
+# A `while read` on the right-hand side of a pipe runs in a subshell, and two
+# things this function depends on live in variables: the bounded-call child and
+# watchdog PIDs the exit trap must kill, and the abandoned-reading list the
+# document is built from. Both would be assigned in the subshell and discarded
+# with it -- so `euicc-eid` would never appear in `incomplete_reads` however
+# often the deadline stopped it, and a killed `mmcli` would be left behind.
+enumerate_endpoints() {
+	ENDPOINT_FILE="$TMP_BASE.endpoints"
+	MODEM_LINES_FILE="$TMP_BASE.modem-lines"
+	SLOT_LINES_FILE="$TMP_BASE.slot-lines"
+	: >"$ENDPOINT_FILE"
+	modem_record_lines >"$MODEM_LINES_FILE"
+	while IFS= read -r enumerate_indexed; do
+		enumerate_index="${enumerate_indexed%%"$TAB"*}"
+		enumerate_line="${enumerate_indexed#*"$TAB"}"
+		enumerate_modem="$(field "$enumerate_line" 2)"
+		[ -n "$enumerate_modem" ] || continue
+		enumerate_section="$(modem_section_at "$enumerate_index")"
+		enumerate_owner="$(field "$enumerate_line" 3)"
+		enumerate_ambiguous="$(field "$enumerate_line" 5)"
+		enumerate_generation="$(field "$enumerate_line" 6)"
+		enumerate_mm="$(section_field "$enumerate_section" mm 2)"
+		enumerate_count="$(section_field "$enumerate_section" slots 3)"
+		printf '%s\n' "$enumerate_section" | awk -F '\t' '$1 == "slot" { print }' >"$SLOT_LINES_FILE"
+		while IFS= read -r slot_line; do
+			slot_number="$(field "$slot_line" 2)"
+			slot_class="$(field "$slot_line" 3)"
+			slot_active="$(field "$slot_line" 4)"
+			slot_eid_known="$(field "$slot_line" 5)"
+			slot_eid_suffix="$(field "$slot_line" 6)"
+			slot_sim_index="$(field "$slot_line" 7)"
+			# A slot whose class is `unknown` produces no endpoint. An endpoint
+			# is a claim that a chip is there, and `unknown` is the absence of
+			# that claim rather than its negation; the modem still appears in
+			# the `modems` list with its slot source, so a page can say the
+			# slots could not be determined instead of saying there is no eSIM.
+			[ "$slot_class" = euicc ] || continue
+
+			endpoint_tier=slot-weak
+			endpoint_id="$(slot_weak_handle "$enumerate_modem" "$slot_number")"
+			endpoint_eid_known=0
+			endpoint_eid_suffix=""
+			endpoint_eid_source=none
+			if [ "$slot_eid_known" = 1 ] && [ "$enumerate_owner" = modemmanager ]; then
+				# A failure here leaves the endpoint at `slot-weak`, which is
+				# honest: the slot said it holds an eUICC and no EID was read
+				# from it. `euicc-eid` reaches `incomplete_reads` from inside
+				# run_read_bounded, so a reader can tell a card that has no
+				# readable EID from a read that ran out of time.
+				if read_eid_from_modemmanager "$enumerate_mm" "$slot_sim_index"; then
+					endpoint_handle="$(endpoint_handle_from_eid "$ENDPOINT_EID" 2>/dev/null || :)"
+					if [ -n "$endpoint_handle" ]; then
+						endpoint_id="$endpoint_handle"
+						endpoint_tier=eid
+						endpoint_eid_known=1
+						endpoint_eid_suffix="$(suffix_of "$ENDPOINT_EID")"
+						endpoint_eid_source="$ENDPOINT_EID_SOURCE"
+					fi
+					# Held no longer than it took to derive a handle and a
+					# suffix from it.
+					ENDPOINT_EID=""
+				fi
+			fi
+
+			endpoint_ambiguous=0
+			endpoint_ambiguity_reason=""
+			if [ "$enumerate_ambiguous" = 1 ]; then
+				endpoint_ambiguous=1
+				endpoint_ambiguity_reason=modem_ambiguous
+			fi
+			resolve_reachability "$enumerate_section" "$slot_active" "$endpoint_ambiguous"
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+				"$endpoint_id" "$endpoint_tier" "$enumerate_modem" "$enumerate_generation" \
+				"$slot_number" "$enumerate_count" "$slot_active" "$slot_class" \
+				"$endpoint_eid_known" "$endpoint_eid_suffix" \
+				"$ESIM_TRANSPORT" "$ESIM_TRANSPORT_DEVICE" "$enumerate_owner" \
+				"$REACHABLE" "$REACHABLE_REASON" \
+				"$endpoint_ambiguous" "$endpoint_ambiguity_reason" "$endpoint_eid_source" \
+				"$enumerate_index" \
+				>>"$ENDPOINT_FILE"
+		done <"$SLOT_LINES_FILE"
+	done <"$MODEM_LINES_FILE"
+	# Kept, not removed: the modem list is what tells a consumer that a modem
+	# was looked at and its slots could not be determined, which is a different
+	# answer from "this modem has no eUICC". The exit trap owns both files.
+	mark_colliding_endpoints
+	return 0
+}
+
+# Two present endpoints whose handles collide cannot be told apart, so both are
+# ambiguous and neither may be targeted. At 64 bits and the handful of eUICCs a
+# router can hold this is a rule for completeness rather than an expected event
+# — but a `slot:` handle is not a hash, and two modems that are themselves
+# indistinguishable produce indistinguishable slot handles, which is the case
+# this actually catches.
+mark_colliding_endpoints() {
+	[ -s "$ENDPOINT_FILE" ] || return 0
+	collision_list="$(cut -f1 "$ENDPOINT_FILE" | sort | uniq -d)"
+	[ -n "$collision_list" ] || return 0
+	collision_tmp="$ENDPOINT_FILE.tmp"
+	awk -F '\t' -v OFS='\t' -v dupes="$collision_list" '
+		BEGIN { n = split(dupes, list, "\n"); for (i = 1; i <= n; i++) if (list[i] != "") bad[list[i]] = 1 }
+		{
+			if ($1 in bad) {
+				$16 = 1
+				$17 = "handle_collision"
+				$14 = "unknown"
+				$15 = "endpoint-ambiguous"
+			}
+			print
+		}
+	' "$ENDPOINT_FILE" >"$collision_tmp" && mv "$collision_tmp" "$ENDPOINT_FILE"
+	rm -f "$collision_tmp"
+	return 0
+}
+
+# ---- the cache ----
+#
+# An eUICC read is expensive and the page polls, so there is a cache, and the
+# whole of its contract is in what it is not allowed to do. A cache authorises
+# nothing: no mutation revalidates against one, a cached capability map never
+# permits an operation, a cached owner state never permits opening a channel,
+# and an entry is never written from a prediction of what an operation is about
+# to do. It is written from a read that happened.
+#
+# The key is the tuple the contract names. Any difference in any element is a
+# miss rather than a stale hit to be refreshed: the generation catches a modem
+# that went away and came back, the slot and its active flag catch the eUICC
+# moving or the mapping changing underneath us, the owner catches a modem
+# ModemManager has claimed since the read, and the schema version catches an
+# upgrade. The operation id is this package's answer to "a modem reset from a
+# path outside this package invalidates the entry": every reset produces one,
+# whoever started it.
+CACHE_SCHEMA=v1
+
+cache_dir() {
+	printf '%s\n' "$STATE_DIR/cache"
+}
+
+cache_key_hash() {
+	# endpoint, modem, generation, slot, slot_active, owner, operation, schema
+	handle_for_identifier "$1|$2|$3|$4|$5|$6|$7|$CACHE_SCHEMA"
+}
+
+cache_path() {
+	# <kind>.<endpoint>.<keyhash>, so pruning every other entry for one endpoint
+	# is an exact prefix match rather than a wildcard over a shared directory.
+	printf '%s/%s.%s.%s\n' "$(cache_dir)" "$1" "$(sanitize_token "$2")" "$3"
+}
+
+CACHE_READ_STATE=unknown
+CACHE_READ_AGE=0
+
+cache_load() {
+	CACHE_READ_STATE=unknown
+	CACHE_READ_AGE=0
+	[ "$REQUESTED_REFRESH" -eq 0 ] || return 1
+	[ "$ESIM_CACHE_TTL_SECONDS" -gt 0 ] || return 1
+	cache_file="$1"
+	[ -f "$cache_file" ] || return 1
+	cache_header="$(sed -n '1p' "$cache_file" 2>/dev/null || :)"
+	case "$cache_header" in
+		"$CACHE_SCHEMA$TAB"*) : ;;
+		*)
+			# An entry written by a different schema version is discarded rather
+			# than interpreted.
+			rm -f "$cache_file"
+			return 1
+		;;
+	esac
+	cache_written="$(field "$cache_header" 2)"
+	case "$cache_written" in ''|*[!0-9]*) rm -f "$cache_file"; return 1 ;; esac
+	cache_age=$(($(date +%s) - cache_written))
+	[ "$cache_age" -ge 0 ] || cache_age=0
+	if [ "$cache_age" -gt "$ESIM_CACHE_TTL_SECONDS" ]; then
+		rm -f "$cache_file"
+		return 1
+	fi
+	CACHE_READ_STATE=cached
+	CACHE_READ_AGE="$cache_age"
+	sed -n '2,$p' "$cache_file"
+	return 0
+}
+
+cache_store() {
+	cache_file="$1"
+	cache_kind="$2"
+	cache_endpoint="$3"
+	[ "$ESIM_CACHE_TTL_SECONDS" -gt 0 ] || return 0
+	( umask 077 && mkdir -p "$(cache_dir)" ) || return 0
+	cache_prune "$cache_kind" "$cache_endpoint"
+	# Atomically, through a temporary file and a rename, so a concurrent reader
+	# sees either the whole old entry or the whole new one.
+	cache_tmp="${cache_file}.tmp.$$"
+	{
+		printf '%s\t%s\n' "$CACHE_SCHEMA" "$(date +%s)"
+		cat
+	} >"$cache_tmp" 2>/dev/null || { rm -f "$cache_tmp"; return 0; }
+	mv "$cache_tmp" "$cache_file" 2>/dev/null || rm -f "$cache_tmp"
+	return 0
+}
+
+# Every entry of one kind for one endpoint, whatever key it was written under.
+# Exact project-owned names only: never a wildcard over a shared root, and never
+# a recursive delete.
+cache_prune() {
+	prune_prefix="$1.$(sanitize_token "$2")."
+	prune_dir="$(cache_dir)"
+	[ -d "$prune_dir" ] || return 0
+	for prune_path in "$prune_dir/$prune_prefix"*; do
+		[ -f "$prune_path" ] || continue
+		[ -L "$prune_path" ] && continue
+		rm -f "$prune_path" 2>/dev/null || :
+	done
+	return 0
+}
+
+# Called by every mutation at its *start*, not at its end. An entry that
+# describes the state a running operation is changing is already wrong, and a
+# page that refreshes mid-operation must not be shown what was true before it.
+cache_invalidate_endpoint() {
+	for invalidate_kind in endpoint profiles notifications; do
+		cache_prune "$invalidate_kind" "$1"
+	done
+	return 0
+}
+
+# ---- reading an eUICC through the LPA ----
+#
+# The LPA's own result document is parsed with `jsonfilter`, one query per field
+# of one small array, rather than by the string surgery the bridge loop uses.
+# The two are different problems: the bridge sees dozens of messages of a shape
+# lpac generates identically every time, where a fork per message is the cost
+# this project measures; a profile name is arbitrary text a subscription chose,
+# and hand-parsing that is how a quote in an operator's name becomes a defect.
+JSONFILTER="${APN_AUTOCONFIG_ESIM_JSONFILTER:-jsonfilter}"
+
+json_query() {
+	# Empty rather than an error when the member is absent. jsonfilter exits 1
+	# and prints nothing for an absent member and for a JSON null alike, which
+	# is exactly the distinction this package does not need: missing means
+	# unknown, and a consumer that cannot find a field is told nothing rather
+	# than told `false`.
+	"$JSONFILTER" -s "$1" -e "$2" 2>/dev/null || :
+}
+
+json_array_length() {
+	json_length="$("$JSONFILTER" -s "$1" -e '@.*' 2>/dev/null | wc -l | tr -d ' ')"
+	case "$json_length" in ''|*[!0-9]*) printf '0\n'; return 0 ;; esac
+	printf '%s\n' "$json_length"
+}
+
+# One field of one array element, in one query. Asking for the element and then
+# querying it again costs a second fork per field and a round trip through
+# jsonfilter's own serialisation; an indexed path avoids both.
+json_element_field() {
+	json_query "$1" "@[$2].$3"
+}
+
+# `profile list`, once, over the bridge, into a tab-separated record per
+# profile:
+#   <profile_id><TAB><iccid_suffix><TAB><state><TAB><class><TAB><nickname>
+#   <TAB><profile_name><TAB><provider_name><TAB><icon_present>
+#
+# `state` and `class` are exact normalised values or `unknown`; a profile whose
+# state is not exactly `enabled` or `disabled` may not be targeted, so the
+# nearest match is never taken.
+read_profiles_through_lpa() {
+	profiles_endpoint="$1"
+	profiles_owner="$2"
+	profiles_candidates="$3"
+	profiles_bearer="$4"
+	profiles_out="$5"
+	: >"$profiles_out"
+	command_exists "$JSONFILTER" || return 3
+	bridge_status=0
+	bridge_run "$profiles_endpoint" "$profiles_owner" "$profiles_candidates" "$profiles_bearer" profile list || bridge_status=$?
+	[ "$bridge_status" -eq 0 ] || return "$bridge_status"
+	profiles_data="$(lpa_result_data 2>/dev/null || :)"
+	[ -n "$profiles_data" ] || return 3
+	profiles_count="$(json_array_length "$profiles_data")"
+	profiles_index=0
+	while [ "$profiles_index" -lt "$profiles_count" ]; do
+		profiles_at="$profiles_index"
+		profiles_index=$((profiles_index + 1))
+		profiles_iccid_raw="$(json_element_field "$profiles_data" "$profiles_at" iccid)"
+		profiles_iccid="$(normalise_iccid "$profiles_iccid_raw" 2>/dev/null || :)"
+		if [ -n "$profiles_iccid" ]; then
+			profiles_handle="$(profile_handle_from_iccid "$profiles_iccid" 2>/dev/null || :)"
+			profiles_suffix="$(suffix_of "$profiles_iccid")"
+		else
+			# An ICCID that does not normalise is not evidence, so the profile
+			# gets no handle and cannot be targeted. It is still listed, because
+			# hiding it would report an eUICC as holding less than it does.
+			profiles_handle=""
+			profiles_suffix=""
+		fi
+		profiles_iccid=""
+		# Exact normalised values only. A state that is not exactly `enabled` or
+		# `disabled` is `unknown` and the profile may not be targeted, so the
+		# nearest match is never taken -- and a class this version does not
+		# recognise is not resolved to the closest one either.
+		profiles_state="$(json_element_field "$profiles_data" "$profiles_at" profileState)"
+		case "$profiles_state" in enabled|disabled) : ;; *) profiles_state=unknown ;; esac
+		profiles_class="$(json_element_field "$profiles_data" "$profiles_at" profileClass)"
+		case "$profiles_class" in operational|provisioning|test) : ;; *) profiles_class=unknown ;; esac
+		# Whether an icon exists, never the image data. Carrying it through a
+		# read the page polls is a cost with no matching benefit, and v1 has no
+		# verb that returns one.
+		profiles_icon="$(json_element_field "$profiles_data" "$profiles_at" icon)"
+		profiles_icon_present=0
+		[ -z "$profiles_icon" ] || profiles_icon_present=1
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$profiles_handle" "$profiles_suffix" "$profiles_state" "$profiles_class" \
+			"$(json_element_field "$profiles_data" "$profiles_at" profileNickname | tr -d '\t\r\n')" \
+			"$(json_element_field "$profiles_data" "$profiles_at" profileName | tr -d '\t\r\n')" \
+			"$(json_element_field "$profiles_data" "$profiles_at" serviceProviderName | tr -d '\t\r\n')" \
+			"$profiles_icon_present" >>"$profiles_out"
+	done
+	return 0
+}
+
+# `notification list`, once, over the bridge, into a record per notification:
+#   <sequence><TAB><operation><TAB><address><TAB><profile_id>
+#
+# A notification's profile handle is present only when its ICCID normalises; a
+# notification about a profile that is gone keeps its sequence number and
+# reports no profile, because the sequence number is what sending and removing
+# it need.
+read_notifications_through_lpa() {
+	notifications_endpoint="$1"
+	notifications_owner="$2"
+	notifications_candidates="$3"
+	notifications_bearer="$4"
+	notifications_out="$5"
+	: >"$notifications_out"
+	command_exists "$JSONFILTER" || return 3
+	bridge_status=0
+	bridge_run "$notifications_endpoint" "$notifications_owner" "$notifications_candidates" "$notifications_bearer" notification list || bridge_status=$?
+	[ "$bridge_status" -eq 0 ] || return "$bridge_status"
+	notifications_data="$(lpa_result_data 2>/dev/null || :)"
+	[ -n "$notifications_data" ] || return 3
+	notifications_count="$(json_array_length "$notifications_data")"
+	notifications_index=0
+	while [ "$notifications_index" -lt "$notifications_count" ]; do
+		notifications_at="$notifications_index"
+		notifications_index=$((notifications_index + 1))
+		notifications_seq="$(json_element_field "$notifications_data" "$notifications_at" seqNumber)"
+		case "$notifications_seq" in ''|*[!0-9]*) continue ;; esac
+		notifications_operation="$(json_element_field "$notifications_data" "$notifications_at" profileManagementOperation)"
+		case "$notifications_operation" in
+			install|enable|disable|delete) : ;;
+			*) notifications_operation=unknown ;;
+		esac
+		notifications_iccid="$(normalise_iccid \
+			"$(json_element_field "$notifications_data" "$notifications_at" iccid)" 2>/dev/null || :)"
+		notifications_handle=""
+		if [ -n "$notifications_iccid" ]; then
+			notifications_handle="$(profile_handle_from_iccid "$notifications_iccid" 2>/dev/null || :)"
+		fi
+		notifications_iccid=""
+		printf '%s\t%s\t%s\t%s\n' \
+			"$notifications_seq" "$notifications_operation" \
+			"$(json_element_field "$notifications_data" "$notifications_at" notificationAddress | tr -d '\t\r\n')" \
+			"$notifications_handle" >>"$notifications_out"
+	done
+	return 0
+}
+
+# ---- the published documents ----
+#
+# Runtime capability, implementation maturity and validation evidence are three
+# separate fields and stay separate. A reader who finds a capability described
+# in detail must not read that detail as a claim that it works, and a green
+# fixture suite moves the evidence field to `synthetic` and no further.
+#
+# Nothing published here carries a raw EID, a raw ICCID or an IMSI. `eid_suffix`
+# and `iccid_suffix` are the last four characters and are the whole of what a
+# display gets.
+IMPLEMENTATION_STATE=alpha
+VALIDATION_STATE=synthetic
+HARDWARE_VALIDATED=0
+
+print_endpoint_capabilities() {
+	capability_reachable="$1"
+	capability_tier="$2"
+	capability_read=0
+	[ "$capability_reachable" = yes ] && [ -x "$LPAC_RUN" ] && capability_read=1
+	capability_takeover=0
+	[ "$capability_reachable" = requires-inhibit ] && capability_takeover=1
+	printf '"capabilities":{'
+	json_key_boolean inventory 1; printf ','
+	json_key_boolean profile_list "$capability_read"; printf ','
+	json_key_boolean notification_list "$capability_read"; printf ','
+	json_key_boolean read_takeover "$capability_takeover"; printf ','
+	# Every mutation is unimplemented in this step. `download` may exist later
+	# because the secret ladder reached rung 3 implementing rung 1; that it may
+	# exist is not that it does.
+	json_key_boolean download 0; printf ','
+	json_key_boolean nickname 0; printf ','
+	json_key_boolean enable 0; printf ','
+	json_key_boolean disable 0; printf ','
+	json_key_boolean delete 0; printf ','
+	json_key_boolean notification_send 0; printf ','
+	json_key_boolean notification_remove 0; printf ','
+	json_key_boolean slot_switch 0
+	printf '}'
+	# A slot-weak endpoint is read-only inventory whatever the matrix says: no
+	# mutation may target it and no operation may be started against it, not to
+	# fix it and not to make it identifiable.
+	[ "$capability_tier" = eid ] || :
+}
+
+print_endpoint_json() {
+	endpoint_line="$1"
+	endpoint_profile_count="${2:-}"
+	endpoint_enabled_profile="${3:-}"
+	endpoint_notification_count="${4:-}"
+	endpoint_read_state="${5:-unknown}"
+	endpoint_read_age="${6:-0}"
+	printf '{'
+	json_key_string endpoint_id "$(field "$endpoint_line" 1)"; printf ','
+	json_key_string evidence_tier "$(field "$endpoint_line" 2)"; printf ','
+	json_key_string modem_id "$(field "$endpoint_line" 3)"; printf ','
+	json_key_number attachment_generation "$(field "$endpoint_line" 4)"; printf ','
+	json_key_number slot "$(field "$endpoint_line" 5)"; printf ','
+	json_key_number slot_count "$(field "$endpoint_line" 6)"; printf ','
+	json_key_boolean slot_active "$(field "$endpoint_line" 7)"; printf ','
+	json_key_string slot_class "$(field "$endpoint_line" 8)"; printf ','
+	json_key_boolean eid_known "$(field "$endpoint_line" 9)"; printf ','
+	json_key_string eid_suffix "$(field "$endpoint_line" 10)"; printf ','
+	json_key_string eid_source "$(field "$endpoint_line" 18)"; printf ','
+	json_key_string transport "$(field "$endpoint_line" 11)"; printf ','
+	json_key_string transport_device "$(field "$endpoint_line" 12)"; printf ','
+	json_key_string owner_state "$(field "$endpoint_line" 13)"; printf ','
+	json_key_string reachable "$(field "$endpoint_line" 14)"; printf ','
+	json_key_string reachable_reason "$(field "$endpoint_line" 15)"; printf ','
+	# Counts are null when nothing was read. An abandoned or refused read may
+	# never be reported as an observation of emptiness, so this is `null` and
+	# never `0`.
+	json_key_number profile_count "$endpoint_profile_count"; printf ','
+	json_key_string enabled_profile_id "$endpoint_enabled_profile"; printf ','
+	json_key_number notification_count "$endpoint_notification_count"; printf ','
+	print_endpoint_capabilities "$(field "$endpoint_line" 14)" "$(field "$endpoint_line" 2)"; printf ','
+	json_key_string implementation_state "$IMPLEMENTATION_STATE"; printf ','
+	json_key_string validation_state "$VALIDATION_STATE"; printf ','
+	json_key_boolean hardware_validated "$HARDWARE_VALIDATED"; printf ','
+	json_key_string read_state "$endpoint_read_state"; printf ','
+	json_key_number read_age_seconds "$endpoint_read_age"; printf ','
+	json_key_boolean ambiguous "$(field "$endpoint_line" 16)"; printf ','
+	json_key_string ambiguity_reason "$(field "$endpoint_line" 17)"
+	printf '}'
+}
+
+# The modems this package looked at, and what it was able to learn about their
+# slots. Present so that a modem whose owner will not discuss its slots is
+# visibly unread rather than absent: "no endpoint" and "could not determine
+# whether there is one" are different answers and a page must be able to tell
+# them apart.
+print_modems_json() {
+	printf '"modems":['
+	modems_separator=""
+	while IFS= read -r modems_indexed; do
+		modems_index="${modems_indexed%%"$TAB"*}"
+		modems_line="${modems_indexed#*"$TAB"}"
+		modems_id="$(field "$modems_line" 2)"
+		[ -n "$modems_id" ] || continue
+		modems_section="$(modem_section_at "$modems_index")"
+		modems_source="$(section_field "$modems_section" slots 2)"
+		[ -n "$modems_source" ] || modems_source=none
+		modems_count="$(section_field "$modems_section" slots 3)"
+		modems_active="$(section_field "$modems_section" slots 4)"
+		modems_reason=""
+		if [ "$modems_source" = none ]; then
+			case "$(field "$modems_line" 3)" in
+				modemmanager) modems_reason=slots-not-published ;;
+				conflicting|transitioning) modems_reason=owner-conflicting ;;
+				*) modems_reason=owner-does-not-publish-slots ;;
+			esac
+		fi
+		printf '%s{' "$modems_separator"
+		json_key_string modem_id "$modems_id"; printf ','
+		json_key_string owner_state "$(field "$modems_line" 3)"; printf ','
+		json_key_string slot_source "$modems_source"; printf ','
+		json_key_boolean slots_read "$([ "$modems_source" = none ] && printf 0 || printf 1)"; printf ','
+		json_key_number slot_count "$modems_count"; printf ','
+		json_key_number active_slot "$modems_active"; printf ','
+		json_key_string slots_unread_reason "$modems_reason"
+		printf '}'
+		modems_separator=','
+	done <"$MODEM_LINES_FILE"
+	printf ']'
+}
+
+# ---- verbs ----
+
+require_endpoint_target() {
+	[ -n "$REQUESTED_MODEM" ] || die_code "$EXIT_USAGE" "$COMMAND_NAME requires --modem"
+	[ -n "$REQUESTED_ENDPOINT" ] || die_code "$EXIT_USAGE" "$COMMAND_NAME requires --endpoint"
+	safe_token "$REQUESTED_MODEM" || die_code "$EXIT_USAGE" "invalid modem identity"
+	safe_token "$REQUESTED_ENDPOINT" || die_code "$EXIT_USAGE" "invalid endpoint identity"
+	load_modem_records "$REQUESTED_MODEM" || \
+		die_code "$EXIT_RETRYABLE" "the modem inventory could not be read"
+	enumerate_endpoints
+	# An operation names both a modem and an endpoint and both are revalidated,
+	# because naming only the endpoint leaves the path to it unproven and naming
+	# only the modem leaves the chip unproven. A removable eUICC that moved
+	# between two attached modems is the case that makes that concrete.
+	TARGET_LINE="$(awk -F '\t' -v modem="$REQUESTED_MODEM" -v endpoint="$REQUESTED_ENDPOINT" '
+		$3 == modem && $1 == endpoint { print; count++ }
+		END { if (count != 1) exit 3 }
+	' "$ENDPOINT_FILE")" || \
+		die_code "$EXIT_BLOCKED" "no single endpoint matches $REQUESTED_ENDPOINT on the named modem"
+	[ -n "$TARGET_LINE" ] || \
+		die_code "$EXIT_BLOCKED" "no single endpoint matches $REQUESTED_ENDPOINT on the named modem"
+	[ "$(field "$TARGET_LINE" 16)" = 0 ] || \
+		die_code "$EXIT_BLOCKED" "endpoint $REQUESTED_ENDPOINT is ambiguous and may not be targeted"
+	return 0
+}
+
+capabilities_json_cmd() {
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string implementation_state "$IMPLEMENTATION_STATE"; printf ','
+	json_key_string validation_state "$VALIDATION_STATE"; printf ','
+	json_key_boolean hardware_validated "$HARDWARE_VALIDATED"; printf ','
+	printf '"present":{'
+	json_key_boolean lpa "$([ -x "$LPAC_RUN" ] && printf 1 || printf 0)"; printf ','
+	json_key_boolean modem_inventory "$(command_exists "$MODEM_BIN" && printf 1 || printf 0)"; printf ','
+	json_key_boolean digest "$(command_exists "$SHA256" && printf 1 || printf 0)"; printf ','
+	json_key_boolean json_reader "$(command_exists "$JSONFILTER" && printf 1 || printf 0)"; printf ','
+	json_key_boolean http_client "$(command_exists "$CURL" && printf 1 || printf 0)"; printf ','
+	json_key_boolean bounded_read "$(at_read_timeout_supported && printf 1 || printf 0)"
+	printf '},'
+	printf '"transports":{'
+	json_key_boolean at 1; printf ','
+	# The QMI and MBIM bridges are this project's to write and are not written.
+	# Naming them false is the difference between a transport that failed and a
+	# transport that was never built.
+	json_key_boolean qmi 0; printf ','
+	json_key_boolean mbim 0
+	printf '},'
+	json_key_number cache_ttl_seconds "$ESIM_CACHE_TTL_SECONDS"
+	printf '}\n'
+}
+
+esim_inventory_json_cmd() {
+	read_deadline_arm
+	inventory_status=0
+	if [ -n "$REQUESTED_MODEM" ]; then
+		safe_token "$REQUESTED_MODEM" || die_code "$EXIT_USAGE" "invalid modem identity"
+		load_modem_records "$REQUESTED_MODEM" || inventory_status=$?
+	else
+		load_modem_records || inventory_status=$?
+	fi
+	if [ "$inventory_status" -ne 0 ]; then
+		# A read that ran out of time is not an error and is not an
+		# observation. It returns a well-formed document that says what it
+		# abandoned, and it says nothing about what is there -- so `endpoints`
+		# is null and never the empty array, which would claim this router has
+		# no eUICC.
+		read_was_abandoned slot-status || \
+			die_code "$EXIT_RETRYABLE" "the modem inventory could not be read"
+		read_abandon esim-endpoints
+		printf '{'
+		json_key_string version v1; printf ','
+		printf '"endpoints":null,"modems":null'
+		print_incomplete_fields
+		printf '}\n'
+		return 0
+	fi
+	enumerate_endpoints
+	printf '{'
+	json_key_string version v1; printf ','
+	printf '"endpoints":['
+	inventory_separator=""
+	while IFS= read -r inventory_line; do
+		[ -n "$inventory_line" ] || continue
+		printf '%s' "$inventory_separator"
+		# The inventory publishes no profile or notification counts. Obtaining
+		# one means opening a channel to the card, which a list of endpoints is
+		# not entitled to do on every poll; `esim-status-json` is where a
+		# consumer asks for one endpoint and pays for it.
+		print_endpoint_json "$inventory_line" "" "" "" unknown 0
+		inventory_separator=','
+	done <"$ENDPOINT_FILE"
+	printf '],'
+	print_modems_json
+	print_incomplete_fields
+	printf '}\n'
+}
+
+# One endpoint, with the counts a read can obtain. The read happens only where
+# the matrix permits it; everywhere else the counts stay unknown and the reason
+# says why, which is the whole of this step's answer to an endpoint it cannot
+# reach.
+esim_status_json_cmd() {
+	read_deadline_arm
+	require_endpoint_target
+	status_reachable="$(field "$TARGET_LINE" 14)"
+	status_endpoint="$(field "$TARGET_LINE" 1)"
+	status_profile_count=""
+	status_enabled_profile=""
+	status_notification_count=""
+	status_read_state=unknown
+	status_read_age=0
+	if [ "$status_reachable" = yes ]; then
+		if esim_read_endpoint "$TARGET_LINE"; then
+			status_profile_count="$ENDPOINT_PROFILE_COUNT"
+			status_enabled_profile="$ENDPOINT_ENABLED_PROFILE"
+			status_notification_count="$ENDPOINT_NOTIFICATION_COUNT"
+			status_read_state="$CACHE_READ_STATE"
+			status_read_age="$CACHE_READ_AGE"
+		fi
+	fi
+	printf '{'
+	json_key_string version v1; printf ','
+	printf '"endpoint":'
+	print_endpoint_json "$TARGET_LINE" "$status_profile_count" "$status_enabled_profile" \
+		"$status_notification_count" "$status_read_state" "$status_read_age"
+	print_incomplete_fields
+	printf '}\n'
+}
+
+ENDPOINT_PROFILE_COUNT=""
+ENDPOINT_ENABLED_PROFILE=""
+ENDPOINT_NOTIFICATION_COUNT=""
+ENDPOINT_PROFILES_FILE=""
+
+# The counts for one reachable endpoint, from the cache when the whole key
+# matches and from the card otherwise. Returns non-zero when neither answered,
+# and leaves every count empty rather than zero when it does.
+esim_read_endpoint() {
+	read_line="$1"
+	ENDPOINT_PROFILE_COUNT=""
+	ENDPOINT_ENABLED_PROFILE=""
+	ENDPOINT_NOTIFICATION_COUNT=""
+	read_endpoint_id="$(field "$read_line" 1)"
+	read_key="$(cache_key_hash "$read_endpoint_id" "$(field "$read_line" 3)" \
+		"$(field "$read_line" 4)" "$(field "$read_line" 5)" "$(field "$read_line" 7)" \
+		"$(field "$read_line" 13)" "$(modem_operation_id "$(field "$read_line" 19)")")" || return 1
+	read_cache_file="$(cache_path endpoint "$read_endpoint_id" "$read_key")"
+	read_cached="$(cache_load "$read_cache_file" 2>/dev/null || :)"
+	if [ -n "$read_cached" ]; then
+		ENDPOINT_PROFILE_COUNT="$(field "$read_cached" 1)"
+		ENDPOINT_ENABLED_PROFILE="$(field "$read_cached" 2)"
+		ENDPOINT_NOTIFICATION_COUNT="$(field "$read_cached" 3)"
+		return 0
+	fi
+	esim_load_profiles "$read_line" || return 1
+	read_notifications_file="$TMP_BASE.lpa-data"
+	if read_notifications_through_lpa "$(field "$read_line" 1)" "$(esim_lpa_owner "$read_line")" \
+		"$(esim_transport_candidates "$read_line")" "$(esim_bearer_device "$read_line")" \
+		"$read_notifications_file"; then
+		ENDPOINT_NOTIFICATION_COUNT="$(wc -l <"$read_notifications_file" | tr -d ' ')"
+	fi
+	ENDPOINT_PROFILE_COUNT="$(wc -l <"$ENDPOINT_PROFILES_FILE" | tr -d ' ')"
+	ENDPOINT_ENABLED_PROFILE="$(awk -F '\t' '$3 == "enabled" { print $1; exit }' "$ENDPOINT_PROFILES_FILE")"
+	printf '%s\t%s\t%s\n' "$ENDPOINT_PROFILE_COUNT" "$ENDPOINT_ENABLED_PROFILE" \
+		"$ENDPOINT_NOTIFICATION_COUNT" | cache_store "$read_cache_file" endpoint "$read_endpoint_id"
+	CACHE_READ_STATE=fresh
+	CACHE_READ_AGE=0
+	return 0
+}
+
+# The owner the launcher is told about. It is the modem's observed owner, not a
+# preference: `lpac-run` refuses `modemmanager`, refuses an unstated owner and
+# refuses a netifd bearer its own control port, and passing anything other than
+# what was observed would be walking around those refusals from the inside.
+esim_lpa_owner() {
+	printf '%s\n' "$(field "$1" 13)"
+}
+
+# The node the bearer is holding, which the launcher needs so it can check that
+# the port we are about to open is not that one. Resolved through the endpoint's
+# own section index rather than through its modem_id, for the reason
+# index_modem_sections records.
+esim_bearer_device() {
+	printf '%s\n' "$(section_device "$(modem_section_at "$(field "$1" 19)")" bearer)"
+}
+
+# Every control port this endpoint's modem offers that the bearer is not
+# holding, in port order.
+#
+# A list rather than the one port the record publishes, because the record is
+# produced by a read that may not probe: it names a candidate, and only the
+# transaction that holds a lock and a bound may find out which candidate
+# answers. On the reference router's RM520N-GL four ports are offered and two
+# reply, and the two that reply are not the two with the lowest numbers.
+esim_transport_candidates() {
+	candidates_section="$(modem_section_at "$(field "$1" 19)")"
+	at_free_candidate_ports "$candidates_section" "$(section_device "$candidates_section" bearer)" |
+		tr '\n' ' '
+}
+
+modem_operation_id() {
+	section_field "$(modem_section_at "$1")" operation 2
+}
+
+esim_load_profiles() {
+	profiles_line="$1"
+	ENDPOINT_PROFILES_FILE="$TMP_BASE.lpa-profiles"
+	profiles_status=0
+	read_profiles_through_lpa "$(field "$profiles_line" 1)" "$(esim_lpa_owner "$profiles_line")" \
+		"$(esim_transport_candidates "$profiles_line")" "$(esim_bearer_device "$profiles_line")" \
+		"$ENDPOINT_PROFILES_FILE" || profiles_status=$?
+	if [ "$profiles_status" -ne 0 ]; then
+		read_abandon esim-profiles budget
+		return 1
+	fi
+	return 0
+}
+
+profiles_json_cmd() {
+	read_deadline_arm
+	require_endpoint_target
+	profiles_reachable="$(field "$TARGET_LINE" 14)"
+	profiles_endpoint="$(field "$TARGET_LINE" 1)"
+	profiles_state=unknown
+	profiles_age=0
+	profiles_have=0
+	if [ "$profiles_reachable" = yes ]; then
+		profiles_key="$(cache_key_hash "$profiles_endpoint" "$(field "$TARGET_LINE" 3)" \
+			"$(field "$TARGET_LINE" 4)" "$(field "$TARGET_LINE" 5)" "$(field "$TARGET_LINE" 7)" \
+			"$(field "$TARGET_LINE" 13)" "$(modem_operation_id "$(field "$TARGET_LINE" 19)")")"
+		profiles_cache_file="$(cache_path profiles "$profiles_endpoint" "$profiles_key")"
+		ENDPOINT_PROFILES_FILE="$TMP_BASE.lpa-profiles"
+		if cache_load "$profiles_cache_file" >"$ENDPOINT_PROFILES_FILE" 2>/dev/null && \
+			[ "$CACHE_READ_STATE" = cached ]; then
+			profiles_have=1
+			profiles_state=cached
+			profiles_age="$CACHE_READ_AGE"
+		elif esim_load_profiles "$TARGET_LINE"; then
+			profiles_have=1
+			profiles_state=fresh
+			profiles_age=0
+			cache_store "$profiles_cache_file" profiles "$profiles_endpoint" <"$ENDPOINT_PROFILES_FILE"
+		fi
+	fi
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string endpoint_id "$profiles_endpoint"; printf ','
+	json_key_string modem_id "$(field "$TARGET_LINE" 3)"; printf ','
+	json_key_string reachable "$profiles_reachable"; printf ','
+	json_key_string reachable_reason "$(field "$TARGET_LINE" 15)"; printf ','
+	json_key_string read_state "$profiles_state"; printf ','
+	json_key_number read_age_seconds "$profiles_age"; printf ','
+	# A read that did not happen publishes no list at all, rather than an empty
+	# one. An empty array here would say the eUICC holds no subscriptions, which
+	# is a statement about the card and not about the read.
+	if [ "$profiles_have" -eq 0 ]; then
+		printf '"profiles":null'
+	else
+		printf '"profiles":['
+		profiles_separator=""
+		while IFS= read -r profiles_line; do
+			[ -n "$profiles_line" ] || continue
+			printf '%s{' "$profiles_separator"
+			json_key_string profile_id "$(field "$profiles_line" 1)"; printf ','
+			json_key_string iccid_suffix "$(field "$profiles_line" 2)"; printf ','
+			json_key_string state "$(field "$profiles_line" 3)"; printf ','
+			json_key_string class "$(field "$profiles_line" 4)"; printf ','
+			json_key_string nickname "$(field "$profiles_line" 5)"; printf ','
+			json_key_string profile_name "$(field "$profiles_line" 6)"; printf ','
+			json_key_string provider_name "$(field "$profiles_line" 7)"; printf ','
+			# The LPA's profile list carries no operator code, so this is
+			# unknown rather than absent-and-therefore-empty. It is published
+			# because it is what would let a page name an operator before a
+			# profile is enabled, and because the APN database is keyed on it.
+			json_key_string provider_mccmnc ""; printf ','
+			json_key_boolean icon_present "$(field "$profiles_line" 8)"
+			printf '}'
+			profiles_separator=','
+		done <"$ENDPOINT_PROFILES_FILE"
+		printf ']'
+	fi
+	print_incomplete_fields
+	printf '}\n'
+}
+
+notifications_json_cmd() {
+	read_deadline_arm
+	require_endpoint_target
+	notifications_reachable="$(field "$TARGET_LINE" 14)"
+	notifications_endpoint="$(field "$TARGET_LINE" 1)"
+	notifications_state=unknown
+	notifications_age=0
+	notifications_have=0
+	notifications_file="$TMP_BASE.lpa-data"
+	if [ "$notifications_reachable" = yes ]; then
+		notifications_key="$(cache_key_hash "$notifications_endpoint" "$(field "$TARGET_LINE" 3)" \
+			"$(field "$TARGET_LINE" 4)" "$(field "$TARGET_LINE" 5)" "$(field "$TARGET_LINE" 7)" \
+			"$(field "$TARGET_LINE" 13)" "$(modem_operation_id "$(field "$TARGET_LINE" 19)")")"
+		notifications_cache_file="$(cache_path notifications "$notifications_endpoint" "$notifications_key")"
+		if cache_load "$notifications_cache_file" >"$notifications_file" 2>/dev/null && \
+			[ "$CACHE_READ_STATE" = cached ]; then
+			notifications_have=1
+			notifications_state=cached
+			notifications_age="$CACHE_READ_AGE"
+		elif read_notifications_through_lpa "$(field "$TARGET_LINE" 1)" \
+			"$(esim_lpa_owner "$TARGET_LINE")" \
+			"$(esim_transport_candidates "$TARGET_LINE")" \
+			"$(esim_bearer_device "$TARGET_LINE")" \
+			"$notifications_file"; then
+			notifications_have=1
+			notifications_state=fresh
+			cache_store "$notifications_cache_file" notifications "$notifications_endpoint" \
+				<"$notifications_file"
+		else
+			read_abandon esim-notifications budget
+		fi
+	fi
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string endpoint_id "$notifications_endpoint"; printf ','
+	json_key_string modem_id "$(field "$TARGET_LINE" 3)"; printf ','
+	json_key_string reachable "$notifications_reachable"; printf ','
+	json_key_string reachable_reason "$(field "$TARGET_LINE" 15)"; printf ','
+	json_key_string read_state "$notifications_state"; printf ','
+	json_key_number read_age_seconds "$notifications_age"; printf ','
+	if [ "$notifications_have" -eq 0 ]; then
+		printf '"notifications":null'
+	else
+		printf '"notifications":['
+		notifications_separator=""
+		while IFS= read -r notifications_line; do
+			[ -n "$notifications_line" ] || continue
+			printf '%s{' "$notifications_separator"
+			json_key_number sequence "$(field "$notifications_line" 1)"; printf ','
+			json_key_string operation "$(field "$notifications_line" 2)"; printf ','
+			json_key_string address "$(field "$notifications_line" 3)"; printf ','
+			json_key_string profile_id "$(field "$notifications_line" 4)"
+			printf '}'
+			notifications_separator=','
+		done <"$notifications_file"
+		printf ']'
+	fi
+	print_incomplete_fields
+	printf '}\n'
+}
+
+# ---- the read takeover, described before it is offered ----
+#
+# Where the matrix refuses, the answer is not to refuse forever: reaching the
+# eUICC requires changing something about the modem, and changing something
+# about the modem is an operation. It takes the full lock order, it requires
+# explicit consent obtained before it starts and named in the units the user
+# experiences it in, it publishes an operation id and its stages, and it
+# restores the exact captured state on every exit path.
+#
+# This verb is the read-only half: what a takeover *would* do, so a frontend
+# can ask before it offers one. A frontend that cannot get a plan does not
+# offer the takeover.
+
+# Whether any uplink other than this modem's own interface is up. Answered
+# through ubus, which is netifd's own view; `unknown` when ubus cannot be
+# reached, because a guess here would be a guess about whether the user is
+# about to lose their connection entirely.
+other_uplink_state() {
+	takeover_interface="$1"
+	command_exists "$UBUS" || { printf 'unknown\n'; return 0; }
+	takeover_dump="$TMP_BASE.bounded"
+	takeover_status=0
+	run_read_bounded uplink-state 5 "$takeover_dump" \
+		"$UBUS" call network.interface dump || takeover_status=$?
+	if [ "$takeover_status" -ne 0 ]; then
+		printf 'unknown\n'
+		return 0
+	fi
+	# One "up": true with a default route, on an interface that is not this
+	# modem's. The dump is netifd's own JSON, so it is read with the JSON
+	# reader rather than by pattern-matching braces.
+	command_exists "$JSONFILTER" || { printf 'unknown\n'; return 0; }
+	takeover_names="$("$JSONFILTER" -i "$takeover_dump" \
+		-e '@.interface[@.up=true].interface' 2>/dev/null || :)"
+	takeover_other=false
+	for takeover_name in $takeover_names; do
+		[ "$takeover_name" = "$takeover_interface" ] && continue
+		# netifd publishes the IPv6 half of one interface as a separate object
+		# named `<name>_6`. It is the same bearer, so counting it as a second
+		# uplink would tell the user their connection survives a takeover that
+		# is about to take it away.
+		[ -n "$takeover_interface" ] && \
+			{ [ "$takeover_name" = "${takeover_interface}_6" ] || \
+			  [ "$takeover_name" = "${takeover_interface}_4" ]; } && continue
+		case "$takeover_name" in loopback|lo|lan) continue ;; esac
+		takeover_other=true
+		break
+	done
+	printf '%s\n' "$takeover_other"
+	return 0
+}
+
+read_takeover_plan_cmd() {
+	read_deadline_arm
+	require_endpoint_target
+	plan_reachable="$(field "$TARGET_LINE" 14)"
+	plan_modem="$(field "$TARGET_LINE" 3)"
+	plan_section="$(modem_section_at "$(field "$TARGET_LINE" 19)")"
+	plan_interface="$(section_field "$plan_section" interface 2)"
+	plan_mechanism=none
+	plan_available=0
+	plan_reason=""
+	case "$plan_reachable" in
+		yes)
+			plan_reason=already-reachable
+		;;
+		requires-inhibit)
+			plan_mechanism=modemmanager-inhibit
+			plan_available="$TAKEOVER_IMPLEMENTED"
+			[ "$plan_available" -eq 1 ] || plan_reason=not-implemented
+		;;
+		requires-slot-change)
+			# No slot change, ever, by any path. Not to reach an endpoint, not
+			# to identify one, not to check one.
+			plan_reason=slot-change-refused
+		;;
+		requires-bearer-stop)
+			plan_mechanism=bearer-stop
+			plan_reason=not-implemented
+		;;
+		*)
+			plan_reason="$(field "$TARGET_LINE" 15)"
+		;;
+	esac
+	plan_other_uplink="$(other_uplink_state "$plan_interface")"
+	# Whether an inhibit for this exact modem is already held by another
+	# component. One that this package did not create is reused, never stopped:
+	# provisioning owns a long-lived inhibit for a modem it dials over AT, and
+	# releasing it would hand the modem back to ModemManager underneath a live
+	# dial.
+	plan_existing=0
+	if [ "$plan_mechanism" = modemmanager-inhibit ] && command_exists "$MODEM_BIN"; then
+		plan_targets="$TMP_BASE.bounded"
+		if run_read_bounded inhibit-targets 5 "$plan_targets" "$MODEM_BIN" inhibit-targets; then
+			awk -F '\t' -v modem="$plan_modem" '$2 == modem { found = 1 } END { exit found ? 0 : 1 }' \
+				"$plan_targets" && plan_existing=1
+		fi
+	fi
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string endpoint_id "$(field "$TARGET_LINE" 1)"; printf ','
+	json_key_string modem_id "$plan_modem"; printf ','
+	json_key_string reachable "$plan_reachable"; printf ','
+	json_key_boolean available "$plan_available"; printf ','
+	json_key_string mechanism "$plan_mechanism"; printf ','
+	json_key_string unavailable_reason "$plan_reason"; printf ','
+	json_key_boolean consent_required 1; printf ','
+	json_key_string interrupts_interface "$plan_interface"; printf ','
+	# The disruption, in the unit the user experiences it in. The frontend
+	# contract owns the wording; this is the number it puts in the sentence.
+	json_key_number worst_case_seconds "$ESIM_INHIBIT_MAX_SECONDS"; printf ','
+	json_key_string other_uplink_up "$plan_other_uplink"; printf ','
+	json_key_boolean reuses_existing_inhibit "$plan_existing"; printf ','
+	json_key_boolean changes_slot 0
+	print_incomplete_fields
+	printf '}\n'
+}
+
+TAKEOVER_IMPLEMENTED=1
+
+# ---- the operation coordinator ----
+#
+# The same shape the modem coordinator publishes, because a second operation
+# model would be a second thing to reason about: an atomic start lock that
+# survives the parent/worker handoff, a state record carrying schema version,
+# operation id, modem, endpoint, action, PID and terminal result, detection of
+# an operation started outside this API, reaping of a stale owner, and exactly
+# one accepted worker when two starts race.
+
+ACTION_STATUS=idle
+ACTION_ACTION=""
+ACTION_PID=""
+ACTION_STARTED=""
+ACTION_FINISHED=""
+ACTION_EXIT_CODE=""
+ACTION_MESSAGE=""
+ACTION_ENDPOINT=""
+ACTION_OPERATION_ID=""
+ACTION_STAGES=""
+ACTION_BUSY=false
+
+action_state_dir_for() {
+	printf '%s/%s\n' "$ACTION_STATE_DIR" "$(sanitize_token "$1")"
+}
+
+action_status_values() {
+	status_modem="$1"
+	ACTION_STATUS=idle
+	ACTION_ACTION=""
+	ACTION_PID=""
+	ACTION_STARTED=""
+	ACTION_FINISHED=""
+	ACTION_EXIT_CODE=""
+	ACTION_MESSAGE=""
+	ACTION_ENDPOINT=""
+	ACTION_OPERATION_ID=""
+	ACTION_STAGES=""
+	ACTION_BUSY=false
+	status_dir="$(action_state_dir_for "$status_modem")"
+	if [ -r "$status_dir/state.tsv" ]; then
+		status_line="$(sed -n '1p' "$status_dir/state.tsv" 2>/dev/null || :)"
+		ACTION_STATUS="$(field "$status_line" 2)"
+		ACTION_ACTION="$(field "$status_line" 3)"
+		ACTION_PID="$(field "$status_line" 4)"
+		ACTION_STARTED="$(field "$status_line" 5)"
+		ACTION_FINISHED="$(field "$status_line" 6)"
+		ACTION_EXIT_CODE="$(field "$status_line" 7)"
+		ACTION_MESSAGE="$(field "$status_line" 8)"
+		ACTION_ENDPOINT="$(field "$status_line" 9)"
+		ACTION_OPERATION_ID="$(field "$status_line" 10)"
+		ACTION_STAGES="$(field "$status_line" 11)"
+		case "$ACTION_STATUS" in
+			starting|running)
+				# The launcher records `starting` under its own PID and then
+				# exits; the accepted worker owns the start lock from the moment
+				# it is forked until it writes a terminal result. Judging
+				# liveness by the state PID alone reports that handoff as a dead
+				# worker. Our own start lock does not count: a launcher holding
+				# it is deciding whether to start, not observing a handoff.
+				handoff_pid="$(lock_owner_pid "${status_dir}.start-lock" 2>/dev/null || :)"
+				[ "$handoff_pid" = "$$" ] && handoff_pid=""
+				if process_is_alive "$ACTION_PID"; then
+					ACTION_BUSY=true
+				elif process_is_alive "$handoff_pid"; then
+					ACTION_BUSY=true
+				else
+					ACTION_STATUS=failed
+					ACTION_EXIT_CODE=1
+					ACTION_MESSAGE="background worker stopped unexpectedly"
+				fi
+			;;
+		esac
+	fi
+	if [ "$ACTION_BUSY" = false ]; then
+		# An operation started outside this API still holds the modem, and a
+		# caller that cannot see it would launch a second one on top of it.
+		external_pid="$(lock_owner_pid "${MODEM_LOCK_ROOT}.$(sanitize_token "$status_modem")" \
+			2>/dev/null || :)"
+		if process_is_alive "$external_pid" && [ "$external_pid" != "$$" ]; then
+			ACTION_STATUS=running
+			ACTION_ACTION=""
+			ACTION_PID="$external_pid"
+			ACTION_MESSAGE="operation started outside the background action API"
+			ACTION_OPERATION_ID=""
+			ACTION_BUSY=true
+		fi
+	fi
+}
+
+print_action_json() {
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_boolean accepted "$1"; printf ','
+	json_key_boolean busy "$([ "$ACTION_BUSY" = true ] && printf 1 || printf 0)"; printf ','
+	json_key_string modem_id "$2"; printf ','
+	json_key_string endpoint_id "$ACTION_ENDPOINT"; printf ','
+	json_key_string status "$ACTION_STATUS"; printf ','
+	json_key_string action "$ACTION_ACTION"; printf ','
+	json_key_string operation_id "$ACTION_OPERATION_ID"; printf ','
+	json_key_string started "$ACTION_STARTED"; printf ','
+	json_key_string finished "$ACTION_FINISHED"; printf ','
+	json_key_number exit_code "$ACTION_EXIT_CODE"; printf ','
+	json_key_string message "$ACTION_MESSAGE"; printf ','
+	# Which stages completed. A result that stopped part way says where, which
+	# is the difference between an operation that refused and one that changed
+	# something and then could not finish.
+	json_key_string stages "$ACTION_STAGES"
+	printf '}\n'
+}
+
+action_status_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code "$EXIT_USAGE" "action-status requires --modem"
+	action_status_values "$REQUESTED_MODEM"
+	print_action_json 0 "$REQUESTED_MODEM"
+}
+
+# ---- the read takeover ----
+#
+# The consented, bounded ModemManager inhibit that makes an otherwise
+# unreachable eUICC readable. It is an operation, not a read: it takes the full
+# lock order, it publishes an operation id and its stages, and it restores the
+# exact captured state on success, failure, timeout, HUP, INT and TERM.
+#
+# It is never started by a poll, a page load, a boot, a hotplug event or a
+# convergence worker. There is no such caller, and the only path to it is a
+# deliberate `action-start read-takeover` — which is what consent means here,
+# obtained by the frontend from a dialog `read-takeover-plan` filled in.
+
+TAKEOVER_INHIBIT_PID=""
+TAKEOVER_INHIBIT_CREATED=0
+TAKEOVER_WATCHDOG_PID=""
+TAKEOVER_PUBLISH_ARMED=0
+TAKEOVER_STATE_DIR=""
+TAKEOVER_START_LOCK=""
+TAKEOVER_STAGES=""
+TAKEOVER_OPERATION_ID=""
+TAKEOVER_STARTED=""
+EXIT_STATUS_OBSERVED=""
+
+takeover_stage() {
+	TAKEOVER_STAGES="${TAKEOVER_STAGES:+$TAKEOVER_STAGES,}$1"
+}
+
+takeover_publish() {
+	[ -n "$TAKEOVER_STATE_DIR" ] || return 0
+	publish_finished="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$1" read-takeover "$$" "${TAKEOVER_STARTED:-}" "$publish_finished" \
+		"$2" "$3" "${REQUESTED_ENDPOINT:-}" "${TAKEOVER_OPERATION_ID:-}" \
+		"${TAKEOVER_STAGES:-}" \
+		>"$TAKEOVER_STATE_DIR/state.tsv" 2>/dev/null || :
+	TAKEOVER_PUBLISH_ARMED=0
+	# The start lock is released only once a terminal result exists, so a
+	# status read between the worker's death and its result still sees an owner.
+	[ -z "$TAKEOVER_START_LOCK" ] || lock_release "$TAKEOVER_START_LOCK"
+	TAKEOVER_START_LOCK=""
+	return 0
+}
+
+# Called from the exit trap on every path, before the locks are released. The
+# order is the contract's: the inhibit goes first, so the modem is back with a
+# working owner before anything else is unwound.
+takeover_rollback() {
+	if [ -n "$TAKEOVER_WATCHDOG_PID" ]; then
+		reap_child "$TAKEOVER_WATCHDOG_PID" TERM
+		wait "$TAKEOVER_WATCHDOG_PID" 2>/dev/null || :
+		TAKEOVER_WATCHDOG_PID=""
+	fi
+	if [ "$TAKEOVER_INHIBIT_CREATED" -eq 1 ] && [ -n "$TAKEOVER_INHIBIT_PID" ]; then
+		# An inhibition lasts exactly as long as the process holding it, so
+		# terminating the holder is the release, and the failure direction is
+		# the safe one: a dead holder returns the modem to ModemManager.
+		#
+		# TERM and then KILL with no pause between them, deliberately. There is
+		# nothing here to put down gracefully -- that argument belongs to the
+		# LPA, which holds a logical channel, and not to the process whose only
+		# job is to exist. And a one-second pause in this exact position was
+		# observed ending the cleanup outright: the release never completed, the
+		# inhibit stayed, and all four locks were left behind. No second signal
+		# was delivered and a minimal reproduction of the same shape did not
+		# reproduce it, so the mechanism is recorded as unexplained rather than
+		# guessed at; what is established is that removing the pause makes the
+		# unwind complete every time, and that the pause bought nothing.
+		reap_child "$TAKEOVER_INHIBIT_PID" TERM
+		reap_child "$TAKEOVER_INHIBIT_PID" KILL
+		wait "$TAKEOVER_INHIBIT_PID" 2>/dev/null || :
+		log notice "released the read takeover inhibit for $(mask_modem_id "${REQUESTED_MODEM:-}")"
+	fi
+	TAKEOVER_INHIBIT_PID=""
+	TAKEOVER_INHIBIT_CREATED=0
+	if [ "$TAKEOVER_PUBLISH_ARMED" -eq 1 ]; then
+		takeover_publish failed "${EXIT_STATUS_OBSERVED:-143}" \
+			"the read takeover ended without publishing a result (exit ${EXIT_STATUS_OBSERVED:-unknown})"
+	fi
+	return 0
+}
+
+action_start_cmd() {
+	action_verb="${1:-}"
+	case "$action_verb" in
+		read-takeover) : ;;
+		download|enable|disable|switch|nickname|notification-send|notification-remove)
+			die_code "$EXIT_BLOCKED" "$action_verb is not implemented in this build"
+		;;
+		'') die_code "$EXIT_USAGE" "action-start requires an action" ;;
+		*) die_code "$EXIT_USAGE" "unknown action: $action_verb" ;;
+	esac
+
+	[ -n "$REQUESTED_MODEM" ] || die_code "$EXIT_USAGE" "action-start requires --modem"
+	[ -n "$REQUESTED_ENDPOINT" ] || die_code "$EXIT_USAGE" "action-start requires --endpoint"
+	[ -x "$ACTION_WORKER" ] || die "the action worker is not executable: $ACTION_WORKER"
+
+	# Busy before target, and the order is not arbitrary.
+	#
+	# A running takeover holds the inhibit, so ModemManager no longer has the
+	# modem and can no longer be asked for its EID -- which drops the endpoint
+	# to `slot-weak` for as long as the operation lasts. Resolving the target
+	# first would therefore turn a repeated start into "no such endpoint"
+	# instead of the coalesced repeat the contract asks for, and would do it
+	# only while an operation was running, which is the one moment it matters.
+	action_status_values "$REQUESTED_MODEM"
+	if [ "$ACTION_BUSY" = true ]; then
+		print_action_json 0 "$REQUESTED_MODEM"
+		return 0
+	fi
+
+	read_deadline_arm
+	require_endpoint_target
+	# A slot-weak endpoint is read-only inventory. No operation may be started
+	# against it -- not to fix it, not to read it "properly", and not to make it
+	# identifiable.
+	[ "$(field "$TARGET_LINE" 2)" = eid ] || \
+		die_code "$EXIT_BLOCKED" "endpoint $REQUESTED_ENDPOINT is unproven; no operation may target it"
+	takeover_reachable="$(field "$TARGET_LINE" 14)"
+	case "$takeover_reachable" in
+		requires-inhibit) : ;;
+		yes) die_code "$EXIT_BLOCKED" "endpoint $REQUESTED_ENDPOINT is already readable" ;;
+		*)
+			# Including `not-supported`, which is why the allow list is checked
+			# before the owner: an outage that ends in a refusal is worse than
+			# the refusal on its own.
+			die_code "$EXIT_BLOCKED" \
+				"a read takeover would not make $REQUESTED_ENDPOINT readable ($takeover_reachable)"
+		;;
+	esac
+	TAKEOVER_STATE_DIR="$(action_state_dir_for "$REQUESTED_MODEM")"
+	mkdir -p "$ACTION_STATE_DIR" || die "cannot create the action state parent"
+	start_lock="${TAKEOVER_STATE_DIR}.start-lock"
+	lock_try_acquire_or_reclaim "$start_lock"
+	start_status=$?
+	case "$start_status" in
+		0) : ;;
+		# Two simultaneous starts: exactly one takes the lock, and the other is
+		# a coalesced repeat rather than a rejection.
+		3) action_status_values "$REQUESTED_MODEM"; print_action_json 0 "$REQUESTED_MODEM"; return 0 ;;
+		*) die "cannot record the action launch lock" ;;
+	esac
+	action_status_values "$REQUESTED_MODEM"
+	if [ "$ACTION_BUSY" = true ]; then
+		lock_release "$start_lock"
+		print_action_json 0 "$REQUESTED_MODEM"
+		return 0
+	fi
+	mkdir -p "$TAKEOVER_STATE_DIR" || {
+		lock_release "$start_lock"
+		die "cannot create the action state directory"
+	}
+	takeover_started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	takeover_operation="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
+	printf 'v1\tstarting\tread-takeover\t%s\t%s\t\t\tstarting background worker\t%s\t%s\n' \
+		"$$" "$takeover_started" "$REQUESTED_ENDPOINT" "$takeover_operation" \
+		>"$TAKEOVER_STATE_DIR/state.tsv"
+	"$ACTION_WORKER" "$REQUESTED_MODEM" "$REQUESTED_ENDPOINT" "$takeover_operation" \
+		"$takeover_started" "$start_lock" </dev/null >/dev/null 2>&1 &
+	takeover_worker_pid=$!
+	# The worker now owns the start lock and clears it when it reaches a
+	# terminal state, so a status read after this launcher exits still sees a
+	# live owner rather than an abandoned operation.
+	lock_set_owner "$start_lock" "$takeover_worker_pid" || :
+	# Not this process's to unwind any more.
+	TAKEOVER_STATE_DIR=""
+	action_status_values "$REQUESTED_MODEM"
+	print_action_json 1 "$REQUESTED_MODEM"
+}
+
+# The worker. Runs under the start lock its launcher handed it, takes the full
+# lock order 1 -> 2 -> 3 -> 4, holds the inhibit for exactly as long as it needs
+# and no longer, and publishes one terminal result naming every stage that
+# completed.
+takeover_run_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code "$EXIT_USAGE" "takeover-run requires --modem"
+	[ -n "$REQUESTED_ENDPOINT" ] || die_code "$EXIT_USAGE" "takeover-run requires --endpoint"
+	[ -n "$REQUESTED_OPERATION" ] || die_code "$EXIT_USAGE" "takeover-run requires --operation"
+	TAKEOVER_OPERATION_ID="$REQUESTED_OPERATION"
+	TAKEOVER_STARTED="${APN_AUTOCONFIG_ESIM_STARTED:-$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)}"
+	TAKEOVER_STATE_DIR="$(action_state_dir_for "$REQUESTED_MODEM")"
+	TAKEOVER_START_LOCK="${APN_AUTOCONFIG_ESIM_START_LOCK:-}"
+	TAKEOVER_PUBLISH_ARMED=1
+	takeover_publish_running
+
+	# 1 and 2. The global lock is system-wide, and a takeover is exactly the
+	# kind of operation it exists for: it changes who owns a modem.
+	acquire_global_lock "$LOCK_WAIT_SECONDS" || {
+		takeover_publish failed "$EXIT_RETRYABLE" "another operation holds the global lock"
+		return "$EXIT_RETRYABLE"
+	}
+	acquire_modem_lock "$REQUESTED_MODEM" "$LOCK_WAIT_SECONDS" || {
+		takeover_publish failed "$EXIT_RETRYABLE" "another operation holds this modem"
+		return "$EXIT_RETRYABLE"
+	}
+	takeover_stage acquire_locks
+
+	# Revalidation after the locks, not before them. Pre-lock validation alone
+	# is a time-of-check/time-of-use race: the launcher proved this a moment
+	# ago, under no lock at all.
+	#
+	# The declaration is what stops the revalidation seeing this operation as
+	# somebody else's. The inventory read runs as a child, so its own PID does
+	# not match the per-modem lock this worker holds, and without saying so the
+	# modem comes back `transitioning` -- because of this operation -- and the
+	# revalidation refuses. Checked on hardware, where it refused exactly that
+	# way on the first real run.
+	APN_AUTOCONFIG_MODEM_LOCK_OWNER_PID=$$
+	export APN_AUTOCONFIG_MODEM_LOCK_OWNER_PID
+	load_modem_records "$REQUESTED_MODEM" || {
+		takeover_publish failed "$EXIT_RETRYABLE" "the modem inventory could not be re-read"
+		return "$EXIT_RETRYABLE"
+	}
+	enumerate_endpoints
+	TARGET_LINE="$(awk -F '\t' -v modem="$REQUESTED_MODEM" -v endpoint="$REQUESTED_ENDPOINT" '
+		$3 == modem && $1 == endpoint { print; count++ }
+		END { if (count != 1) exit 3 }
+	' "$ENDPOINT_FILE")" || {
+		takeover_publish blocked "$EXIT_BLOCKED" "the endpoint is no longer present or is ambiguous"
+		return "$EXIT_BLOCKED"
+	}
+	[ "$(field "$TARGET_LINE" 2)" = eid ] || {
+		takeover_publish blocked "$EXIT_BLOCKED" "the endpoint is no longer proven"
+		return "$EXIT_BLOCKED"
+	}
+	[ "$(field "$TARGET_LINE" 14)" = requires-inhibit ] || {
+		takeover_publish blocked "$EXIT_BLOCKED" \
+			"the endpoint no longer needs a takeover, or no longer permits one"
+		return "$EXIT_BLOCKED"
+	}
+	takeover_stage revalidate
+
+	takeover_section="$(modem_section_at "$(field "$TARGET_LINE" 19)")"
+	takeover_mm="$(section_field "$takeover_section" mm 2)"
+	case "$takeover_mm" in ''|*[!0-9]*)
+		takeover_publish blocked "$EXIT_BLOCKED" "ModemManager does not name this modem"
+		return "$EXIT_BLOCKED"
+	;; esac
+
+	takeover_acquire_inhibit "$takeover_mm" || return $?
+	takeover_stage inhibit
+
+	# 3 and 4, and the read. The bridge takes those two itself and releases only
+	# those two, so this worker keeps standing on 1 and 2 throughout. The owner
+	# it is given is the one that is true *now* -- `none`, because ModemManager
+	# has let go -- rather than the one the record was written with, which is
+	# exactly what the inhibit changed.
+	# Every port, because ModemManager has let go of all of them, and the
+	# bridge picks the one that answers rather than the one numbered lowest.
+	takeover_candidates="$(at_free_candidate_ports "$takeover_section" "" | tr '\n' ' ')"
+	[ -n "$takeover_candidates" ] || {
+		takeover_publish failed "$EXIT_RETRYABLE" "no control port could be resolved after the inhibit"
+		return "$EXIT_RETRYABLE"
+	}
+	takeover_profiles="$TMP_BASE.lpa-profiles"
+	takeover_status=0
+	read_profiles_through_lpa "$REQUESTED_ENDPOINT" none "$takeover_candidates" "" \
+		"$takeover_profiles" || takeover_status=$?
+	if [ "$takeover_status" -ne 0 ]; then
+		takeover_publish failed "$takeover_status" "the eUICC could not be read under the inhibit"
+		return "$takeover_status"
+	fi
+	takeover_stage read
+
+	takeover_count="$(wc -l <"$takeover_profiles" | tr -d ' ')"
+	# The inhibit is released here rather than by the trap, so the modem is back
+	# with ModemManager before the result says the operation finished.
+	takeover_rollback_inhibit
+	takeover_stage restore
+	takeover_publish succeeded 0 "read $takeover_count profile(s) under a bounded inhibit"
+	return 0
+}
+
+takeover_publish_running() {
+	[ -n "$TAKEOVER_STATE_DIR" ] || return 0
+	mkdir -p "$TAKEOVER_STATE_DIR" 2>/dev/null || :
+	printf 'v1\trunning\tread-takeover\t%s\t%s\t\t\ttaking a bounded inhibit\t%s\t%s\n' \
+		"$$" "$TAKEOVER_STARTED" "$REQUESTED_ENDPOINT" "$TAKEOVER_OPERATION_ID" \
+		>"$TAKEOVER_STATE_DIR/state.tsv" 2>/dev/null || :
+	return 0
+}
+
+# Takes the inhibit, or adopts one that is already held, and proves that
+# ownership actually moved rather than assuming the request was atomic.
+takeover_acquire_inhibit() {
+	inhibit_index="$1"
+	command_exists "$MMCLI" || {
+		takeover_publish blocked "$EXIT_BLOCKED" "ModemManager is not installed"
+		return "$EXIT_BLOCKED"
+	}
+	# An inhibit this package did not create is reused, never stopped.
+	# Provisioning owns a long-lived one for a modem it dials over AT, and
+	# releasing it would hand that modem back to ModemManager underneath a live
+	# dial. Adopting it also means this operation's cleanup must not touch it,
+	# which is what TAKEOVER_INHIBIT_CREATED records.
+	inhibit_targets="$TMP_BASE.bounded"
+	if run_read_bounded inhibit-targets 5 "$inhibit_targets" "$MODEM_BIN" inhibit-targets; then
+		if awk -F '\t' -v modem="$REQUESTED_MODEM" \
+			'$2 == modem { found = 1 } END { exit found ? 0 : 1 }' "$inhibit_targets"; then
+			log notice "reusing an inhibit another component already holds"
+			TAKEOVER_INHIBIT_CREATED=0
+			return 0
+		fi
+	fi
+
+	inhibit_uid="$(takeover_device_uid "$inhibit_index")"
+	case "$inhibit_uid" in
+		/sys/*) : ;;
+		*)
+			takeover_publish blocked "$EXIT_BLOCKED" "the modem has no usable device path to inhibit"
+			return "$EXIT_BLOCKED"
+		;;
+	esac
+
+	# Armed before the child exists, not after: a TERM between the fork and the
+	# assignment would otherwise leave an inhibition nothing releases.
+	TAKEOVER_INHIBIT_CREATED=1
+	"$MMCLI" --inhibit-device="$inhibit_uid" >/dev/null 2>&1 &
+	TAKEOVER_INHIBIT_PID=$!
+	log notice "taking a bounded inhibit for $(mask_modem_id "$REQUESTED_MODEM")"
+
+	# The supervisor is this worker, plus a watchdog bounded by
+	# esim_inhibit_max_seconds that terminates the inhibiting child and returns
+	# the modem if this worker outlives it.
+	(
+		watchdog_sleep_pid=""
+		trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		"$SLEEP" "$ESIM_INHIBIT_MAX_SECONDS" &
+		watchdog_sleep_pid=$!
+		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
+		kill -TERM "$TAKEOVER_INHIBIT_PID" 2>/dev/null || :
+		"$SLEEP" 2 &
+		watchdog_sleep_pid=$!
+		wait "$watchdog_sleep_pid" 2>/dev/null || :
+		kill -KILL "$TAKEOVER_INHIBIT_PID" 2>/dev/null || :
+	) >/dev/null 2>&1 &
+	TAKEOVER_WATCHDOG_PID=$!
+
+	# ModemManager may win the race, exactly as it may in provisioning. This
+	# verifies that ownership actually moved instead of assuming the request
+	# took effect the moment it was made.
+	inhibit_waited=0
+	while [ "$inhibit_waited" -lt "$ESIM_INHIBIT_MAX_SECONDS" ]; do
+		if ! process_is_alive "$TAKEOVER_INHIBIT_PID"; then
+			takeover_publish failed "$EXIT_RETRYABLE" "the inhibit was refused or ended immediately"
+			return "$EXIT_RETRYABLE"
+		fi
+		inhibit_probe="$TMP_BASE.bounded"
+		if ! run_bounded_to_file 5 "$inhibit_probe" \
+			"$MMCLI" -m "$inhibit_index" --output-keyvalue; then
+			# ModemManager no longer has the modem, which is the observable
+			# consequence of the inhibition rather than a report of it.
+			return 0
+		fi
+		"$SLEEP" 1 2>/dev/null || break
+		inhibit_waited=$((inhibit_waited + 1))
+	done
+	takeover_publish failed "$EXIT_RETRYABLE" "ownership did not move within the inhibit bound"
+	return "$EXIT_RETRYABLE"
+}
+
+# ModemManager matches an inhibition against the stable physical device path it
+# publishes, so it is read from ModemManager rather than derived from sysfs by
+# this package.
+takeover_device_uid() {
+	uid_file="$TMP_BASE.bounded"
+	run_bounded_to_file 8 "$uid_file" "$MMCLI" -m "$1" --output-keyvalue || return 1
+	awk -F ':' '
+		{
+			key = $1
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			if (key != "modem.generic.physdev") next
+			$1 = ""
+			sub(/^:[[:space:]]*/, "", $0)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+			if ($0 == "--" || $0 == "unknown") next
+			print $0
+			exit
+		}
+	' "$uid_file" 2>/dev/null || :
+}
+
+# The release, as a step rather than as cleanup, so a successful operation
+# hands the modem back before it reports that it finished.
+takeover_rollback_inhibit() {
+	if [ -n "$TAKEOVER_WATCHDOG_PID" ]; then
+		reap_child "$TAKEOVER_WATCHDOG_PID" TERM
+		wait "$TAKEOVER_WATCHDOG_PID" 2>/dev/null || :
+		TAKEOVER_WATCHDOG_PID=""
+	fi
+	[ "$TAKEOVER_INHIBIT_CREATED" -eq 1 ] || return 0
+	reap_child "$TAKEOVER_INHIBIT_PID" TERM
+	"$SLEEP" 1 2>/dev/null || :
+	reap_child "$TAKEOVER_INHIBIT_PID" KILL
+	wait "$TAKEOVER_INHIBIT_PID" 2>/dev/null || :
+	TAKEOVER_INHIBIT_PID=""
+	TAKEOVER_INHIBIT_CREATED=0
+	log notice "released the read takeover inhibit for $(mask_modem_id "$REQUESTED_MODEM")"
+	return 0
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG <command> [--modem <modem_id>] [--endpoint <endpoint_id>]
+                       [--profile <profile_id>] [--refresh]
+
+Read-only commands. None of them writes, opens a channel it does not release,
+or changes a slot, a profile, a bearer or a control owner:
+
+  capabilities-json    What this installation can do, and what is merely
+                       described. Runtime capability, implementation maturity
+                       and validation evidence are three separate fields
+  esim-inventory-json  Every eUICC endpoint this router can see, which modem
+                       and slot it is in, whether it can be reached right now
+                       and if not what would have to change. Optionally for one
+                       --modem
+  esim-status-json     One endpoint, with the counts a read can obtain;
+                       requires --modem and --endpoint
+  profiles-json        The subscriptions on one endpoint; requires --modem and
+                       --endpoint
+  notifications-json   The pending RSP notifications on one endpoint; requires
+                       --modem and --endpoint
+  read-takeover-plan   What a consented read takeover would do, what it would
+                       interrupt and for how long. Requires --modem and
+                       --endpoint
+
+Operations:
+
+  action-start <action> --modem <id> --endpoint <id>
+  action-status --modem <id>
+
+--refresh bypasses the cache and is reachable from a deliberate user action,
+never from a poll.
+EOF
+}
+
+main() {
+	# Before anything of ours exists under these names, and on every entry
+	# point, because the interrupted run that left them may have been started
+	# from any of them.
+	sweep_dead_scratch_files
+	COMMAND_NAME="${1:-}"
+	[ "$#" -eq 0 ] || shift
+	case "$COMMAND_NAME" in -h|--help|help|'') usage; return 0 ;; esac
+	command_argument=""
+	case "$COMMAND_NAME" in
+		action-start) command_argument="${1:-}"; [ "$#" -eq 0 ] || shift ;;
+	esac
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--modem)
+				[ "$#" -ge 2 ] || die_code "$EXIT_USAGE" "--modem needs a value"
+				REQUESTED_MODEM="$2"; shift 2
+			;;
+			--endpoint)
+				[ "$#" -ge 2 ] || die_code "$EXIT_USAGE" "--endpoint needs a value"
+				REQUESTED_ENDPOINT="$2"; shift 2
+			;;
+			--profile)
+				[ "$#" -ge 2 ] || die_code "$EXIT_USAGE" "--profile needs a value"
+				REQUESTED_PROFILE="$2"; shift 2
+			;;
+			--operation)
+				[ "$#" -ge 2 ] || die_code "$EXIT_USAGE" "--operation needs a value"
+				REQUESTED_OPERATION="$2"; shift 2
+			;;
+			--refresh) REQUESTED_REFRESH=1; shift ;;
+			*) die_code "$EXIT_USAGE" "unexpected argument: $1" ;;
+		esac
+	done
+	# A secret is refused as an argument, never sanitised: by the time it could
+	# be stripped the value has already been in this process's world-readable
+	# command line, and removing it afterwards would hide the leak rather than
+	# prevent it.
+	for main_argument in "$REQUESTED_MODEM" "$REQUESTED_ENDPOINT" "$REQUESTED_PROFILE" \
+		"$command_argument"; do
+		case "$main_argument" in
+			LPA:*|*'$'*'$'*)
+				die_code "$EXIT_USAGE" \
+					'a secret was passed as an argument; pass it in the environment instead'
+			;;
+		esac
+	done
+	load_config
+	validate_config
+	( umask 077 && mkdir -p "$STATE_DIR" ) 2>/dev/null || :
+	for main_token in "$REQUESTED_MODEM" "$REQUESTED_ENDPOINT" "$REQUESTED_PROFILE"; do
+		[ -n "$main_token" ] || continue
+		safe_token "$main_token" || die_code "$EXIT_USAGE" "invalid identity argument"
+	done
+	case "$COMMAND_NAME" in
+		capabilities-json) capabilities_json_cmd ;;
+		esim-inventory-json) esim_inventory_json_cmd ;;
+		esim-status-json) esim_status_json_cmd ;;
+		profiles-json) profiles_json_cmd ;;
+		notifications-json) notifications_json_cmd ;;
+		read-takeover-plan) read_takeover_plan_cmd ;;
+		action-start) action_start_cmd "$command_argument" ;;
+		action-status) action_status_cmd ;;
+		# Internal. Reached only by this package's own worker, never by a
+		# wrapper: neither LuCI-facing script knows the verb exists.
+		takeover-run) takeover_run_cmd ;;
+		*) usage >&2; exit "$EXIT_USAGE" ;;
+	esac
+}
+
+main "$@"

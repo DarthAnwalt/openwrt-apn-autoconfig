@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Konstantin=20Sch=C3=B6ning?= <konstantin@lukianov.pp.ua>
+Date: Tue, 25 Aug 2026 23:55:23 +0200
+Subject: [PATCH] driver/at: accept a bare-decimal AT+CCHO response
+
+AT+CCHO's answer was matched only in its "+CCHO: <n>" form. Some modems
+answer with the bare channel number and OK, and SGP.22 does not require
+the prefix. A Fibocom FM350-GL is one of them, so on that module
+logic_channel_open always failed and the eUICC looked absent rather than
+unsupported - a failure mode that sends the reader looking at the card
+rather than at the parser.
+
+Remember the last line of an exchange that matched neither OK, ERROR nor
+the expected prefix, and fall back to it when it is entirely decimal.
+
+The prefixed form is still preferred and is tried first, so no modem that
+worked before changes behaviour.
+
+Upstream: https://github.com/estkme-group/lpac/pull/449
+---
+ driver/apdu/at.c | 46 ++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 44 insertions(+), 2 deletions(-)
+
+diff --git a/driver/apdu/at.c b/driver/apdu/at.c
+index 21d17ca..c6da1c8 100644
+--- a/driver/apdu/at.c
++++ b/driver/apdu/at.c
+@@ -7,6 +7,7 @@
+ 
+ #include <dirent.h>
+ #include <inttypes.h>
++#include <stdbool.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -15,6 +16,9 @@
+ static FILE *fuart;
+ static int logic_channel = 0;
+ static char *buffer;
++// The last line that was neither OK, ERROR nor the expected prefix. Modems that
++// answer a command with a bare value and no prefix leave their answer here.
++static char *last_unmatched;
+ 
+ static void enumerate_serial_device_linux(cJSON *data) {
+     const char *dir_path = "/dev/serial/by-id";
+@@ -39,8 +43,21 @@ static void enumerate_serial_device_linux(cJSON *data) {
+     closedir(dir);
+ }
+ 
++static bool is_decimal_channel(const char *line) {
++    if (line == NULL || line[0] == '\0') {
++        return false;
++    }
++    for (size_t i = 0; line[i] != '\0'; i++) {
++        if (line[i] < '0' || line[i] > '9') {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static int at_expect(char **response, const char *expected) {
+     memset(buffer, 0, AT_BUFFER_SIZE);
++    last_unmatched[0] = '\0';
+ 
+     if (response)
+         *response = NULL;
+@@ -57,6 +74,8 @@ static int at_expect(char **response, const char *expected) {
+         } else if (expected && strncmp(buffer, expected, strlen(expected)) == 0) {
+             if (response)
+                 *response = strdup(buffer + strlen(expected));
++        } else if (buffer[0] != '\0') {
++            snprintf(last_unmatched, AT_BUFFER_SIZE, "%s", buffer);
+         }
+     }
+     return 0;
+@@ -178,7 +197,18 @@ static int apdu_interface_logic_channel_open(struct euicc_ctx *ctx, const uint8_
+         return -1;
+     }
+     if (response == NULL) {
+-        return -1;
++        // SGP.22 does not mandate the +CCHO: prefix and some modems omit it.
++        // A Fibocom FM350-GL answers AT+CCHO with the bare channel number
++        // followed by OK, which the prefixed match above cannot see; without
++        // this the module reports no eUICC at all rather than an unsupported
++        // reply format.
++        if (!is_decimal_channel(last_unmatched)) {
++            return -1;
++        }
++        response = strdup(last_unmatched);
++        if (response == NULL) {
++            return -1;
++        }
+     }
+     logic_channel = atoi(response);
+ 
+@@ -211,6 +241,15 @@ static int libapduinterface_init(struct euicc_apdu_interface *ifstruct) {
+         return -1;
+     }
+ 
++    last_unmatched = malloc(AT_BUFFER_SIZE);
++    if (!last_unmatched) {
++        fprintf(stderr, "Failed to allocate memory\n");
++        free(buffer);
++        buffer = NULL;
++        return -1;
++    }
++    last_unmatched[0] = '\0';
++
+     return 0;
+ }
+ 
+@@ -236,7 +275,10 @@ static int libapduinterface_main(const int argc, char **argv) {
+     return 0;
+ }
+ 
+-static void libapduinterface_fini(struct euicc_apdu_interface *ifstruct) { free(buffer); }
++static void libapduinterface_fini(struct euicc_apdu_interface *ifstruct) {
++    free(buffer);
++    free(last_unmatched);
++}
+ 
+ const struct euicc_driver driver_apdu_at = {
+     .type = DRIVER_APDU,

@@ -1,0 +1,84 @@
+#!/bin/sh
+
+# Holds one ModemManager inhibition for one modem, for as long as this process
+# lives. Started by procd from the init script, one instance per modem this
+# package has provisioned onto the AT-dial protocol.
+#
+# Why a process rather than a setting: an inhibition in ModemManager lasts
+# exactly as long as the client holding it. `mmcli --inhibit-device` blocks and
+# releases the device when it is signalled, and ModemManager also drops the
+# inhibition on its own if the client disappears. Both directions are the safe
+# one — a dead holder returns the modem to ModemManager rather than leaving it
+# owned by nobody.
+#
+# Why at all: a modem this project dials over AT cannot be owned by
+# ModemManager at the same time. On the reference hardware ModemManager claims
+# an FM350-GL and reports it as `model unknown`, because the RNDIS data
+# interface has no bound driver and it cannot drive what it has claimed. It
+# holds the ports and delivers nothing for them.
+#
+# ModemManager is never restarted here. A restart drops every session it
+# manages, which on a router with a second, working ModemManager modem means
+# taking production connectivity down to configure an unrelated device.
+
+MMCLI="${APN_AUTOCONFIG_MODEM_MMCLI:-mmcli}"
+LOG_TAG=apn-autoconfig-modem
+
+UID_PATH="${1:-}"
+MODEM_ID="${2:-}"
+
+# Masks the evidence half of a `modem_id` for logging, keeping the tier prefix.
+# Same convention as `mask_modem_id` in `apn-autoconfig-modem`, duplicated for
+# the same reason: this worker is a standalone script with no shared library.
+mask_modem_id() {
+	case "${1:-}" in
+		'') printf '<unknown>' ; return 0 ;;
+		imei:*) mask_prefix='imei:'; mask_value="${1#imei:}" ;;
+		usb-serial:*) mask_prefix='usb-serial:'; mask_value="${1#usb-serial:}" ;;
+		*) printf '%s' "$1" ; return 0 ;;
+	esac
+	if [ "${#mask_value}" -le 4 ]; then
+		printf '%s...' "$mask_prefix"
+	else
+		printf '%s...%s' "$mask_prefix" "${mask_value#"${mask_value%????}"}"
+	fi
+}
+
+log() {
+	if command -v logger >/dev/null 2>&1; then
+		logger -t "$LOG_TAG" "$*"
+	else
+		printf '%s: %s\n' "$LOG_TAG" "$*" >&2
+	fi
+}
+
+[ -n "$UID_PATH" ] || {
+	log "inhibit worker started without a device uid"
+	exit 2
+}
+
+# The uid is a sysfs device path, which is what ModemManager matches an
+# inhibition against. Anything else is a caller error rather than a device that
+# has gone away.
+case "$UID_PATH" in
+	/sys/*) : ;;
+	*)
+		log "inhibit worker refusing an implausible device uid"
+		exit 2
+	;;
+esac
+
+command -v "$MMCLI" >/dev/null 2>&1 || {
+	# No ModemManager on this system means nothing to inhibit, and that is a
+	# perfectly ordinary configuration rather than a failure. Exiting cleanly
+	# lets procd stop retrying.
+	log "no mmcli present; nothing to inhibit for $(mask_modem_id "${MODEM_ID:-}")"
+	exit 0
+}
+
+log "holding a ModemManager inhibition for $(mask_modem_id "${MODEM_ID:-}")"
+
+# exec so procd signals reach mmcli directly. mmcli installs handlers for INT,
+# HUP and TERM and releases the inhibition from them, so procd's ordinary stop
+# is a clean release rather than an abandoned one.
+exec "$MMCLI" --inhibit-device="$UID_PATH"

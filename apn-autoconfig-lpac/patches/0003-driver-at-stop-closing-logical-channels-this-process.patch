@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Konstantin=20Sch=C3=B6ning?= <konstantin@lukianov.pp.ua>
+Date: Tue, 25 Aug 2026 23:55:45 +0200
+Subject: [PATCH] driver/at: stop closing logical channels this process does
+ not own
+
+logic_channel_open began by sending AT+CCHC for channels 1 through 4 on
+every call. The early return above it proves this process holds none of
+them, so each of those closes can only land on a channel belonging to
+something else talking to the same card - a bearer's own stack, a modem
+manager, another LPA - and it happens unprompted, on a card the driver has
+just been pointed at and knows nothing about.
+
+Make the sweep opt-in through LPAC_APDU_AT_RESET_CHANNELS. It is still the
+way to recover a channel leaked by an earlier run; it is no longer the
+default behaviour of opening one.
+
+Found while reviewing the driver for use on a router where the modem
+carrying the eUICC may also be carrying the uplink. No upstream pull
+request covers this.
+---
+ driver/apdu/at.c        | 18 +++++++++++++++---
+ driver/apdu/at_common.h |  1 +
+ 2 files changed, 16 insertions(+), 3 deletions(-)
+
+diff --git a/driver/apdu/at.c b/driver/apdu/at.c
+index c6da1c8..5dfa43d 100644
+--- a/driver/apdu/at.c
++++ b/driver/apdu/at.c
+@@ -184,9 +184,21 @@ static int apdu_interface_logic_channel_open(struct euicc_ctx *ctx, const uint8_
+         return logic_channel;
+     }
+ 
+-    for (int i = 1; i <= 4; i++) {
+-        fprintf(fuart, "AT+CCHC=%d\r\n", i);
+-        at_expect(NULL, NULL);
++    // Do not close logical channels 1-4 on every open. This process holds none
++    // of them - the early return above proves it - so each AT+CCHC here can
++    // only tear down a channel belonging to whatever else is talking to the
++    // card: a bearer's own stack, a modem manager, another LPA. That is a
++    // destructive act performed unprompted, on a card we have just been pointed
++    // at and know nothing about.
++    //
++    // The sweep is still the way to recover a channel leaked by an earlier run,
++    // so it stays - but as something a caller asks for, having decided that it
++    // owns the card.
++    if (getenv_or_default(ENV_AT_RESET_CHANNELS, false)) {
++        for (int i = 1; i <= 4; i++) {
++            fprintf(fuart, "AT+CCHC=%d\r\n", i);
++            at_expect(NULL, NULL);
++        }
+     }
+     fprintf(fuart, "AT+CCHO=\"");
+     for (int i = 0; i < aid_len; i++) {
+diff --git a/driver/apdu/at_common.h b/driver/apdu/at_common.h
+index 43afde1..cb3c3f8 100644
+--- a/driver/apdu/at_common.h
++++ b/driver/apdu/at_common.h
+@@ -7,5 +7,6 @@
+ 
+ #define ENV_AT_DEBUG APDU_ENV_NAME(AT, DEBUG)
+ #define ENV_AT_DEVICE APDU_ENV_NAME(AT, DEVICE)
++#define ENV_AT_RESET_CHANNELS APDU_ENV_NAME(AT, RESET_CHANNELS)
+ 
+ bool jprint_enumerate_devices(cJSON *data);

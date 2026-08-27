@@ -1043,7 +1043,9 @@ The independently versioned provider database is maintained here as a narrow
 exception. A scheduled public workflow reads only the declared GNOME MBPI and
 AOSP revisions, verifies their licences and reproducibility, builds only
 `apn-autoconfig-providers`, and replaces only that package in the signed feed.
-It does not receive the private test suite or rebuild the other packages.
+It does not receive the private test suite or rebuild the other packages. If
+the public sources remain unchanged for 45 days, it records an empty maintenance
+commit so GitHub does not disable the weekly schedule after 60 inactive days.
 
 That is a deliberate boundary rather than an oversight, and it was drawn after
 real subscriber and equipment identifiers -- belonging to the SIM cards in the

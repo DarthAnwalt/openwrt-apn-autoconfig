@@ -51,6 +51,19 @@ jobs:
           else
             echo "publish=true" >>"$GITHUB_OUTPUT"
           fi
+      - name: Keep an unchanged public schedule from expiring
+        if: steps.changes.outputs.publish == 'false'
+        run: |
+          now="$(date +%s)"
+          last_activity="$(git log -1 --format=%ct)"
+          if test "$((now - last_activity))" -lt 3888000; then
+            echo "Repository activity is newer than 45 days; no keepalive is needed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Keep provider update schedule active"
+          git push origin HEAD:main
       - name: Verify reproducible public provider input
         if: steps.changes.outputs.publish == 'true'
         run: sh scripts/verify-provider-pipeline.sh

@@ -1,0 +1,426 @@
+#!/bin/sh
+
+# Read-only QMI identity adapter for the backend contract.
+# It never modifies a profile, registration state, SIM state or netifd state.
+
+umask 077
+
+UQMI="${APN_AUTOCONFIG_UQMI:-uqmi}"
+SMS_TOOL="${APN_AUTOCONFIG_SMS_TOOL:-sms_tool}"
+TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
+SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
+AT_TIMEOUT_SECONDS="${APN_AUTOCONFIG_AT_TIMEOUT_SECONDS:-6}"
+SYSFS_ROOT="${APN_AUTOCONFIG_SYSFS_ROOT:-/sys}"
+IDENTITY_LOCK_ROOT="${APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT:-/var/lock/apn-autoconfig-qmi-identity}"
+AT_CACHE_DIR="${APN_AUTOCONFIG_QMI_AT_CACHE_DIR:-/var/run/apn-autoconfig-qmi}"
+IDENTITY_LOCK_DIR=
+
+case "$AT_TIMEOUT_SECONDS" in
+	''|*[!0-9]*) AT_TIMEOUT_SECONDS=6 ;;
+	*) [ "$AT_TIMEOUT_SECONDS" -ge 1 ] && [ "$AT_TIMEOUT_SECONDS" -le 30 ] || AT_TIMEOUT_SECONDS=6 ;;
+esac
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+release_identity_lock() {
+	[ -n "$IDENTITY_LOCK_DIR" ] || return 0
+	rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
+	rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+	IDENTITY_LOCK_DIR=
+}
+
+identity_signal() {
+	release_identity_lock
+	exit 3
+}
+
+acquire_identity_lock() {
+	device_name="${1#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	IDENTITY_LOCK_DIR="$IDENTITY_LOCK_ROOT.$device_name"
+	waited=0
+	while ! mkdir "$IDENTITY_LOCK_DIR" 2>/dev/null; do
+		owner="$(sed -n '1p' "$IDENTITY_LOCK_DIR/pid" 2>/dev/null)"
+		case "$owner" in
+			''|*[!0-9]*) owner= ;;
+		esac
+		if [ -z "$owner" ] && [ "$waited" -eq 0 ]; then
+			"$SLEEP" 1
+			waited=1
+			continue
+		fi
+		if [ -z "$owner" ] || ! kill -0 "$owner" 2>/dev/null; then
+			rm -f "$IDENTITY_LOCK_DIR/pid" 2>/dev/null || :
+			rmdir "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+			continue
+		fi
+		[ "$waited" -lt 15 ] || {
+			IDENTITY_LOCK_DIR=
+			return 1
+		}
+		"$SLEEP" 1
+		waited=$((waited + 1))
+	done
+	printf '%s\n' "$$" >"$IDENTITY_LOCK_DIR/pid" || {
+		release_identity_lock
+		return 1
+	}
+	trap identity_signal HUP INT TERM
+}
+
+capabilities() {
+	command_exists "$UQMI" && command_exists "$SMS_TOOL" && \
+		command_exists jsonfilter && command_exists readlink
+}
+
+safe_single_line() {
+	value="$1"
+	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
+}
+
+json_digits() {
+	value="$1"
+	case "$value" in
+		\"*\") value="${value#\"}"; value="${value%\"}" ;;
+	esac
+	case "$value" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s\n' "$value"
+}
+
+json_value() {
+	document="$1"
+	expression="$2"
+	jsonfilter -s "$document" -e "$expression" 2>/dev/null
+}
+
+run_uqmi() {
+	device="$1"
+	shift
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" 6 "$UQMI" -s -d "$device" -t 3000 "$@"
+	else
+		# uqmi has its own per-request timeout. Minimal OpenWrt images do not
+		# necessarily provide a separate timeout command, so keep QMI identity
+		# available while retaining the bounded backend request.
+		"$UQMI" -s -d "$device" -t 3000 "$@"
+	fi
+}
+
+usb_device_path() {
+	path="$1"
+	while [ "$path" != "$SYSFS_ROOT" ] && [ "$path" != / ] && [ -n "$path" ]; do
+		name="${path##*/}"
+		case "$name" in
+			*:1.*)
+				printf '%s\n' "${path%/*}"
+				return 0
+			;;
+		esac
+		path="${path%/*}"
+	done
+	return 1
+}
+
+control_usb_device() {
+	device_name="${1#/dev/}"
+	case "$device_name" in
+		cdc-wdm*) class=usbmisc ;;
+		wwan*qmi*) class=wwan ;;
+		*) return 1 ;;
+	esac
+	class_device="$SYSFS_ROOT/class/$class/$device_name/device"
+	[ -e "$class_device" ] || return 1
+	resolved="$(readlink -f "$class_device" 2>/dev/null)" || return 1
+	case "$resolved" in "$SYSFS_ROOT"/devices/*) : ;; *) return 1 ;; esac
+	usb_device_path "$resolved"
+}
+
+related_at_devices() {
+	normalized_sysfs="$(readlink -f "$SYSFS_ROOT" 2>/dev/null)" || return 1
+	SYSFS_ROOT="$normalized_sysfs"
+	control_usb="$(control_usb_device "$1")" || return 1
+	for class_device in \
+		"$SYSFS_ROOT"/class/tty/ttyUSB*/device \
+		"$SYSFS_ROOT"/class/tty/ttyACM*/device
+	do
+		[ -e "$class_device" ] || continue
+		resolved="$(readlink -f "$class_device" 2>/dev/null)" || continue
+		case "$resolved" in "$SYSFS_ROOT"/devices/*) : ;; *) continue ;; esac
+		candidate_usb="$(usb_device_path "$resolved")" || continue
+		[ "$candidate_usb" = "$control_usb" ] || continue
+		device_name="${class_device%/device}"
+		device_name="${device_name##*/}"
+		case "$device_name" in
+			ttyUSB*) index="${device_name#ttyUSB}" ;;
+			ttyACM*) index="${device_name#ttyACM}" ;;
+			*) continue ;;
+		esac
+		case "$index" in ''|*[!0-9]*) continue ;; esac
+		printf '/dev/%s\n' "$device_name"
+	done
+}
+
+at_digits() {
+	kind="$1"
+	awk -v kind="$kind" '
+		{
+			gsub(/\r/, "")
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+			if (kind == "iccid") sub(/^\+(Q)?CCID:[[:space:]]*/, "")
+			if ($0 !~ /^[0-9]+$/) next
+			lengths_ok = (kind == "iccid" && length($0) >= 10 && length($0) <= 32) ||
+				(kind == "imsi" && length($0) >= 5 && length($0) <= 18)
+			if (!lengths_ok) next
+			value = $0
+			count++
+		}
+		END {
+			if (count != 1) exit 1
+			print value
+		}
+	'
+}
+
+run_at() {
+	device="$1"
+	command="$2"
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" "$AT_TIMEOUT_SECONDS" "$SMS_TOOL" -d "$device" at "$command" 2>/dev/null
+		return
+	fi
+
+	# BusyBox sms_tool has no request-timeout option and can remain blocked on a
+	# serial port. Minimal OpenWrt images do not necessarily install an external
+	# timeout command, so retain a local watchdog instead of allowing status-json
+	# (and therefore LuCI) to hang indefinitely.
+	mkdir -p "$AT_CACHE_DIR" 2>/dev/null || return 1
+	timeout_marker="$AT_CACHE_DIR/.at-timeout.$$"
+	rm -f "$timeout_marker" 2>/dev/null || return 1
+	"$SMS_TOOL" -d "$device" at "$command" 2>/dev/null &
+	at_pid=$!
+	(
+		"$SLEEP" "$AT_TIMEOUT_SECONDS"
+		: >"$timeout_marker" 2>/dev/null || :
+		kill "$at_pid" 2>/dev/null || exit 0
+		"$SLEEP" 1
+		kill -9 "$at_pid" 2>/dev/null || :
+	) 2>/dev/null &
+	watchdog_pid=$!
+
+	at_status=0
+	wait "$at_pid" || at_status=$?
+	kill "$watchdog_pid" 2>/dev/null || :
+	wait "$watchdog_pid" 2>/dev/null || :
+	if [ -e "$timeout_marker" ]; then
+		rm -f "$timeout_marker" 2>/dev/null || :
+		return 124
+	fi
+	return "$at_status"
+}
+
+at_identity() {
+	control_device="$1"
+	device_name="${control_device#/dev/}"
+	cache_file="$AT_CACHE_DIR/$device_name.at-device"
+	related_devices="$(related_at_devices "$control_device")" || return 1
+	cached_device="$(sed -n '1p' "$cache_file" 2>/dev/null)"
+	case "$cached_device" in /dev/ttyUSB[0-9]*|/dev/ttyACM[0-9]*) : ;; *) cached_device= ;; esac
+	if [ -n "$cached_device" ] && ! printf '%s\n' "$related_devices" | grep -F -x -q "$cached_device"; then
+		cached_device=
+	fi
+	ordered_devices=
+	[ -z "$cached_device" ] || ordered_devices="$cached_device"
+	for at_device in $related_devices; do
+		[ "$at_device" = "$cached_device" ] || ordered_devices="${ordered_devices}${ordered_devices:+
+}$at_device"
+	done
+	for at_device in $ordered_devices; do
+		iccid_status=0
+		iccid_output="$(run_at "$at_device" 'AT+CCID')" || iccid_status=$?
+		iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || {
+			# A timed-out serial port is not an AT command channel. Trying the
+			# vendor spelling there would only repeat the same bounded delay.
+			# Immediate command errors still get the Quectel-compatible fallback.
+			case "$iccid_status" in 124|137|143) continue ;; esac
+			iccid_output="$(run_at "$at_device" 'AT+QCCID')" || iccid_output=""
+			iccid="$(printf '%s\n' "$iccid_output" | at_digits iccid)" || continue
+		}
+		imsi_output="$(run_at "$at_device" 'AT+CIMI')" || continue
+		imsi="$(printf '%s\n' "$imsi_output" | at_digits imsi)" || continue
+		mkdir -p "$AT_CACHE_DIR" 2>/dev/null || :
+		if [ -d "$AT_CACHE_DIR" ]; then
+			printf '%s\n' "$at_device" >"$cache_file.$$" 2>/dev/null &&
+				mv -f "$cache_file.$$" "$cache_file" 2>/dev/null ||
+				rm -f "$cache_file.$$" 2>/dev/null || :
+		fi
+		printf '%s\n%s\n' "$iccid" "$imsi"
+		return 0
+	done
+	return 1
+}
+
+normalize_registration() {
+	registration="$1"
+	roaming="$2"
+	case "$registration" in
+		registered)
+			case "$roaming" in true) printf '%s\n' roaming ;; false) printf '%s\n' home ;; *) printf '%s\n' registered ;; esac
+		;;
+		not_registered) printf '%s\n' idle ;;
+		searching) printf '%s\n' searching ;;
+		registering_denied|registration_denied) printf '%s\n' denied ;;
+		*) printf '%s\n' unknown ;;
+	esac
+}
+
+serving_operator_id() {
+	mcc="$1"
+	mnc="$2"
+	case "$mcc" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) : ;; *) return 0 ;; esac
+	case "$mnc" in [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) : ;; *) return 0 ;; esac
+	if [ "$mnc" -lt 100 ]; then
+		printf '%03d%02d\n' "$mcc" "$mnc"
+	else
+		printf '%03d%03d\n' "$mcc" "$mnc"
+	fi
+}
+
+signal_quality_percent() {
+	document="$1"
+	rsrp_values="$(json_value "$document" '@[*].rsrp')"
+	quality="$(printf '%s\n' "$rsrp_values" | awk '
+		$0 ~ /^-?[0-9]+([.][0-9]+)?$/ {
+			if (!found || $0 > best) best=$0
+			found=1
+		}
+		END {
+			if (!found) exit 1
+			value=(best + 120) * 2.5
+			if (value < 0) value=0
+			if (value > 100) value=100
+			printf "%d\n", int(value + 0.5)
+		}
+	' 2>/dev/null)" && {
+		printf '%s\n' "$quality"
+		return 0
+	}
+
+	rssi_values="$(json_value "$document" '@[*].rssi')"
+	printf '%s\n' "$rssi_values" | awk '
+		$0 ~ /^-?[0-9]+([.][0-9]+)?$/ {
+			if (!found || $0 > best) best=$0
+			found=1
+		}
+		END {
+			if (!found) exit 1
+			value=(best + 110) * (100 / 60)
+			if (value < 0) value=0
+			if (value > 100) value=100
+			printf "%d\n", int(value + 0.5)
+		}
+	'
+}
+
+identity_locked() {
+	device="$1"
+	case "$device" in /dev/*) : ;; *) return 1 ;; esac
+	device_name="${device#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$device_name" in
+		cdc-wdm*)
+			device_index="${device_name#cdc-wdm}"
+			case "$device_index" in ''|*[!0-9]*) return 1 ;; esac
+		;;
+		wwan*qmi*)
+			wwan_index="${device_name#wwan}"
+			wwan_index="${wwan_index%%qmi*}"
+			qmi_index="${device_name##*qmi}"
+			case "$wwan_index" in ''|*[!0-9]*) return 1 ;; esac
+			case "$qmi_index" in ''|*[!0-9]*) return 1 ;; esac
+			[ "$device_name" = "wwan${wwan_index}qmi${qmi_index}" ] || return 1
+		;;
+		*) return 1 ;;
+	esac
+
+	iccid_status=0
+	iccid_json="$(run_uqmi "$device" --get-iccid 2>/dev/null)" || iccid_status=$?
+	imsi_status=0
+	imsi_json="$(run_uqmi "$device" --get-imsi 2>/dev/null)" || imsi_status=$?
+	if [ "$iccid_status" -eq 0 ] && [ "$imsi_status" -eq 0 ]; then
+		iccid="$(json_digits "$iccid_json")" || return 1
+		imsi="$(json_digits "$imsi_json")" || return 1
+	else
+		at_values="$(at_identity "$device")" || return 3
+		iccid="$(printf '%s\n' "$at_values" | sed -n '1p')"
+		imsi="$(printf '%s\n' "$at_values" | sed -n '2p')"
+	fi
+	[ "${#iccid}" -ge 10 ] && [ "${#iccid}" -le 32 ] || return 1
+	[ "${#imsi}" -ge 5 ] && [ "${#imsi}" -le 18 ] || return 1
+
+	serving="$(run_uqmi "$device" --get-serving-system 2>/dev/null || printf '{}')"
+	registration="$(json_value "$serving" '@.registration')"
+	roaming="$(json_value "$serving" '@.roaming')"
+	case "$roaming" in 1|true) roaming=true ;; 0|false) roaming=false ;; *) roaming=unknown ;; esac
+	mcc="$(json_value "$serving" '@.plmn_mcc')"
+	mnc="$(json_value "$serving" '@.plmn_mnc')"
+	serving_id="$(serving_operator_id "$mcc" "$mnc")"
+	serving_name="$(json_value "$serving" '@.plmn_description')"
+	access="$(json_value "$serving" '@.radio_interface[0]')"
+	signal="$(run_uqmi "$device" --get-signal-info 2>/dev/null || printf '[]')"
+	signal_quality="$(signal_quality_percent "$signal" 2>/dev/null || :)"
+	registration="$(normalize_registration "$registration" "$roaming")"
+	case "$registration" in home|roaming) modem_state=connected ;; *) modem_state=enabled ;; esac
+
+	for value in "$serving_id" "$serving_name" "$access" "$registration"; do
+		safe_single_line "$value" || return 1
+	done
+	case "$serving_id" in ''|*[!0-9]*) [ -z "$serving_id" ] || return 1 ;; esac
+
+	printf '%s\n' v1
+	printf 'sim_index\t%s\n' 1
+	printf 'modem_index\t%s\n' "$device"
+	printf 'iccid\t%s\n' "$iccid"
+	printf 'imsi\t%s\n' "$imsi"
+	printf 'eid\t\n'
+	# uqmi does not expose a reliable home PLMN; the engine can still match the
+	# MCC/MNC prefix in IMSI without confusing a roaming serving PLMN for home.
+	printf 'operator_id\t\n'
+	printf 'operator_name\t\n'
+	printf 'gid1\t\n'
+	printf 'gid2\t\n'
+	printf 'modem_state\t%s\n' "$modem_state"
+	printf 'registration_state\t%s\n' "$registration"
+	printf 'roaming\t%s\n' "$roaming"
+	printf 'serving_operator_id\t%s\n' "$serving_id"
+	printf 'serving_operator_name\t%s\n' "$serving_name"
+	printf 'access_technologies\t%s\n' "$access"
+	printf 'signal_quality\t%s\n' "$signal_quality"
+}
+
+identity() {
+	acquire_identity_lock "$1" || return 3
+	identity_status=0
+	identity_locked "$@" || identity_status=$?
+	release_identity_lock
+	trap - HUP INT TERM
+	return "$identity_status"
+}
+
+case "${1:-}" in
+	capabilities)
+		[ "$#" -eq 1 ] || exit 2
+		capabilities
+	;;
+	identity)
+		[ "$#" -eq 2 ] || exit 2
+		capabilities || exit 3
+		identity "$2"
+	;;
+	*) exit 2 ;;
+esac

@@ -1,0 +1,65 @@
+config apn_autoconfig_modem 'main'
+	option autostart '1'
+	option boot_delay '10'
+	option sysfs_root '/sys'
+	option state_dir '/var/run/apn-autoconfig-modem'
+	# Identity evidence — the IMEI and the model strings an AT read learned —
+	# kept apart from volatile scan state because it describes the modem rather
+	# than this boot. Model strings are safe to display after reboot. The cached
+	# IMEI is accepted as strong identity only after a fresh read corroborates it
+	# for the current USB enumeration, so an identical replacement in the same
+	# socket cannot inherit it.
+	option identity_dir '/etc/apn-autoconfig-modem/identity'
+	option lock_root '/var/lock/apn-autoconfig-modem'
+	option action_state_dir '/tmp/apn-autoconfig-modem-action'
+	option hotplug_coalesce_seconds '3'
+	option modem_power_path '/sys/class/gpio/modem_power/value'
+	option modem_power_off_value '1'
+	option modem_power_on_value '0'
+	option modem_power_off_seconds '5'
+	option modem_wait_seconds '90'
+	# How long a reset issued over the modem's own control channel — AT+CFUN or
+	# a request to ModemManager — has to actually take the device off the USB
+	# bus. Such a reset returns while the modem is still enumerated, so its
+	# departure is what proves it took effect; never seeing one means the
+	# command was accepted and did nothing. Board power cycles skip this, having
+	# removed the device already. Measured on an FM350-GL: 36 seconds to depart,
+	# 32 more to return.
+	option modem_depart_seconds '90'
+	option modem_poll_seconds '2'
+	option connect_wait_seconds '60'
+	# Convergence, which runs when a modem that was already known comes back.
+	# The SIM wait is the modem's own settling time after it reappears on the
+	# bus; network registration is bounded again by the APN engine's own
+	# preflight and is not repeated here. The attempts and the pause between
+	# them cover an operation the user started while the modem was returning:
+	# that is a deferred convergence, neither a failure nor a success. Zero
+	# attempts is refused; a zero SIM wait means "do not wait", which is
+	# legitimate on a modem this project may not read anyway.
+	option converge_sim_wait_seconds '30'
+	option converge_attempts '5'
+	option converge_retry_seconds '5'
+	option converge_result_wait_seconds '600'
+	# Per-command bound for AT probes and reads. Five seconds is enough for a
+	# live control port and short enough that sweeping a modem whose other
+	# ports never answer stays tolerable. Raising it multiplies by the number
+	# of silent ports, which on some modems is most of them.
+	option at_timeout_seconds '5'
+	option at_port_lock_root '/var/lock/apn-autoconfig-at-port'
+	# How long to wait for the shared AT port lock before refusing. Contention is
+	# normal and brief: another component of this suite is reading identity, or
+	# the AT-dial protocol handler is holding the port for a bring-up. Waiting is
+	# what keeps an ordinary overlap from surfacing as a failure. Zero refuses
+	# immediately. Failing to acquire is always a refusal, never a licence to use
+	# the port anyway.
+	option at_lock_wait_seconds '15'
+	option hardware_integration_file '/usr/share/apn-autoconfig/integrations/huasifei-wh3000'
+	# Route metric for sections this package creates. A provisioned modem is the
+	# least preferred route by default, so it cannot take the default route away
+	# from an uplink that already works; with no other uplink it still becomes
+	# the default one. Empty restores netifd's own default of 0. The same
+	# default is compiled in, so an upgraded installation gets it too.
+	option provision_metric '1024'
+	# Reset stays unavailable until the administrator pins the strong modem_id
+	# of the internal modem controlled by the board GPIO.
+	option reset_modem_id ''

@@ -1,0 +1,13 @@
+#!/bin/sh
+
+# Coalesces USB add/remove hotplug storms into one debounced, read-only
+# rescan. Never mutates UCI or netifd state from hotplug context; it only
+# schedules the same inventory scan that runs at service start.
+
+case "${ACTION:-}" in add|remove) : ;; *) exit 0 ;; esac
+
+modem_bin="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
+[ -x "$modem_bin" ] || exit 0
+
+"$modem_bin" rescan-async >/dev/null 2>&1 || :
+exit 0

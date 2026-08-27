@@ -8,6 +8,7 @@ mkdir -p "$TMP"
 
 OLD_MANIFEST="$ROOT/data/provider-sources.json"
 OLD_DATABASE="$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
+PREVIOUS_SNAPSHOT="$ROOT/data/providers-previous.tsv"
 OLD_REPORT="$ROOT/data/providers-report.json"
 OLD_VERSION="$ROOT/apn-autoconfig-providers/VERSION"
 NEW_MANIFEST="$TMP/provider-sources.json"
@@ -42,6 +43,10 @@ python3 "$ROOT/scripts/check-provider-update.py" \
 	--old-report "$OLD_REPORT" --new-report "$NEW_REPORT" \
 	--old-database "$OLD_DATABASE" --new-database "$NEW_DATABASE"
 
+# Keep the exact predecessor as an explicit public build input. Reproducibility
+# must not depend on repository ancestry: public release snapshots deliberately
+# have compact, rewritten history, and a forced rebuild must work from a clone.
+cp "$OLD_DATABASE" "$PREVIOUS_SNAPSHOT"
 mv "$NEW_MANIFEST" "$OLD_MANIFEST"
 mv "$NEW_DATABASE" "$OLD_DATABASE"
 mv "$NEW_REPORT" "$OLD_REPORT"

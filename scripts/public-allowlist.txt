@@ -51,6 +51,7 @@ data/licenses/
 # builds only apn-autoconfig-providers; it neither receives nor runs the private
 # repository's tests or hardware records.
 data/provider-sources.json
+data/providers-previous.tsv
 data/providers-report.json
 data/providers-overrides.tsv
 .github/workflows/update-provider-database.yml
@@ -63,6 +64,7 @@ scripts/fetch-published-packages.py
 scripts/generate-providers.py
 scripts/openwrt-sdk-config.sh
 scripts/publish-feed.sh
+scripts/public-allowlist.txt
 scripts/refresh-provider-sources.py
 scripts/refresh-providers.sh
 scripts/update-providers.sh

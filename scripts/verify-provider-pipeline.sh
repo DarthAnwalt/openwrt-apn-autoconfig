@@ -26,10 +26,10 @@ PYTHONPYCACHEPREFIX="$WORK/pycache" python3 -m py_compile \
 	"$ROOT/scripts/verify-provider-source-licenses.py"
 
 database="$ROOT/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
-database_path="apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv"
+previous="$ROOT/data/providers-previous.tsv"
 version="$ROOT/apn-autoconfig-providers/VERSION"
 report="$ROOT/data/providers-report.json"
-[ -s "$database" ] && [ -s "$version" ] && [ -s "$report" ]
+[ -s "$database" ] && [ -s "$previous" ] && [ -s "$version" ] && [ -s "$report" ]
 grep -F -q '# sources:' "$database"
 grep -F -q '# revisions:' "$database"
 grep -F -q '# database-version:' "$database"
@@ -37,24 +37,10 @@ grep -F -q '# database-version:' "$database"
 # Re-fetch the pinned public sources, re-check their licences and prove that
 # the committed package input is reproducible from them and the declared
 # overrides. The previous database is an explicit input because it preserves
-# profiles temporarily removed upstream. Use the exact preceding public blob,
-# not the new database as its own predecessor: retained rows are deliberately
-# demoted once per upstream removal, so feeding the result back would demote
-# them a second time and would not reproduce the update that actually ran.
-previous="$WORK/previous-providers.tsv"
-if git -C "$ROOT" diff --quiet -- "$database_path"; then
-	database_commit="$(git -C "$ROOT" log -1 --format=%H -- "$database_path")"
-	[ -n "$database_commit" ] || {
-		printf 'No committed provider database exists to verify.\n' >&2
-		exit 1
-	}
-	git -C "$ROOT" show "$database_commit^:$database_path" >"$previous" 2>/dev/null || {
-		printf 'The previous provider database is absent from public history.\n' >&2
-		exit 1
-	}
-else
-	git -C "$ROOT" show "HEAD:$database_path" >"$previous"
-fi
+# profiles temporarily removed upstream. The exact predecessor is committed as
+# a public input instead of being recovered from Git ancestry: retained rows
+# are deliberately demoted once per upstream removal, so the current result
+# cannot be fed back as its own predecessor.
 APN_PROVIDER_OUTPUT="$WORK/providers.tsv" \
 APN_PROVIDER_REPORT="$WORK/providers-report.json" \
 	APN_PROVIDER_PREVIOUS="$previous" \

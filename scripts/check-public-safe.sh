@@ -101,6 +101,7 @@ identifier_shape_exempt() {
 		# Releases before 0.8.0 carried the same generated public database in
 		# the core package, before it became independently versioned.
 		files/usr/share/apn-autoconfig/providers.tsv) return 0 ;;
+		data/providers-previous.tsv) return 0 ;;
 		apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv) return 0 ;;
 	esac
 	return 1

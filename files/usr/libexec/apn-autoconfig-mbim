@@ -1,0 +1,571 @@
+#!/bin/sh
+
+# Read-only MBIM identity adapter for the backend contract.
+# It never modifies a profile, registration state, SIM state or netifd state,
+# and never closes a control session netifd opened for a live bearer.
+# See docs/mbim-contract-v1.md.
+
+umask 077
+
+UMBIM="${APN_AUTOCONFIG_UMBIM:-umbim}"
+TIMEOUT="${APN_AUTOCONFIG_TIMEOUT:-timeout}"
+SLEEP="${APN_AUTOCONFIG_SLEEP:-sleep}"
+MBIM_TIMEOUT_SECONDS="${APN_AUTOCONFIG_MBIM_TIMEOUT_SECONDS:-20}"
+NETIFD_STATE_DIR="${APN_AUTOCONFIG_NETIFD_STATE_DIR:-/var/state}"
+# Deliberately the same namespace and the same override as apn-autoconfig-qmi:
+# both adapters can be asked about one physical modem, and an MBIM read must not
+# run inside another adapter's identity transaction on the same control device.
+IDENTITY_LOCK_ROOT="${APN_AUTOCONFIG_QMI_IDENTITY_LOCK_ROOT:-/var/lock/apn-autoconfig-qmi-identity}"
+RUN_DIR="${APN_AUTOCONFIG_MBIM_RUN_DIR:-/var/run/apn-autoconfig-mbim}"
+# netifd's own transaction counter starts at 2 and increments per message. A
+# separate high range cannot collide with it, and the adapter refuses to run
+# while a netifd transition is in flight anyway.
+TRANSACTION_BASE="${APN_AUTOCONFIG_MBIM_TRANSACTION_BASE:-16384}"
+IDENTITY_LOCK_DIR=
+UMBIM_ACTIVE_PID=
+SESSION_MODE=
+MBIM_TRANSACTION=
+
+case "$MBIM_TIMEOUT_SECONDS" in
+	''|*[!0-9]*) MBIM_TIMEOUT_SECONDS=20 ;;
+	*) [ "$MBIM_TIMEOUT_SECONDS" -ge 1 ] && [ "$MBIM_TIMEOUT_SECONDS" -le 60 ] || MBIM_TIMEOUT_SECONDS=20 ;;
+esac
+case "$TRANSACTION_BASE" in
+	''|*[!0-9]*) TRANSACTION_BASE=16384 ;;
+	*) [ "$TRANSACTION_BASE" -ge 1024 ] || TRANSACTION_BASE=16384 ;;
+esac
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+log() {
+	level="$1"
+	shift
+	command_exists logger || return 0
+	logger -t apn-autoconfig-mbim -p "daemon.$level" -- "$*" 2>/dev/null || :
+}
+
+# ---- lock primitives ----
+#
+# Identical protocol to apn-autoconfig, apn-autoconfig-qmi and
+# apn-autoconfig-modem: the lock is a regular file whose first line is the owner
+# PID, published atomically by `ln`.
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+lock_owner_pid() {
+	if [ -d "$1" ]; then
+		lock_owner_value="$(sed -n '1p' "$1/pid" 2>/dev/null || :)"
+	else
+		lock_owner_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	fi
+	case "$lock_owner_value" in ''|*[!0-9]*|0) return 1 ;; esac
+	printf '%s\n' "$lock_owner_value"
+}
+
+# 0 acquired, 1 unusable path, 2 already present
+lock_try_acquire() {
+	acquire_path="$1"
+	# `ln source directory` links *into* the directory instead of failing, so a
+	# lock left behind as a 0.10.0-style directory has to be rejected here and
+	# handled by the reclaim path rather than silently "acquired".
+	[ -d "$acquire_path" ] && return 2
+	acquire_tmp="${acquire_path}.tmp.$$"
+	printf '%s\n' "$$" >"$acquire_tmp" 2>/dev/null || return 1
+	if ln "$acquire_tmp" "$acquire_path" 2>/dev/null; then
+		if [ -f "$acquire_path" ] && [ "$(sed -n '1p' "$acquire_path" 2>/dev/null)" = "$$" ]; then
+			rm -f "$acquire_tmp"
+			return 0
+		fi
+		rm -f "$acquire_path/${acquire_tmp##*/}" 2>/dev/null || :
+		rm -f "$acquire_tmp"
+		return 2
+	fi
+	rm -f "$acquire_tmp"
+	return 2
+}
+
+lock_reclaim_if_stale() {
+	reclaim_path="$1"
+	reclaim_guard="${reclaim_path}.reclaim"
+	reclaim_guard_owner="$(lock_owner_pid "$reclaim_guard" 2>/dev/null || :)"
+	if [ -n "$reclaim_guard_owner" ] && ! process_is_alive "$reclaim_guard_owner"; then
+		rm -f "$reclaim_guard" 2>/dev/null || :
+	fi
+	lock_try_acquire "$reclaim_guard" || return 1
+	reclaim_result=1
+	reclaim_owner="$(lock_owner_pid "$reclaim_path" 2>/dev/null || :)"
+	if [ -n "$reclaim_owner" ] && process_is_alive "$reclaim_owner"; then
+		reclaim_result=1
+	elif [ -d "$reclaim_path" ]; then
+		rm -f "$reclaim_path/pid" 2>/dev/null || :
+		rmdir "$reclaim_path" 2>/dev/null && reclaim_result=0
+	else
+		rm -f "$reclaim_path" 2>/dev/null && reclaim_result=0
+	fi
+	rm -f "$reclaim_guard" 2>/dev/null || :
+	return "$reclaim_result"
+}
+
+# 0 acquired, 1 unusable path, 3 held by a live owner
+lock_try_acquire_or_reclaim() {
+	attempt_path="$1"
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	attempt_owner="$(lock_owner_pid "$attempt_path" 2>/dev/null || :)"
+	if [ -n "$attempt_owner" ] && process_is_alive "$attempt_owner"; then
+		return 3
+	fi
+	lock_reclaim_if_stale "$attempt_path" || return 3
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	return 3
+}
+
+release_identity_lock() {
+	[ -n "$IDENTITY_LOCK_DIR" ] || return 0
+	rm -f "$IDENTITY_LOCK_DIR" 2>/dev/null || :
+	IDENTITY_LOCK_DIR=
+}
+
+terminate_active_query() {
+	[ -n "$UMBIM_ACTIVE_PID" ] || return 0
+	kill "$UMBIM_ACTIVE_PID" 2>/dev/null || :
+	UMBIM_ACTIVE_PID=
+}
+
+identity_signal() {
+	terminate_active_query
+	release_identity_lock
+	exit 3
+}
+
+acquire_identity_lock() {
+	device_name="${1#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	IDENTITY_LOCK_DIR="$IDENTITY_LOCK_ROOT.$device_name"
+	mkdir -p "$(dirname "$IDENTITY_LOCK_ROOT")" 2>/dev/null || :
+	waited=0
+	while :; do
+		lock_try_acquire_or_reclaim "$IDENTITY_LOCK_DIR"
+		identity_lock_status=$?
+		[ "$identity_lock_status" -eq 0 ] && break
+		if [ "$identity_lock_status" -eq 1 ] || [ "$waited" -ge 15 ]; then
+			IDENTITY_LOCK_DIR=
+			return 1
+		fi
+		"$SLEEP" 1
+		waited=$((waited + 1))
+	done
+	trap identity_signal HUP INT TERM
+}
+
+capabilities() {
+	command_exists "$UMBIM" && command_exists uci && command_exists ubus
+}
+
+safe_single_line() {
+	value="$1"
+	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
+}
+
+device_name_is_safe() {
+	case "$1" in /dev/*) : ;; *) return 1 ;; esac
+	safe_name="${1#/dev/}"
+	case "$safe_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	case "$safe_name" in
+		cdc-wdm*)
+			safe_index="${safe_name#cdc-wdm}"
+			case "$safe_index" in ''|*[!0-9]*) return 1 ;; esac
+		;;
+		wwan*mbim*)
+			wwan_index="${safe_name#wwan}"
+			wwan_index="${wwan_index%%mbim*}"
+			mbim_index="${safe_name##*mbim}"
+			case "$wwan_index" in ''|*[!0-9]*) return 1 ;; esac
+			case "$mbim_index" in ''|*[!0-9]*) return 1 ;; esac
+			[ "$safe_name" = "wwan${wwan_index}mbim${mbim_index}" ] || return 1
+		;;
+		*) return 1 ;;
+	esac
+}
+
+# ---- netifd session discovery ----
+
+mbim_section_names() {
+	uci -q show network 2>/dev/null | while IFS= read -r line; do
+		case "$line" in network.*.proto=*) : ;; *) continue ;; esac
+		section="${line#network.}"
+		section="${section%%.proto=*}"
+		proto="${line#*=}"
+		case "$proto" in "'"*"'") proto="${proto#\'}"; proto="${proto%\'}" ;; esac
+		case "$section" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+		case "$proto" in mbim|umbim) printf '%s\n' "$section" ;; esac
+	done
+}
+
+section_transaction_id() {
+	# mbim.sh records the next transaction id in netifd state while its control
+	# session is open, and reverts it during teardown.
+	transaction_value="$(uci -q -P "$NETIFD_STATE_DIR" get "network.$1.tid" 2>/dev/null || :)"
+	case "$transaction_value" in ''|*[!0-9]*) return 0 ;; esac
+	printf '%s\n' "$transaction_value"
+}
+
+section_status() {
+	ubus call "network.interface.$1" status 2>/dev/null || :
+}
+
+status_flag_is_true() {
+	printf '%s\n' "$1" | grep -q "\"$2\"[[:space:]]*:[[:space:]]*true"
+}
+
+# Sets SESSION_MODE to private or shared. Returns 3 when the answer is
+# uncertain: a transition in flight, two sections claiming one device, or an
+# MBIM section whose binding cannot be resolved while it is active. Uncertainty
+# is never permission to open a second session on a live control channel.
+resolve_session_mode() {
+	resolve_device="$1"
+	SESSION_MODE=private
+	resolve_matches=0
+	resolve_section=""
+	resolve_unresolved_active=0
+
+	for candidate_section in $(mbim_section_names); do
+		candidate_device="$(uci -q get "network.$candidate_section.device" 2>/dev/null || :)"
+		if [ "$candidate_device" = "$resolve_device" ]; then
+			resolve_matches=$((resolve_matches + 1))
+			resolve_section="$candidate_section"
+			continue
+		fi
+		[ -n "$candidate_device" ] && continue
+		# Bound by devpath or not bound at all: this adapter cannot prove the
+		# section is a different modem, so an active one makes the answer
+		# uncertain.
+		[ -n "$(section_transaction_id "$candidate_section")" ] && resolve_unresolved_active=1
+		status_flag_is_true "$(section_status "$candidate_section")" up && resolve_unresolved_active=1
+	done
+
+	if [ "$resolve_matches" -gt 1 ]; then
+		log warning "several netifd sections claim $resolve_device; refusing to open a control session"
+		return 3
+	fi
+	if [ "$resolve_matches" -eq 0 ]; then
+		[ "$resolve_unresolved_active" -eq 0 ] || {
+			log warning "an active MBIM section could not be bound to a device; treating $resolve_device as busy"
+			return 3
+		}
+		return 0
+	fi
+
+	resolve_tid="$(section_transaction_id "$resolve_section")"
+	resolve_status="$(section_status "$resolve_section")"
+	resolve_up=1
+	status_flag_is_true "$resolve_status" up || resolve_up=0
+	if status_flag_is_true "$resolve_status" pending; then
+		log notice "netifd is still bringing $resolve_section up; identity is retryable"
+		return 3
+	fi
+	case "$resolve_tid:$resolve_up" in
+		:0) SESSION_MODE=private ;;
+		:1)
+			# Up without a recorded transaction id means netifd is mid-setup:
+			# mbim.sh publishes the id only after the bearer is configured.
+			log notice "$resolve_section is up without a recorded MBIM session; identity is retryable"
+			return 3
+		;;
+		*:1) SESSION_MODE=shared ;;
+		*)
+			# mbim.sh reverts the id during teardown, so an id left behind on a
+			# down interface belongs to a session nothing is using. Refusing here
+			# would make identity permanently retryable after one killed
+			# teardown; opening a private session is both safe and the recovery.
+			log notice "ignoring a stale MBIM session record for $resolve_section"
+			SESSION_MODE=private
+		;;
+	esac
+	return 0
+}
+
+# ---- bounded queries ----
+
+run_umbim_to_file() {
+	output_file="$1"
+	shift
+	: >"$output_file" 2>/dev/null || return 1
+	if command_exists "$TIMEOUT"; then
+		umbim_status=0
+		"$TIMEOUT" "$MBIM_TIMEOUT_SECONDS" "$UMBIM" "$@" >"$output_file" 2>/dev/null || umbim_status=$?
+		return "$umbim_status"
+	fi
+
+	# umbim bounds a single MBIM message at 15 s internally, which is not proof
+	# that the process cannot block on the control device. Minimal OpenWrt images
+	# do not necessarily install a separate timeout command, so keep a local
+	# watchdog instead of letting status-json - and therefore LuCI - hang.
+	mkdir -p "$RUN_DIR" 2>/dev/null || return 1
+	timeout_marker="$RUN_DIR/.mbim-timeout.$$"
+	rm -f "$timeout_marker" 2>/dev/null || return 1
+	"$UMBIM" "$@" >"$output_file" 2>/dev/null &
+	UMBIM_ACTIVE_PID=$!
+	(
+		"$SLEEP" "$MBIM_TIMEOUT_SECONDS"
+		: >"$timeout_marker" 2>/dev/null || :
+		kill "$UMBIM_ACTIVE_PID" 2>/dev/null || exit 0
+		"$SLEEP" 1
+		kill -9 "$UMBIM_ACTIVE_PID" 2>/dev/null || :
+	) 2>/dev/null &
+	watchdog_pid=$!
+
+	umbim_status=0
+	wait "$UMBIM_ACTIVE_PID" || umbim_status=$?
+	UMBIM_ACTIVE_PID=
+	kill "$watchdog_pid" 2>/dev/null || :
+	wait "$watchdog_pid" 2>/dev/null || :
+	if [ -e "$timeout_marker" ]; then
+		rm -f "$timeout_marker" 2>/dev/null || :
+		return 124
+	fi
+	return "$umbim_status"
+}
+
+# umbim exits with the observed modem state for several perfectly valid
+# answers, so the caller reads stdout and uses the status only to detect a
+# transport failure. Returns 124 for a timeout.
+umbim_query() {
+	query_name="$1"
+	query_file="$2"
+	if [ "$SESSION_MODE" = shared ]; then
+		MBIM_TRANSACTION=$((MBIM_TRANSACTION + 1))
+		run_umbim_to_file "$query_file" -n -t "$MBIM_TRANSACTION" -d "$MBIM_DEVICE" "$query_name"
+		return $?
+	fi
+	run_umbim_to_file "$query_file" -d "$MBIM_DEVICE" "$query_name"
+}
+
+umbim_field() {
+	awk -v key="$2" '
+		{
+			line = $0
+			gsub(/\r/, "", line)
+			sub(/^[ \t]+/, "", line)
+			sub(/[ \t]+$/, "", line)
+			position = index(line, ":")
+			if (position == 0) next
+			name = substr(line, 1, position - 1)
+			if (name != key) next
+			value = substr(line, position + 1)
+			sub(/^[ \t]+/, "", value)
+			print value
+			exit
+		}
+	' "$1" 2>/dev/null
+}
+
+# umbim prints enumerated values as "%04X - label". The number is authoritative;
+# the label is a lookup that prints "unknown" for anything the table misses.
+hex_token_value() {
+	printf '%s\n' "${1%% *}" | awk '
+		BEGIN { digits = "0123456789abcdef" }
+		{
+			value = tolower($0)
+			sub(/^0x/, "", value)
+			if (value !~ /^[0-9a-f]+$/) exit 1
+			total = 0
+			for (position = 1; position <= length(value); position++)
+				total = total * 16 + index(digits, substr(value, position, 1)) - 1
+			print total
+		}
+	' 2>/dev/null
+}
+
+plmn_or_empty() {
+	case "$1" in
+		[0-9][0-9][0-9][0-9][0-9]|[0-9][0-9][0-9][0-9][0-9][0-9]) printf '%s\n' "$1" ;;
+		*) : ;;
+	esac
+}
+
+# MBIM reports RSSI as an index: 0 is "-113 dBm or less" and 99 is "unknown".
+# Real firmware also leaves the home-provider field at 0 when it has no
+# measurement, so both extremes are treated as unknown rather than as a signal
+# this adapter cannot prove.
+signal_quality_percent() {
+	rssi_index="$1"
+	case "$rssi_index" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$rssi_index" -ge 1 ] && [ "$rssi_index" -le 31 ] || return 1
+	printf '%s\n' "$rssi_index" | awk '
+		{
+			dbm = -113 + (2 * $0)
+			value = (dbm + 113) * (100 / 62)
+			if (value < 0) value = 0
+			if (value > 100) value = 100
+			printf "%d\n", int(value + 0.5)
+		}
+	'
+}
+
+normalize_registration() {
+	case "$1" in
+		3) printf '%s\n' home ;;
+		4|5) printf '%s\n' roaming ;;
+		6) printf '%s\n' denied ;;
+		2) printf '%s\n' searching ;;
+		1) printf '%s\n' idle ;;
+		*) printf '%s\n' unknown ;;
+	esac
+}
+
+ready_state_label() {
+	case "$1" in
+		0) printf '%s\n' not-initialized ;;
+		2) printf '%s\n' sim-not-inserted ;;
+		3) printf '%s\n' bad-sim ;;
+		4) printf '%s\n' failure ;;
+		5) printf '%s\n' not-activated ;;
+		6) printf '%s\n' device-locked ;;
+		*) printf '%s\n' unknown ;;
+	esac
+}
+
+identity_locked() {
+	MBIM_DEVICE="$1"
+	MBIM_TRANSACTION="$TRANSACTION_BASE"
+	device_name_is_safe "$MBIM_DEVICE" || return 1
+
+	resolve_session_mode "$MBIM_DEVICE" || return 3
+	mkdir -p "$RUN_DIR" 2>/dev/null || return 3
+	subscriber_file="$RUN_DIR/subscriber.$$"
+	home_file="$RUN_DIR/home.$$"
+	registration_file="$RUN_DIR/registration.$$"
+
+	query_status=0
+	umbim_query subscriber "$subscriber_file" || query_status=$?
+	if [ "$query_status" -eq 124 ]; then
+		log warning "MBIM subscriber query timed out on $MBIM_DEVICE"
+		return 3
+	fi
+
+	ready_state="$(hex_token_value "$(umbim_field "$subscriber_file" readystate)")" || ready_state=""
+	if [ -z "$ready_state" ]; then
+		log err "unparseable MBIM subscriber response on $MBIM_DEVICE"
+		return 1
+	fi
+	if [ "$ready_state" -ne 1 ]; then
+		log notice "MBIM SIM is not ready on $MBIM_DEVICE: $(ready_state_label "$ready_state")"
+		return 3
+	fi
+
+	iccid="$(umbim_field "$subscriber_file" simiccid)"
+	imsi="$(umbim_field "$subscriber_file" subscriberid)"
+	if [ -n "$(umbim_field "$subscriber_file" 'dont display subscriberID')" ]; then
+		# The modem asked for the unique subscriber id not to be displayed.
+		imsi=""
+	fi
+	case "$iccid" in ''|*[!0-9]*) return 1 ;; esac
+	[ "${#iccid}" -ge 10 ] && [ "${#iccid}" -le 32 ] || return 1
+	if [ -n "$imsi" ]; then
+		case "$imsi" in *[!0-9]*) return 1 ;; esac
+		[ "${#imsi}" -ge 5 ] && [ "${#imsi}" -le 18 ] || return 1
+	fi
+
+	operator_id=""
+	operator_name=""
+	signal_quality=""
+	query_status=0
+	umbim_query home "$home_file" || query_status=$?
+	if [ "$query_status" -eq 124 ]; then
+		log warning "MBIM home-provider query timed out on $MBIM_DEVICE"
+		return 3
+	fi
+	operator_id="$(plmn_or_empty "$(umbim_field "$home_file" provider_id)")"
+	operator_name="$(umbim_field "$home_file" provider_name)"
+	rssi_value="$(hex_token_value "$(umbim_field "$home_file" rssi)")" || rssi_value=""
+	signal_quality="$(signal_quality_percent "$rssi_value" 2>/dev/null || :)"
+
+	registration_state=unknown
+	roaming=unknown
+	serving_id=""
+	serving_name=""
+	query_status=0
+	umbim_query registration "$registration_file" || query_status=$?
+	if [ "$query_status" -eq 124 ]; then
+		log warning "MBIM registration query timed out on $MBIM_DEVICE"
+		return 3
+	fi
+	register_state="$(hex_token_value "$(umbim_field "$registration_file" registerstate)")" || register_state=""
+	if [ -n "$register_state" ]; then
+		registration_state="$(normalize_registration "$register_state")"
+		case "$registration_state" in
+			home) roaming=false ;;
+			roaming) roaming=true ;;
+			*) roaming=unknown ;;
+		esac
+		serving_id="$(plmn_or_empty "$(umbim_field "$registration_file" provider_id)")"
+		serving_name="$(umbim_field "$registration_file" provider_name)"
+	fi
+	case "$registration_state" in home|roaming) modem_state=connected ;; *) modem_state=enabled ;; esac
+
+	for value in "$operator_name" "$serving_name" "$serving_id" "$registration_state"; do
+		safe_single_line "$value" || return 1
+	done
+
+	printf '%s\n' v1
+	printf 'sim_index\t%s\n' 1
+	printf 'modem_index\t%s\n' "$MBIM_DEVICE"
+	printf 'iccid\t%s\n' "$iccid"
+	printf 'imsi\t%s\n' "$imsi"
+	printf 'eid\t\n'
+	printf 'operator_id\t%s\n' "$operator_id"
+	printf 'operator_name\t%s\n' "$operator_name"
+	printf 'gid1\t\n'
+	printf 'gid2\t\n'
+	printf 'modem_state\t%s\n' "$modem_state"
+	printf 'registration_state\t%s\n' "$registration_state"
+	printf 'roaming\t%s\n' "$roaming"
+	printf 'serving_operator_id\t%s\n' "$serving_id"
+	printf 'serving_operator_name\t%s\n' "$serving_name"
+	# The only read-only sources are an availability bitmask and a GSM/CDMA
+	# class, neither of which is the current radio access technology.
+	printf 'access_technologies\t\n'
+	printf 'signal_quality\t%s\n' "$signal_quality"
+}
+
+cleanup_query_files() {
+	rm -f "$RUN_DIR/subscriber.$$" "$RUN_DIR/home.$$" "$RUN_DIR/registration.$$" 2>/dev/null || :
+}
+
+identity() {
+	acquire_identity_lock "$1" || return 3
+	identity_status=0
+	identity_locked "$@" || identity_status=$?
+	cleanup_query_files
+	release_identity_lock
+	trap - HUP INT TERM
+	return "$identity_status"
+}
+
+case "${1:-}" in
+	capabilities)
+		[ "$#" -eq 1 ] || exit 2
+		capabilities
+	;;
+	identity)
+		[ "$#" -eq 2 ] || exit 2
+		capabilities || exit 3
+		identity "$2"
+	;;
+	*) exit 2 ;;
+esac

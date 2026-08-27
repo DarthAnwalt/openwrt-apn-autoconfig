@@ -1,0 +1,62 @@
+#!/bin/sh
+
+PROG="apn-autoconfig-modem-boot"
+MODEM_BIN="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
+CHILD_PID=""
+
+on_signal() {
+	trap - HUP INT TERM
+	if [ -n "$CHILD_PID" ]; then
+		kill -TERM "$CHILD_PID" 2>/dev/null || :
+		wait "$CHILD_PID" 2>/dev/null || :
+	fi
+	exit 143
+}
+
+trap on_signal HUP INT TERM
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+config_value() {
+	key="$1"
+	default="$2"
+	value="$(uci -q get "apn-autoconfig-modem.main.${key}")" || value=""
+	printf '%s\n' "${value:-$default}"
+}
+
+numeric_value() {
+	key="$1"
+	default="$2"
+	value="$(config_value "$key" "$default")"
+	case "$value" in
+		''|*[!0-9]*)
+			log err "invalid numeric option $key: $value"
+			exit 2
+		;;
+	esac
+	printf '%s\n' "$value"
+}
+
+delay="$(numeric_value boot_delay 10)" || exit $?
+[ -x "$MODEM_BIN" ] || {
+	log err "helper is not executable: $MODEM_BIN"
+	exit 2
+}
+
+log notice "waiting ${delay}s before the first modem inventory scan"
+[ "$delay" -eq 0 ] || sleep "$delay"
+
+"$MODEM_BIN" rescan >/dev/null 2>&1 &
+CHILD_PID=$!
+status=0
+wait "$CHILD_PID" || status=$?
+CHILD_PID=""
+[ "$status" -eq 0 ] || log warning "initial modem inventory scan exited with status $status"
+exit 0

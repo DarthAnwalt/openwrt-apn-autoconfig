@@ -1,0 +1,25 @@
+#!/bin/sh
+
+enabled="$(uci -q get apn-autoconfig.main.button_enabled)"
+[ "$enabled" = "1" ] || exit 0
+
+configured_button="$(uci -q get apn-autoconfig.main.button_name)"
+[ -n "$configured_button" ] || configured_button="BTN_0"
+[ "${BUTTON:-}" = "$configured_button" ] || exit 0
+[ "${ACTION:-}" = "released" ] || exit 0
+
+logger -t apn-autoconfig-button -p user.notice -- \
+	"button $configured_button released; starting modem reset and APN reconciliation" 2>/dev/null || :
+
+autoconfig_bin="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
+[ -x "$autoconfig_bin" ] || {
+	logger -t apn-autoconfig-button -p user.err -- \
+		"APN helper is not executable: $autoconfig_bin" 2>/dev/null || :
+	exit 1
+}
+
+(
+	"$autoconfig_bin" modem-reset </dev/null >/dev/null 2>&1
+) &
+
+exit 0

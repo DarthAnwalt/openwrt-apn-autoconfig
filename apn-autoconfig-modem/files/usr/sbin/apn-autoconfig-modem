@@ -1,0 +1,1841 @@
+#!/bin/sh
+
+# Modem inventory, stable identity and control-owner coordinator.
+# POSIX shell; intended for OpenWrt 25.12 and BusyBox ash.
+# Read-only discovery plus a bounded reset operation; see
+# docs/modem-contract-v1.md for the schema, evidence hierarchy and lock
+# ordering this script implements.
+
+umask 077
+
+PROG="apn-autoconfig-modem"
+CONFIG="apn-autoconfig-modem"
+
+SYSFS_ROOT="${APN_AUTOCONFIG_MODEM_SYSFS_ROOT:-/sys}"
+STATE_DIR="/var/run/apn-autoconfig-modem"
+LOCK_ROOT="/var/lock/apn-autoconfig-modem"
+APN_LOCK_DIR="/var/lock/apn-autoconfig.lock"
+ACTION_STATE_DIR="/tmp/apn-autoconfig-modem-action"
+QMI_IDENTITY_LOCK_ROOT="/var/lock/apn-autoconfig-qmi-identity"
+ACTION_WORKER="${APN_AUTOCONFIG_MODEM_ACTION_WORKER:-/usr/libexec/apn-autoconfig-modem-action}"
+HOTPLUG_COALESCE_SECONDS="3"
+MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
+MODEM_POWER_OFF_VALUE="1"
+MODEM_POWER_ON_VALUE="0"
+MODEM_POWER_OFF_SECONDS="5"
+MODEM_WAIT_SECONDS="90"
+MODEM_POLL_SECONDS="2"
+CONNECT_WAIT_SECONDS="60"
+HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
+RESET_MODEM_ID=""
+
+UQMI="${APN_AUTOCONFIG_MODEM_UQMI:-uqmi}"
+TIMEOUT="${APN_AUTOCONFIG_MODEM_TIMEOUT:-timeout}"
+MMCLI="${APN_AUTOCONFIG_MODEM_MMCLI:-mmcli}"
+
+COMMAND_NAME=""
+REQUESTED_MODEM=""
+REQUESTED_INTERFACE=""
+INVENTORY_FILE=""
+MM_USB_PATHS_FILE=""
+MM_DISCOVERY_UNCERTAIN=0
+
+LOCK_HELD=0
+LOCK_PATH=""
+APN_LOCK_HELD=0
+APN_LOCK_BORROWED=0
+MODEM_POWER_OFF_ARMED=0
+RESET_INTERFACE=""
+RESET_INTERFACE_RESTORE_ARMED=0
+PROVISION_ROLLBACK_ARMED=0
+PROVISION_CREATED_SECTION=""
+PROVISION_BASELINE_FILE=""
+PROVISION_CHILD_PID=""
+REQUESTED_AUTOCONNECT=1
+BOUNDED_CHILD_PID=""
+BOUNDED_WATCHDOG_PID=""
+
+log() {
+	level="$1"
+	shift
+	message="$*"
+	case "$level" in warning) priority="warn" ;; *) priority="$level" ;; esac
+	logger -t "$PROG" -p "user.$priority" -- "$message" 2>/dev/null || :
+	printf '%s: %s\n' "$PROG" "$message" >&2
+}
+
+die() {
+	log err "$*"
+	exit 1
+}
+
+die_code() {
+	code="$1"
+	shift
+	log err "$*"
+	exit "$code"
+}
+
+command_exists() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+cleanup_files() {
+	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
+		kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+		BOUNDED_WATCHDOG_PID=""
+	fi
+	if [ -n "$BOUNDED_CHILD_PID" ]; then
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		BOUNDED_CHILD_PID=""
+	fi
+	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
+		write_modem_power "$MODEM_POWER_ON_VALUE" || \
+			log err "failed to restore modem power during cleanup"
+		MODEM_POWER_OFF_ARMED=0
+	fi
+	if [ "$RESET_INTERFACE_RESTORE_ARMED" -eq 1 ] && [ -n "$RESET_INTERFACE" ]; then
+		ifup "$RESET_INTERFACE" >/dev/null 2>&1 || \
+			log err "failed to restart interface $RESET_INTERFACE during cleanup"
+		RESET_INTERFACE_RESTORE_ARMED=0
+	fi
+	if [ -n "$PROVISION_CHILD_PID" ]; then
+		kill -TERM "$PROVISION_CHILD_PID" 2>/dev/null || :
+		wait "$PROVISION_CHILD_PID" 2>/dev/null || :
+		PROVISION_CHILD_PID=""
+	fi
+	# Unwind provisioning before the locks are released, so no other operation
+	# can observe a half-created staging section.
+	provisioning_rollback
+	[ -z "$INVENTORY_FILE" ] || rm -f "$INVENTORY_FILE"
+	[ -z "$MM_USB_PATHS_FILE" ] || rm -f "$MM_USB_PATHS_FILE"
+	if [ "$LOCK_HELD" -eq 1 ] && [ -n "$LOCK_PATH" ]; then
+		lock_release "$LOCK_PATH"
+		LOCK_HELD=0
+	fi
+	if [ "$APN_LOCK_HELD" -eq 1 ]; then
+		lock_release "$APN_LOCK_DIR"
+		APN_LOCK_HELD=0
+	fi
+	APN_LOCK_BORROWED=0
+}
+
+on_exit() {
+	on_exit_status=$?
+	trap - 0 HUP INT TERM
+	cleanup_files
+	exit "$on_exit_status"
+}
+
+on_signal() {
+	exit 143
+}
+
+trap on_exit 0
+trap on_signal HUP INT TERM
+
+load_config() {
+	command_exists uci || die "uci is required"
+	value="$(uci -q get "${CONFIG}.main.sysfs_root")" && [ -n "$value" ] && SYSFS_ROOT="$value"
+	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.lock_root")" && [ -n "$value" ] && LOCK_ROOT="$value"
+	value="$(uci -q get apn-autoconfig.main.lock_dir)" && [ -n "$value" ] && APN_LOCK_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
+	value="$(uci -q get apn-autoconfig.main.qmi_identity_lock_root)" && [ -n "$value" ] && QMI_IDENTITY_LOCK_ROOT="$value"
+	value="$(uci -q get "${CONFIG}.main.hotplug_coalesce_seconds")" && [ -n "$value" ] && HOTPLUG_COALESCE_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_path")" && [ -n "$value" ] && MODEM_POWER_PATH="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_value")" && [ -n "$value" ] && MODEM_POWER_OFF_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_on_value")" && [ -n "$value" ] && MODEM_POWER_ON_VALUE="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_power_off_seconds")" && [ -n "$value" ] && MODEM_POWER_OFF_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_wait_seconds")" && [ -n "$value" ] && MODEM_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.modem_poll_seconds")" && [ -n "$value" ] && MODEM_POLL_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.connect_wait_seconds")" && [ -n "$value" ] && CONNECT_WAIT_SECONDS="$value"
+	value="$(uci -q get "${CONFIG}.main.hardware_integration_file")" && [ -n "$value" ] && HARDWARE_INTEGRATION_FILE="$value"
+	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
+}
+
+hardware_integration_name() {
+	[ -r "$HARDWARE_INTEGRATION_FILE" ] || return 1
+	name="$(sed -n '1p' "$HARDWARE_INTEGRATION_FILE" 2>/dev/null)"
+	case "$name" in huasifei-wh3000-gpio-v1) printf '%s\n' "$name" ;; *) return 1 ;; esac
+}
+
+validate_config() {
+	case "$SYSFS_ROOT" in /|*/../*|*/..) die "unsafe sysfs_root" ;; /*) : ;; *) die "sysfs_root must be absolute" ;; esac
+	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
+	case "$LOCK_ROOT" in /|*/../*|*/..) die "unsafe lock_root" ;; /*) : ;; *) die "lock_root must be absolute" ;; esac
+	case "$APN_LOCK_DIR" in /|*/../*|*/..) die "unsafe APN lock_dir" ;; /*) : ;; *) die "APN lock_dir must be absolute" ;; esac
+	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
+	case "$ACTION_STATE_DIR" in */../*|*/..) die "unsafe action_state_dir" ;; esac
+	case "$QMI_IDENTITY_LOCK_ROOT" in /|*/../*|*/..) die "unsafe QMI identity lock root" ;; /*) : ;; *) die "QMI identity lock root must be absolute" ;; esac
+	case "$HARDWARE_INTEGRATION_FILE" in /|*/../*|*/..) die "unsafe hardware_integration_file" ;; /*) : ;; *) die "hardware_integration_file must be absolute" ;; esac
+	case "$MODEM_POWER_PATH" in "$SYSFS_ROOT"/class/gpio/*/value) : ;; *) die "modem_power_path must be a GPIO value under $SYSFS_ROOT/class/gpio" ;; esac
+	case "$MODEM_POWER_OFF_VALUE" in 0|1) : ;; *) die "modem_power_off_value must be 0 or 1" ;; esac
+	case "$MODEM_POWER_ON_VALUE" in 0|1) : ;; *) die "modem_power_on_value must be 0 or 1" ;; esac
+	[ "$MODEM_POWER_OFF_VALUE" != "$MODEM_POWER_ON_VALUE" ] || die "modem power on/off values must differ"
+	case "$HOTPLUG_COALESCE_SECONDS" in ''|*[!0-9]*) die "hotplug_coalesce_seconds must be numeric" ;; esac
+	case "$MODEM_POWER_OFF_SECONDS" in ''|*[!0-9]*) die "modem_power_off_seconds must be numeric" ;; esac
+	case "$MODEM_WAIT_SECONDS" in ''|*[!0-9]*) die "modem_wait_seconds must be numeric" ;; esac
+	case "$MODEM_POLL_SECONDS" in ''|*[!0-9]*) die "modem_poll_seconds must be numeric" ;; esac
+	case "$CONNECT_WAIT_SECONDS" in ''|*[!0-9]*) die "connect_wait_seconds must be numeric" ;; esac
+	[ "$MODEM_POWER_OFF_SECONDS" -gt 0 ] || die "modem_power_off_seconds must be greater than zero"
+	[ "$MODEM_WAIT_SECONDS" -gt 0 ] || die "modem_wait_seconds must be greater than zero"
+	[ "$MODEM_POLL_SECONDS" -gt 0 ] || die "modem_poll_seconds must be greater than zero"
+	[ "$CONNECT_WAIT_SECONDS" -gt 0 ] || die "connect_wait_seconds must be greater than zero"
+	if [ -n "$RESET_MODEM_ID" ]; then
+		safe_token "$RESET_MODEM_ID" || die "reset_modem_id contains unsafe characters"
+		case "$RESET_MODEM_ID" in usb-serial:*|imei:*) : ;; *) die "reset_modem_id must use strong usb-serial or imei evidence" ;; esac
+	fi
+}
+
+safe_single_line() {
+	value="$1"
+	tab="$(printf '\t')"
+	carriage_return="$(printf '\r')"
+	case "$value" in *"$tab"*) return 1 ;; esac
+	case "$value" in *"$carriage_return"*) return 1 ;; esac
+	[ "$(printf '%s' "$value" | awk 'END { print NR + 0 }')" -le 1 ]
+}
+
+safe_token() {
+	case "$1" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
+	[ "${#1}" -le 200 ] || return 1
+	return 0
+}
+
+valid_imei() {
+	case "$1" in ''|*[!0-9]*) return 1 ;; esac
+	case ${#1} in 14|15|16) return 0 ;; *) return 1 ;; esac
+}
+
+sanitize_token() {
+	printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '_'
+}
+
+# ---- process and lock primitives ----
+#
+# A lock is a regular file whose first line is the owner PID. `ln` publishes
+# the name and the owner together in one atomic step, so a competitor can
+# never observe a created-but-unowned lock. The previous mkdir-then-write
+# protocol had exactly that window, and every waiter treated an empty PID as
+# proof of a crashed owner, which let it delete a live lock and proceed. The
+# same protocol is implemented by apn-autoconfig and apn-autoconfig-qmi so the
+# shared APN and QMI identity namespaces stay mutually exclusive across
+# packages.
+
+process_is_alive() {
+	case "$1" in ''|*[!0-9]*|0) return 1 ;; esac
+	kill -0 "$1" 2>/dev/null
+}
+
+# 0.10.0 and earlier represented a lock as a directory containing "pid". An
+# upgrade can leave one behind, and a still-running process from the older
+# package may legitimately hold one, so read both shapes.
+lock_owner_pid() {
+	if [ -d "$1" ]; then
+		lock_owner_value="$(sed -n '1p' "$1/pid" 2>/dev/null || :)"
+	else
+		lock_owner_value="$(sed -n '1p' "$1" 2>/dev/null || :)"
+	fi
+	case "$lock_owner_value" in ''|*[!0-9]*|0) return 1 ;; esac
+	printf '%s\n' "$lock_owner_value"
+}
+
+# 0 acquired, 1 unusable path, 2 already present
+lock_try_acquire() {
+	acquire_path="$1"
+	# `ln source directory` links *into* the directory instead of failing, so a
+	# lock left behind as a 0.10.0-style directory has to be rejected here and
+	# handled by the reclaim path rather than silently "acquired".
+	[ -d "$acquire_path" ] && return 2
+	acquire_tmp="${acquire_path}.tmp.$$"
+	printf '%s\n' "$$" >"$acquire_tmp" 2>/dev/null || return 1
+	if ln "$acquire_tmp" "$acquire_path" 2>/dev/null; then
+		if [ -f "$acquire_path" ] && [ "$(sed -n '1p' "$acquire_path" 2>/dev/null)" = "$$" ]; then
+			rm -f "$acquire_tmp"
+			return 0
+		fi
+		# A directory appeared underneath us and took the link inside itself.
+		rm -f "$acquire_path/${acquire_tmp##*/}" 2>/dev/null || :
+		rm -f "$acquire_tmp"
+		return 2
+	fi
+	rm -f "$acquire_tmp"
+	return 2
+}
+
+lock_release() {
+	[ -n "$1" ] || return 0
+	rm -f "$1" 2>/dev/null || :
+}
+
+# Hand an already-held lock to another process. rename(2) replaces the whole
+# file, so a concurrent reader sees either the old or the new owner and never
+# an empty lock it could mistake for a crashed one.
+lock_set_owner() {
+	set_owner_path="$1"
+	set_owner_tmp="${set_owner_path}.own.$$"
+	printf '%s\n' "$2" >"$set_owner_tmp" 2>/dev/null || return 1
+	mv "$set_owner_tmp" "$set_owner_path" 2>/dev/null || {
+		rm -f "$set_owner_tmp"
+		return 1
+	}
+}
+
+# Remove a lock only while holding the reclaim guard and only after re-reading
+# the owner inside that guarded section, so a racing reclaimer can never
+# delete a lock that another process has just legitimately taken.
+lock_reclaim_if_stale() {
+	# Every name here is prefixed because POSIX shell has no local scope and
+	# this function calls lock_try_acquire, which assigns its own variables.
+	reclaim_path="$1"
+	reclaim_guard="${reclaim_path}.reclaim"
+	reclaim_guard_owner="$(lock_owner_pid "$reclaim_guard" 2>/dev/null || :)"
+	if [ -n "$reclaim_guard_owner" ] && ! process_is_alive "$reclaim_guard_owner"; then
+		rm -f "$reclaim_guard" 2>/dev/null || :
+	fi
+	lock_try_acquire "$reclaim_guard" || return 1
+	reclaim_result=1
+	reclaim_owner="$(lock_owner_pid "$reclaim_path" 2>/dev/null || :)"
+	if [ -n "$reclaim_owner" ] && process_is_alive "$reclaim_owner"; then
+		reclaim_result=1
+	elif [ -d "$reclaim_path" ]; then
+		rm -f "$reclaim_path/pid" 2>/dev/null || :
+		rmdir "$reclaim_path" 2>/dev/null && reclaim_result=0
+	else
+		rm -f "$reclaim_path" 2>/dev/null && reclaim_result=0
+	fi
+	rm -f "$reclaim_guard" 2>/dev/null || :
+	return "$reclaim_result"
+}
+
+# One bounded attempt: 0 acquired, 1 unusable path, 3 held by a live owner.
+lock_try_acquire_or_reclaim() {
+	attempt_path="$1"
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	attempt_owner="$(lock_owner_pid "$attempt_path" 2>/dev/null || :)"
+	if [ -n "$attempt_owner" ] && process_is_alive "$attempt_owner"; then
+		return 3
+	fi
+	lock_reclaim_if_stale "$attempt_path" || return 3
+	lock_try_acquire "$attempt_path"
+	attempt_status=$?
+	[ "$attempt_status" -eq 0 ] && return 0
+	[ "$attempt_status" -eq 1 ] && return 1
+	return 3
+}
+
+json_escape() {
+	awk 'BEGIN { ORS="" }
+	{
+		if (NR > 1) printf "\\n"
+		gsub(/\\/, "\\\\")
+		gsub(/\"/, "\\\"")
+		gsub(/\t/, "\\t")
+		gsub(/\r/, "\\r")
+		printf "%s", $0
+	}'
+}
+
+json_string() {
+	printf '"'
+	printf '%s' "$1" | json_escape
+	printf '"'
+}
+
+json_key_string() {
+	printf '"%s":' "$1"
+	json_string "$2"
+}
+
+json_key_boolean() {
+	printf '"%s":%s' "$1" "$([ "$2" = 1 ] || [ "$2" = true ] && printf true || printf false)"
+}
+
+# Tab-delimited records may contain empty fields (missing data/at device,
+# unbound netifd_interface, empty ambiguity_reason). POSIX `read`/word
+# splitting always treats a literal tab as IFS whitespace and silently
+# collapses runs of it, which would misalign a shell `read` into many
+# variables. awk field splitting on -F '\t' does not have that problem, so
+# every multi-field extraction below goes through this helper instead of
+# `read`.
+field() {
+	printf '%s' "$1" | awk -F '\t' -v n="$2" '{ print $n }'
+}
+
+# ---- sysfs USB topology helpers (same algorithm as apn-autoconfig-qmi) ----
+
+usb_device_path() {
+	path="$1"
+	while [ "$path" != "$SYSFS_ROOT" ] && [ "$path" != / ] && [ -n "$path" ]; do
+		name="${path##*/}"
+		case "$name" in
+			*:1.*)
+				printf '%s\n' "${path%/*}"
+				return 0
+			;;
+		esac
+		path="${path%/*}"
+	done
+	return 1
+}
+
+physical_usb_device_path() {
+	# ModemManager and netifd may report either a USB interface path
+	# (.../2-1.4:1.4) or the physical device root itself (.../2-1.4).
+	# Normalize both forms to the latter before correlating candidates.
+	path="$(readlink -f "$1" 2>/dev/null)" || return 1
+	case "$path" in "$SYSFS_ROOT"/devices/*) : ;; *) return 1 ;; esac
+	if [ -r "$path/idVendor" ] && [ -r "$path/idProduct" ]; then
+		printf '%s\n' "$path"
+		return 0
+	fi
+	usb_device_path "$path"
+}
+
+usb_attr() {
+	usb_path="$1"
+	attr="$2"
+	[ -r "$usb_path/$attr" ] || return 1
+	value="$(sed -n '1p' "$usb_path/$attr" 2>/dev/null)"
+	safe_single_line "$value" || return 1
+	[ -n "$value" ] || return 1
+	printf '%s\n' "$value"
+}
+
+resolve_class_device_usb_path() {
+	class_device="$1"
+	[ -e "$class_device" ] || return 1
+	resolved="$(readlink -f "$class_device" 2>/dev/null)" || return 1
+	case "$resolved" in "$SYSFS_ROOT"/devices/*) : ;; *) return 1 ;; esac
+	usb_device_path "$resolved"
+}
+
+# ---- read-only candidate discovery ----
+
+CANDIDATES_FILE=""
+
+emit_candidate() {
+	# modem_id evidence_tier usb_path vendor_id product_id control_device data_device at_device protocol mm_bound
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" >>"$CANDIDATES_FILE"
+}
+
+find_data_device_for_usb_path() {
+	wanted_usb_path="$1"
+	matched_device=""
+	matched_count=0
+	for net_device in "$SYSFS_ROOT"/class/net/*/device; do
+		[ -e "$net_device" ] || continue
+		candidate_usb="$(resolve_class_device_usb_path "$net_device")" || continue
+		[ "$candidate_usb" = "$wanted_usb_path" ] || continue
+		iface="${net_device%/device}"
+		iface="${iface##*/}"
+		matched_device="$iface"
+		matched_count=$((matched_count + 1))
+	done
+	[ "$matched_count" -gt 0 ] || return 1
+	if [ "$matched_count" -gt 1 ]; then printf '%s\n' '!ambiguous'; return 0; fi
+	printf '%s\n' "$matched_device"
+}
+
+find_at_device_for_usb_path() {
+	wanted_usb_path="$1"
+	matched_device=""
+	matched_count=0
+	for class_device in "$SYSFS_ROOT"/class/tty/ttyUSB*/device "$SYSFS_ROOT"/class/tty/ttyACM*/device; do
+		[ -e "$class_device" ] || continue
+		candidate_usb="$(resolve_class_device_usb_path "$class_device")" || continue
+		[ "$candidate_usb" = "$wanted_usb_path" ] || continue
+		device_name="${class_device%/device}"
+		device_name="${device_name##*/}"
+		matched_device="/dev/$device_name"
+		matched_count=$((matched_count + 1))
+	done
+	[ "$matched_count" -gt 0 ] || return 1
+	if [ "$matched_count" -gt 1 ]; then printf '%s\n' '!ambiguous'; return 0; fi
+	printf '%s\n' "$matched_device"
+}
+
+direct_protocol_for_class_device() {
+	class_device="$1"
+	case "$class_device" in "$SYSFS_ROOT"/class/wwan/wwan*qmi*/device) printf '%s\n' qmi; return 0 ;; esac
+	resolved="$(readlink -f "$class_device" 2>/dev/null)" || return 1
+	driver="$(readlink -f "$resolved/driver" 2>/dev/null || :)"
+	driver="${driver##*/}"
+	case "$driver" in
+		qmi_wwan|qmi_wwan_q|mhi_wwan_ctrl) printf '%s\n' qmi ;;
+		cdc_mbim) printf '%s\n' mbim ;;
+		*) printf '%s\n' unknown ;;
+	esac
+}
+
+qmi_probe_imei() {
+	control_device="$1"
+	command_exists "$UQMI" || return 1
+	device_name="${control_device#/dev/}"
+	case "$device_name" in ''|*/*|*[!A-Za-z0-9_.-]*) return 1 ;; esac
+	probe_lock="${QMI_IDENTITY_LOCK_ROOT}.${device_name}"
+	mkdir -p "$(dirname "$QMI_IDENTITY_LOCK_ROOT")" 2>/dev/null || return 1
+	waited=0
+	while :; do
+		lock_try_acquire_or_reclaim "$probe_lock"
+		probe_lock_status=$?
+		[ "$probe_lock_status" -eq 0 ] && break
+		[ "$probe_lock_status" -eq 1 ] && return 1
+		# Held by a live owner: this is the APN engine's identity transaction
+		# or a parallel scan. Waiting is correct; stealing is not.
+		[ "$waited" -lt 15 ] || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	output_file="$STATE_DIR/.uqmi-imei.$$.$device_name"
+	probe_status=0
+	run_bounded_to_file 6 "$output_file" "$UQMI" -s -d "$control_device" -t 3000 --get-imei || probe_status=$?
+	output="$(cat "$output_file" 2>/dev/null || :)"
+	rm -f "$output_file"
+	lock_release "$probe_lock"
+	[ "$probe_status" -eq 0 ] || return 1
+	imei="$(printf '%s\n' "$output" | tr -d '"[:space:]')"
+	valid_imei "$imei" || return 1
+	printf '%s\n' "$imei"
+}
+
+discover_direct_candidates() {
+	for class_device in "$SYSFS_ROOT"/class/usbmisc/cdc-wdm*/device "$SYSFS_ROOT"/class/wwan/wwan*qmi*/device; do
+		[ -e "$class_device" ] || continue
+		device_name="${class_device%/device}"
+		device_name="${device_name##*/}"
+		control_device="/dev/$device_name"
+		usb_path="$(resolve_class_device_usb_path "$class_device")" || continue
+		protocol="$(direct_protocol_for_class_device "$class_device" 2>/dev/null || printf '%s' unknown)"
+
+		vendor_id="$(usb_attr "$usb_path" idVendor 2>/dev/null || :)"
+		product_id="$(usb_attr "$usb_path" idProduct 2>/dev/null || :)"
+		serial="$(usb_attr "$usb_path" serial 2>/dev/null || :)"
+		usb_label="${usb_path##*/}"
+		safe_token "$usb_label" || continue
+
+		data_device="$(find_data_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+		at_device="$(find_at_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+
+		if [ -n "$serial" ] && safe_token "$serial"; then
+			modem_id="usb-serial:${usb_label}:${vendor_id}:${product_id}:${serial}"
+			tier="usb-serial"
+			elif [ "$protocol" = qmi ] && [ "$MM_DISCOVERY_UNCERTAIN" -eq 0 ] && \
+			     ! grep -F -x -q "$usb_path" "$MM_USB_PATHS_FILE" 2>/dev/null; then
+			imei="$(qmi_probe_imei "$control_device" 2>/dev/null || :)"
+			if [ -n "$imei" ]; then
+				modem_id="imei:${imei}"
+				tier="imei"
+			else
+				modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+				tier="weak-vidpid"
+			fi
+		else
+			modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+			tier="weak-vidpid"
+		fi
+
+		emit_candidate "$modem_id" "$tier" "$usb_path" "$vendor_id" "$product_id" \
+			"$control_device" "$data_device" "$at_device" "$protocol" 0
+	done
+}
+
+discover_at_candidates() {
+	for class_device in "$SYSFS_ROOT"/class/tty/ttyUSB*/device "$SYSFS_ROOT"/class/tty/ttyACM*/device; do
+		[ -e "$class_device" ] || continue
+		usb_path="$(resolve_class_device_usb_path "$class_device")" || continue
+		vendor_id="$(usb_attr "$usb_path" idVendor 2>/dev/null || :)"
+		product_id="$(usb_attr "$usb_path" idProduct 2>/dev/null || :)"
+		serial="$(usb_attr "$usb_path" serial 2>/dev/null || :)"
+		usb_label="${usb_path##*/}"
+		safe_token "$usb_label" || continue
+		data_device="$(find_data_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+		at_device="$(find_at_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+		if [ -n "$serial" ] && safe_token "$serial"; then
+			modem_id="usb-serial:${usb_label}:${vendor_id}:${product_id}:${serial}"
+			tier="usb-serial"
+		else
+			modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+			tier="weak-vidpid"
+		fi
+		emit_candidate "$modem_id" "$tier" "$usb_path" "$vendor_id" "$product_id" \
+			"" "$data_device" "$at_device" at 0
+	done
+}
+
+run_bounded_to_file() {
+	seconds="$1"
+	output_file="$2"
+	shift 2
+	if command_exists "$TIMEOUT"; then
+		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null
+		return
+	fi
+	"$@" >"$output_file" 2>/dev/null &
+	BOUNDED_CHILD_PID=$!
+	(
+		sleep "$seconds"
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
+		sleep 1
+		kill -9 "$BOUNDED_CHILD_PID" 2>/dev/null || :
+	) >/dev/null 2>&1 &
+	BOUNDED_WATCHDOG_PID=$!
+	bounded_status=0
+	wait "$BOUNDED_CHILD_PID" || bounded_status=$?
+	BOUNDED_CHILD_PID=""
+	kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
+	BOUNDED_WATCHDOG_PID=""
+	return "$bounded_status"
+}
+
+discover_modemmanager_candidates() {
+	command_exists "$MMCLI" || return 0
+	mm_list_file="$STATE_DIR/.mmcli-list.$$"
+	run_bounded_to_file 8 "$mm_list_file" "$MMCLI" -L || {
+		MM_DISCOVERY_UNCERTAIN=1
+		rm -f "$mm_list_file"
+		return 0
+	}
+	modem_list="$(sed -n 's#^.*/Modem/\([0-9][0-9]*\).*#\1#p' "$mm_list_file")"
+	if [ -s "$mm_list_file" ] && [ -z "$modem_list" ]; then
+		MM_DISCOVERY_UNCERTAIN=1
+	fi
+	rm -f "$mm_list_file"
+	for modem_index in $modem_list; do
+		case "$modem_index" in ''|*[!0-9]*) continue ;; esac
+		mm_data="$STATE_DIR/.mmcli.$$"
+		run_bounded_to_file 8 "$mm_data" "$MMCLI" -m "$modem_index" --output-keyvalue || {
+			MM_DISCOVERY_UNCERTAIN=1
+			rm -f "$mm_data"
+			continue
+		}
+
+		device_field="$(kv_value_from "$mm_data" 'modem.generic.device')"
+		physdev_field="$(kv_value_from "$mm_data" 'modem.generic.physdev')"
+		imei="$(kv_value_from "$mm_data" 'modem.generic.equipment-identifier')"
+		rm -f "$mm_data"
+
+		control_device=""
+		case "$device_field" in
+			cdc-wdm*) control_device="/dev/$device_field" ;;
+			/dev/cdc-wdm*) control_device="$device_field" ;;
+		esac
+
+		usb_path=""
+		case "$physdev_field" in
+			/*) usb_path="$(physical_usb_device_path "$physdev_field" 2>/dev/null || :)" ;;
+			*[!\ ]*) usb_path="$(physical_usb_device_path "$SYSFS_ROOT/bus/usb/devices/$physdev_field" 2>/dev/null || :)" ;;
+		esac
+		[ -n "$usb_path" ] || [ -z "$control_device" ] || \
+			usb_path="$(resolve_class_device_usb_path "$SYSFS_ROOT/class/usbmisc/${control_device#/dev/}/device" 2>/dev/null || :)"
+		[ -z "$usb_path" ] || printf '%s\n' "$usb_path" >>"$MM_USB_PATHS_FILE"
+
+		vendor_id=""
+		product_id=""
+		usb_label=""
+		if [ -n "$usb_path" ]; then
+			vendor_id="$(usb_attr "$usb_path" idVendor 2>/dev/null || :)"
+			product_id="$(usb_attr "$usb_path" idProduct 2>/dev/null || :)"
+			usb_label="${usb_path##*/}"
+		fi
+
+		valid_imei "$imei" || imei=""
+
+		if [ -n "$imei" ]; then
+			modem_id="imei:${imei}"
+			tier="imei"
+		elif [ -n "$usb_label" ] && safe_token "$usb_label"; then
+			modem_id="weak-vidpid:${usb_label}:${vendor_id}:${product_id}"
+			tier="weak-vidpid"
+		else
+			# No usable sysfs correlation and no IMEI: still report presence so
+			# LuCI/CLI can show an unmanageable modem instead of hiding it, but
+			# it cannot be a stable, reusable identity.
+			modem_id="weak-vidpid:mm-${modem_index}"
+			tier="weak-vidpid"
+		fi
+
+		data_device=""
+		at_device=""
+		[ -z "$usb_path" ] || data_device="$(find_data_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+		[ -z "$usb_path" ] || at_device="$(find_at_device_for_usb_path "$usb_path" 2>/dev/null || :)"
+
+		emit_candidate "$modem_id" "$tier" "$usb_path" "$vendor_id" "$product_id" \
+			"$control_device" "$data_device" "$at_device" modemmanager 1
+	done
+}
+
+kv_value_from() {
+	file="$1"
+	keys="$2"
+	awk -F ':' -v wanted="$keys" '
+		BEGIN { n=split(wanted, a, " ") }
+		{
+			key=$1
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+			for (i=1; i<=n; i++) if (key == a[i]) {
+				$1=""
+				sub(/^:[[:space:]]*/, "", $0)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+				if ($0 != "--" && $0 != "unknown") { print $0; exit }
+			}
+		}
+	' "$file"
+}
+
+protocol_is_netifd_direct() {
+	case "$1" in qmi|uqmi|mbim|umbim|fibocom|atc|xmm|ncm|wwan|3g) return 0 ;; *) return 1 ;; esac
+}
+
+netifd_interface_for_record() {
+	control_device="$1"
+	data_device="$2"
+	usb_path="$3"
+	control_name="${control_device#/dev/}"
+	uci -q show network 2>/dev/null | while IFS= read -r line; do
+		case "$line" in network.*.proto=*) : ;; *) continue ;; esac
+		section="${line#network.}"
+		section="${section%%.proto=*}"
+		proto="${line#*=}"
+		case "$proto" in "'"*"'") proto="${proto#\'}"; proto="${proto%\'}" ;; esac
+		case "$section" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+		protocol_is_netifd_direct "$proto" || { [ "$proto" = modemmanager ] || continue; }
+		section_device="$(uci -q get "network.${section}.device" 2>/dev/null || :)"
+		section_devpath="$(uci -q get "network.${section}.devpath" 2>/dev/null || :)"
+		matched=0
+		case "$section_device" in
+			"$data_device"|"$control_device"|"/dev/$control_name"|"$control_name") matched=1 ;;
+		esac
+		if [ "$matched" -eq 0 ] && [ -n "$section_device" ] && [ -n "$usb_path" ]; then
+			candidate_usb="$(physical_usb_device_path "$section_device" 2>/dev/null || :)"
+			[ "$candidate_usb" = "$usb_path" ] && matched=1
+		fi
+		if [ "$matched" -eq 0 ] && [ -n "$section_devpath" ] && [ -n "$usb_path" ]; then
+			candidate_usb="$(physical_usb_device_path "$section_devpath" 2>/dev/null || :)"
+			[ "$candidate_usb" = "$usb_path" ] && matched=1
+		fi
+		[ "$matched" -eq 1 ] || continue
+		printf '%s\t%s\n' "$section" "$proto"
+	done
+}
+
+# ---- registry persistence (first_seen tracking; local observation cache only) ----
+
+registry_dir() {
+	mkdir -p "$STATE_DIR/modems" 2>/dev/null || :
+	printf '%s\n' "$STATE_DIR/modems"
+}
+
+record_seen() {
+	modem_id="$1"
+	now="$2"
+	dir="$(registry_dir)"
+	file="$dir/$(sanitize_token "$modem_id").tsv"
+	first_seen="$now"
+	[ -r "$file" ] && first_seen="$(sed -n '1p' "$file" 2>/dev/null || printf '%s' "$now")"
+	[ -n "$first_seen" ] || first_seen="$now"
+	tmp="$file.$$"
+	printf '%s\n%s\n' "$first_seen" "$now" >"$tmp" && mv "$tmp" "$file" || rm -f "$tmp"
+	printf '%s\n' "$first_seen"
+}
+
+# ---- inventory scan orchestration ----
+
+scan_inventory() {
+	INVENTORY_FILE="/tmp/apn-autoconfig-modem.$$.inventory"
+	CANDIDATES_FILE="/tmp/apn-autoconfig-modem.$$.candidates"
+	MM_USB_PATHS_FILE="/tmp/apn-autoconfig-modem.$$.mm-usb-paths"
+	: >"$CANDIDATES_FILE"
+	: >"$MM_USB_PATHS_FILE"
+	mkdir -p "$STATE_DIR" 2>/dev/null || :
+
+	discover_modemmanager_candidates
+	discover_direct_candidates
+	discover_at_candidates
+
+	now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+
+	# Merge candidates sharing one usb_path into a single record: prefer the
+	# strongest evidence tier, keep whichever fields either scan populated,
+	# and remember whether ModemManager claimed the device.
+	sort -t "$(printf '\t')" -k3,3 "$CANDIDATES_FILE" | awk -F '\t' -v OFS='\t' '
+		function tier_rank(t) { if (t == "usb-serial") return 3; if (t == "imei") return 2; return 1 }
+		function protocol_rank(p) { if (p == "qmi" || p == "mbim") return 4; if (p == "at") return 3; if (p == "unknown") return 2; return 1 }
+		{
+			key = ($3 != "" ? $3 : "id:" $1)
+			if (!(key in seen)) {
+				order[++n] = key
+				seen[key] = 1
+				id[key] = $1; tier[key] = $2; usbp[key] = $3; vend[key] = $4; prod[key] = $5
+				ctl[key] = $6; datad[key] = $7; atd[key] = $8; proto[key] = $9; mm[key] = $10
+			} else {
+				if (tier_rank($2) > tier_rank(tier[key])) { id[key] = $1; tier[key] = $2 }
+				if (ctl[key] == "") ctl[key] = $6
+				else if ($6 != "" && ctl[key] != $6) ctl[key] = "!ambiguous"
+				if (datad[key] == "") datad[key] = $7
+				if (atd[key] == "") atd[key] = $8
+				if ($10 == 1) mm[key] = 1
+				if (protocol_rank($9) > protocol_rank(proto[key])) proto[key] = $9
+			}
+		}
+		END {
+			for (i = 1; i <= n; i++) {
+				k = order[i]
+				print id[k], tier[k], usbp[k], vend[k], prod[k], ctl[k], datad[k], atd[k], proto[k], mm[k]
+			}
+		}
+	' >"$INVENTORY_FILE.merged"
+
+	# Ambiguity: two distinct sysfs candidates that reduced to the same modem_id.
+	awk -F '\t' '{ print $1 }' "$INVENTORY_FILE.merged" | sort | uniq -d >"$INVENTORY_FILE.dupes"
+	awk -F '\t' '$2 == "weak-vidpid" { print $4 ":" $5 }' "$INVENTORY_FILE.merged" | \
+		sort | uniq -d >"$INVENTORY_FILE.weak-dupes"
+
+	: >"$INVENTORY_FILE"
+	while IFS= read -r raw_line; do
+		modem_id="$(field "$raw_line" 1)"
+		[ -n "$modem_id" ] || continue
+		tier="$(field "$raw_line" 2)"
+		usb_path="$(field "$raw_line" 3)"
+		vendor_id="$(field "$raw_line" 4)"
+		product_id="$(field "$raw_line" 5)"
+		control_device="$(field "$raw_line" 6)"
+		data_device="$(field "$raw_line" 7)"
+		at_device="$(field "$raw_line" 8)"
+		protocol="$(field "$raw_line" 9)"
+		mm_bound="$(field "$raw_line" 10)"
+		ambiguous=0
+		ambiguity_reason=""
+		if [ "$control_device" = '!ambiguous' ]; then
+			control_device=""
+			ambiguous=1
+			ambiguity_reason="multiple control devices claim the same physical modem"
+		fi
+		if [ "$data_device" = '!ambiguous' ]; then
+			data_device=""
+			ambiguous=1
+			ambiguity_reason="multiple data devices claim the same physical modem"
+		fi
+		if [ "$at_device" = '!ambiguous' ]; then
+			at_device=""
+			# Composite USB modems normally expose several ttyUSB ports. That is
+			# terminal ambiguity only when AT is the sole control transport. A
+			# proven QMI/MBIM control path may remain inventory/reset-capable, but
+			# it advertises no AT device until a future AT backend identifies one
+			# by role instead of enumeration order.
+			if [ -z "$control_device" ] || [ "$protocol" = at ]; then
+				ambiguous=1
+				ambiguity_reason="multiple AT ports claim the same physical modem"
+			fi
+		fi
+		if [ "$ambiguous" -eq 0 ] && grep -F -x -q "$modem_id" "$INVENTORY_FILE.dupes" 2>/dev/null; then
+			ambiguous=1
+			ambiguity_reason="multiple present devices reduced to the same stable identity"
+		elif [ "$ambiguous" -eq 0 ] && [ "$tier" = weak-vidpid ] && grep -F -x -q "$vendor_id:$product_id" "$INVENTORY_FILE.weak-dupes" 2>/dev/null; then
+			ambiguous=1
+			ambiguity_reason="multiple present devices have the same weak vendor/product identity"
+		fi
+
+		netifd_interface=""
+		netifd_proto=""
+		if [ "$ambiguous" -eq 0 ]; then
+			pairs="$(netifd_interface_for_record "$control_device" "$data_device" "$usb_path" 2>/dev/null || :)"
+			pair_count="$(printf '%s\n' "$pairs" | awk 'NF { count++ } END { print count + 0 }')"
+			if [ "$pair_count" -gt 1 ]; then
+				ambiguous=1
+				ambiguity_reason="multiple netifd interfaces claim this modem"
+			elif [ "$pair_count" -eq 1 ]; then
+				netifd_interface="${pairs%%$(printf '\t')*}"
+				netifd_proto="${pairs#*$(printf '\t')}"
+			fi
+		fi
+
+		owner_state=none
+		if [ "$ambiguous" -eq 1 ]; then
+			owner_state=conflicting
+			ambiguity_reason="${ambiguity_reason:-ambiguous identity}"
+		elif [ "$mm_bound" = 1 ]; then
+			if [ -n "$netifd_interface" ] && [ "$netifd_proto" != modemmanager ]; then
+				owner_state=conflicting
+				ambiguity_reason="ModemManager and a direct netifd protocol both claim this modem"
+			else
+				owner_state=modemmanager
+			fi
+		elif [ -n "$netifd_interface" ]; then
+			owner_state=netifd-direct
+		fi
+
+		first_seen="$(record_seen "$modem_id" "$now")"
+
+		capable_reset=0
+		if [ "$protocol" = qmi ] && [ "$ambiguous" -eq 0 ] && [ "$owner_state" != conflicting ] && \
+		   [ -n "$RESET_MODEM_ID" ] && [ "$modem_id" = "$RESET_MODEM_ID" ] && \
+		   hardware_integration_name >/dev/null 2>&1 && [ -w "$MODEM_POWER_PATH" ]; then
+			capable_reset=1
+		fi
+
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+			"$modem_id" "$tier" "$usb_path" "$control_device" "$data_device" "$at_device" \
+			"$protocol" "$owner_state" "$netifd_interface" "$first_seen" "$now" \
+			"$ambiguous" "$ambiguity_reason" "$capable_reset" "$vendor_id:$product_id" \
+			>>"$INVENTORY_FILE"
+	done <"$INVENTORY_FILE.merged"
+
+	rm -f "$CANDIDATES_FILE" "$MM_USB_PATHS_FILE" "$INVENTORY_FILE.merged" \
+		"$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
+}
+
+print_modem_json() {
+	line="$1"
+	modem_id="$(field "$line" 1)"
+	tier="$(field "$line" 2)"
+	usb_path="$(field "$line" 3)"
+	control_device="$(field "$line" 4)"
+	data_device="$(field "$line" 5)"
+	at_device="$(field "$line" 6)"
+	protocol="$(field "$line" 7)"
+	owner_state="$(field "$line" 8)"
+	netifd_interface="$(field "$line" 9)"
+	first_seen="$(field "$line" 10)"
+	last_seen="$(field "$line" 11)"
+	ambiguous="$(field "$line" 12)"
+	ambiguity_reason="$(field "$line" 13)"
+	capable_reset="$(field "$line" 14)"
+	vendor_product="$(field "$line" 15)"
+	printf '{'
+	json_key_string modem_id "$modem_id"; printf ','
+	json_key_string evidence_tier "$tier"; printf ','
+	json_key_string usb_path "$usb_path"; printf ','
+	json_key_string vendor_id "${vendor_product%%:*}"; printf ','
+	json_key_string product_id "${vendor_product#*:}"; printf ','
+	json_key_string control_device "$control_device"; printf ','
+	json_key_string data_device "$data_device"; printf ','
+	json_key_string at_device "$at_device"; printf ','
+	json_key_string protocol "$protocol"; printf ','
+	json_key_string implementation_state experimental; printf ','
+	json_key_string validation_state synthetic; printf ','
+	json_key_boolean hardware_validated false; printf ','
+	json_key_string owner_state "$owner_state"; printf ','
+	json_key_string netifd_interface "$netifd_interface"; printf ','
+	printf '"capabilities":{"inventory":true,'
+	json_key_boolean reset "$capable_reset"
+	printf '},'
+	json_key_string first_seen "$first_seen"; printf ','
+	json_key_string last_seen "$last_seen"; printf ','
+	json_key_boolean ambiguous "$ambiguous"; printf ','
+	json_key_string ambiguity_reason "$ambiguity_reason"
+	printf '}'
+}
+
+overlay_transitioning() {
+	# Reads $INVENTORY_FILE, replaces owner_state (field 8) with
+	# "transitioning" for any modem_id currently busy per the action
+	# coordinator. Discovery itself never persists this value; it is a
+	# display-time overlay only. Uses field()/single-variable read rather
+	# than a multi-variable `read`, which would silently collapse the empty
+	# fields these records legitimately contain.
+	while IFS= read -r raw_line; do
+		modem_id="$(field "$raw_line" 1)"
+		[ -n "$modem_id" ] || continue
+		action_status_values "$modem_id"
+		if [ "$ACTION_BUSY" = true ]; then
+			printf '%s\n' "$raw_line" | awk -F '\t' -v OFS='\t' '{ $8 = "transitioning"; print }'
+		else
+			printf '%s\n' "$raw_line"
+		fi
+	done <"$INVENTORY_FILE"
+}
+
+inventory_json_cmd() {
+	scan_inventory
+	overlay_transitioning >"$INVENTORY_FILE.display"
+	printf '{'
+	json_key_string version v1; printf ','
+	printf '"modems":['
+	separator=""
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		printf '%s' "$separator"
+		print_modem_json "$line"
+		separator=','
+	done <"$INVENTORY_FILE.display"
+	printf ']}\n'
+	rm -f "$INVENTORY_FILE.display"
+}
+
+find_record() {
+	wanted="$1"
+	scan_inventory
+	overlay_transitioning >"$INVENTORY_FILE.display"
+	line="$(awk -F '\t' -v id="$wanted" '$1 == id { print; exit }' "$INVENTORY_FILE.display")"
+	rm -f "$INVENTORY_FILE.display"
+	[ -n "$line" ] || return 1
+	printf '%s\n' "$line"
+}
+
+find_inventory_record() {
+	wanted="$1"
+	scan_inventory
+	line="$(awk -F '\t' -v id="$wanted" '$1 == id { print; exit }' "$INVENTORY_FILE")"
+	[ -n "$line" ] || return 1
+	printf '%s\n' "$line"
+}
+
+status_json_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "status-json requires --modem"
+	line="$(find_record "$REQUESTED_MODEM")" || {
+		printf '{'
+		json_key_string version v1; printf ','
+		json_key_string error not_found; printf ','
+		json_key_string modem_id "$REQUESTED_MODEM"
+		printf '}\n'
+		return 3
+	}
+	print_modem_json "$line"
+	printf '\n'
+}
+
+# ---- provisioning (read-only planning; see docs/provisioning-contract-v1.md) ----
+
+PROVISION_SECTION_PREFIX="apnmodem"
+PROVISION_OWNER="apn-autoconfig-modem"
+
+network_section_names() {
+	uci -q show network 2>/dev/null | awk -F. '
+		/^network\.[A-Za-z0-9_]+=/ { split($2, parts, "="); print parts[1] }
+	'
+}
+
+# The protocol provisioning would configure, which is not the same as the
+# protocol inventory observed: a modem ModemManager owns is provisioned as a
+# modemmanager section even though its kernel transport is QMI.
+provision_protocol_for_record() {
+	provision_owner_state="$1"
+	provision_observed_protocol="$2"
+	case "$provision_owner_state" in
+		modemmanager) printf '%s\n' modemmanager; return 0 ;;
+	esac
+	case "$provision_observed_protocol" in
+		qmi) printf '%s\n' qmi; return 0 ;;
+	esac
+	return 1
+}
+
+provision_device_for_record() {
+	case "$1" in
+		modemmanager) printf '%s\n' "$3" ;;
+		qmi) printf '%s\n' "$2" ;;
+		*) return 1 ;;
+	esac
+}
+
+# Returns the project-owned section already provisioned for this modem, if any.
+provision_existing_section() {
+	wanted_modem="$1"
+	for candidate_section in $(network_section_names); do
+		candidate_owner="$(uci -q get "network.${candidate_section}.apn_autoconfig_owner" 2>/dev/null || :)"
+		[ "$candidate_owner" = "$PROVISION_OWNER" ] || continue
+		candidate_modem="$(uci -q get "network.${candidate_section}.apn_autoconfig_modem_id" 2>/dev/null || :)"
+		[ "$candidate_modem" = "$wanted_modem" ] || continue
+		printf '%s\n' "$candidate_section"
+		return 0
+	done
+	return 1
+}
+
+provision_free_section_name() {
+	existing_names="$(network_section_names)"
+	index=1
+	while [ "$index" -le 64 ]; do
+		candidate="${PROVISION_SECTION_PREFIX}${index}"
+		printf '%s\n' "$existing_names" | grep -F -x -q "$candidate" || {
+			printf '%s\n' "$candidate"
+			return 0
+		}
+		index=$((index + 1))
+	done
+	return 1
+}
+
+# Evaluates provisioning preconditions against one inventory record without
+# writing anything. Sets PROVISION_* and returns the exit class.
+provision_evaluate() {
+	PROVISION_REASON=""
+	PROVISION_SECTION=""
+	PROVISION_EXISTING=""
+	PROVISION_PROTOCOL=""
+	PROVISION_DEVICE=""
+
+	provision_line="$(find_inventory_record "$1" 2>/dev/null || :)"
+	if [ -z "$provision_line" ]; then
+		PROVISION_REASON="not_present"
+		return 3
+	fi
+	provision_ambiguous="$(field "$provision_line" 12)"
+	provision_owner_state="$(field "$provision_line" 8)"
+	provision_interface="$(field "$provision_line" 9)"
+	provision_observed_protocol="$(field "$provision_line" 7)"
+	provision_control_device="$(field "$provision_line" 4)"
+	provision_usb_path="$(field "$provision_line" 3)"
+
+	PROVISION_EXISTING="$(provision_existing_section "$1" 2>/dev/null || :)"
+
+	if [ "$provision_ambiguous" = 1 ]; then
+		PROVISION_REASON="ambiguous"
+		return 4
+	fi
+	if [ "$provision_owner_state" = conflicting ]; then
+		PROVISION_REASON="conflicting_owner"
+		return 4
+	fi
+	if [ -n "$PROVISION_EXISTING" ]; then
+		# Already provisioned by this package for this exact modem: report it
+		# instead of creating a second section.
+		PROVISION_SECTION="$PROVISION_EXISTING"
+		PROVISION_REASON="already_provisioned"
+		return 0
+	fi
+	if [ -n "$provision_interface" ]; then
+		PROVISION_REASON="already_configured"
+		return 4
+	fi
+	PROVISION_PROTOCOL="$(provision_protocol_for_record "$provision_owner_state" "$provision_observed_protocol" 2>/dev/null || :)"
+	if [ -z "$PROVISION_PROTOCOL" ]; then
+		PROVISION_REASON="unsupported_protocol"
+		return 4
+	fi
+	PROVISION_DEVICE="$(provision_device_for_record "$PROVISION_PROTOCOL" "$provision_control_device" "$provision_usb_path" 2>/dev/null || :)"
+	if [ -z "$PROVISION_DEVICE" ]; then
+		PROVISION_REASON="unsupported_protocol"
+		return 4
+	fi
+	PROVISION_SECTION="$(provision_free_section_name 2>/dev/null || :)"
+	if [ -z "$PROVISION_SECTION" ]; then
+		PROVISION_REASON="name_unavailable"
+		return 3
+	fi
+	PROVISION_REASON="ok"
+	return 0
+}
+
+provisioning_baseline_file() {
+	printf '%s/provisioning/%s.tsv\n' "$STATE_DIR" "$(sanitize_token "$1")"
+}
+
+# Removes exactly the section this process created and nothing else. Armed
+# before the first write so a failure or signal in any later step unwinds it.
+provisioning_rollback() {
+	[ "$PROVISION_ROLLBACK_ARMED" -eq 1 ] || return 0
+	PROVISION_ROLLBACK_ARMED=0
+	if [ -n "$PROVISION_CREATED_SECTION" ]; then
+		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
+		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
+		if uci -q delete "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
+			uci commit network >/dev/null 2>&1 || \
+				log err "failed to commit removal of staging section $PROVISION_CREATED_SECTION"
+		else
+			log err "failed to remove staging section $PROVISION_CREATED_SECTION during rollback"
+		fi
+		PROVISION_CREATED_SECTION=""
+	fi
+	if [ -n "$PROVISION_BASELINE_FILE" ]; then
+		rm -f "$PROVISION_BASELINE_FILE"
+		PROVISION_BASELINE_FILE=""
+	fi
+}
+
+provision_cmd() {
+	prov_modem="$REQUESTED_MODEM"
+	[ -n "$prov_modem" ] || die_code 2 "provision requires --modem"
+	command_exists uci || die "uci is required"
+	command_exists apn-autoconfig || \
+		die_code 4 "apn-autoconfig is required to reconcile a provisioned section"
+
+	provision_evaluate "$prov_modem"
+	prov_status=$?
+	case "$PROVISION_REASON" in
+		ok) : ;;
+		already_provisioned)
+			die_code 4 "modem $prov_modem already owns section $PROVISION_EXISTING; deprovision it first"
+		;;
+		*) die_code "$prov_status" "modem $prov_modem cannot be provisioned: $PROVISION_REASON" ;;
+	esac
+
+	# One global order, same as every other composite operation: the APN
+	# operation lock first, then the selected per-modem lock.
+	acquire_apn_lock
+	acquire_modem_lock "$prov_modem"
+
+	# Pre-lock validation alone is a time-of-check/time-of-use race, so
+	# presence, identity, capability, owner and the free section name are all
+	# re-resolved now that nothing else can mutate them.
+	provision_evaluate "$prov_modem"
+	prov_status=$?
+	[ "$PROVISION_REASON" = ok ] || \
+		die_code "$prov_status" "modem $prov_modem stopped being provisionable: $PROVISION_REASON"
+
+	prov_section="$PROVISION_SECTION"
+	prov_protocol="$PROVISION_PROTOCOL"
+	prov_device="$PROVISION_DEVICE"
+	case "$prov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	prov_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	prov_operation="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
+
+	mkdir -p "$STATE_DIR/provisioning" || die "cannot create provisioning state directory"
+	prov_baseline="$(provisioning_baseline_file "$prov_modem")"
+	prov_tmp="$prov_baseline.$$"
+	printf 'v1\t%s\t%s\t%s\t%s\t%s\n' \
+		"$prov_operation" "$prov_modem" "$prov_section" 0 "$prov_now" >"$prov_tmp" || \
+		die "cannot write provisioning baseline"
+	mv "$prov_tmp" "$prov_baseline" || {
+		rm -f "$prov_tmp"
+		die "cannot persist provisioning baseline"
+	}
+	PROVISION_BASELINE_FILE="$prov_baseline"
+
+	# Final free-name check immediately before the write. A name that appeared
+	# in the meantime aborts without mutating instead of silently picking
+	# another one.
+	if network_section_names | grep -F -x -q "$prov_section"; then
+		die_code 3 "section $prov_section appeared before it could be created; retry"
+	fi
+
+	PROVISION_ROLLBACK_ARMED=1
+	PROVISION_CREATED_SECTION="$prov_section"
+
+	log notice "provisioning modem $prov_modem as $prov_protocol section $prov_section"
+	# Staged: administratively disabled and carrying no apn option, so netifd
+	# cannot dial a vendor default before reconciliation chooses a profile.
+	uci set "network.${prov_section}=interface" || die "cannot create section $prov_section"
+	uci set "network.${prov_section}.proto=${prov_protocol}" || die "cannot set proto"
+	uci set "network.${prov_section}.device=${prov_device}" || die "cannot set device"
+	uci set "network.${prov_section}.disabled=1" || die "cannot stage the section as disabled"
+	uci set "network.${prov_section}.auto=0" || die "cannot stage the section without autostart"
+	uci set "network.${prov_section}.apn_autoconfig_owner=apn-autoconfig-modem" || die "cannot mark ownership"
+	uci set "network.${prov_section}.apn_autoconfig_modem_id=${prov_modem}" || die "cannot mark modem identity"
+	uci set "network.${prov_section}.apn_autoconfig_provisioned=${prov_now}" || die "cannot mark provisioning time"
+	uci commit network || die "cannot commit the staging section"
+
+	# Clear "disabled" so the APN engine is able to start the section, but do
+	# not start it here. Bringing it up at this point would hand netifd a
+	# modemmanager/qmi section that still has no apn option, which is exactly
+	# the vendor-default dial the staging rules exist to prevent. The engine
+	# owns bring-up: it writes the profile and cycles the interface itself.
+	# auto=0 still keeps netifd from starting it on any unrelated reload.
+	uci delete "network.${prov_section}.disabled" || die "cannot enable the staging section"
+	uci commit network || die "cannot commit the enabled staging section"
+
+	# The APN engine owns matching, profile application, connectivity
+	# verification and profile rollback. It borrows this operation's lock
+	# rather than trying to take one we already hold.
+	# Run the engine as a tracked child. A signal during reconciliation has to
+	# terminate and reap it before the staging section is unwound, otherwise an
+	# orphaned engine keeps mutating a target we are deleting underneath it.
+	prov_reconcile=0
+	APN_AUTOCONFIG_LOCK_OWNER_PID="$$" \
+		apn-autoconfig reconcile --target "network:${prov_section}" &
+	PROVISION_CHILD_PID=$!
+	wait "$PROVISION_CHILD_PID" || prov_reconcile=$?
+	PROVISION_CHILD_PID=""
+	if [ "$prov_reconcile" -ne 0 ]; then
+		case "$prov_reconcile" in
+			3) die_code 3 "APN reconciliation for $prov_section is temporarily unavailable" ;;
+			*) die_code 4 "APN reconciliation failed for $prov_section (exit $prov_reconcile)" ;;
+		esac
+	fi
+
+	# Promotion happens only after reconciliation verified real connectivity.
+	if [ "$REQUESTED_AUTOCONNECT" = 0 ]; then
+		uci set "network.${prov_section}.auto=0" || die "cannot record the requested autoconnect state"
+		prov_autoconnect=false
+	else
+		uci delete "network.${prov_section}.auto" >/dev/null 2>&1 || :
+		prov_autoconnect=true
+	fi
+	uci commit network || die "cannot commit the promoted section"
+
+	PROVISION_ROLLBACK_ARMED=0
+	PROVISION_CREATED_SECTION=""
+	PROVISION_BASELINE_FILE=""
+	release_modem_lock
+	log notice "modem $prov_modem provisioned as $prov_section"
+
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$prov_modem"; printf ','
+	json_key_string section "$prov_section"; printf ','
+	json_key_string protocol "$prov_protocol"; printf ','
+	json_key_string device "$prov_device"; printf ','
+	json_key_string state promoted; printf ','
+	json_key_boolean autoconnect "$prov_autoconnect"; printf ','
+	json_key_string operation_id "$prov_operation"
+	printf '}\n'
+}
+
+# netifd stays the bearer owner. These verbs only ask it to act on a section
+# this package created, and report what netifd then reports.
+interface_is_up() {
+	command_exists ubus || return 1
+	command_exists jsonfilter || return 1
+	conn_state="$(ubus call "network.interface.$1" status 2>/dev/null | \
+		jsonfilter -e '@.up' 2>/dev/null || :)"
+	[ "$conn_state" = true ]
+}
+
+wait_for_interface_up() {
+	conn_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		interface_is_up "$1" && return 0
+		conn_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		conn_elapsed=$((conn_now - conn_started))
+		[ "$conn_elapsed" -ge 0 ] || conn_elapsed="$CONNECT_WAIT_SECONDS"
+		[ "$conn_elapsed" -lt "$CONNECT_WAIT_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
+connection_cmd() {
+	conn_action="$1"
+	conn_modem="$REQUESTED_MODEM"
+	[ -n "$conn_modem" ] || die_code 2 "$conn_action requires --modem"
+	command_exists uci || die "uci is required"
+
+	# v1 acts only on sections this package owns. A user-created interface is
+	# never driven from here; see docs/provisioning-contract-v1.md.
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "no section owned by this package is bound to modem $conn_modem"
+	case "$conn_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	acquire_apn_lock
+	acquire_modem_lock "$conn_modem"
+
+	conn_section="$(provision_existing_section "$conn_modem" 2>/dev/null || :)"
+	[ -n "$conn_section" ] || \
+		die_code 4 "modem $conn_modem no longer owns a project-created section"
+
+	conn_result=up
+	case "$conn_action" in
+		disconnect)
+			ifdown "$conn_section" >/dev/null 2>&1 || die "failed to stop $conn_section"
+			conn_result=down
+		;;
+		connect|reconnect)
+			if [ "$conn_action" = reconnect ]; then
+				ifdown "$conn_section" >/dev/null 2>&1 || :
+			fi
+			ifup "$conn_section" >/dev/null 2>&1 || die "failed to start $conn_section"
+			if ! wait_for_interface_up "$conn_section"; then
+				die_code 3 "$conn_section did not come up within ${CONNECT_WAIT_SECONDS}s"
+			fi
+		;;
+		*) die_code 2 "unsupported connection action: $conn_action" ;;
+	esac
+
+	release_modem_lock
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$conn_modem"; printf ','
+	json_key_string section "$conn_section"; printf ','
+	json_key_string action "$conn_action"; printf ','
+	json_key_string state "$conn_result"
+	printf '}\n'
+}
+
+deprovision_cmd() {
+	deprov_modem="$REQUESTED_MODEM"
+	[ -n "$deprov_modem" ] || die_code 2 "deprovision requires --modem"
+	command_exists uci || die "uci is required"
+
+	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
+	[ -n "$deprov_section" ] || \
+		die_code 4 "no section owned by this package is bound to modem $deprov_modem"
+
+	acquire_apn_lock
+	acquire_modem_lock "$deprov_modem"
+
+	# Re-prove ownership under the locks. A section that lost or never had the
+	# marker is never deleted, however much it looks like one of ours.
+	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
+	[ -n "$deprov_section" ] || \
+		die_code 4 "modem $deprov_modem no longer owns a project-created section"
+	case "$deprov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	log notice "removing project-owned section $deprov_section for modem $deprov_modem"
+	ifdown "$deprov_section" >/dev/null 2>&1 || :
+	uci delete "network.${deprov_section}" || die "cannot remove section $deprov_section"
+	uci commit network || die "cannot commit removal of $deprov_section"
+	rm -f "$(provisioning_baseline_file "$deprov_modem")"
+
+	# The APN engine keeps its own per-target baseline and active state. Ask it
+	# to forget this now-deleted section rather than reaching into its files:
+	# left behind, that state accumulates and a later provisioning reusing the
+	# section name would meet state belonging to a different SIM.
+	deprov_engine_state=retained
+	if command_exists apn-autoconfig; then
+		if APN_AUTOCONFIG_LOCK_OWNER_PID="$$" \
+			apn-autoconfig forget-target --target "network:${deprov_section}" >/dev/null 2>&1; then
+			deprov_engine_state=dropped
+		else
+			log warning "apn-autoconfig kept its state for network:${deprov_section}"
+		fi
+	fi
+	release_modem_lock
+
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$deprov_modem"; printf ','
+	json_key_string section "$deprov_section"; printf ','
+	json_key_string state removed; printf ','
+	json_key_string engine_state "$deprov_engine_state"
+	printf '}\n'
+}
+
+provision_plan_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "provision-plan requires --modem"
+	plan_status=0
+	provision_evaluate "$REQUESTED_MODEM" || plan_status=$?
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$REQUESTED_MODEM"; printf ','
+	printf '"can_provision":%s,' "$([ "$plan_status" -eq 0 ] && [ "$PROVISION_REASON" = ok ] && printf true || printf false)"
+	json_key_string reason "$PROVISION_REASON"; printf ','
+	json_key_string section "$PROVISION_SECTION"; printf ','
+	json_key_string existing_section "$PROVISION_EXISTING"; printf ','
+	json_key_string protocol "$PROVISION_PROTOCOL"; printf ','
+	json_key_string device "$PROVISION_DEVICE"
+	printf '}\n'
+	return "$plan_status"
+}
+
+resolve_cmd() {
+	[ -n "$REQUESTED_INTERFACE" ] || die_code 2 "resolve requires --interface"
+	case "$REQUESTED_INTERFACE" in ''|*[!A-Za-z0-9_]*) die_code 2 "invalid interface name" ;; esac
+	scan_inventory
+	match="$(awk -F '\t' -v iface="$REQUESTED_INTERFACE" '$9 == iface && $8 != "conflicting" && $12 == 0 { print $1; count++ } END { if (count != 1) exit 3 }' "$INVENTORY_FILE")"
+	status=$?
+	[ "$status" -eq 0 ] && [ -n "$match" ] || die_code 3 "no unambiguous modem is bound to interface $REQUESTED_INTERFACE"
+	printf '%s\n' "$match"
+}
+
+# ---- coordinator: per-modem lock, action-start/action-status, reset ----
+
+acquire_modem_lock() {
+	modem_id="$1"
+	LOCK_PATH="${LOCK_ROOT}.$(sanitize_token "$modem_id")"
+	mkdir -p "$(dirname "$LOCK_ROOT")" || die "cannot create lock parent"
+	lock_try_acquire_or_reclaim "$LOCK_PATH"
+	modem_lock_status=$?
+	case "$modem_lock_status" in
+		0) : ;;
+		3)
+			old_pid="$(lock_owner_pid "$LOCK_PATH" 2>/dev/null || :)"
+			die_code 3 "another operation is already running for this modem (PID ${old_pid:-unknown}); retry later"
+		;;
+		*) die "cannot acquire lock: $LOCK_PATH" ;;
+	esac
+	LOCK_HELD=1
+}
+
+acquire_apn_lock() {
+	parent_pid="${APN_AUTOCONFIG_COORDINATOR_PARENT_PID:-}"
+	case "$parent_pid" in
+		''|*[!0-9]*) parent_pid="" ;;
+	esac
+	if [ -n "$parent_pid" ]; then
+		lock_pid="$(lock_owner_pid "$APN_LOCK_DIR" 2>/dev/null || :)"
+		[ "$lock_pid" = "$parent_pid" ] && process_is_alive "$parent_pid" || \
+			die_code 3 "caller did not prove ownership of the APN operation lock"
+		APN_LOCK_BORROWED=1
+		return 0
+	fi
+	mkdir -p "$(dirname "$APN_LOCK_DIR")" || die "cannot create APN lock parent"
+	lock_try_acquire_or_reclaim "$APN_LOCK_DIR"
+	apn_lock_status=$?
+	case "$apn_lock_status" in
+		0) : ;;
+		3)
+			old_pid="$(lock_owner_pid "$APN_LOCK_DIR" 2>/dev/null || :)"
+			die_code 3 "another APN or modem operation is already running (PID ${old_pid:-unknown}); retry later"
+		;;
+		*) die "cannot acquire APN lock: $APN_LOCK_DIR" ;;
+	esac
+	APN_LOCK_HELD=1
+}
+
+release_modem_lock() {
+	[ "$LOCK_HELD" -eq 1 ] || return 0
+	lock_release "$LOCK_PATH"
+	LOCK_HELD=0
+}
+
+write_modem_power() {
+	printf '%s\n' "$1" >"$MODEM_POWER_PATH" 2>/dev/null
+}
+
+wait_for_control_owner() {
+	modem_id="$1"
+	expected_owner="$2"
+	# Bound the wall clock, not the iteration count. Each pass runs a full
+	# inventory scan whose ModemManager reads have their own multi-second
+	# bound, so subtracting only the poll interval turned the configured and
+	# LuCI-labelled maximum into a much longer outage with the interface down.
+	wait_started="$(date +%s 2>/dev/null || printf '%s' 0)"
+	while :; do
+		scan_inventory
+		if awk -F '\t' -v id="$modem_id" -v owner="$expected_owner" \
+			'$1 == id && $8 == owner && $12 == 0 { found=1; exit } END { exit(found ? 0 : 1) }' \
+			"$INVENTORY_FILE" 2>/dev/null; then
+			return 0
+		fi
+		rm -f "$INVENTORY_FILE"
+		wait_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+		wait_elapsed=$((wait_now - wait_started))
+		[ "$wait_elapsed" -ge 0 ] || wait_elapsed="$MODEM_WAIT_SECONDS"
+		[ "$wait_elapsed" -lt "$MODEM_WAIT_SECONDS" ] || return 1
+		sleep "$MODEM_POLL_SECONDS"
+	done
+}
+
+reset_cmd() {
+	modem_id="$REQUESTED_MODEM"
+	[ -n "$modem_id" ] || die_code 2 "reset requires --modem"
+	hardware_integration_name >/dev/null 2>&1 || die_code 4 "reset requires an installed, supported board integration"
+	[ -w "$MODEM_POWER_PATH" ] || die "modem power GPIO is not writable: $MODEM_POWER_PATH"
+
+	# Reset decisions use the discovered owner, not the public
+	# action-status overlay that deliberately reports this worker as
+	# "transitioning" while a background reset is active.
+	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id is not currently present"
+	capable_reset="$(printf '%s' "$line" | awk -F '\t' '{ print $14 }')"
+	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is not the strongly identified modem bound to the board reset GPIO"
+	owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
+	case "$owner_state" in
+		conflicting) die_code 4 "modem $modem_id has a conflicting control-owner state; refusing to reset" ;;
+	esac
+	expected_owner_state="$owner_state"
+	netifd_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
+
+	# Every composite operation uses one global order: APN lock, then the
+	# selected modem lock. A compatibility caller may borrow its already-held
+	# APN lock only after proving the owner PID above.
+	acquire_apn_lock
+	acquire_modem_lock "$modem_id"
+	line="$(find_inventory_record "$modem_id")" || die_code 4 "modem $modem_id disappeared before reset could start"
+	capable_reset="$(field "$line" 14)"
+	current_owner_state="$(field "$line" 8)"
+	[ "$capable_reset" = 1 ] || die_code 4 "modem $modem_id is no longer safely reset-capable"
+	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $modem_id acquired a conflicting owner before reset"
+	[ "$current_owner_state" = "$expected_owner_state" ] || \
+		die_code 4 "modem $modem_id changed control owner before reset"
+	netifd_interface="$(field "$line" 9)"
+
+	restore_armed=0
+	if [ -n "$netifd_interface" ]; then
+		log notice "modem reset requested for $modem_id; stopping interface $netifd_interface"
+		restore_armed=1
+		RESET_INTERFACE="$netifd_interface"
+		RESET_INTERFACE_RESTORE_ARMED=1
+		ifdown "$netifd_interface" >/dev/null 2>&1 || :
+	else
+		log notice "modem reset requested for $modem_id (no bound netifd interface)"
+	fi
+
+	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
+	MODEM_POWER_OFF_ARMED=1
+	write_modem_power "$MODEM_POWER_OFF_VALUE" || die "failed to switch modem power off"
+	sleep "$MODEM_POWER_OFF_SECONDS"
+	write_modem_power "$MODEM_POWER_ON_VALUE" || die "failed to switch modem power on"
+	MODEM_POWER_OFF_ARMED=0
+
+	log notice "modem power restored; waiting up to ${MODEM_WAIT_SECONDS}s for stable identity and control owner $expected_owner_state"
+	if ! wait_for_control_owner "$modem_id" "$expected_owner_state"; then
+		die_code 3 "modem $modem_id did not return with control owner $expected_owner_state within ${MODEM_WAIT_SECONDS}s"
+	fi
+
+	if [ "$restore_armed" -eq 1 ]; then
+		ifup "$netifd_interface" >/dev/null 2>&1 || die "failed to restart interface $netifd_interface after modem reset"
+		RESET_INTERFACE_RESTORE_ARMED=0
+	fi
+	release_modem_lock
+	log notice "modem $modem_id reset completed; stable identity and control owner are available again"
+}
+
+action_state_dir_for() {
+	printf '%s/%s\n' "$ACTION_STATE_DIR" "$(sanitize_token "$1")"
+}
+
+action_status_values() {
+	modem_id="$1"
+	ACTION_STATUS="idle"
+	ACTION_NAME=""
+	ACTION_PID=""
+	ACTION_STARTED=""
+	ACTION_FINISHED=""
+	ACTION_EXIT_CODE=""
+	ACTION_MESSAGE=""
+	ACTION_OPERATION_ID=""
+	ACTION_BUSY=false
+	state_dir="$(action_state_dir_for "$modem_id")"
+	if [ -r "$state_dir/state.tsv" ]; then
+		ACTION_STATUS="$(awk -F '\t' 'NR==1{print $2}' "$state_dir/state.tsv")"
+		ACTION_NAME="$(awk -F '\t' 'NR==1{print $3}' "$state_dir/state.tsv")"
+		ACTION_PID="$(awk -F '\t' 'NR==1{print $4}' "$state_dir/state.tsv")"
+		ACTION_STARTED="$(awk -F '\t' 'NR==1{print $5}' "$state_dir/state.tsv")"
+		ACTION_FINISHED="$(awk -F '\t' 'NR==1{print $6}' "$state_dir/state.tsv")"
+		ACTION_EXIT_CODE="$(awk -F '\t' 'NR==1{print $7}' "$state_dir/state.tsv")"
+		ACTION_MESSAGE="$(awk -F '\t' 'NR==1{print $8}' "$state_dir/state.tsv")"
+		ACTION_OPERATION_ID="$(awk -F '\t' 'NR==1{print $10}' "$state_dir/state.tsv")"
+		case "$ACTION_STATUS" in
+			starting|queued|running)
+				# The launcher records "starting" under its own PID and then
+				# exits; the accepted worker owns the start lock from the moment
+				# it is forked until it writes a terminal result. Judging
+				# liveness by the state PID alone reported that handoff as a
+				# dead worker, which also made a duplicate button release look
+				# like a rejection instead of a coalesced repeat. Our own start
+				# lock does not count: a launcher holding it is deciding whether
+				# to start, not observing someone else's handoff.
+				handoff_pid="$(lock_owner_pid "${state_dir}.start-lock" 2>/dev/null || :)"
+				[ "$handoff_pid" = "$$" ] && handoff_pid=""
+				if process_is_alive "$ACTION_PID"; then
+					ACTION_BUSY=true
+				elif process_is_alive "$handoff_pid"; then
+					ACTION_BUSY=true
+				else
+					ACTION_STATUS="failed"
+					ACTION_EXIT_CODE="1"
+					ACTION_MESSAGE="background worker stopped unexpectedly"
+				fi
+			;;
+		esac
+	fi
+	if [ "$ACTION_BUSY" = false ]; then
+		external_lock="${LOCK_ROOT}.$(sanitize_token "$modem_id")"
+		external_pid="$(lock_owner_pid "$external_lock" 2>/dev/null || :)"
+		if process_is_alive "$external_pid"; then
+			ACTION_STATUS="running"
+			ACTION_NAME=""
+			ACTION_PID="$external_pid"
+			ACTION_STARTED=""
+			ACTION_FINISHED=""
+			ACTION_EXIT_CODE=""
+			ACTION_MESSAGE="operation started outside the background action API"
+			ACTION_OPERATION_ID=""
+			ACTION_BUSY=true
+		fi
+	fi
+}
+
+print_action_json() {
+	accepted="$1"
+	modem_id="$2"
+	action_status_values "$modem_id"
+	printf '{'
+	json_key_string version v2; printf ','
+	printf '"accepted":%s,' "$accepted"
+	printf '"busy":%s,' "$ACTION_BUSY"
+	json_key_string modem_id "$modem_id"; printf ','
+	json_key_string state "$ACTION_STATUS"; printf ','
+	json_key_string action "$ACTION_NAME"; printf ','
+	json_key_string operation_id "$ACTION_OPERATION_ID"; printf ','
+	json_key_string pid "$ACTION_PID"; printf ','
+	json_key_string started_at "$ACTION_STARTED"; printf ','
+	json_key_string finished_at "$ACTION_FINISHED"; printf ','
+	json_key_string exit_code "$ACTION_EXIT_CODE"; printf ','
+	json_key_string message "$ACTION_MESSAGE"
+	printf '}\n'
+}
+
+action_status_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "action-status requires --modem"
+	print_action_json false "$REQUESTED_MODEM"
+}
+
+# Each background action states its own precondition here, before a worker is
+# accepted. A caller must never learn from a terminal failure that the
+# operation was never possible in the first place.
+action_precondition() {
+	precondition_action="$1"
+	precondition_modem="$2"
+	case "$precondition_action" in
+		reset)
+			line="$(find_record "$precondition_modem")" || \
+				die_code 4 "modem $precondition_modem is not currently present"
+			[ "$(field "$line" 14)" = 1 ] || \
+				die_code 4 "modem $precondition_modem is not bound to the supported board reset integration"
+		;;
+		provision)
+			provision_evaluate "$precondition_modem"
+			precondition_status=$?
+			[ "$PROVISION_REASON" = ok ] || \
+				die_code "$precondition_status" "modem $precondition_modem cannot be provisioned: $PROVISION_REASON"
+		;;
+		deprovision|connect|disconnect|reconnect)
+			[ -n "$(provision_existing_section "$precondition_modem" 2>/dev/null || :)" ] || \
+				die_code 4 "no section owned by this package is bound to modem $precondition_modem"
+		;;
+	esac
+}
+
+action_start_cmd() {
+	action="$1"
+	case "$action" in
+		reset|provision|deprovision|connect|disconnect|reconnect) : ;;
+		*) die_code 2 "unsupported background action: $action" ;;
+	esac
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "action-start requires --modem"
+	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
+	action_precondition "$action" "$REQUESTED_MODEM"
+
+	state_dir="$(action_state_dir_for "$REQUESTED_MODEM")"
+	mkdir -p "$ACTION_STATE_DIR" || die "cannot create action state parent"
+	start_lock="${state_dir}.start-lock"
+	lock_try_acquire_or_reclaim "$start_lock"
+	start_lock_status=$?
+	case "$start_lock_status" in
+		0) : ;;
+		3) print_action_json false "$REQUESTED_MODEM"; return 0 ;;
+		*) die "cannot record action launch lock" ;;
+	esac
+
+	action_status_values "$REQUESTED_MODEM"
+	if [ "$ACTION_BUSY" = true ]; then
+		lock_release "$start_lock"
+		print_action_json false "$REQUESTED_MODEM"
+		return 0
+	fi
+
+	mkdir -p "$state_dir" || {
+		lock_release "$start_lock"
+		die "cannot create action state directory"
+	}
+	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	operation_id="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
+	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\t%s\t%s\n' \
+		"$action" "$$" "$started" "$REQUESTED_MODEM" "$operation_id" >"$state_dir/state.tsv"
+	"$ACTION_WORKER" "$action" "$state_dir" "$started" "$REQUESTED_MODEM" "$operation_id" "$start_lock" \
+		</dev/null >/dev/null 2>&1 &
+	worker_pid=$!
+	# The worker now owns the start lock and clears it when it reaches a
+	# terminal state, so action-status can still see a live owner after this
+	# launcher exits.
+	lock_set_owner "$start_lock" "$worker_pid" || :
+	print_action_json true "$REQUESTED_MODEM"
+}
+
+rescan_cmd() {
+	scan_inventory
+	rm -f "$INVENTORY_FILE"
+	printf 'ok\n'
+}
+
+rescan_async_cmd() {
+	# The debounce marker is an ordinary lock so a coalescing window whose
+	# worker was killed (service stop, package upgrade replacing this script,
+	# OOM) is reclaimed by the next event instead of silently swallowing every
+	# later hotplug for the rest of the uptime.
+	debounce_lock="${LOCK_ROOT}.hotplug-debounce"
+	mkdir -p "$(dirname "$LOCK_ROOT")" 2>/dev/null || exit 0
+	lock_try_acquire_or_reclaim "$debounce_lock"
+	debounce_status=$?
+	[ "$debounce_status" -eq 0 ] || exit 0
+	(
+		sleep "$HOTPLUG_COALESCE_SECONDS"
+		"$0" rescan >/dev/null 2>&1 || :
+		lock_release "$debounce_lock"
+	) </dev/null >/dev/null 2>&1 &
+	# `$$` inside the subshell is still this shell's PID, so the owner has to
+	# be published from here once the coalescing worker actually exists.
+	lock_set_owner "$debounce_lock" "$!" || :
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG <command> [--modem <modem_id>] [--interface <network-section>]
+                       [--autoconnect 0|1]
+
+Commands:
+  inventory-json    Read-only scan of currently present modems (JSON)
+  status-json       Single modem record; requires --modem
+  resolve           Print the modem_id bound to --interface, or fail closed
+  provision-plan    Read-only check of whether --modem can be provisioned
+  provision         Create a project-owned section for --modem, reconcile its
+                    APN through apn-autoconfig and promote autoconnect
+  deprovision       Remove the project-owned section created for --modem
+  connect           Bring the project-owned section for --modem up
+  disconnect        Bring the project-owned section for --modem down
+  reconnect         Cycle the project-owned section for --modem
+  action-start reset  Start a bounded power-cycle in background; requires --modem
+  action-status     Show background/external reset operation state; requires --modem
+  reset             Synchronous power-cycle and re-enumeration wait; requires --modem
+  rescan            Synchronous full read-only rescan (updates first/last seen)
+  rescan-async      Debounced rescan entry point for hotplug handlers
+EOF
+}
+
+main() {
+	COMMAND_NAME="${1:-}"
+	case "$COMMAND_NAME" in -h|--help|help|'') usage; return 0 ;; esac
+	shift
+	command_argument=""
+	case "$COMMAND_NAME" in
+		action-start) command_argument="${1:-}"; [ "$#" -eq 0 ] || shift ;;
+	esac
+	while [ "$#" -gt 0 ]; do
+		case "$1" in
+			--modem)
+				[ "$#" -ge 2 ] || die_code 2 "--modem requires a value"
+				REQUESTED_MODEM="$2"
+				shift 2
+			;;
+			--interface)
+				[ "$#" -ge 2 ] || die_code 2 "--interface requires a value"
+				REQUESTED_INTERFACE="$2"
+				shift 2
+			;;
+			--autoconnect)
+				[ "$#" -ge 2 ] || die_code 2 "--autoconnect requires a value"
+				case "$2" in 0|1) REQUESTED_AUTOCONNECT="$2" ;; *) die_code 2 "--autoconnect must be 0 or 1" ;; esac
+				shift 2
+			;;
+			*) die_code 2 "unexpected argument: $1" ;;
+		esac
+	done
+	load_config
+	# Normalize once so every sysfs prefix comparison below (usb_device_path,
+	# resolve_class_device_usb_path) compares against the same canonical form
+	# a resolved /dev symlink chain will already be in, matching the same
+	# normalization apn-autoconfig-qmi applies before its own prefix checks.
+	SYSFS_ROOT="$(readlink -f "$SYSFS_ROOT" 2>/dev/null || printf '%s' "$SYSFS_ROOT")"
+	validate_config
+	if [ -n "$REQUESTED_MODEM" ]; then
+		safe_token "$REQUESTED_MODEM" || die_code 2 "invalid modem identity"
+	fi
+	case "$COMMAND_NAME" in
+		inventory-json) inventory_json_cmd ;;
+		status-json) status_json_cmd ;;
+		resolve) resolve_cmd ;;
+		provision-plan) provision_plan_cmd ;;
+		provision) provision_cmd ;;
+		deprovision) deprovision_cmd ;;
+		connect|disconnect|reconnect) connection_cmd "$COMMAND_NAME" ;;
+		action-start) action_start_cmd "$command_argument" ;;
+		action-status) action_status_cmd ;;
+		reset) reset_cmd ;;
+		rescan) rescan_cmd ;;
+		rescan-async) rescan_async_cmd ;;
+		*) usage >&2; exit 2 ;;
+	esac
+}
+
+main "$@"

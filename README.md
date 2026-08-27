@@ -1047,12 +1047,8 @@ It does not receive the private test suite or rebuild the other packages. If
 the public sources remain unchanged for 45 days, it records an empty maintenance
 commit so GitHub does not disable the weekly schedule after 60 inactive days.
 
-That is a deliberate boundary rather than an oversight, and it was drawn after
-real subscriber and equipment identifiers -- belonging to the SIM cards in the
-maintainer's own test router -- were found published here inside test fixtures.
-They had been public for months because everything was public by default. The
-identifiers have since been removed from this repository and its history, and
-what may be published is now decided by an explicit list and checked, twice,
-before anything leaves.
+The boundary is enforced by an explicit source allowlist and by content checks
+over both the exported source and the final release artifacts. Material outside
+that release surface remains in the private development repository.
 
 Bug reports and questions are welcome through this repository's issues.

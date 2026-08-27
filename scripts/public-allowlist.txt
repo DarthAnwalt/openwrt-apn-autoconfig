@@ -7,9 +7,8 @@
 # workflow below: its public-source inputs, generator, checks and package-only
 # builder are published because that package is maintained in public.
 #
-# The rule this file exists to enforce is the maintainer's, recorded after
-# real subscriber identifiers were found published in test fixtures: what goes
-# out is what a user or a licence needs, not the development record.
+# This is a security boundary: what goes out is what a user, a licence or the
+# isolated public provider pipeline needs, not the development record.
 #
 # Adding a line here is a decision to publish. It is not a formality: run
 # `sh scripts/check-public-safe.sh` afterwards, because a path being allowed

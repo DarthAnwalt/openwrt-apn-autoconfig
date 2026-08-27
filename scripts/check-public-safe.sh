@@ -4,11 +4,9 @@ set -eu
 # Scans everything the allowlist would publish for material that must not leave
 # the private repository.
 #
-# The allowlist decides which files go out. This decides whether what is inside
-# them may. Both are needed and neither substitutes for the other: real
-# subscriber identifiers reached the public repository inside files that were
-# entirely legitimate to publish -- test fixtures -- and no path rule would
-# have stopped them.
+# The allowlist decides which files go out. This independently decides whether
+# their contents may. Both controls are required: an allowed path is not an
+# exemption from content validation.
 #
 # Exit 0 means the publishable set is clean. Any finding is a refusal.
 
@@ -94,8 +92,8 @@ done <"$FILES" || exit 1
 # rules of identifier length are its entire content -- and that content comes
 # from AOSP and GNOME MBPI, declared in its own header, rather than from
 # anything typed here. Every other rule below still applies to it, which is the
-# point of exempting a rule instead of a file: an exemption is exactly where a
-# leak would otherwise hide.
+# point of exempting a rule instead of a file: every unrelated content rule
+# continues to apply.
 identifier_shape_exempt() {
 	case "$1" in
 		# Releases before 0.8.0 carried the same generated public database in
@@ -133,6 +131,17 @@ while IFS= read -r file; do
 	for value in $hits; do
 		report "$file carries a private network address"
 	done
+done <"$FILES"
+
+# ---- internal incident narratives are not public documentation ----
+# Public files describe current behaviour. They do not advertise private
+# incident history. Split the phrases so this rule can scan its own source.
+incident_pattern='were found pub'"lished|public for mon"'ths|real subscriber and equipment ident'"ifiers"
+while IFS= read -r file; do
+	[ -f "$ROOT/$file" ] || continue
+	if grep -qiE "$incident_pattern" "$ROOT/$file" 2>/dev/null; then
+		report "$file carries an internal incident narrative"
+	fi
 done <"$FILES"
 
 # ---- key material ----

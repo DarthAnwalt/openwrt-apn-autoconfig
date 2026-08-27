@@ -1,0 +1,134 @@
+{
+  "packages": [
+    {
+      "name": "apn-autoconfig",
+      "version": "0.15.3-r1",
+      "hashes": "6be5630387e6444226569620827bbeb357efddb4281058461a576759b7480044",
+      "description": "POSIX-shell cellular profile detection and testing engine for OpenWrt. It supports already configured ModemManager, QMI and MBIM netifd targets. QMI uses an installed uqmi command with a same-USB-device identity fallback through sms-tool, and MBIM uses an installed umbim; the core does not install a modem manager. It matches SIM identity against a worldwide local TSV database, verifies real Internet access, caches successful profiles per ICCID and safely rolls back failures.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 218158,
+      "file-size": 57726,
+      "depends": [
+        "apn-autoconfig-providers",
+        "ca-bundle",
+        "curl",
+        "jsonfilter",
+        "libc",
+        "netifd",
+        "sms-tool",
+        "ubus",
+        "uci"
+      ],
+      "provides": [
+        "apn-autoconfig-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-integration-huasifei-wh3000",
+      "version": "0.15.3-r1",
+      "hashes": "7a8987627c62fcf25d48e4c9f5a2416d0406666fc9215aff7a83e37a4b95377d",
+      "description": "Optional board integration for the tested Huasifei WH3000 Pro setup. It maps the BTN_0 release event to the guarded GPIO modem power-cycle and APN reconciliation action. It is not a generic router-button implementation.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 2918,
+      "file-size": 2316,
+      "depends": [
+        "apn-autoconfig",
+        "kmod-button-hotplug",
+        "libc"
+      ],
+      "provides": [
+        "apn-autoconfig-integration-huasifei-wh3000-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-modem",
+      "version": "0.15.3-r1",
+      "hashes": "af4a2099bf7876120219d8df5506bbfdf280fec3fec5c373c27230a099051d16",
+      "description": "POSIX-shell modem-control foundation for apn-autoconfig. Provides read-only modem inventory with stable hardware identity independent of volatile device names, explicit ModemManager/direct-control ownership state and a serialized per-modem operation coordinator. It does not implement APN policy, network provisioning, MBIM profile mutation or eSIM lifecycle; see docs/modem-contract-v1.md. Optional runtime backends (uqmi, sms-tool, mmcli) are detected, not required, so capability stays truthful.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig-modem",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 203807,
+      "file-size": 61156,
+      "depends": [
+        "jsonfilter",
+        "libc",
+        "sms-tool",
+        "ubus",
+        "uci"
+      ],
+      "provides": [
+        "apn-autoconfig-modem-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-proto-atdial",
+      "version": "0.15.3-r1",
+      "hashes": "69b279fb5366a2ed11ec17a1157be12b7f53a356d3bcac229ec5885ad8aebe9f",
+      "description": "netifd protocol `apn_atdial` for modems that expose no cdc-wdm control channel, such as a Fibocom FM350-GL in RNDIS composition. Their data path is an ordinary usbnet interface, so the host defines and activates the PDP context over an AT port and configures the address the modem reports; the modem serves no DHCP. Port resolution, identity and control-owner arbitration stay in apn-autoconfig-modem, and netifd remains the bearer owner. The Intel XMM path used by Fibocom L850/L860 is implemented but has not been validated on hardware; see docs/atdial-contract-v1.md.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig-proto-atdial",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 53249,
+      "file-size": 19193,
+      "depends": [
+        "apn-autoconfig-modem",
+        "jsonfilter",
+        "kmod-usb-net-cdc-ether",
+        "kmod-usb-net-cdc-ncm",
+        "kmod-usb-net-rndis",
+        "libc",
+        "sms-tool"
+      ],
+      "provides": [
+        "apn-autoconfig-proto-atdial-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-providers",
+      "version": "2026.08.24-r1",
+      "hashes": "5da55e8ca5b51ebd2cfa903a929dc0fea87ff6fbc48fffd18715081720239742",
+      "description": "Generated worldwide mobile provider and APN profiles for apn-autoconfig. The database can be upgraded independently from the program and LuCI.",
+      "arch": "noarch",
+      "license": "Apache-2.0 AND CC-PDDC",
+      "origin": "feeds/base/apn-autoconfig-providers",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 209281,
+      "file-size": 42122,
+      "depends": [
+        "libc"
+      ],
+      "provides": [
+        "apn-autoconfig-providers-any"
+      ]
+    }, {
+      "name": "luci-app-apn-autoconfig",
+      "version": "0.15.3-r1",
+      "hashes": "274734f29759fea7e811a101c03235f224ceb193c19d05b6f6cf1b883f5cfa9b",
+      "description": "Status, safe background actions and configuration for apn-autoconfig.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/luci-app-apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "installed-size": 85440,
+      "file-size": 24482,
+      "depends": [
+        "apn-autoconfig",
+        "libc",
+        "luci-base"
+      ],
+      "provides": [
+        "luci-app-apn-autoconfig-any"
+      ]
+    }
+  ]
+}

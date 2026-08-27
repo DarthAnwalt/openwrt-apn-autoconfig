@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# Narrow read-only entry point for rpcd/LuCI ACLs.
+
+COMMAND="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
+
+case "${1:-}" in
+	status) exec "$COMMAND" status-json ;;
+	detect) exec "$COMMAND" detect-json ;;
+	action-status) exec "$COMMAND" action-status ;;
+	*) exit 2 ;;
+esac

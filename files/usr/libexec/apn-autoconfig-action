@@ -1,0 +1,58 @@
+#!/bin/sh
+
+# Background action worker for LuCI and other non-blocking callers.
+
+PROG="apn-autoconfig-action"
+ACTION="${1:-}"
+STATE_DIR="${2:-}"
+STARTED="${3:-}"
+COMMAND="${APN_AUTOCONFIG_ACTION_COMMAND:-/usr/sbin/apn-autoconfig}"
+STATE_FILE="$STATE_DIR/state.tsv"
+
+case "$ACTION" in reconcile|modem-reset) : ;; *) exit 2 ;; esac
+case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
+timestamp() {
+	date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
+}
+
+sanitize() {
+	printf '%s' "$*" | tr '\t\r\n' '   '
+}
+
+write_state() {
+	state="$1"
+	exit_code="$2"
+	message="$(sanitize "$3")"
+	finished=""
+	case "$state" in success|failed) finished="$(timestamp)" ;; esac
+	tmp="$STATE_DIR/.state.tmp.$$"
+	printf 'v1\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$state" "$ACTION" "$$" "$STARTED" "$finished" "$exit_code" "$message" >"$tmp" || exit 1
+	mv "$tmp" "$STATE_FILE" || exit 1
+}
+
+on_signal() {
+	write_state failed 143 "background operation was interrupted"
+	logger -t "$PROG" -p user.err -- "operation $ACTION was interrupted" 2>/dev/null || :
+	exit 143
+}
+
+trap on_signal HUP INT TERM
+
+[ -x "$COMMAND" ] || {
+	write_state failed 127 "action command is not executable"
+	exit 127
+}
+
+write_state running "" "operation is running"
+logger -t "$PROG" -p user.notice -- "starting background operation: $ACTION" 2>/dev/null || :
+"$COMMAND" "$ACTION"
+status=$?
+if [ "$status" -eq 0 ]; then
+	write_state success 0 "operation completed successfully"
+	logger -t "$PROG" -p user.notice -- "background operation completed: $ACTION" 2>/dev/null || :
+else
+	write_state failed "$status" "operation failed; inspect apn-autoconfig logs"
+	logger -t "$PROG" -p user.err -- "background operation failed: $ACTION (exit $status)" 2>/dev/null || :
+fi
+exit "$status"

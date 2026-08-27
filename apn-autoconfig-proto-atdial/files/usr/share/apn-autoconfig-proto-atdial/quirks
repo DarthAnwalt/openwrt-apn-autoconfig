@@ -1,0 +1,63 @@
+# apn-autoconfig-proto-atdial transport quirk table v1
+#
+# Divergence in how a modem moves *data*, for devices where the standard 3GPP
+# dial completes and the link still carries nothing. This is a different
+# question from the capability table in apn-autoconfig-modem, which answers what
+# a modem can be asked to do; that one stays keyed by AT+CGMI/AT+CGMM and stays
+# empty until someone has watched a capability work.
+#
+# Format, tab-separated:
+#
+#   <vendor_id>	<product_id>	<model>	<key>	<value>
+#
+# `vendor_id` and `product_id` are the USB identifiers as they appear in sysfs,
+# lowercase hex without the 0x. `product_id` and `model` may be `*`; `vendor_id`
+# may not, because a rule that applies to every device is not a quirk. `model`
+# matches AT+CGMM exactly and exists so an entry can be narrowed later without a
+# format change. The most specific match wins: exact model, then product, then
+# vendor.
+#
+# **Why this table is keyed by USB identifier and not by model.** Keying by what
+# the modem reports about itself is the better shape, and it is what
+# apn-autoconfig-modem does. It is not available here. These entries come from
+# another project's hardware reports, and what those reports contain is the USB
+# vendor — their production code branches on `idVendor == 8087` and nothing
+# else. The AT+CGMM strings of these devices have not been observed by anyone
+# whose notes this project has read, so putting a guessed model string here
+# would be exactly the invention the "absent means untested" rule exists to
+# prevent. The `model` column is present so that a measured string can narrow an
+# entry the day someone reads one off a real device.
+#
+# Every entry names the evidence behind it. `third-party` means it comes from a
+# report this project has read but not reproduced; nothing here has run on this
+# project's own bench, and the runtime reports these paths as
+# alpha/synthetic accordingly.
+#
+# Keys:
+#
+#   data_channel  `xmm`  — bind the first NCM channel to the context and start
+#                          data after an address exists. Without it the address
+#                          is assigned and no frames move.
+#   dns_source    `xdns` — enable the vendor DNS report before activation and
+#                          read servers from it afterwards. On these devices
+#                          AT+CGCONTRDP returns nothing.
+#   link_arp      `off`  — disable ARP on the link and route on-link with no
+#                          gateway. The NCM channel does not answer ARP, so
+#                          every packet otherwise dies in neighbour resolution.
+#
+# Intel XMM, as used by Fibocom L850 and L860. Evidence: luci-app-5gmodem
+# 2.4.10, which folded these three behaviours into its own handler after live
+# reports from an L850 and an L860 on one router, and whose notes record that
+# both modules enumerate as 8087:095a — which is also why the model column
+# cannot distinguish them here and is left open.
+8087	095a	*	data_channel	xmm	# third-party
+8087	095a	*	dns_source	xdns	# third-party
+8087	095a	*	link_arp	off	# third-party
+#
+# A second Intel product id carrying an L860 profile in the same upstream tree.
+# Same three behaviours, same evidence class, one step weaker: it is inferred
+# from that project shipping an L860 metrics profile for this id, not from a
+# report naming it while dialing.
+8087	07f9	*	data_channel	xmm	# third-party
+8087	07f9	*	dns_source	xdns	# third-party
+8087	07f9	*	link_arp	off	# third-party

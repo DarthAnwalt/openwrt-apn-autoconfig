@@ -1,9 +1,11 @@
 # apn-autoconfig — OpenWrt source packages
 
-`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. Version
-0.15.3 includes the released ModemManager, native OpenWrt QMI and MBIM profile
-backends; optional modem inventory, ownership and provisioning; an AT-dialed
-netifd protocol; and a strictly read-only eSIM inventory built on a pinned LPA.
+`apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. This
+branch prepares 0.16.0; the latest released version is 0.15.3. Release validation
+of the new candidate is still in progress. It includes ModemManager, native
+OpenWrt QMI and MBIM profile backends; optional modem inventory, ownership and
+provisioning; an AT-dialed netifd protocol; and eSIM management built on a pinned
+LPA with a LuCI workspace for each modem.
 The APN engine discovers configured cellular netifd interfaces and publishes
 their runtime capabilities and validation level through a GUI-independent API.
 QMI identity
@@ -39,26 +41,40 @@ packages with the official OpenWrt 25.12 SDK:
 - `apn-autoconfig-proto-atdial`, the optional netifd protocol for AT-dialed
   usbnet modems;
 - `apn-autoconfig-lpac`, the pinned and namespaced LPA runtime; and
-- `apn-autoconfig-esim`, the strictly read-only eUICC and profile inventory.
+- `apn-autoconfig-esim`, eUICC inventory and guarded profile management.
 
-## Direction to 1.0
+## eSIM management in the 0.16.0 candidate
 
-The released packages intentionally retain the configured-target requirement
-described above. The accepted architecture now grows them into a signed,
-self-contained mobile-connectivity suite. A supported modem may be present
-before package installation, attached later or installed internally at boot;
-service-start scanning and hotplug must converge to the same inventory without
-requiring a physical reconnect. Later milestones add safe project-owned netifd
-provisioning, MBIM, bounded AT/Fibocom support and eSIM lifecycle behind one
-capability-driven LuCI package.
+On supported hardware, the optional eSIM packages can read card information,
+profiles and notifications; download a disposable or operator-issued profile
+from a text activation code or a QR image; change its nickname; enable or
+disable it; and plan and explicitly confirm deletion. QR decoding takes place
+in the browser. The page shows the modem's actual capabilities and validation
+level; installing a package does not establish hardware support.
 
-Version 0.15.3 establishes modem inventory, identity, ownership, provisioning,
-AT-dialed bearer support and read-only eSIM inventory before any eUICC mutation.
-It preserves the tested Huasifei
-BTN_0 behavior: guarded modem power-cycle,
-re-enumeration, targeted APN reconcile and verified connectivity as one
-serialized operation. Later milestones remain future capability claims and are
-not implied by the 0.10.0 foundation.
+Opening or refreshing the page does not consent to interrupting a connection.
+Where card access requires stopping a bearer or temporarily taking control from
+ModemManager, the operation explains the interruption and requests explicit
+consent. A card behind its own AT-dial connection can be probed only after the
+modem coordinator proves the bearer quiet. Accepted work survives loss of the
+initiating client and reports a result that can be recovered by operation ID.
+
+Cached identity is for display; changes require physical identity validation
+under the operation locks. A lost or ambiguous response does not authorize a
+repeat mutation. Existing profiles are never deleted as cleanup or rollback.
+Deletion requires a separate, expiring confirmation for the selected profile;
+an enabled, in-use or unproven profile is refused. A deleted subscription may
+require a new activation code from its issuer. If a notification cannot be
+delivered, the page reports the unfinished issuer communication separately.
+
+After a supported profile or slot switch, recovery and APN reconciliation apply
+only to the selected target. An incomplete connection recovery is distinct from
+a completed card change. User-created interfaces can be explicitly adopted
+and released with their saved settings; they are not automatically adopted.
+
+The path to 1.0 retains these ownership, identity, consent and restoration
+boundaries. Support claims depend on the capabilities and validation evidence
+reported by the installed backend.
 
 The generated provider database combines GNOME mobile-broadband-provider-info,
 the AOSP sample APN database and locally verified overrides. Large upstream XML
@@ -307,26 +323,27 @@ On Linux x86_64:
 sh scripts/build-with-sdk.sh
 ```
 
-The resulting packages and checksums are written to `dist/`. On macOS, use the
-included GitHub Actions workflow because the official SDK is a Linux x86_64
-toolchain.
+The resulting packages and checksums are written to `dist/`. From macOS, run
+the same build on a Linux x86_64 host or suitable Linux environment; the
+official SDK does not run natively on macOS. Hosted release builds are an
+explicit release operation, not a prerequisite for local verification.
 
 Install locally built packages on OpenWrt 25.12 in one transaction:
 
 ```sh
 apk add --allow-untrusted \
   ./apn-autoconfig-providers-2026.08.24-r1.apk \
-  ./apn-autoconfig-0.15.3-r1.apk \
-  ./luci-app-apn-autoconfig-0.15.3-r1.apk
+  ./apn-autoconfig-0.16.0-r1.apk \
+  ./luci-app-apn-autoconfig-0.16.0-r1.apk
 ```
 
-`apn-autoconfig-modem-0.15.3-r1.apk` is optional and not part of this
+`apn-autoconfig-modem-0.16.0-r1.apk` is optional and not part of this
 transaction: `apn-autoconfig` does not depend on it. It adds read-only modem
 inventory, stable identity, control-owner arbitration and a coordinator-based
 `modem-reset` path alongside the compatibility path. Install it when those
 functions are required.
 
-`apn-autoconfig-proto-atdial-0.15.3-r1.apk` is also optional, and only useful
+`apn-autoconfig-proto-atdial-0.16.0-r1.apk` is also optional, and only useful
 for a modem that exposes no control channel at all — a Fibocom FM350-GL in RNDIS
 composition, for example, where there is no `cdc-wdm` node for QMI or MBIM to
 use. It adds the `apn_atdial` netifd protocol, which defines and activates the
@@ -775,7 +792,7 @@ config apn_autoconfig 'main'
         option state_dir '/etc/apn-autoconfig'
         option test_url 'https://connectivitycheck.gstatic.com/generate_204'
         option wait_seconds '35'
-        option registration_wait_seconds '30'
+        option registration_wait_seconds '180'
         option try_empty '0'
         option use_mwan3 'auto'
         option lock_dir '/var/lock/apn-autoconfig.lock'

@@ -1,0 +1,4 @@
+# apn-autoconfig-esim Consumer CI trust set v1
+# key-id	sha256-der	name	specification	source
+81370f5125d0b1d408d4c3b232e6d25e795bebfb	5e3e91fd454327c3af5d32a7a73bbc59fe43aa7d85fd32d5db44423f80a56bb3	GSM Association - RSP2 Root CI1	SGP.21/SGP.22 v2/v3	https://www.gsma.com/solutions-and-impact/technologies/esim/gsma-root-ci/
+4c27967ad20c14b391e9601e41e604ad57c0222f	9c9fa2e94602c260137122d9704d79993a6ef6d067ce0999ec2f4c109dd7a1a2	OISTE GSMA CI G1	SGP.21/SGP.22 v2/v3	https://www.gsma.com/solutions-and-impact/technologies/esim/gsma-root-ci/

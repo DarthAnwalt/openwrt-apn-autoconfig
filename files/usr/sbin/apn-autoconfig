@@ -11,6 +11,10 @@ CONFIG="apn-autoconfig"
 INTERFACE="wwan"
 CONFIGURED_INTERFACE="auto"
 REQUESTED_TARGET=""
+# Whether an absent SIM is reported as its own exit class rather than folded
+# into the retryable one. Off unless a caller asks: every consumer that existed
+# before this class treats anything but 3 as a failure.
+SIM_ABSENCE_IS_AN_ANSWER=0
 MANUAL_APN=""
 MANUAL_USERNAME="-"
 MANUAL_PASSWORD="-"
@@ -45,7 +49,21 @@ LEGACY_BASELINE_FILE="/etc/apn-autoconfig/baseline.tsv"
 LEGACY_ACTIVE_FILE="/etc/apn-autoconfig/active.tsv"
 TEST_URL="https://connectivitycheck.gstatic.com/generate_204"
 WAIT_SECONDS="35"
-REGISTRATION_WAIT_SECONDS="30"
+# Ceiling on waiting for the modem to settle on a registration state. Not a
+# schedule: registration_preflight polls and stops the moment the state stops
+# being pending, so a home attach costs its own few seconds and no more.
+#
+# It was 30, and 30 is impossible for the case this product is built around.
+# Measured on the reference router during A8's hardware gate: a roaming attach
+# after a modem reset, on a profile that modem had never used, reported itself
+# registered after **61 seconds**; the same modem returning to its home network
+# took **5**. At 30 the switch concluded a working subscription had failed,
+# rolled back over it, and left the modem needing a power cycle.
+#
+# This is a travel router. Roaming is the ordinary condition, not the exception,
+# and the ceiling has to be sized for it. Three times the measurement, spent
+# only when something is genuinely stuck.
+REGISTRATION_WAIT_SECONDS="180"
 TRY_EMPTY="0"
 USE_MWAN3="auto"
 MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
@@ -77,6 +95,8 @@ HARDWARE_INTEGRATION_FILE="${APN_AUTOCONFIG_HARDWARE_INTEGRATION:-/usr/share/apn
 LOCK_DIR="/var/lock/apn-autoconfig.lock"
 ACTION_STATE_DIR="/tmp/apn-autoconfig-action"
 ACTION_WORKER="${APN_AUTOCONFIG_ACTION_WORKER:-/usr/libexec/apn-autoconfig-action}"
+SETSID="${APN_AUTOCONFIG_SETSID:-setsid}"
+JOB_SLEEP="${APN_AUTOCONFIG_JOB_SLEEP:-sleep}"
 TMP_DIR="${APN_AUTOCONFIG_TMP_DIR:-/tmp}"
 TMP_BASE="$TMP_DIR/$PROG.$$"
 SIM_DATA="${TMP_BASE}.sim"
@@ -116,6 +136,7 @@ LEAVE_INTERFACE_DOWN=0
 SETTLE_SLEEP_PID=""
 # The per-target child of a run that covers every managed target.
 FANOUT_CHILD_PID=""
+COORDINATOR_CHILD_PID=""
 BOUNDED_CHILD_PID=""
 BOUNDED_WATCHDOG_PID=""
 MODEM_COORDINATOR_ID=""
@@ -189,6 +210,22 @@ mask_identifier() {
 	fi
 }
 
+# A modem identity, masked but still classifiable.
+#
+# The same shape apn-autoconfig-modem publishes, and deliberately not
+# mask_identifier applied to the whole string: masking the prefix away would
+# leave a tail nobody can tell from an ICCID's. A `weak-vidpid:` id is a bus
+# path and a VID:PID rather than a per-device identifier, so it passes through
+# unchanged -- masking it would remove the only thing separating two of them.
+mask_modem_id() {
+	case "${1:-}" in
+		imei:*) printf 'imei:%s' "$(mask_identifier "${1#imei:}")" ;;
+		usb-serial:*) printf 'usb-serial:%s' "$(mask_identifier "${1#usb-serial:}")" ;;
+		'') printf '<unknown>' ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
+
 log() {
 	level="$1"
 	shift
@@ -226,17 +263,25 @@ die_code() {
 	exit "$code"
 }
 
-cleanup_files() {
+stop_bounded_command() {
+	# Stop transport access before any profile/interface restoration. Retain the
+	# watchdog until its child has been reaped, including a TERM-resistant child.
+	if [ -n "$BOUNDED_CHILD_PID" ]; then
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		"$SLEEP" 1
+		kill -KILL "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		BOUNDED_CHILD_PID=""
+	fi
 	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
 		kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 		BOUNDED_WATCHDOG_PID=""
 	fi
-	if [ -n "$BOUNDED_CHILD_PID" ]; then
-		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
-		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
-		BOUNDED_CHILD_PID=""
-	fi
+}
+
+cleanup_files() {
+	stop_bounded_command
 	for tmp_suffix in $TMP_SUFFIXES; do
 		rm -f "$TMP_BASE.$tmp_suffix"
 	done
@@ -456,10 +501,12 @@ restore_owned_profile() {
 	set_or_delete_option "$auth_option" "$OLD_ALLOWEDAUTH_SET" "$OLD_ALLOWEDAUTH" || return 1
 	set_or_delete_option "$ip_option" "$OLD_IPTYPE_SET" "$OLD_IPTYPE" || return 1
 	uci commit network >/dev/null 2>&1 || return 1
-	ifdown "$INTERFACE" >/dev/null 2>&1 || :
-	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return 0
-	settle_after_ifdown
-	ifup "$INTERFACE" >/dev/null 2>&1 || :
+	profile_restore_status=0
+	run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || profile_restore_status=1
+	[ "$LEAVE_INTERFACE_DOWN" -eq 1 ] && return "$profile_restore_status"
+	settle_after_ifdown || profile_restore_status=1
+	run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || profile_restore_status=1
+	return "$profile_restore_status"
 }
 
 restore_old_profile() {
@@ -600,13 +647,30 @@ set_profile() {
 	esac
 }
 
+# An asynchronous subshell can receive a signal before resetting inherited
+# traps. Its $$ still names this operation, but it owns none of our resources.
+# Read procfs with the shell builtin: an external cat would identify cat itself.
+cleanup_owner_is_current() {
+	if [ -r /proc/self/stat ]; then
+		IFS=' ' read -r cleanup_current_pid cleanup_stat_rest </proc/self/stat || return 1
+		[ "$cleanup_current_pid" = "$$" ]
+		return $?
+	fi
+	# Development on macOS uses bash, including the system version without
+	# BASHPID. Deployment always uses the Linux procfs check above.
+	[ "${BASH_SUBSHELL:-0}" -eq 0 ]
+}
+
 on_exit() {
 	on_exit_status=$?
-	trap - 0 HUP INT TERM
+	trap - 0
+	trap '' HUP INT TERM
 	# PIPE is ignored rather than restored for the duration of the cleanup: the
 	# reader that went away may have been reading stderr too, and a rollback
 	# that logs its progress must not be killed halfway by a second SIGPIPE.
 	trap '' PIPE
+	cleanup_owner_is_current || exit "$on_exit_status"
+	stop_bounded_command
 	if [ -n "$SETTLE_SLEEP_PID" ]; then
 		kill -TERM "$SETTLE_SLEEP_PID" 2>/dev/null || :
 		wait "$SETTLE_SLEEP_PID" 2>/dev/null || :
@@ -616,6 +680,13 @@ on_exit() {
 	# own the child that is mutating one right now. Terminating and reaping it
 	# is what lets that child roll its own target back; leaving it would put a
 	# signalled operation beyond anyone's reach.
+	# The coordinator borrows our global lock. Keep it owned until that child
+	# has stopped its hardware work and completed its own reset restoration.
+	if [ -n "$COORDINATOR_CHILD_PID" ]; then
+		kill -TERM "$COORDINATOR_CHILD_PID" 2>/dev/null || :
+		wait "$COORDINATOR_CHILD_PID" 2>/dev/null || :
+		COORDINATOR_CHILD_PID=""
+	fi
 	if [ -n "$FANOUT_CHILD_PID" ]; then
 		kill -TERM "$FANOUT_CHILD_PID" 2>/dev/null || :
 		wait "$FANOUT_CHILD_PID" 2>/dev/null || :
@@ -629,7 +700,7 @@ on_exit() {
 	if [ "$ROLLBACK_ARMED" -eq 1 ]; then
 		restore_old_profile || log err "automatic rollback failed; restore the mobile profile in LuCI"
 	elif [ "$INTERFACE_RESTORE_ARMED" -eq 1 ]; then
-		ifup "$INTERFACE" >/dev/null 2>&1 || \
+		run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || \
 			log err "failed to restart interface $INTERFACE after modem reset failure"
 	fi
 	cleanup_files
@@ -667,10 +738,7 @@ run_bounded_to_file() {
 	seconds="$1"
 	output_file="$2"
 	shift 2
-	if command_exists "$TIMEOUT"; then
-		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null
-		return
-	fi
+	# Track the actual command even when an external timeout is installed.
 	"$@" >"$output_file" 2>/dev/null &
 	BOUNDED_CHILD_PID=$!
 	# The watchdog runs its sleep as a background child of its own and waits
@@ -681,11 +749,24 @@ run_bounded_to_file() {
 	# call on the read path is bounded.
 	(
 		watchdog_sleep_pid=""
-		trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		# `$!` rather than the recorded PID alone. `$!` is set when the sleep is
+		# forked, so it names the sleep one command before the assignment does,
+		# and a TERM arriving in between would otherwise find the variable empty,
+		# kill nothing, and leave the sleep to run out the whole budget as an
+		# orphan -- one per bounded call, on an image where this is the branch
+		# every call takes. Linux CI caught that; this suite, on a shell that
+		# schedules the two differently, never did.
+		#
+		# Before the first fork `$!` still names the caller's own child, which
+		# this must never kill, so it is compared rather than trusted. The
+		# variable is cleared before each fork so the second sleep is covered by
+		# the same reasoning as the first.
+		trap 'watchdog_target="${watchdog_sleep_pid:-$!}"; [ "$watchdog_target" = "$BOUNDED_CHILD_PID" ] || kill -TERM "$watchdog_target" 2>/dev/null; exit 0' TERM
 		"$SLEEP" "$seconds" &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
 		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
+		watchdog_sleep_pid=""
 		"$SLEEP" 1 &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
@@ -1070,6 +1151,18 @@ select_target() {
 				apply-manual:*|reset:*|roaming-policy-set:*|action-start:roaming-default|action-start:roaming-allow|action-start:roaming-block)
 					[ "$AUTO_TARGET_COUNT" -eq 1 ] || \
 						die_code 4 "$COMMAND_NAME acts on one target; several are managed, so name one with --target"
+				;;
+				# A reset is a disruption to one modem, and which one must never
+				# be decided by enumeration order. This was missing, so a
+				# `modem-reset` that named no target -- which is what the case
+				# button sends -- power-cycled whichever managed target sorted
+				# first, silently, on a router with more than one. The button
+				# names its target from `button_target`; a caller that names
+				# none and has several to choose from is refused rather than
+				# guessed for. See docs/work-items/A10-which-modem-the-button-resets.md.
+				modem-reset:*|action-start:modem-reset)
+					[ "$AUTO_TARGET_COUNT" -eq 1 ] || \
+						die_code 4 "modem-reset acts on one modem; several targets are managed, so name one with --target, or set button_target for the case button"
 				;;
 			esac
 			INTERFACE="$(printf '%s\n' "$AUTO_TARGETS" | sed -n '1p')"
@@ -1581,6 +1674,23 @@ mbim_resolve_control_device() {
 	resolve_control_device mbim
 }
 
+# Whether this invocation is allowed to be answered from a recent inventory
+# scan the modem coordinator already paid for.
+#
+# The list is the engine's strictly read-only verbs and nothing else. It is
+# written out rather than derived from a "does not mutate" predicate on purpose:
+# the whole safety of the coordinator's display cache rests on which verbs are
+# named here, and a list is auditable in a way an inference is not. `apply`,
+# `reconcile`, `apply-manual`, `modem-reset` and `reset` all read identity
+# through the same function and are all absent, so they still resolve against a
+# scan of their own.
+modem_scan_cache_allowed() {
+	case "$COMMAND_NAME" in
+		detect|detect-json|status|status-json) return 0 ;;
+	esac
+	return 1
+}
+
 # AT identity comes from apn-autoconfig-modem, not from an adapter here.
 #
 # This is the decision 0.14.0 deferred until it had a caller. The protocol
@@ -1595,9 +1705,35 @@ atdial_read_sim() {
 	# Bounded like every other read-path call: resolving an interface costs a
 	# full inventory scan, which is exactly the kind of wait the deadline
 	# exists to survive.
+	#
+	# On a strictly read-only verb it is also allowed to cost nothing at all.
+	# `resolve --interface` is one full inventory scan, and on the reference
+	# router a page that already bought one for `inventory-json` bought a second
+	# here 0.85 s later, for a fact that had not changed in between. The
+	# coordinator will answer such a read from that first scan when the caller
+	# says it is drawing a page -- and only then, because this same function is
+	# what `apply`, `reconcile` and `apply-manual` read identity through, and a
+	# mutation may never be planned on a cached record. See
+	# modem_scan_cache_allowed and scan_cache_try_serve in apn-autoconfig-modem.
 	atdial_resolve_status=0
-	run_read_bounded modem-resolve '' "$READ_DATA" \
-		apn-autoconfig-modem resolve --interface "$INTERFACE" || atdial_resolve_status=$?
+	if modem_scan_cache_allowed; then
+		run_read_bounded modem-resolve '' "$READ_DATA" \
+			apn-autoconfig-modem resolve --interface "$INTERFACE" --allow-cached-scan || \
+			atdial_resolve_status=$?
+		# A coordinator older than 0.16.0 rejects the option as a usage error.
+		# The retry is the call every released version understands, and it is
+		# the *stricter* of the two: the fallback costs a full scan, so a
+		# version mismatch loses the saving and can never gain a permission.
+		if [ "$atdial_resolve_status" -eq 2 ]; then
+			atdial_resolve_status=0
+			run_read_bounded modem-resolve '' "$READ_DATA" \
+				apn-autoconfig-modem resolve --interface "$INTERFACE" || \
+				atdial_resolve_status=$?
+		fi
+	else
+		run_read_bounded modem-resolve '' "$READ_DATA" \
+			apn-autoconfig-modem resolve --interface "$INTERFACE" || atdial_resolve_status=$?
+	fi
 	if [ "$atdial_resolve_status" -ne 0 ] && read_was_abandoned modem-resolve; then
 		die_code 3 "resolving the modem bound to $TARGET_ID ran out of time"
 	fi
@@ -1615,6 +1751,24 @@ atdial_read_sim() {
 		# which is a different thing from a modem that cannot answer yet.
 		4) die_code 4 "another control owner holds the modem bound to $TARGET_ID" ;;
 		3) die_code 3 "cannot yet read AT SIM identity for $TARGET_ID" ;;
+		# The modem answered and has no SIM. That is an answer, and one caller
+		# needs it: a deletion plan deciding something irreversible must be
+		# able to tell "there is nothing there" from "I could not look".
+		#
+		# It is published only to a caller that asked for it, and folded back
+		# into 3 for everyone else. Found on the reference router 2026-09-04,
+		# after it was not: every existing consumer of this path treats 3 as
+		# "try later" and anything else as a failure, so an absent SIM turned
+		# a reconcile from a retryable wait into a reported failure on the
+		# page. Whether an absent SIM is fatal or merely not-yet is a judgement
+		# each caller already had, and it was right; this class must not
+		# overrule it.
+		5)
+			if [ "$SIM_ABSENCE_IS_AN_ANSWER" -eq 1 ]; then
+				die_code 5 "no SIM is present in the modem bound to $TARGET_ID"
+			fi
+			die_code 3 "cannot yet read AT SIM identity for $TARGET_ID"
+		;;
 		*)
 			read_was_abandoned sim-identity && \
 				die_code 3 "the AT SIM identity read for $TARGET_ID ran out of time"
@@ -1964,9 +2118,9 @@ reset_cmd() {
 		*) die "unknown baseline format" ;;
 	esac
 	uci commit network >/dev/null 2>&1 || die "cannot commit restored mobile profile"
-	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	settle_after_ifdown
-	ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
+	run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || die "restored mobile profile, but interface $INTERFACE did not start"
 	rm -rf "$CACHE_DIR"
 	rm -f "$ACTIVE_FILE"
 	rm -f "$BASELINE_FILE"
@@ -2036,8 +2190,8 @@ reset_all_cmd() {
 
 interface_is_up() {
 	if command_exists ubus; then
-		ubus call "network.interface.${INTERFACE}" status 2>/dev/null | \
-			grep -q '"up"[[:space:]]*:[[:space:]]*true'
+		run_bounded_to_file 5 "$READ_DATA" ubus call "network.interface.${INTERFACE}" status || return 1
+		grep -q '"up"[[:space:]]*:[[:space:]]*true' "$READ_DATA"
 	else
 		return 1
 	fi
@@ -2046,7 +2200,8 @@ interface_is_up() {
 refresh_l3_device() {
 	L3_DEVICE=""
 	command_exists ubus || return 1
-	status="$(ubus call "network.interface.${INTERFACE}" status 2>/dev/null || :)"
+	run_bounded_to_file 5 "$READ_DATA" ubus call "network.interface.${INTERFACE}" status || return 1
+	status="$(cat "$READ_DATA")"
 	value="$(printf '%s\n' "$status" | sed -n 's/.*"l3_device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
 	[ -n "$value" ] || value="$(printf '%s\n' "$status" | sed -n 's/.*"device"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n '1p')"
 	case "$value" in ''|*[!A-Za-z0-9_.:-]*) return 1 ;; esac
@@ -2136,6 +2291,15 @@ targets_json_cmd() {
 	printf '{'
 	json_key_string version "v2"; printf ','
 	json_key_string configured_target "$([ "$CONFIGURED_INTERFACE" = auto ] && printf auto || printf 'network:%s' "$CONFIGURED_INTERFACE")"; printf ','
+	# Whether a supported board integration is installed is a fact about this
+	# router, not about one target, and establishing it is one file read. It was
+	# published only inside `status-json`, whose entire cost is a fresh identity
+	# detection -- so a page that draws the board's own settings had to buy three
+	# seconds of modem interrogation to learn the result of reading a file.
+	#
+	# It is published here as well, additively: `status-json` keeps its copy, so
+	# the per-modem diagnostics row and any older consumer are unaffected.
+	json_key_string hardware_integration "$(hardware_integration_name 2>/dev/null || :)"; printf ','
 	printf '"targets":['
 	separator=""
 	while IFS="$(printf '\t')" read -r section proto; do
@@ -2489,15 +2653,17 @@ action_status_values() {
 	ACTION_TARGET=""
 	ACTION_BUSY=false
 
-	if [ -r "$ACTION_STATE_DIR/state.tsv" ]; then
-		ACTION_STATUS="$(action_state_field 2)"
-		ACTION_NAME="$(action_state_field 3)"
-		ACTION_PID="$(action_state_field 4)"
-		ACTION_STARTED="$(action_state_field 5)"
-		ACTION_FINISHED="$(action_state_field 6)"
-		ACTION_EXIT_CODE="$(action_state_field 7)"
-		ACTION_MESSAGE="$(action_state_field 8)"
-		ACTION_TARGET="$(action_state_field 9)"
+	status_snapshot_attempt=0
+	status_line="$(sed -n '1p' "$ACTION_STATE_DIR/state.tsv" 2>/dev/null || :)"
+	while [ -n "$status_line" ]; do
+		ACTION_STATUS="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $2}')"
+		ACTION_NAME="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $3}')"
+		ACTION_PID="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $4}')"
+		ACTION_STARTED="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $5}')"
+		ACTION_FINISHED="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $6}')"
+		ACTION_EXIT_CODE="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $7}')"
+		ACTION_MESSAGE="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $8}')"
+		ACTION_TARGET="$(printf '%s\n' "$status_line" | awk -F '\t' '$1 == "v1" || $1 == "v2" {print $9}')"
 		case "$ACTION_STATUS" in
 			starting|queued|running)
 				# Launcher exited but the accepted worker still owns the start
@@ -2511,6 +2677,20 @@ action_status_values() {
 				elif process_is_alive "$handoff_pid"; then
 					ACTION_BUSY=true
 				else
+					# The worker publishes its terminal record before exiting. A
+					# dead PID invalidates our earlier running snapshot: read
+					# again before inventing an unexpected-exit result. Repeated
+					# replacements are busy uncertainty, with a bounded reader.
+					status_latest="$(sed -n '1p' "$ACTION_STATE_DIR/state.tsv" 2>/dev/null || :)"
+					if [ -n "$status_latest" ] && [ "$status_latest" != "$status_line" ]; then
+						status_snapshot_attempt=$((status_snapshot_attempt + 1))
+						if [ "$status_snapshot_attempt" -lt 3 ]; then
+							status_line="$status_latest"
+							continue
+						fi
+						ACTION_BUSY=true
+						break
+					fi
 					ACTION_STATUS="failed"
 					ACTION_FINISHED="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
 					ACTION_EXIT_CODE="1"
@@ -2518,7 +2698,8 @@ action_status_values() {
 				fi
 			;;
 		esac
-	fi
+		break
+	done
 
 	lock_pid="$(operation_lock_pid 2>/dev/null || :)"
 	if [ -n "$lock_pid" ] && [ "$ACTION_BUSY" != true ]; then
@@ -2556,6 +2737,34 @@ action_status_cmd() {
 	print_action_json false
 }
 
+# State from the actual worker acknowledges an isolated launch, even if a
+# short operation has already finished and released its start lock.
+wait_action_handoff() {
+	job_pid="$1"
+	job_lock="$2"
+	job_state="$3"
+	job_waited=0
+	while :; do
+		job_owner="$(lock_owner_pid "$job_lock" 2>/dev/null || :)"
+		case "$job_owner" in ''|*[!0-9]*) : ;; *) [ "$job_owner" = "$$" ] || job_pid="$job_owner" ;; esac
+		if awk -F '\t' -v parent="$$" '$1 == "v2" && $4 != parent && $2 != "starting" {ok=1} END {exit !ok}' "$job_state" 2>/dev/null; then
+			return 0
+		fi
+		# The supervisor can exit between the lock and state reads.
+		# Wait for the child acknowledgment up to the same bounded deadline.
+		[ "$job_waited" -lt 5 ] || break
+		"$JOB_SLEEP" 1 2>/dev/null || break
+		job_waited=$((job_waited + 1))
+	done
+	kill -TERM "$job_pid" 2>/dev/null || :
+	"$JOB_SLEEP" 1 2>/dev/null || :
+	kill -KILL "$job_pid" 2>/dev/null || :
+	wait "$job_pid" 2>/dev/null || :
+	job_owner="$(lock_owner_pid "$job_lock" 2>/dev/null || :)"
+	case "$job_owner" in "$job_pid"|"$$") lock_release "$job_lock" ;; esac
+	return 1
+}
+
 action_start_cmd() {
 	action="${1:-}"
 	case "$action" in
@@ -2563,6 +2772,7 @@ action_start_cmd() {
 		*) die "unsupported background action: $action" ;;
 	esac
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
+	command_exists "$SETSID" || die "session isolation is unavailable; no job was started"
 
 	start_lock="${ACTION_STATE_DIR}.start-lock"
 	mkdir -p "$(dirname "$ACTION_STATE_DIR")" || die "cannot create action state parent"
@@ -2588,14 +2798,29 @@ action_start_cmd() {
 	started="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
 	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\t%s\n' \
 		"$action" "$$" "$started" "$TARGET_ID" >"$ACTION_STATE_DIR/state.tsv"
-	"$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" "$TARGET_ID" "$start_lock" \
+	APN_AUTOCONFIG_JOB_DETACHED=launch
+	export APN_AUTOCONFIG_JOB_DETACHED
+	"$SETSID" /bin/sh "$ACTION_WORKER" "$action" "$ACTION_STATE_DIR" "$started" "$TARGET_ID" "$start_lock" \
 		</dev/null >/dev/null 2>&1 &
 	# Hand the start lock to the worker instead of dropping it here. It is the
 	# only live token between this launcher's exit and the worker's first
 	# "running" record, and without it action-status reported an accepted
 	# operation as a dead worker - which the WH3000 button handler in turn
 	# reads as a rejected launch rather than a coalesced duplicate release.
-	lock_set_owner "$start_lock" "$!" || :
+	job_supervisor=$!
+	unset APN_AUTOCONFIG_JOB_DETACHED
+	if ! wait_action_handoff "$job_supervisor" "$start_lock" "$ACTION_STATE_DIR/state.tsv"; then
+		# The last state write can race the timeout cleanup. If this exact worker
+		# acknowledged the launch, it was accepted even if it has since finished.
+		if awk -F '\t' -v parent="$$" -v name="$action" -v began="$started" -v target="$TARGET_ID" \
+			'$1 == "v2" && $2 != "starting" && $3 == name && $4 != parent && $5 == began && $9 == target {ok=1} END {exit !ok}' \
+			"$ACTION_STATE_DIR/state.tsv" 2>/dev/null; then
+			print_action_json true
+			return 0
+		fi
+		print_action_json false
+		return 3
+	fi
 	print_action_json true
 }
 
@@ -2723,9 +2948,9 @@ build_apply_candidates() {
 }
 
 restart_interface() {
-	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 	settle_after_ifdown
-	ifup "$INTERFACE" >/dev/null 2>&1 || return 1
+	run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || return 1
 	return 0
 }
 
@@ -2758,7 +2983,8 @@ wait_for_interface() {
 data_interface_is_ready() {
 	command_exists ubus || return 1
 	for data_interface in "$INTERFACE" "${INTERFACE}_4" "${INTERFACE}_6"; do
-		status="$(ubus call "network.interface.${data_interface}" status 2>/dev/null || :)"
+		run_bounded_to_file 5 "$READ_DATA" ubus call "network.interface.${data_interface}" status || continue
+		status="$(cat "$READ_DATA")"
 		printf '%s\n' "$status" | grep -q '"up"[[:space:]]*:[[:space:]]*true' || continue
 		printf '%s\n' "$status" | grep -q '"address"[[:space:]]*:[[:space:]]*"' && return 0
 	done
@@ -2986,7 +3212,7 @@ registration_preflight() {
 		refresh_modem_status || :
 		registration_is_pending || break
 		if [ "$registration_start_attempted" -eq 0 ] && ! interface_is_up; then
-			ifup "$INTERFACE" >/dev/null 2>&1 || :
+			run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || :
 			registration_start_attempted=1
 			log notice "started interface $INTERFACE once to obtain mobile registration state"
 		fi
@@ -3004,7 +3230,7 @@ registration_preflight() {
 		roaming)
 			if [ "$ROAMING_ALLOWED" != true ]; then
 				if interface_is_up; then
-					ifdown "$INTERFACE" >/dev/null 2>&1 || :
+					run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 					log notice "stopped interface $INTERFACE to enforce the roaming-data block"
 				fi
 				write_last_result blocked-roaming-policy \
@@ -3428,18 +3654,18 @@ roaming_policy_set_cmd() {
 	log notice "roaming policy for $INTERFACE changed to $ROAMING_POLICY"
 
 	if [ "$requested" = block ] && [ "$was_roaming" = true ]; then
-		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 		log notice "mobile interface $INTERFACE stopped because the modem is registered in roaming"
 		return 0
 	fi
 	if [ "$requested" = block ] && [ "$was_roaming" = unknown ] && [ "$was_up" -eq 1 ]; then
-		ifdown "$INTERFACE" >/dev/null 2>&1 || :
+		run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 		log warning "mobile interface $INTERFACE stopped because roaming state could not be verified while applying the block"
 		return 0
 	fi
 
 	if [ "$requested" != block ] && [ "$was_up" -eq 0 ] && [ "$sim_available" -eq 1 ]; then
-		ifup "$INTERFACE" >/dev/null 2>&1 || die "roaming policy was saved, but interface $INTERFACE did not start"
+		run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 || die "roaming policy was saved, but interface $INTERFACE did not start"
 		wait_for_interface || :
 		reconcile_cmd
 		return $?
@@ -3485,7 +3711,7 @@ modem_reset_inline_cmd() {
 	migrate_target_state
 	log notice "hardware modem reset requested; stopping interface $INTERFACE"
 	INTERFACE_RESTORE_ARMED=1
-	ifdown "$INTERFACE" >/dev/null 2>&1 || :
+	run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 
 	log notice "switching modem power off for ${MODEM_POWER_OFF_SECONDS}s"
 	MODEM_POWER_OFF_ARMED=1
@@ -3503,12 +3729,12 @@ modem_reset_inline_cmd() {
 		# client close before handing the control device back to netifd, then
 		# wait for qmi.sh to own initialization before reconcile queries status.
 		settle_after_ifdown
-		if ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_data_interface; then
+		if run_bounded_to_file 30 /dev/null ifup "$INTERFACE" >/dev/null 2>&1 && wait_for_interface && wait_for_data_interface; then
 			INTERFACE_RESTORE_ARMED=0
 			log notice "QMI data interface $INTERFACE is ready after modem power return"
 		else
 			log warning "QMI data interface $INTERFACE did not become ready before APN reconciliation"
-			ifdown "$INTERFACE" >/dev/null 2>&1 || :
+			run_bounded_to_file 30 /dev/null ifdown "$INTERFACE" >/dev/null 2>&1 || :
 			settle_after_ifdown
 			return 3
 		fi
@@ -3540,22 +3766,25 @@ modem_reset_coordinator_modem_id() {
 	[ -n "$MODEM_COORDINATOR_ID" ] || \
 		die_code 4 "apn-autoconfig-modem returned an empty modem identity for interface $INTERFACE"
 	coordinator_status_json="$(apn-autoconfig-modem status-json --modem "$MODEM_COORDINATOR_ID" 2>/dev/null)" || \
-		die_code 4 "apn-autoconfig-modem could not validate modem $MODEM_COORDINATOR_ID"
+		die_code 4 "apn-autoconfig-modem could not validate modem $(mask_modem_id "$MODEM_COORDINATOR_ID")"
 	coordinator_reset_capability="$(jsonfilter -s "$coordinator_status_json" -e '@.capabilities.reset' 2>/dev/null || :)"
 	[ "$coordinator_reset_capability" = true ] || \
-		die_code 4 "modem $MODEM_COORDINATOR_ID is not explicitly bound to the supported board reset integration"
+		die_code 4 "modem $(mask_modem_id "$MODEM_COORDINATOR_ID") is not explicitly bound to the supported board reset integration"
 }
 
 modem_reset_via_coordinator_cmd() {
 	acquire_lock
 	migrate_target_state
-	log notice "hardware modem reset requested; delegating power-cycle to apn-autoconfig-modem for $MODEM_COORDINATOR_ID"
+	log notice "hardware modem reset requested; delegating power-cycle to apn-autoconfig-modem for $(mask_modem_id "$MODEM_COORDINATOR_ID")"
 	coordinator_status=0
 	APN_AUTOCONFIG_COORDINATOR_PARENT_PID="$$" \
-		apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID" || coordinator_status=$?
+		apn-autoconfig-modem reset --modem "$MODEM_COORDINATOR_ID" &
+	COORDINATOR_CHILD_PID=$!
+	wait "$COORDINATOR_CHILD_PID" || coordinator_status=$?
+	COORDINATOR_CHILD_PID=""
 	if [ "$coordinator_status" -ne 0 ]; then
 		case "$coordinator_status" in
-			3) die_code 3 "modem $MODEM_COORDINATOR_ID did not become ready again in time" ;;
+			3) die_code 3 "modem $(mask_modem_id "$MODEM_COORDINATOR_ID") did not become ready again in time" ;;
 			*) die_code "$coordinator_status" "apn-autoconfig-modem reset failed (exit $coordinator_status)" ;;
 		esac
 	fi
@@ -3716,6 +3945,13 @@ main() {
 	esac
 	while [ "$#" -gt 0 ]; do
 		case "$1" in
+			# Opt-in, and deliberately not a default: see the exit-5 arm of the
+			# AT identity read. A caller that does not ask sees exactly what it
+			# saw before this class existed.
+			--sim-absence-is-an-answer)
+				SIM_ABSENCE_IS_AN_ANSWER=1
+				shift
+			;;
 			--target)
 				[ "$#" -ge 2 ] || die_code 4 "--target requires a target ID"
 				[ -z "$REQUESTED_TARGET" ] || die_code 4 "--target was specified more than once"

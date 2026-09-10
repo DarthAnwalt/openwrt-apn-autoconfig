@@ -2,33 +2,242 @@
 
 # Narrow mutating entry point for rpcd/LuCI ACLs.
 #
-# One verb exists in this release: the read takeover, which is the consented,
-# bounded ModemManager inhibit that makes an otherwise unreachable eUICC
-# readable. Every profile operation is refused here as well as by the backend,
-# so a frontend that learns a verb name early cannot reach one.
+# This wrapper exposes the additive C3 mutations, the consented read takeover,
+# the two verbs that change which profile is active, and the two steps of the
+# guarded deletion.
+#
+# Both deletion steps are here rather than split across the read wrapper,
+# although `delete-plan` destroys nothing -- it starts the job that does. A
+# plan reads the card, and on the
+# hardware this project has that means taking the modem away from ModemManager
+# for a bounded outage -- which is not a read-only power, whatever it does to
+# the card. Authority to reach it is therefore write access to this wrapper
+# through rpcd's ACL, which is already the level `reset`, `provision` and
+# `connect` are authorised at, and the backend still enforces that a confirm
+# needs a live, unexpired, single-use plan for that exact profile.
+#
+# Changing the active SIM slot is deliberately not here and never was a card
+# operation: it belongs to `apn-autoconfig-modem-control slot-switch`, because
+# a modem has slots whether or not either holds an eUICC.
 #
 # `--refresh` is deliberately absent from the read wrapper and present here:
 # bypassing the cache is a deliberate user action, never a poll.
 
 COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
-VERB="${1:-}"
-MODEM_ID="${2:-}"
-ENDPOINT_ID="${3:-}"
-[ "$#" -le 3 ] || exit 2
 
+# How a value that may not be in a command line gets here.
+#
+# rpcd refuses `file exec` outright when a session-scoped caller passes an
+# environment -- `if (sid && env) return UBUS_STATUS_PERMISSION_DENIED;` -- so
+# the page cannot hand this wrapper a secret the way this project once
+# documented. It arrives instead as a ubus call parameter, which is neither a
+# command line nor an environment, and the plugin that receives it writes it to
+# this wrapper's standard input. A wrapper is an ordinary shell and may set the
+# environment of the backend it executes, so the backends are unchanged.
+#
+# Each verb declares the keys it will accept. A key outside that list is a
+# refusal rather than a pass-through: the allowlist is the whole of what makes a
+# pipe from a web page safe to read at all.
+read_secrets_from_stdin() {
+	secrets_allowed=" $1 "
+	while IFS= read -r secrets_line; do
+		[ -n "$secrets_line" ] || continue
+		secrets_key="${secrets_line%%=*}"
+		secrets_value="${secrets_line#*=}"
+		case "$secrets_key" in
+			''|*[!A-Z_]*) return 2 ;;
+		esac
+		case "$secrets_allowed" in
+			*" $secrets_key "*) : ;;
+			*) return 2 ;;
+		esac
+		# `export name=value` is an assignment the shell performs itself. No
+		# `eval`, and the value never becomes a word to be re-parsed.
+		export "$secrets_key=$secrets_value"
+	done
+	return 0
+}
+
+VERB="${1:-}"
+[ "$#" -ge 1 ] || exit 2
+shift
+MODEM_ID=""
+ENDPOINT_ID=""
+TARGET_ID=""
+SECRETS_STDIN=0
+
+# Consents are flags, not secrets, so they travel as ordinary arguments and this
+# wrapper turns them into the environment the backend already expects. A flag in
+# a world-readable command line discloses nothing; the value it guards is what
+# had to move.
+for wrapper_word in "$@"; do
+	case "$wrapper_word" in
+		--secrets-stdin) SECRETS_STDIN=1; continue ;;
+		--allow-unverified)
+			APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT=1
+			export APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT
+			continue
+		;;
+		--confirm-discard)
+			APN_ESIM_CONFIRM_DISCARD=1
+			export APN_ESIM_CONFIRM_DISCARD
+			continue
+		;;
+		--allow-takeover)
+			APN_ESIM_ALLOW_TAKEOVER=1
+			export APN_ESIM_ALLOW_TAKEOVER
+			continue
+		;;
+		--*) exit 2 ;;
+	esac
+	if [ -z "$MODEM_ID" ]; then MODEM_ID="$wrapper_word"
+	elif [ -z "$ENDPOINT_ID" ]; then ENDPOINT_ID="$wrapper_word"
+	elif [ -z "$TARGET_ID" ]; then TARGET_ID="$wrapper_word"
+	else exit 2
+	fi
+done
+
+[ -n "$MODEM_ID" ] || exit 2
+case "$VERB" in
+	card-probe) [ -z "$ENDPOINT_ID" ] || exit 2 ;;
+	*) [ -n "$ENDPOINT_ID" ] || exit 2 ;;
+esac
 for wrapper_argument in "$MODEM_ID" "$ENDPOINT_ID"; do
-	[ -n "$wrapper_argument" ] || exit 2
 	case "$wrapper_argument" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
 	[ "${#wrapper_argument}" -le 200 ] || exit 2
 done
+if [ -n "$TARGET_ID" ]; then
+	case "$TARGET_ID" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+	[ "${#TARGET_ID}" -le 200 ] || exit 2
+fi
 
-case "$MODEM_ID$ENDPOINT_ID" in
+case "$MODEM_ID$ENDPOINT_ID$TARGET_ID" in
 	LPA:*|*'$'*) exit 2 ;;
 esac
 
 case "$VERB" in
 	read-takeover)
+		[ -z "$TARGET_ID" ] || exit 2
 		exec "$COMMAND" action-start read-takeover --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID"
+	;;
+	download)
+		[ -z "$TARGET_ID" ] || exit 2
+		if [ "$SECRETS_STDIN" -eq 1 ]; then
+			read_secrets_from_stdin \
+				"APN_ESIM_ACTIVATION_CODE APN_ESIM_CONFIRMATION_CODE APN_ESIM_MATCHING_ID" || exit 2
+		fi
+		[ -n "${APN_ESIM_ACTIVATION_CODE:-}" ] || exit 2
+		case "${APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT:-0}" in 0|1) : ;; *) exit 2 ;; esac
+		exec "$COMMAND" action-start download --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID"
+	;;
+	nickname)
+		[ -n "$TARGET_ID" ] || exit 2
+		if [ "$SECRETS_STDIN" -eq 1 ]; then
+			read_secrets_from_stdin APN_ESIM_NICKNAME || exit 2
+		fi
+		[ "${APN_ESIM_NICKNAME+x}" = x ] || exit 2
+		exec "$COMMAND" action-start nickname --modem "$MODEM_ID" \
+			--endpoint "$ENDPOINT_ID" --profile "$TARGET_ID"
+	;;
+	notification-send)
+		case "$TARGET_ID" in ''|*[!0-9]*) exit 2 ;; esac
+		case "${APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT:-0}" in 0|1) : ;; *) exit 2 ;; esac
+		exec "$COMMAND" action-start "$VERB" --modem "$MODEM_ID" \
+			--endpoint "$ENDPOINT_ID" --sequence "$TARGET_ID"
+	;;
+	enable|disable)
+		[ -n "$TARGET_ID" ] || exit 2
+		exec "$COMMAND" action-start "$VERB" --modem "$MODEM_ID" \
+			--endpoint "$ENDPOINT_ID" --profile "$TARGET_ID"
+	;;
+	card-probe)
+		# A modem, and nothing else. No endpoint, because the operation exists
+		# to find one; no profile or sequence, because it writes nothing.
+		[ -z "$ENDPOINT_ID" ] || exit 2
+		[ -z "$TARGET_ID" ] || exit 2
+		# Stopping somebody's connection is not a thing to do on a bare call,
+		# so the consent is required here rather than merely permitted. The
+		# other two consents belong to other verbs and are refused, so a caller
+		# that arrived with the wrong one is stopped before an interface goes
+		# down rather than by the result.
+		[ "${APN_ESIM_ALLOW_TAKEOVER:-0}" = 1 ] || exit 2
+		[ "${APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT:-0}" = 0 ] || exit 2
+		[ "${APN_ESIM_CONFIRM_DISCARD:-0}" = 0 ] || exit 2
+		exec "$COMMAND" action-start card-probe --modem "$MODEM_ID"
+	;;
+	delete-plan)
+		[ -n "$TARGET_ID" ] || exit 2
+		# The takeover consent is this verb's own, and it is the only one it
+		# takes. A deletion is verified-only and the discard confirmation
+		# belongs to notification-remove; both are refused here as well as in
+		# the backend, so a caller that arrived with the wrong consent is
+		# stopped before an inhibit is taken rather than by its result.
+		case "${APN_ESIM_ALLOW_TAKEOVER:-0}" in 0|1) : ;; *) exit 2 ;; esac
+		[ "${APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT:-0}" = 0 ] || exit 2
+		[ "${APN_ESIM_CONFIRM_DISCARD:-0}" = 0 ] || exit 2
+		# Started, not run. Measured on the FM350-GL 2026-09-03: a plan that
+		# runs to the end reads the card, which took 24 seconds against the 20
+		# LuCI gives an RPC, so a caller on the far side of rpcd could not
+		# reach a deletion at all. It is a job like every other long thing
+		# here, and this returns the launch answer promptly.
+		#
+		# The token never comes back through this wrapper in either shape. The
+		# worker writes the plan with the token already stripped, and
+		# `delete-confirm` below resolves the real one from the root-only file
+		# the backend wrote.
+		exec "$COMMAND" action-start delete-plan --modem "$MODEM_ID" \
+			--endpoint "$ENDPOINT_ID" --profile "$TARGET_ID"
+	;;
+	delete-confirm)
+		# The plan is named by the operation id it published, which is not a
+		# secret and is the same id `action-status` resolves the outcome by.
+		[ -n "$TARGET_ID" ] || exit 2
+		case "${APN_ESIM_ALLOW_TAKEOVER:-0}" in 0|1) : ;; *) exit 2 ;; esac
+		[ "${APN_ESIM_ALLOW_UNVERIFIED_TRANSPORT:-0}" = 0 ] || exit 2
+		[ "${APN_ESIM_CONFIRM_DISCARD:-0}" = 0 ] || exit 2
+		# The same option the backend resolves its state directory from, read
+		# the same way and defaulted the same way: a wrapper that hardcoded one
+		# would stop finding the record the moment the option was set.
+		delete_state_dir="$(uci -q get apn-autoconfig-esim.main.state_dir 2>/dev/null || :)"
+		[ -n "$delete_state_dir" ] || delete_state_dir=/var/run/apn-autoconfig-esim
+		case "$delete_state_dir" in /*) : ;; *) exit 2 ;; esac
+		# Exactly one record may match. Zero is a plan that expired, was already
+		# spent or never existed; several is an ambiguity, and neither is a
+		# choice this wrapper gets to make.
+		delete_token=""
+		delete_matches=0
+		for delete_path in "$delete_state_dir"/delete/*; do
+			[ -f "$delete_path" ] || continue
+			[ -L "$delete_path" ] && continue
+			delete_name="${delete_path##*/}"
+			# A token is 32 hexadecimal characters. A claimed record carries a
+			# suffix and is another operation's; it is never re-spent.
+			case "$delete_name" in *[!0-9a-f]*) continue ;; esac
+			[ "${#delete_name}" -eq 32 ] || continue
+			awk -F '\t' -v operation="$TARGET_ID" -v modem="$MODEM_ID" \
+				-v endpoint="$ENDPOINT_ID" '
+				NR == 1 && $1 == "v1" && $2 == operation && $3 == modem && $4 == endpoint {
+					found = 1
+				}
+				END { exit found ? 0 : 1 }' "$delete_path" 2>/dev/null || continue
+			delete_matches=$((delete_matches + 1))
+			delete_token="$delete_name"
+		done
+		[ "$delete_matches" -eq 1 ] || exit 2
+		# Standard input, exactly as a CLI caller would: rpcd's exec channel has
+		# none, which is the whole reason the token is resolved on this side of
+		# it rather than carried through the browser.
+		printf '%s\n' "$delete_token" | "$COMMAND" delete-confirm --token-stdin
+		exit "$?"
+	;;
+	notification-remove)
+		case "$TARGET_ID" in ''|*[!0-9]*) exit 2 ;; esac
+		# Refused here as well as in the backend, so a caller that reached this
+		# wrapper without saying it is discarding an undelivered message is
+		# stopped before an operation exists rather than by its result.
+		[ "${APN_ESIM_CONFIRM_DISCARD:-0}" = 1 ] || exit 2
+		exec "$COMMAND" action-start "$VERB" --modem "$MODEM_ID" \
+			--endpoint "$ENDPOINT_ID" --sequence "$TARGET_ID"
 	;;
 	*) exit 2 ;;
 esac

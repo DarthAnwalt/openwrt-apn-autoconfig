@@ -1,0 +1,76 @@
+Recognise GSMA RSP certificate policies
+
+mbedTLS enforces certificatePolicies by refusing to parse any certificate whose
+policy extension is marked critical and names a policy it does not itself know.
+Only anyPolicy is known, so every GSMA RSP certificate issued under the arc
+2.23.146.1.2.1 fails to parse with MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE.
+
+That is fatal for an ES9+ client on this platform. The GSMA CI roots carry
+2.23.146.1.2.1.0 marked critical, and an SM-DP+ may send its issuing root inside
+its own TLS chain -- two of the three live Consumer servers this project has
+measured do. The peer chain is parsed by the SSL layer before any authmode is
+consulted, so such a server cannot be reached at all: not with verification, and
+not with verification disabled either.
+
+mbedtls_x509_crt_parse_der_with_ext_cb() is the sanctioned escape for a policy
+the application understands, but it is reachable only where the application does
+the parsing, and the peer chain is parsed inside the handshake.
+
+So this build recognises the one policy arc it does in fact understand. The
+change is deliberately narrower than MBEDTLS_X509_ALLOW_UNSUPPORTED_CRITICAL_-
+EXTENSION: an unknown critical extension stays fatal, an unknown critical policy
+outside the GSMA RSP arc stays fatal, and nothing about validation changes. The
+certificate is still verified normally afterwards; all that is added is the
+ability to read it.
+
+This patch applies to a copy of mbedTLS built into apn-autoconfig-esim's own
+ES9+ client and linked statically. The system TLS library is not touched and no
+other package's behaviour changes.
+
+--- a/library/x509_crt.c
++++ b/library/x509_crt.c
+@@ -736,6 +736,31 @@
+  * NOTE: we only parse and use anyPolicy without qualifiers at this point
+  * as defined in RFC 5280.
+  */
++/*
++ * GSMA RSP certificate policies: joint-iso-itu-t(2) international-
++ * organizations(23) gsma(146) rsp(1) certificate-policies(2) v2(1), which
++ * encodes as 67 81 12 01 02 01 followed by the individual policy arc. The CI
++ * roots use ...1.0 and SM-DP+ leaves ...1.3; the whole arc is matched so a
++ * later policy in the same tree does not reintroduce the parse failure.
++ */
++#define X509_GSMA_RSP_POLICY_PREFIX "\x67\x81\x12\x01\x02\x01"
++#define X509_GSMA_RSP_POLICY_PREFIX_LEN 6
++
++static int x509_policy_is_understood(const mbedtls_x509_buf *policy_oid)
++{
++    if (MBEDTLS_OID_CMP(MBEDTLS_OID_ANY_POLICY, policy_oid) == 0) {
++        return 1;
++    }
++
++    if (policy_oid->len > X509_GSMA_RSP_POLICY_PREFIX_LEN &&
++        memcmp(policy_oid->p, X509_GSMA_RSP_POLICY_PREFIX,
++               X509_GSMA_RSP_POLICY_PREFIX_LEN) == 0) {
++        return 1;
++    }
++
++    return 0;
++}
++
+ static int x509_get_certificate_policies(unsigned char **p,
+                                          const unsigned char *end,
+                                          mbedtls_x509_sequence *certificate_policies)
+@@ -789,9 +814,10 @@
+         policy_oid.p = *p;
+ 
+         /*
+-         * Only AnyPolicy is currently supported when enforcing policy.
++         * anyPolicy, and the GSMA RSP arc this build exists to read, are
++         * understood when enforcing policy.
+          */
+-        if (MBEDTLS_OID_CMP(MBEDTLS_OID_ANY_POLICY, &policy_oid) != 0) {
++        if (!x509_policy_is_understood(&policy_oid)) {
+             /*
+              * Set the parsing return code but continue parsing, in case this
+              * extension is critical.

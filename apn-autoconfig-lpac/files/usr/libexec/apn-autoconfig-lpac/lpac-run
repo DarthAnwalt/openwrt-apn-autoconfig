@@ -106,6 +106,12 @@ cleanup() {
 }
 
 on_signal() {
+	# A signal starts one cleanup, not a recursive cleanup through the EXIT trap
+	# and not another copy when a child reports the same signal while it is
+	# being reaped. The caller is holding the card transport and cannot safely
+	# continue until this unwind has definitely finished.
+	trap - EXIT
+	trap '' HUP INT TERM
 	cleanup
 	# Report the signal as a signal rather than as a plain failure: a caller
 	# distinguishing "interrupted" from "refused" is the whole reason the exit
@@ -125,9 +131,11 @@ device=
 bearer_device=
 model=
 timeout_s="$DEFAULT_TIMEOUT"
+child_pid_fd=""
 
 while [ $# -gt 0 ]; do
 	case "$1" in
+		--child-pid-fd) child_pid_fd="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--child-pid-fd needs a value' ;;
 		--transport) transport="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--transport needs a value' ;;
 		--owner) owner="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--owner needs a value' ;;
 		--device) device="${2:-}"; shift 2 || fail "$EXIT_USAGE" '--device needs a value' ;;
@@ -138,6 +146,12 @@ while [ $# -gt 0 ]; do
 		*) fail "$EXIT_USAGE" "unknown option: $1" ;;
 	esac
 done
+
+case "$child_pid_fd" in
+	'') exec 4>/dev/null ;;
+	4) : ;;
+	*) fail "$EXIT_USAGE" 'the child PID descriptor is invalid' ;;
+esac
 
 [ $# -gt 0 ] || fail "$EXIT_USAGE" 'no LPA command was given'
 
@@ -284,6 +298,15 @@ export LPAC_HTTP
 # by it, by an APDU plugin, or by anything else it spawns.
 # ---------------------------------------------------------------------------
 secret_document=
+inherited_secret_fd="${APN_AUTOCONFIG_LPAC_SECRET_FD:-}"
+unset APN_AUTOCONFIG_LPAC_SECRET_FD
+case "$inherited_secret_fd" in
+	'') : ;;
+	# C3 hands the background worker descriptor 5. Keeping one exact descriptor
+	# avoids eval and makes an unexpected caller fail before the LPA exists.
+	5) : ;;
+	*) fail "$EXIT_USAGE" 'the inherited secret descriptor is invalid' ;;
+esac
 add_secret() {
 	[ -n "$2" ] || return 0
 	# A literal newline in the pattern. `$(printf '\n')` cannot be used here:
@@ -313,6 +336,10 @@ unset APN_ESIM_ACTIVATION_CODE APN_ESIM_CONFIRMATION_CODE APN_ESIM_MATCHING_ID
 RUN_DIR="$RUNTIME_DIR/$$"
 ( umask 077 && mkdir "$RUN_DIR" ) ||
 	fail "$EXIT_RETRYABLE" 'could not create the run directory'
+
+if [ -n "$inherited_secret_fd" ] && [ -n "$secret_document" ]; then
+	fail "$EXIT_USAGE" 'two secret channels were supplied'
+fi
 
 if [ -n "$secret_document" ]; then
 	( umask 077 && mkfifo "$RUN_DIR/params" ) ||
@@ -351,13 +378,26 @@ fi
 # The saved descriptor is closed in the child: the LPA has its standard input
 # and has no use for a second copy of it.
 exec 9<&0
-if [ -p "$RUN_DIR/params" ]; then
-	"$LPAC_BIN" "$@" <&9 9<&- 3<"$RUN_DIR/params" &
+if [ "$inherited_secret_fd" = 5 ]; then
+	"$LPAC_BIN" "$@" -R 3 <&9 9<&- 3<&5 5<&- 4>&- &
+	CHILD_PID=$!
+	exec 5<&-
+elif [ -p "$RUN_DIR/params" ]; then
+	"$LPAC_BIN" "$@" <&9 9<&- 3<"$RUN_DIR/params" 4>&- &
+	CHILD_PID=$!
 else
-	"$LPAC_BIN" "$@" <&9 9<&- &
+	"$LPAC_BIN" "$@" <&9 9<&- 4>&- &
+	CHILD_PID=$!
 fi
-CHILD_PID=$!
 exec 9<&-
+
+# The coordinator owns descriptor 4 and uses the reported PID only to stop the
+# actual card client before it returns modem ownership. A descriptor avoids an
+# arbitrary root-writable path and contains no card or activation data.
+if [ "$child_pid_fd" = 4 ]; then
+	printf '%s\n' "$CHILD_PID" >&4 || fail "$EXIT_RETRYABLE" 'could not publish the LPA child PID'
+fi
+exec 4>&-
 
 # `timeout` is the outer bound where the image has one; BusyBox provides the
 # applet, so a router normally does. A minimal image may not, and this wrapper is
@@ -372,7 +412,13 @@ exec 9<&-
 # charges every fast call its entire deadline.
 (
 	watchdog_sleep_pid=""
-	trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+	# `$!` rather than the recorded PID alone. `$!` is set when the sleep is
+	# forked, so it names the sleep one command before the assignment does,
+	# and a TERM arriving in between would otherwise find the variable empty,
+	# kill nothing, and leave the sleep to run out the whole budget as an
+	# orphan. Before the first fork `$!` still names the caller's own child,
+	# which this must never kill, so it is compared rather than trusted.
+	trap 'watchdog_target="${watchdog_sleep_pid:-$!}"; [ "$watchdog_target" = "$CHILD_PID" ] || kill -TERM "$watchdog_target" 2>/dev/null; exit 0' TERM
 
 	if command -v "$TIMEOUT" >/dev/null 2>&1; then
 		"$TIMEOUT" "$timeout_s" "$SLEEP" "$timeout_s" &
@@ -392,6 +438,7 @@ exec 9<&-
 	: >"$RUN_DIR/bound-exceeded" 2>/dev/null || :
 
 	kill -TERM "$CHILD_PID" 2>/dev/null || exit 0
+	watchdog_sleep_pid=""
 	"$SLEEP" 2 &
 	watchdog_sleep_pid=$!
 	wait "$watchdog_sleep_pid" 2>/dev/null || :

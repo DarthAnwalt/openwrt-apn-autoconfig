@@ -1,0 +1,187 @@
+// The one channel a value that may not reach a command line can take.
+//
+// rpcd refuses `file exec` outright when a session-scoped caller passes an
+// environment -- `if (sid && env) return UBUS_STATUS_PERMISSION_DENIED;` in its
+// file plugin, with no ACL that can grant it. So the mechanism this project
+// documented for an activation code and for the manual-APN password does not
+// exist, and never did on any OpenWrt carrying that check.
+//
+// A ubus call's parameters are neither a command line nor an environment. This
+// object receives them, spawns the ordinary narrow wrapper, and writes the value
+// to its standard input -- the same channel `delete-confirm --token-stdin`
+// already uses for a capability that must not be in argv. The wrapper turns it
+// into the environment the backend has always read, so no backend changes.
+//
+//   browser --ubus params--> here --stdin--> wrapper --env--> backend
+//
+// Nothing here decides anything. Authority is the ubus ACL, at the level the
+// mutating wrappers already sit at, and every refusal stays in the wrapper and
+// the backend where it was.
+
+'use strict';
+
+import { popen, open, unlink, mkdir, readfile } from 'fs';
+
+const CONTROL = '/usr/libexec/apn-autoconfig-control';
+const ESIM_CONTROL = '/usr/libexec/apn-autoconfig-esim-control';
+const SPOOL = '/var/run/apn-autoconfig-luci';
+
+function shellquote(value) {
+	return `'${replace('' + value, "'", "'\\''")}'`;
+}
+
+// The wrapper's answer comes back through a file because a pipe here is
+// one-directional and the secret needs the writing end. The answer is a
+// document -- accepted, busy, an operation id -- and never carries a secret;
+// the spool is root-only regardless.
+let answerSerial = 0;
+
+function answerPath() {
+	mkdir(SPOOL, 448);
+	answerSerial++;
+	return `${SPOOL}/answer.${time()}.${answerSerial}`;
+}
+
+// Every value that goes on the command line is quoted here; every value that
+// must not be on one goes in `secrets` and is written to standard input as
+// `KEY=VALUE`, one per line, which is what the wrapper's allowlist parses.
+function spawn(command, args, secrets) {
+	const out = answerPath();
+	let line = shellquote(command);
+
+	for (let arg in args) {
+		if (arg === null || arg === '')
+			continue;
+		line += ' ' + shellquote(arg);
+	}
+
+	// stdout is captured, stderr is dropped: a wrapper's diagnostic is for the
+	// system log, and this object must not become a way to read one.
+	const proc = popen(`${line} >${shellquote(out)} 2>/dev/null`, 'w');
+	if (!proc) {
+		unlink(out);
+		return { code: -1, stdout: '' };
+	}
+
+	for (let key in secrets) {
+		const value = secrets[key];
+		if (value === null)
+			continue;
+		// A newline would end the record and start another one, so a value
+		// carrying one is refused rather than truncated or split.
+		if (index('' + value, '\n') >= 0) {
+			proc.close();
+			unlink(out);
+			return { code: 2, stdout: '' };
+		}
+		proc.write(`${key}=${value}\n`);
+	}
+
+	const code = proc.close();
+	let answer = readfile(out);
+	if (answer === null)
+		answer = '';
+	unlink(out);
+	return { code: code, stdout: answer };
+}
+
+function run(command, args, secrets) {
+	try {
+		return spawn(command, args, secrets);
+	}
+	catch (e) {
+		// rpcd turns an uncaught exception into "Unknown error" and logs
+		// nothing at all, so this says which side failed rather than leaving a
+		// caller to guess. It is the channel, never the wrapper's own answer.
+		return { code: 255, stdout: '', error: '' + e };
+	}
+}
+
+const methods = {
+	// The manual APN. Its password is the value that may not be an argument;
+	// the rest travel beside it for the same reason the engine reads them from
+	// one place.
+	apply_manual: {
+		args: {
+			target: 'target',
+			apn: 'apn',
+			username: 'username',
+			password: 'password',
+			auth: 'auth',
+			ip_type: 'ip_type'
+		},
+		call: function(request) {
+			const a = request.args || {};
+			if (!a.target || !a.apn)
+				return { code: 2, stdout: '' };
+			const secrets = { APN_AUTOCONFIG_MANUAL_APN: a.apn };
+			// Omitted rather than sent empty: the engine tells "not given" from
+			// "given empty", and a page that always sent both would take that
+			// distinction away from it.
+			if (a.username)
+				secrets.APN_AUTOCONFIG_MANUAL_USERNAME = a.username;
+			if (a.password)
+				secrets.APN_AUTOCONFIG_MANUAL_PASSWORD = a.password;
+			if (a.auth)
+				secrets.APN_AUTOCONFIG_MANUAL_AUTH = a.auth;
+			if (a.ip_type)
+				secrets.APN_AUTOCONFIG_MANUAL_IP_TYPE = a.ip_type;
+			return run(CONTROL, [ 'apply-manual', a.target, '--secrets-stdin' ], secrets);
+		}
+	},
+
+	// An activation code is worth the subscription it buys, and an unbound one
+	// can be redeemed on somebody else's eUICC.
+	esim_download: {
+		args: {
+			modem: 'modem',
+			endpoint: 'endpoint',
+			activation_code: 'activation_code',
+			confirmation_code: 'confirmation_code',
+			matching_id: 'matching_id',
+			allow_unverified: false
+		},
+		call: function(request) {
+			const a = request.args || {};
+			if (!a.modem || !a.endpoint || !a.activation_code)
+				return { code: 2, stdout: '' };
+			const argv = [ 'download', a.modem, a.endpoint, '--secrets-stdin' ];
+			// A consent is a flag and stays one: it discloses nothing in a
+			// command line, and the wrapper is what turns it into what the
+			// backend reads.
+			if (a.allow_unverified === true)
+				push(argv, '--allow-unverified');
+			const secrets = { APN_ESIM_ACTIVATION_CODE: a.activation_code };
+			if (a.confirmation_code)
+				secrets.APN_ESIM_CONFIRMATION_CODE = a.confirmation_code;
+			if (a.matching_id)
+				secrets.APN_ESIM_MATCHING_ID = a.matching_id;
+			return run(ESIM_CONTROL, argv, secrets);
+		}
+	},
+
+	// A nickname is not a secret. It is here because the alternative is
+	// widening the character class the wrappers validate arguments against,
+	// and that class is a security property rather than a formality.
+	esim_nickname: {
+		args: {
+			modem: 'modem',
+			endpoint: 'endpoint',
+			profile: 'profile',
+			nickname: 'nickname'
+		},
+		call: function(request) {
+			const a = request.args || {};
+			if (!a.modem || !a.endpoint || !a.profile)
+				return { code: 2, stdout: '' };
+			let name = a.nickname;
+			if (name === null)
+				name = '';
+			return run(ESIM_CONTROL, [ 'nickname', a.modem, a.endpoint, a.profile, '--secrets-stdin' ], {
+				APN_ESIM_NICKNAME: name
+			});
+		}
+	}
+};
+
+return { 'apn-autoconfig': methods };

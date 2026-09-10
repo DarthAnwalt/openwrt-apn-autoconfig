@@ -6,12 +6,23 @@
 # never to invoke an LPA binary at all. Every verb here writes nothing, opens
 # no channel it does not release, and changes no slot, profile, bearer or
 # control owner.
+#
+# One verb, `probe`, does open a channel: it is how the active slot is asked
+# whether it holds an eUICC where no slot table can say. It still writes
+# nothing and still releases what it opened, and it refuses to open anything
+# at all unless the reachability matrix says the card can be read without
+# stopping a bearer or changing a slot. It is a read that costs a device
+# handle, not a mutation.
 
 COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
 VERB="${1:-}"
 MODEM_ID="${2:-}"
 ENDPOINT_ID="${3:-}"
-[ "$#" -le 3 ] || exit 2
+# The fourth argument exists for one verb: which switching action a plan is
+# being asked about. It is matched against a fixed set below and never passed
+# through as text.
+PLAN_ACTION="${4:-}"
+[ "$#" -le 4 ] || exit 2
 
 # The same character class the existing wrappers use. A value that is not a
 # plain token is refused rather than quoted: nothing downstream needs one.
@@ -30,18 +41,75 @@ esac
 
 case "$VERB" in
 	capabilities)
-		[ -z "$MODEM_ID" ] && [ -z "$ENDPOINT_ID" ] || exit 2
+		[ -z "$MODEM_ID" ] && [ -z "$ENDPOINT_ID" ] && [ -z "$PLAN_ACTION" ] || exit 2
 		exec "$COMMAND" capabilities-json
 	;;
+	trust)
+		[ -z "$MODEM_ID" ] && [ -z "$ENDPOINT_ID" ] && [ -z "$PLAN_ACTION" ] || exit 2
+		exec "$COMMAND" trust-store-json
+	;;
 	inventory)
-		[ -z "$ENDPOINT_ID" ] || exit 2
+		[ -z "$ENDPOINT_ID" ] && [ -z "$PLAN_ACTION" ] || exit 2
 		if [ -n "$MODEM_ID" ]; then
 			exec "$COMMAND" esim-inventory-json --modem "$MODEM_ID"
 		fi
 		exec "$COMMAND" esim-inventory-json
 	;;
+	probe)
+		# The one verb here that opens a channel to the card, and the reason
+		# the header says "releases" rather than "never opens". A slot table
+		# cannot say whether the active slot holds an eUICC unless
+		# ModemManager owns the modem, so for every other composition the card
+		# is asked directly -- which `inventory` alone will never do, because
+		# the probe behind it runs only under `--refresh`.
+		#
+		# It reads. It installs nothing, enables nothing, changes no slot and
+		# takes no bearer down: the enumeration gates itself on the
+		# reachability matrix and does nothing at all unless the active slot
+		# can be read with no disruption. That is why it belongs beside
+		# `inventory` rather than beside the operations.
+		#
+		# A modem is required. `inventory` may be asked about the whole router
+		# because it costs nothing; a probe of every modem on the router from
+		# one call is not a thing a page should be able to ask for.
+		[ -n "$MODEM_ID" ] || exit 2
+		[ -z "$ENDPOINT_ID" ] && [ -z "$PLAN_ACTION" ] || exit 2
+		exec "$COMMAND" esim-inventory-json --modem "$MODEM_ID" --refresh
+	;;
+	delete-plan-result)
+		# What the plan job produced. A read: it opens nothing, and the
+		# document it serves had its token stripped by the worker that wrote
+		# it, so there is no capability here to hand out.
+		#
+		# The fourth argument is the operation that asked, and it is required.
+		# The stored document is one per modem, so a caller that does not say
+		# which operation it is collecting can be handed an earlier plan for a
+		# different subscription -- which happened on 2026-09-04, and put the
+		# wrong subscription's identifier in a deletion dialog.
+		[ -n "$MODEM_ID" ] && [ -n "$ENDPOINT_ID" ] || exit 2
+		# `<seconds>-<pid>`, and nothing else shaped like an argument.
+		case "$PLAN_ACTION" in
+			''|*[!0-9-]*) exit 2 ;;
+			*-*) : ;;
+			*) exit 2 ;;
+		esac
+		[ "${#PLAN_ACTION}" -le 40 ] || exit 2
+		exec "$COMMAND" delete-plan-result --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" \
+			--operation "$PLAN_ACTION"
+	;;
+	card-probe-plan)
+		# The one plan addressed by a modem alone: it describes an operation
+		# whose purpose is to find out whether this modem has an endpoint, so
+		# an endpoint argument would be a contradiction and is refused rather
+		# than ignored.
+		[ -n "$MODEM_ID" ] || exit 2
+		[ -z "$ENDPOINT_ID" ] || exit 2
+		[ -z "$PLAN_ACTION" ] || exit 2
+		exec "$COMMAND" card-probe-plan --modem "$MODEM_ID"
+	;;
 	status|profiles|notifications|read-takeover-plan)
 		[ -n "$MODEM_ID" ] && [ -n "$ENDPOINT_ID" ] || exit 2
+		[ -z "$PLAN_ACTION" ] || exit 2
 		case "$VERB" in
 			status) wrapper_verb=esim-status-json ;;
 			profiles) wrapper_verb=profiles-json ;;
@@ -50,9 +118,15 @@ case "$VERB" in
 		esac
 		exec "$COMMAND" "$wrapper_verb" --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID"
 	;;
+	switch-plan)
+		[ -n "$MODEM_ID" ] && [ -n "$ENDPOINT_ID" ] || exit 2
+		case "$PLAN_ACTION" in enable|disable|switch) : ;; *) exit 2 ;; esac
+		exec "$COMMAND" switch-plan --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" \
+			--action "$PLAN_ACTION"
+	;;
 	action-status)
 		[ -n "$MODEM_ID" ] || exit 2
-		[ -z "$ENDPOINT_ID" ] || exit 2
+		[ -z "$ENDPOINT_ID" ] && [ -z "$PLAN_ACTION" ] || exit 2
 		exec "$COMMAND" action-status --modem "$MODEM_ID"
 	;;
 	*) exit 2 ;;

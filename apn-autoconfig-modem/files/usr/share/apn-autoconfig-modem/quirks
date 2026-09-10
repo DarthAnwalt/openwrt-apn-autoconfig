@@ -30,3 +30,28 @@
 # everything it does — port resolution, identity, registration, signal, soft
 # reset — is standard. The first entries are expected in 0.15.0, where the
 # Fibocom connection path needs behaviour that genuinely differs by device.
+
+# ---- SIM slots a modem knows about and ModemManager does not ----
+#
+# `sim_slots` names the *dialect* a modem speaks about its physical slots, not
+# a command. The query, the range and the switch differ together, and naming
+# them separately would let a table entry mix two vendors' halves.
+#
+# The dialect owns the numbering. Vendors count slots from zero here; every
+# consumer above counts from one, as ModemManager does.
+#
+# Observed on the reference board on 2026-08-30, on a Fibocom FM350-GL
+# (81600.0000.00.29.21.27), over a free AT port with the modem's own bearer up:
+#
+#   AT+GTDUALSIM=?   ->  +GTDUALSIM: (0-1)
+#   AT+GTDUALSIM?    ->  +GTDUALSIM : 0, "SUB1", "NR"
+#
+# so two slots, the first of them active. The space before the colon in the
+# second reply and its absence in the first are both real; the parser matches
+# the prefix and then takes numbers rather than a fixed string.
+#
+# The same run established that this modem carries APDUs correctly
+# (AT+CSIM SELECT MF returned an FCP ending 9000) and answers AT+CCHO=? with OK,
+# which is why its eUICC being unreachable is about which slot is active and
+# not about the modem.
+Fibocom Wireless Inc.	FM350-GL	*	sim_slots	gtdualsim

@@ -32,6 +32,7 @@ ATDIAL_INTERFACE=""
 ATDIAL_DATA_CHANNEL=""
 ATDIAL_DNS_SOURCE=""
 ATDIAL_LINK_ARP=""
+ATDIAL_SHA256="${APN_ATDIAL_SHA256:-sha256sum}"
 
 # Masks the evidence half of a `modem_id` for logging, keeping the tier prefix.
 # netifd sends handler output to the system log, so an `imei:` id logged here
@@ -55,6 +56,39 @@ atdial_mask_modem_id() {
 
 atdial_log() {
 	echo "apn_atdial[$$] $*"
+}
+
+# Same kernel attachment, even if a USB address eventually wraps around.
+# Both the device number and sysfs inode must match; no modem query is made.
+atdial_bearer_attachment() {
+	local path="$1" devnum inode
+	atdial_valid_usb_path "$path" || return 1
+	devnum="$(atdial_usb_devnum "$path" 2>/dev/null || :)"
+	inode="$(ls -idL "$(atdial_usb_dir "$path")" 2>/dev/null | awk '{print $1}')"
+	case "$devnum:$inode" in :*|*:|*[!0-9:]*) return 1 ;; esac
+	printf '%s:%s\n' "$devnum" "$inode"
+}
+
+# A completed teardown is the evidence that status.up=false alone cannot
+# provide. Store fingerprints, never modem identifiers.
+atdial_bearer_state() {
+	local interface="$1" phase="$2" root fingerprint state_tmp attachment
+	case "$interface" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+	root="${APN_AUTOCONFIG_BEARER_STATE_DIR:-}"
+	if [ -z "$root" ]; then
+		root="$(atdial_uci_get apn-autoconfig-modem.main.state_dir || :)"
+		root="${root:-/var/run/apn-autoconfig-modem}/bearer"
+	fi
+	case "$root" in /|*/../*|*/..|*[[:space:]]*) return 1 ;; /*) : ;; *) return 1 ;; esac
+	attachment="$(atdial_bearer_attachment "$usbpath" || :)"
+	[ "$phase" != down ] || [ -n "$attachment" ] || phase=failed
+	fingerprint="$(printf '%s\n' "$modem_id" "$usbpath" "$atport" "$attachment" | \
+		"$ATDIAL_SHA256" | awk 'NF {print $1; found=1} END {exit !found}')" || fingerprint=""
+	[ -n "$fingerprint" ] || phase=failed
+	(umask 077 && mkdir -p "$root") || return 1
+	state_tmp="$root/$interface.tmp.$$"
+	(umask 077 && printf 'v2\t%s\t%s\n' "$phase" "$fingerprint" >"$state_tmp") || return 1
+	mv "$state_tmp" "$root/$interface"
 }
 
 # The identity currently bound to this physical path.
@@ -327,6 +361,9 @@ proto_apn_atdial_setup() {
 
 	json_get_vars usbpath modem_id device atport apn username password auth \
 		pdptype metric allow_roaming
+	# Publish before any control channel can be opened. A failed publication
+	# must not leave an old teardown acknowledgement behind while dialing.
+	atdial_bearer_state "$interface" busy || return 1
 
 	ATDIAL_INTERFACE="$interface"
 	ATDIAL_ACTIVATED=0
@@ -745,9 +782,11 @@ atdial_reuse_is_safe() {
 
 proto_apn_atdial_teardown() {
 	local interface="$1"
-	local modem_id usbpath atport dial binding_status
+	local modem_id usbpath atport dial binding_status teardown_phase=failed teardown_attachment
 
 	json_get_vars modem_id usbpath atport
+	teardown_attachment="$(atdial_bearer_attachment "$usbpath" || :)"
+	atdial_bearer_state "$interface" busy || return 1
 
 	atdial_scratch_init
 	dial="$atport"
@@ -772,7 +811,9 @@ proto_apn_atdial_teardown() {
 	# bearer no interface claims, so it cannot be found again except by
 	# dialing over it.
 	if [ -n "$dial" ] && atdial_lock_acquire "$dial"; then
-		atdial_at "$dial" 'AT+CGACT=0,1' >/dev/null 2>&1
+		if atdial_at "$dial" 'AT+CGACT=0,1' >/dev/null 2>&1; then
+			teardown_phase=down
+		fi
 		atdial_lock_release
 	fi
 	atdial_scratch_clean
@@ -782,6 +823,11 @@ proto_apn_atdial_teardown() {
 	# answers PERMISSION_DENIED in that state — so the notification cannot
 	# succeed and only produces a permission-denied line on every disconnect.
 	# Error codes travel by another path and still arrive.
+	# Use the original configuration identity, before binding resolution above.
+	json_get_vars modem_id usbpath atport
+	[ -n "$teardown_attachment" ] && \
+		[ "$teardown_attachment" = "$(atdial_bearer_attachment "$usbpath" || :)" ] || teardown_phase=failed
+	atdial_bearer_state "$interface" "$teardown_phase"
 }
 
 [ -n "$INCLUDE_ONLY" ] || add_protocol apn_atdial

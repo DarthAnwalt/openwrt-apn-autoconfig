@@ -1,0 +1,87 @@
+#!/bin/sh
+
+# Starts one bounded ModemManager inhibit and publishes the holder's immutable
+# process identity before exec(2) turns this process into mmcli.  The lease is
+# deliberately written by this process rather than its parent: a SIGKILL in the
+# gap after fork must leave either no holder or a recoverable record, never an
+# unrecorded inhibition.
+
+set -u
+umask 077
+
+LEASE_FILE="${1:-}"
+OPERATION_ID="${2:-}"
+MODEM_ID="${3:-}"
+DEVICE_UID="${4:-}"
+WORKER_PID="${5:-}"
+WORKER_BIRTH="${6:-}"
+BOUND="${7:-}"
+MMCLI="${8:-}"
+SLEEP="${9:-sleep}"
+
+case "$LEASE_FILE" in /|*/../*|*/..) exit 2 ;; /*/inhibit.tsv) : ;; *) exit 2 ;; esac
+case "$OPERATION_ID" in ''|*[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+case "$MODEM_ID" in ''|*[!A-Za-z0-9_.:-]*) exit 2 ;; esac
+case "$DEVICE_UID" in /sys/*) : ;; *) exit 2 ;; esac
+case "$WORKER_PID:$BOUND" in *[!0-9:]*|:*|*:|0:*|*:0) exit 2 ;; esac
+[ -n "$WORKER_BIRTH" ] && [ -n "$MMCLI" ] || exit 2
+
+process_birth() {
+	process_pid="$1"
+	case "$process_pid" in ''|*[!0-9]*|0) return 1 ;; esac
+	if [ -r "/proc/$process_pid/stat" ]; then
+		# mmcli has no ')' in its comm field. Taking the twentieth field after
+		# the closing comm gives Linux stat field 22, the immutable start ticks.
+		process_stat="$(sed -n '1p' "/proc/$process_pid/stat" 2>/dev/null)" || return 1
+		process_rest="${process_stat##*) }"
+		set -- $process_rest
+		[ "$#" -ge 20 ] || return 1
+		shift 19
+		printf '%s\n' "$1"
+		return 0
+	fi
+	# Fixture fallback for development hosts without procfs. OpenWrt always
+	# takes the branch above; lstart is stable for the life of a process.
+	process_started="$(ps -o lstart= -p "$process_pid" 2>/dev/null | sed -n '1p')" || return 1
+	[ -n "$process_started" ] || return 1
+	printf '%s' "$process_pid:$process_started" | cksum | awk '{print $1}'
+}
+
+process_matches() {
+	[ "$(process_birth "$1" 2>/dev/null || :)" = "$2" ]
+}
+
+HOLDER_PID="$$"
+HOLDER_BIRTH="$(process_birth "$HOLDER_PID")" || exit 1
+
+(
+	trap 'exit 0' TERM HUP INT
+	"$SLEEP" "$BOUND" 2>/dev/null || exit 0
+	if process_matches "$HOLDER_PID" "$HOLDER_BIRTH"; then
+		kill -TERM "$HOLDER_PID" 2>/dev/null || :
+	fi
+	"$SLEEP" 2 2>/dev/null || exit 0
+	if process_matches "$HOLDER_PID" "$HOLDER_BIRTH"; then
+		kill -KILL "$HOLDER_PID" 2>/dev/null || :
+	fi
+) >/dev/null 2>&1 &
+WATCHDOG_PID=$!
+WATCHDOG_BIRTH="$(process_birth "$WATCHDOG_PID")" || {
+	kill -TERM "$WATCHDOG_PID" 2>/dev/null || :
+	exit 1
+}
+
+LEASE_TMP="${LEASE_FILE}.tmp.$$"
+printf 'v1\tcreated\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+	"$OPERATION_ID" "$MODEM_ID" "$DEVICE_UID" "$WORKER_PID" "$WORKER_BIRTH" \
+	"$HOLDER_PID" "$HOLDER_BIRTH" "$WATCHDOG_PID" "$WATCHDOG_BIRTH" "$MMCLI" \
+	>"$LEASE_TMP" || exit 1
+mv "$LEASE_TMP" "$LEASE_FILE" || {
+	rm -f "$LEASE_TMP"
+	kill -TERM "$WATCHDOG_PID" 2>/dev/null || :
+	exit 1
+}
+
+# exec preserves PID and Linux start ticks, so the lease above identifies the
+# exact D-Bus client that holds the inhibition, not merely a numeric PID.
+exec "$MMCLI" --inhibit-device="$DEVICE_UID"

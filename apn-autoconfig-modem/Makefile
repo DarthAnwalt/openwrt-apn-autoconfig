@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=apn-autoconfig-modem
-PKG_VERSION:=0.15.3
+PKG_VERSION:=0.16.0
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
@@ -119,7 +119,22 @@ for state_file in /etc/apn-autoconfig-modem/identity/identity.* \
 	[ -f "$${state_file}" ] && rm -f "$${state_file}"
 done
 rmdir /etc/apn-autoconfig-modem/identity 2>/dev/null || :
+# /etc/apn-autoconfig-modem/adoption is deliberately absent from this cleanup.
+# It contains the only exact pre-adoption baseline for user-created sections;
+# an uninstall may leave inert ownership markers, but must never destroy the
+# record a reinstall needs to release them safely.
 rmdir /etc/apn-autoconfig-modem 2>/dev/null || :
+# The display-only inventory scan cache. One exact name, plus the publication
+# temporaries a SIGKILLed reader can leave: each is rebuilt from a numeric PID
+# and this package's own name, never removed by the glob itself.
+rm -f /var/run/apn-autoconfig-modem/scan-cache/scan 2>/dev/null || :
+for state_file in /var/run/apn-autoconfig-modem/scan-cache/.scan.[0-9]*; do
+	[ -f "$${state_file}" ] || continue
+	state_pid="$${state_file##*/.scan.}"
+	case "$${state_pid}" in ''|*[!0-9]*) continue ;; esac
+	rm -f "/var/run/apn-autoconfig-modem/scan-cache/.scan.$${state_pid}"
+done
+rmdir /var/run/apn-autoconfig-modem/scan-cache 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/modems 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/provisioning 2>/dev/null || :
 rmdir /var/run/apn-autoconfig-modem/at-ports 2>/dev/null || :

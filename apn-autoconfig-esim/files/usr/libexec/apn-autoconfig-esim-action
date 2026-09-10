@@ -18,15 +18,54 @@ set -u
 
 COMMAND="${APN_AUTOCONFIG_ESIM_BIN:-/usr/sbin/apn-autoconfig-esim}"
 
-MODEM_ID="${1:-}"
-ENDPOINT_ID="${2:-}"
-OPERATION_ID="${3:-}"
-STARTED="${4:-}"
-START_LOCK="${5:-}"
+ACTION="${1:-}"
+MODEM_ID="${2:-}"
+ENDPOINT_ID="${3:-}"
+OPERATION_ID="${4:-}"
+STARTED="${5:-}"
+START_LOCK="${6:-}"
+PROFILE_ID="${7:-}"
+SEQUENCE="${8:-}"
 
+[ -n "$ACTION" ] || exit 2
 [ -n "$MODEM_ID" ] || exit 2
-[ -n "$ENDPOINT_ID" ] || exit 2
 [ -n "$OPERATION_ID" ] || exit 2
+# Every action but one names the endpoint it acts on, and is refused without
+# one. `card-probe` exists to find out whether there is an endpoint at all, so
+# it is refused *with* one instead. Per action rather than optional: nothing
+# here becomes vaguer for the operations that have always known their target.
+case "$ACTION" in
+	card-probe) [ -z "$ENDPOINT_ID" ] || exit 2 ;;
+	*) [ -n "$ENDPOINT_ID" ] || exit 2 ;;
+esac
+
+# The setsid supervisor never opens a modem tty. Its child is not a session
+# leader, so opening a modem cannot acquire it as a controlling terminal.
+# Hand off the real child's PID atomically before that child starts card work.
+if [ "${APN_AUTOCONFIG_ESIM_DETACHED:-}" = launch ]; then
+	if [ -r "/proc/$$/stat" ]; then
+		IFS= read -r session_stat <"/proc/$$/stat" || exit 3
+		session_stat="${session_stat##*) }"
+		session_ids="$(printf '%s\n' "$session_stat" | awk '{print $3 ":" $4}')"
+		[ "$session_ids" = "$$:$$" ] || exit 3
+	else
+		[ "$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" = "$$" ] || exit 3
+	fi
+	case "$START_LOCK" in /*.start-lock) : ;; *) exit 2 ;; esac
+	case "$START_LOCK" in */../*|*/..|*[[:space:]]*) exit 2 ;; esac
+	APN_AUTOCONFIG_ESIM_DETACHED=1
+	export APN_AUTOCONFIG_ESIM_DETACHED
+	/bin/sh "$0" "$@" </dev/null &
+	detached_pid=$!
+	handoff_tmp="${START_LOCK}.own.$$"
+	if ! (umask 077 && printf '%s\n' "$detached_pid" >"$handoff_tmp") || \
+		! mv "$handoff_tmp" "$START_LOCK"; then
+		kill -TERM "$detached_pid" 2>/dev/null || :
+		rm -f "$handoff_tmp"
+		exit 3
+	fi
+	exit 0
+fi
 
 # The started timestamp and the start lock travel in the environment rather
 # than in arguments, because they are bookkeeping the operation publishes about
@@ -35,5 +74,51 @@ APN_AUTOCONFIG_ESIM_STARTED="$STARTED"
 APN_AUTOCONFIG_ESIM_START_LOCK="$START_LOCK"
 export APN_AUTOCONFIG_ESIM_STARTED APN_AUTOCONFIG_ESIM_START_LOCK
 
-exec "$COMMAND" takeover-run \
-	--modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" --operation "$OPERATION_ID"
+case "$ACTION" in
+	read-takeover)
+		exec "$COMMAND" takeover-run \
+			--modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" --operation "$OPERATION_ID"
+	;;
+	download|nickname|notification-send|notification-remove)
+		set -- mutation-run --action "$ACTION" \
+			--modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" --operation "$OPERATION_ID"
+		[ -z "$PROFILE_ID" ] || set -- "$@" --profile "$PROFILE_ID"
+		[ -z "$SEQUENCE" ] || set -- "$@" --sequence "$SEQUENCE"
+		exec "$COMMAND" "$@"
+	;;
+	delete)
+		# The one action with no `action-start` of its own. It is reachable only
+		# from `delete-confirm`, which claims a single-use token and hands the
+		# claimed record to this worker in the environment; the backend refuses
+		# to issue a delete request without one, so a caller that invents this
+		# invocation still cannot destroy anything.
+		set -- delete-run --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" \
+			--operation "$OPERATION_ID"
+		[ -z "$PROFILE_ID" ] || set -- "$@" --profile "$PROFILE_ID"
+		exec "$COMMAND" "$@"
+	;;
+	card-probe)
+		# The only worker started without an endpoint. It stops the bearer that
+		# holds this modem's one answering port, asks the card who it is, and
+		# puts the interface back -- after which an endpoint exists and every
+		# other operation can name it.
+		exec "$COMMAND" card-probe-run --modem "$MODEM_ID" --operation "$OPERATION_ID"
+	;;
+	delete-plan)
+		# A plan is a job because reading a card takes longer than a page may
+		# hold a request open. It removes nothing: it mints the single-use
+		# token that `delete-confirm` needs, and without that token the backend
+		# refuses to issue a delete request at all.
+		set -- delete-plan-run --modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" \
+			--operation "$OPERATION_ID"
+		[ -z "$PROFILE_ID" ] || set -- "$@" --profile "$PROFILE_ID"
+		exec "$COMMAND" "$@"
+	;;
+	enable|disable)
+		set -- switch-run --action "$ACTION" \
+			--modem "$MODEM_ID" --endpoint "$ENDPOINT_ID" --operation "$OPERATION_ID"
+		[ -z "$PROFILE_ID" ] || set -- "$@" --profile "$PROFILE_ID"
+		exec "$COMMAND" "$@"
+	;;
+	*) exit 2 ;;
+esac

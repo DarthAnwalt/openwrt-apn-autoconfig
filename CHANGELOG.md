@@ -1,100 +1,89 @@
 # Changelog
 
-## Unreleased
+## apn-autoconfig 0.16.0 / apn-autoconfig-modem 0.16.0 / apn-autoconfig-proto-atdial 0.16.0 / apn-autoconfig-providers 2026.08.24 / luci-app-apn-autoconfig 0.16.0 (2026-09-10)
 
-Not in any published package yet. This section describes what is on `main`
-after 0.15.3 and will be folded into the notes of whichever release carries it.
+This release adds eSIM management and a LuCI workspace for each modem.
 
-**The LuCI page is Overview plus a workspace per modem.** A router with one
-modem sees less page and the same power: the list collapses to a line and that
-modem's workspace opens straight away. A router with two sees two cards with two
-answers, instead of one page and a dropdown that decided both what was displayed
-and what a button would act on. Every operation the old page could do is still
-there, in the place `docs/frontend-contract-v2.md` puts it, acting on the same
-identity and refusing on the same field — which is checked, row by row, by
-`tests/test-luci-v2-parity.js`.
+**How far the eSIM support has been proven.** The eSIM package reports its own
+maturity and its own evidence as two different things, and they deliberately
+disagree: the evidence is `hardware`, because every verb it offers has been
+driven against a real eUICC on the reference board, while the maturity stays
+`alpha`, because working on one board is not the same claim as being finished.
+The AT-driven path on a second modem has known defects, the direct QMI and MBIM
+producers are a gap rather than an untested path, and no board here has a
+second SIM slot to prove a slot change on. What has been measured on real
+hardware is card discovery and
+identification behind a modem's own connection, the bounded consented read of a
+card ModemManager owns, the transport that carries it, verified TLS to a live
+SM-DP+, and the refusal paths around all of them. Removing a subscription, and telling its issuer, were
+proven end to end on the reference board, including that the message comes off
+the card only once the issuer has taken it. Downloading a subscription,
+switching one on and switching one off were each proven on the reference board
+as well, from the page, on both a test eUICC and a card carrying live operator
+subscriptions: the download reported verified transport and a delivered issuer
+notification, and switching between two live subscriptions moved the APN with
+the subscription and brought the connection back on each of them, once at home
+and once while registered in roaming. Everything else in
+this release — the connection engine, the modem coordinator, the AT-dial
+protocol, the button integration and package lifecycle — was validated on the
+reference board.
 
-Three differences a user will notice. A connection that is down because somebody
-pressed Disconnect no longer looks like one that failed: it says "Switched off
-here" and takes no failure colour, while a connection that was wanted and did not
-hold says so and does. A greyed-out button now means one thing only — an
-operation is running — so a control that cannot work is not drawn at all, and the
-page says in a sentence whether that is a refusal or an answer it could not
-obtain. And the eSIM areas exist as one line saying what is coming, rather than
-as buttons that would fail.
+- Manage supported eUICCs: read card information, profiles and pending
+  notifications; download a profile from an activation code or QR image;
+  rename, enable or disable it; and explicitly plan and confirm deletion.
+  QR images are decoded locally in the browser.
+- Review the exact subscription before deletion. Confirmation belongs to one
+  operation, expires after five minutes and requires its identifier suffix.
+  Deleted subscriptions may require a new activation code from the operator.
+  Profiles are never deleted as cleanup or rollback.
+- Switch physical SIM slots where the modem reports a supported method. After
+  a subscription change, the router performs the applicable modem recovery and
+  APN reconciliation; incomplete recovery is reported separately from the card
+  change.
+- Probe a card behind its modem's own AT-dial connection with explicit consent.
+  The modem coordinator must prove the bearer is quiet before card access; the
+  operation bounds its work and restores the prior connection request. Where a
+  modem exposes several safe AT command ports, the read-only card handshake
+  selects the port that actually reaches ISD-R instead of assuming every
+  AT-speaking port routes APDUs. A port that answers nothing is reported as
+  that and not as a verdict about the card, and an operation that has already
+  interrupted a connection asks the silent ports again inside the budget it
+  announced, because on the reference hardware a card port goes quiet for tens
+  of seconds at a time.
+- Keep what a consented card read cost. Reading a card behind ModemManager
+  interrupts a connection, and what it read now stays displayable for longer
+  than a page redraw's cache does; a change of modem, attachment, slot or owner
+  still discards it immediately.
+- Keep accepted operations running when the browser or SSH session closes.
+  Interruptions stop card access before restoration and release operation locks
+  afterwards. Results remain available by operation ID. Background launch
+  handoff uses whole-second BusyBox-compatible pacing in both launcher and
+  worker, and never labels the operation it just started as a busy duplicate.
+  A launch refused before a worker exists still returns the versioned action
+  document, including the reason, while preserving its non-zero exit status.
+- Bind AT-dial release and eUICC display evidence with SHA-256 on the target.
+  A missing digest fails closed, and a never-dialled bearer with no defined PDP
+  contexts can prove that there is no active context without weakening the
+  locked physical check.
+- Revalidate the physical eUICC before each mutation. Cached identity helps
+  display the card but cannot authorize a change, and a changed attachment
+  invalidates that cache.
+- Show disconnected, administratively disabled, absent and unreadable devices
+  distinctly. Modem workspaces update as hardware changes, and page navigation
+  does not interrupt a connection.
+- Adopt a supported existing network interface explicitly, then release it
+  with its saved settings. User-created interfaces are not automatically
+  adopted or deleted.
+- Pass activation codes and manual APN credentials through the protected
+  request channel rather than process arguments. Report uncertain downloads
+  and pending issuer notifications without claiming an unverified success.
+- Update the eSIM client's bundled mbedTLS to 3.6.7 and harden HTTP/QMI parsing,
+  exchange deadlines and signal cleanup.
 
-The old page is removed. It was removed after the parity matrix passed and not
-before, which is the order `docs/frontend-contract-v2.md` requires.
-
-The page was then driven in a browser on the reference router with two modems
-attached, which found three things six green test suites could not: a refresh
-that stole the keyboard every two seconds, an identifier that pushed its own
-reveal button off a phone screen, and a confirmation dialog you could Tab out of
-while it was still open. All three are fixed, each with a test that fails
-against the old code. `docs/router-test-0.16.0.md` records the pass.
-
-This is evidence about the page, not about any modem: no backend's validation
-state moves because of it, and the package itself has not been through the
-official SDK at this revision. `docs/testing-0.16.0.md` records what is proven
-and what is not.
-
-**The read path costs a third less on the router.** One
-`apn-autoconfig-modem inventory-json` on the reference WH3000 with two modems
-attached takes 1.03–1.13 s where it took 2.33 s, and the whole set of calls a
-page load makes takes 8.7 s where it took 13.1 s. Nothing it answers changed:
-`inventory-json`, `status-json`, `provision-plan`, `resolve`, `attachment` and
-`inhibit-targets` were compared byte for byte against 0.15.3 on the live router
-and are identical, key order included.
-
-The cost was never the hardware — ModemManager answers in tens of milliseconds
-— it was processes. A scan extracted 92 tab-separated fields through a pipeline
-and an `awk` each, escaped every JSON string through another, re-resolved all
-twenty-one class-device symlinks once per candidate rather than once per scan,
-and asked `uci` a separate question for every network option it wanted. Field
-extraction, string escaping and the single-line check are now done by the shell;
-class devices are correlated once per scan; and a read-only command reads
-`uci show network` once at start. That last one is not a cache with an
-invalidation problem: only read-only verbs take a snapshot, so no write in the
-process can be followed by a stale read, and a value uci would quote unusually
-is still answered by uci itself.
-
-The synthetic suite, which is where the cost was first noticed, went from 434.8 s
-to 395.9 s. That was never the target and it is the smaller half of the
-result. `docs/work-items/P1-inventory-scan-cost.md` records the profiling
-method, every number, and the one lever that was measured and deliberately left
-alone.
-
-**Identifiers no longer reach the system log in full.** A reconcile wrote the
-SIM's complete 20-digit ICCID to syslog at notice level — `SIM
-89…050 is already reconciled with APN 'web.vodafone.de'` and four sibling lines
-— which contradicted this project's own standing rule that a SIM identifier is
-never logged. `logread` is readable by anything on the box that can run it, and
-its output is what people paste into issue trackers, so a value the state file
-guards behind `umask 077` was being published by the log line that described it.
-
-Seven sites carried it, not five: the five reconcile branches, plus the
-descriptions `apply` and `apply-manual` hand to the shared attempt logger. They
-are now masked to the last four characters — the one masking convention this
-project already has, the same `maskedIdentifier` the LuCI page renders and the
-same four digits the eSIM contract publishes as `iccid_suffix`, so a log line
-and the page name a SIM the same way. The full value still goes to the
-root-only state file that needs it, and `detect` still prints it on request.
-
-The audit that followed found the same shape elsewhere and fixed it: a
-`modem_id` is a deliberate stable targeting key and stays whole in UCI,
-`targets-json` and the inventory, but sixteen reset messages, the AT-dial
-handler's three rebinding notices and the ModemManager inhibitor were putting a
-full IMEI or USB serial into syslog for no diagnostic gain. Those keep their
-tier prefix and lose the digits — `imei:…4885` — which is still enough to match
-a line against the id you targeted. `weak-vidpid:` ids are a bus path and a
-VID:PID rather than a per-device identifier and pass through unchanged.
-
-The regression test scans the whole log of a run rather than one expected line,
-and drives every reconcile branch plus both apply descriptions, because the
-identifier is interpolated separately in each. The AT-dial suite has carried a
-test under almost this name since 0.13.0; it could never have caught these,
-because it drives the netifd protocol handler, which has no reconcile path, and
-its loop scans for two credentials and no SIM identifier at all.
+The optional eSIM packages are `apn-autoconfig-esim` 0.16.0 and the pinned
+`apn-autoconfig-lpac` 2.3.0 runtime. Provider data remains independently
+versioned at 2026.08.24. Available operations depend on the modem, active slot,
+control owner and the capabilities the router can verify.
 
 ## apn-autoconfig 0.15.3 / apn-autoconfig-modem 0.15.3 / apn-autoconfig-proto-atdial 0.15.3 / apn-autoconfig-providers 2026.08.24 / luci-app-apn-autoconfig 0.15.3 (2026-08-25)
 

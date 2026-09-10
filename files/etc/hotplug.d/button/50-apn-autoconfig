@@ -15,9 +15,39 @@ autoconfig_bin="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 	exit 1
 }
 
-launch_result="$("$autoconfig_bin" action-start modem-reset </dev/null 2>/dev/null)" || {
+# Which modem this button resets, where the administrator has said. A router
+# with one managed target needs nothing here and behaves as it always has; a
+# router with several must say, because otherwise the choice falls to whatever
+# the engine's enumeration returned first and a press disrupts a modem nobody
+# picked. The engine refuses that case rather than guessing, and this is how
+# the answer is given.
+button_target="$(uci -q get apn-autoconfig.main.button_target)"
+case "$button_target" in
+	'') : ;;
+	network:*[!A-Za-z0-9_]*|network:)
+		logger -t apn-autoconfig-button -p user.err -- \
+			"button_target is not a usable target name; ignoring it" 2>/dev/null || :
+		button_target=""
+	;;
+	network:*) : ;;
+	*)
+		logger -t apn-autoconfig-button -p user.err -- \
+			"button_target must name a target as network:<section>; ignoring it" 2>/dev/null || :
+		button_target=""
+	;;
+esac
+
+if [ -n "$button_target" ]; then
+	launch_result="$("$autoconfig_bin" action-start modem-reset --target "$button_target" \
+		</dev/null 2>/dev/null)" || launch_failed=1
+else
+	launch_result="$("$autoconfig_bin" action-start modem-reset </dev/null 2>/dev/null)" || launch_failed=1
+fi
+[ "${launch_failed:-0}" = 0 ] || {
+	# The likely cause on a router with more than one managed target, and the
+	# one a person can act on: nobody has said which modem the button is for.
 	logger -t apn-autoconfig-button -p user.err -- \
-		"failed to enqueue modem reset and APN reconciliation" 2>/dev/null || :
+		"failed to enqueue modem reset and APN reconciliation; if this router has several mobile connections, set apn-autoconfig.main.button_target to the one this button should reset" 2>/dev/null || :
 	exit 1
 }
 

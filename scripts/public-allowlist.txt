@@ -22,6 +22,7 @@ apn-autoconfig-modem/files/
 apn-autoconfig-modem/LICENSE
 apn-autoconfig-esim/Makefile
 apn-autoconfig-esim/files/
+apn-autoconfig-esim/mbedtls/
 apn-autoconfig-esim/LICENSE
 apn-autoconfig-proto-atdial/Makefile
 apn-autoconfig-proto-atdial/files/

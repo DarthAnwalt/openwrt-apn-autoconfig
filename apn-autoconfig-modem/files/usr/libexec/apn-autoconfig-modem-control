@@ -2,22 +2,54 @@
 
 # Narrow mutating entry point for rpcd/LuCI ACLs.
 #
-# Every verb is a fixed background action on one validated modem identity.
+# Every verb but one is a fixed background action on one validated modem
+# identity; `sim-slots-probe` is synchronous and bounded, and says why below.
 # LuCI never receives the general-purpose CLI, and nothing here accepts a
 # section name, a device path or a profile field: those are resolved by the
 # coordinator from the modem identity alone.
 
 COMMAND="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
 MODEM_ID="${2:-}"
-[ "$#" -le 2 ] || exit 2
+SLOT="${3:-}"
+[ "$#" -le 3 ] || exit 2
 
 case "$MODEM_ID" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
 [ "${#MODEM_ID}" -le 200 ] || exit 2
 
 case "${1:-}" in
-	reset|provision|deprovision|connect|disconnect|reconnect)
+	reset|provision|adopt|deprovision|release-adoption|connect|disconnect|reconnect)
 		[ -n "$MODEM_ID" ] || exit 2
+		[ -z "$SLOT" ] || exit 2
 		exec "$COMMAND" action-start "$1" --modem "$MODEM_ID"
+	;;
+	sim-slots-probe)
+		# The one verb here that is not a background action, and it is here
+		# rather than beside the reads because it opens the modem's command
+		# port and asks it something. Discovery never does that -- deliberately
+		# -- so on a modem whose owner does not publish a slot table there is
+		# nothing to show until somebody asks, and this is the asking.
+		#
+		# The coordinator refuses it for a ModemManager-owned modem, whose
+		# table comes from the daemon and is never missing this way.
+		#
+		# The reply is the ordinary status document, not the probe's own
+		# record: what the question changes is the table the next read serves,
+		# so the useful answer is that read. A probe that could not ask still
+		# answers, and the document then says the slots are unknown.
+		[ -n "$MODEM_ID" ] || exit 2
+		[ -z "$SLOT" ] || exit 2
+		"$COMMAND" sim-slots --modem "$MODEM_ID" --probe >/dev/null 2>&1 || :
+		exec "$COMMAND" status-json --modem "$MODEM_ID"
+	;;
+	slot-switch)
+		# A slot number, and nothing that could be mistaken for one. Zero is
+		# not a slot: this project counts them from one, as ModemManager does,
+		# and the vendor dialects convert.
+		[ -n "$MODEM_ID" ] || exit 2
+		case "$SLOT" in ''|*[!0-9]*) exit 2 ;; esac
+		[ "$SLOT" != 0 ] || exit 2
+		[ "${#SLOT}" -le 2 ] || exit 2
+		exec "$COMMAND" action-start slot-switch --modem "$MODEM_ID" --slot "$SLOT"
 	;;
 	*) exit 2 ;;
 esac

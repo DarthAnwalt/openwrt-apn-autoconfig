@@ -5,7 +5,7 @@ AUTOCONFIG_BIN="${APN_AUTOCONFIG_BIN:-/usr/sbin/apn-autoconfig}"
 CHILD_PID=""
 
 on_signal() {
-	trap - HUP INT TERM
+	trap '' HUP INT TERM
 	if [ -n "$CHILD_PID" ]; then
 		kill -TERM "$CHILD_PID" 2>/dev/null || :
 		wait "$CHILD_PID" 2>/dev/null || :

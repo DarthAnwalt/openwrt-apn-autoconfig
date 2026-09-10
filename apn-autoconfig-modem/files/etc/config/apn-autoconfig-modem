@@ -10,6 +10,10 @@ config apn_autoconfig_modem 'main'
 	# for the current USB enumeration, so an identical replacement in the same
 	# socket cannot inherit it.
 	option identity_dir '/etc/apn-autoconfig-modem/identity'
+	# Exact pre-adoption network option baselines. They make an explicit
+	# takeover reversible and are deliberately persistent across reboot and
+	# package upgrades.
+	option adoption_dir '/etc/apn-autoconfig-modem/adoption'
 	option lock_root '/var/lock/apn-autoconfig-modem'
 	option action_state_dir '/tmp/apn-autoconfig-modem-action'
 	option hotplug_coalesce_seconds '3'
@@ -60,6 +64,17 @@ config apn_autoconfig_modem 'main'
 	# the default one. Empty restores netifd's own default of 0. The same
 	# default is compiled in, so an upgraded installation gets it too.
 	option provision_metric '1024'
+	# How long one read-only inventory scan may be reused by a *display* read
+	# made by another process — the LuCI page and the read-only verbs of
+	# apn-autoconfig, which ask for it explicitly and are the only callers that
+	# can. Nothing that writes can ever be answered from it, a change to the USB
+	# devices it describes retires it whatever the clock says, and every
+	# mutating command retires it before and after its work.
+	#
+	# Five seconds covers one page load, whose first and last reads are about
+	# 3.4 s apart on the reference router. Zero disables the cache and makes
+	# every read scan, which is what every release before 0.16.0 did.
+	option scan_cache_seconds '5'
 	# Reset stays unavailable until the administrator pins the strong modem_id
 	# of the internal modem controlled by the board GPIO.
 	option reset_modem_id ''

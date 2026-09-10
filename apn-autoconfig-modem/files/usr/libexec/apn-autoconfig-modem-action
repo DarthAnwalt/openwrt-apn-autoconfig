@@ -11,16 +11,76 @@ STARTED="${3:-}"
 MODEM_ID="${4:-}"
 OPERATION_ID="${5:-}"
 START_LOCK="${6:-}"
+SLOT="${7:-}"
 COMMAND="${APN_AUTOCONFIG_MODEM_ACTION_COMMAND:-/usr/sbin/apn-autoconfig-modem}"
 STATE_FILE="$STATE_DIR/state.tsv"
 CHILD_PID=""
 
-case "$ACTION" in reset|provision|deprovision|connect|disconnect|reconnect) : ;; *) exit 2 ;; esac
+case "$ACTION" in reset|provision|adopt|deprovision|release-adoption|connect|disconnect|reconnect|slot-switch) : ;; *) exit 2 ;; esac
+# A slot number reaches exactly the action that changes a slot, and only as a
+# validated integer. Everything else is refused before a command is built.
+case "$ACTION:$SLOT" in
+	slot-switch:*[!0-9]*|slot-switch:) exit 2 ;;
+	slot-switch:*) : ;;
+	*:) : ;;
+	*) exit 2 ;;
+esac
 case "$STATE_DIR" in /|*/../*|*/..) exit 2 ;; /*) : ;; *) exit 2 ;; esac
 [ -n "$MODEM_ID" ] || exit 2
 case "$OPERATION_ID" in ''|*[!A-Za-z0-9_.:-]*) exit 2 ;; esac
 case "$START_LOCK" in /tmp/?*.start-lock) : ;; *) exit 2 ;; esac
 case "$START_LOCK" in */../*|*/..) exit 2 ;; esac
+
+# The setsid supervisor never opens a modem tty. Its child is not a session
+# leader, so opening a modem cannot acquire it as a controlling terminal.
+# Hand off the real child's PID atomically before that child starts card work.
+if [ "${APN_AUTOCONFIG_JOB_DETACHED:-}" = launch ]; then
+	if [ -r "/proc/$$/stat" ]; then
+		IFS= read -r session_stat <"/proc/$$/stat" || exit 3
+		session_stat="${session_stat##*) }"
+		session_ids="$(printf '%s\n' "$session_stat" | awk '{print $3 ":" $4}')"
+		[ "$session_ids" = "$$:$$" ] || exit 3
+	else
+		[ "$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" = "$$" ] || exit 3
+	fi
+	case "$START_LOCK" in /*.start-lock) : ;; *) exit 2 ;; esac
+	case "$START_LOCK" in */../*|*/..|*[[:space:]]*) exit 2 ;; esac
+	APN_AUTOCONFIG_JOB_DETACHED=1
+	export APN_AUTOCONFIG_JOB_DETACHED
+	/bin/sh "$0" "$@" </dev/null &
+	detached_pid=$!
+	handoff_tmp="${START_LOCK}.own.$$"
+	if ! (umask 077 && printf '%s\n' "$detached_pid" >"$handoff_tmp") || \
+		! mv "$handoff_tmp" "$START_LOCK"; then
+		kill -TERM "$detached_pid" 2>/dev/null || :
+		rm -f "$handoff_tmp"
+		exit 3
+	fi
+	exit 0
+fi
+
+
+# Do not publish or run a command before the supervisor has handed us the
+# lock. Otherwise a very short job can remove it before the supervisor writes
+# its PID, leaving a stale lock after a successful operation. The target's
+# BusyBox sleep accepts whole seconds only, so this second half of the handoff
+# uses the same five-second bound and pacing as the launcher.
+wait_start_lock_handoff() {
+	handoff_pid="$1"
+	handoff_lock="$2"
+	handoff_waited=0
+	while [ "$(cat "$handoff_lock" 2>/dev/null)" != "$handoff_pid" ]; do
+		[ "$handoff_waited" -lt 5 ] || return 1
+		"${APN_AUTOCONFIG_JOB_SLEEP:-sleep}" 1 2>/dev/null || return 1
+		handoff_waited=$((handoff_waited + 1))
+	done
+	return 0
+}
+
+if [ "${APN_AUTOCONFIG_JOB_DETACHED:-}" = 1 ]; then
+	wait_start_lock_handoff "$$" "$START_LOCK" || exit 3
+fi
+unset APN_AUTOCONFIG_JOB_DETACHED
 
 timestamp() {
 	date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date
@@ -30,11 +90,33 @@ sanitize() {
 	printf '%s' "$*" | tr '\t\r\n' '   '
 }
 
+# The same masking the coordinator applies, because this worker logs the modem
+# it was handed and a log is a log wherever it is written. Kept as its own copy
+# rather than sourced: this script is deliberately standalone, and a worker that
+# cannot start because a library moved is worse than a duplicated four-liner.
+mask_modem_id() {
+	mask_value="${1:-}"
+	case "$mask_value" in
+		imei:*|usb-serial:*)
+			mask_prefix="${mask_value%%:*}"
+			mask_rest="${mask_value#*:}"
+			if [ "${#mask_rest}" -le 4 ]; then
+				printf '%s:...' "$mask_prefix"
+			else
+				printf '%s:...%s' "$mask_prefix" "${mask_rest#"${mask_rest%????}"}"
+			fi
+		;;
+		'') printf '<unknown>' ;;
+		*) printf '%s' "$mask_value" ;;
+	esac
+}
+
 # The launcher hands this worker the start lock (a regular file holding the
 # owner PID) so action-status can still see a live owner between the
 # launcher's exit and the first "running" record written below.
 cleanup_start_lock() {
-	rm -f "$START_LOCK" 2>/dev/null || :
+	[ "$(cat "$START_LOCK" 2>/dev/null)" != "$$" ] || \
+		rm -f "$START_LOCK" 2>/dev/null || :
 }
 
 trap cleanup_start_lock 0
@@ -53,7 +135,7 @@ write_state() {
 }
 
 on_signal() {
-	trap - HUP INT TERM
+	trap '' HUP INT TERM
 	if [ -n "$CHILD_PID" ]; then
 		kill -TERM "$CHILD_PID" 2>/dev/null || :
 		wait "$CHILD_PID" 2>/dev/null || :
@@ -73,8 +155,18 @@ trap on_signal HUP INT TERM
 }
 
 write_state running "" "operation is running"
-logger -t "$PROG" -p user.notice -- "starting background operation: $ACTION for $MODEM_ID" 2>/dev/null || :
-"$COMMAND" "$ACTION" --modem "$MODEM_ID" &
+logger -t "$PROG" -p user.notice -- "starting background operation: $ACTION for $(mask_modem_id "$MODEM_ID")" 2>/dev/null || :
+# The command appends the stages it completes here; this worker stays the only
+# writer of state.tsv. Truncated first, so one operation never reports the
+# stages of the one before it.
+APN_AUTOCONFIG_MODEM_STAGE_FILE="$STATE_DIR/stages"
+: >"$APN_AUTOCONFIG_MODEM_STAGE_FILE" 2>/dev/null || :
+export APN_AUTOCONFIG_MODEM_STAGE_FILE
+if [ "$ACTION" = slot-switch ]; then
+	"$COMMAND" "$ACTION" --modem "$MODEM_ID" --slot "$SLOT" &
+else
+	"$COMMAND" "$ACTION" --modem "$MODEM_ID" &
+fi
 CHILD_PID=$!
 status=0
 wait "$CHILD_PID" || status=$?

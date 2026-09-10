@@ -1,0 +1,33 @@
+jsQR — QR decoding for the eSIM activation-code form
+
+Carried here rather than fetched, because the router this runs on has no
+internet by definition: it is the thing being configured, and the page may be
+open before any connection exists. Nothing about this file is loaded from a
+network at any point.
+
+  name       jsQR
+  version    1.4.0
+  licence    Apache-2.0 (see jsQR.LICENSE beside this file)
+  upstream   https://github.com/cozmo/jsQR
+  obtained   https://registry.npmjs.org/jsqr/-/jsqr-1.4.0.tgz
+  file       package/dist/jsQR.js from that tarball, byte for byte
+
+Hashes of the tarball, which are the ones the registry publishes and which
+were checked against it before anything was copied here, on 2026-09-04:
+
+  sha1       8efb8d0a7cc6863cb6d95116b9069123ce9eb2d1
+  sha512     dxLob7q65Xg2DvstYkRpkYtmKm2sPJ9oFhrhmudT1dZvNFFTlroai3AWSpLey/w5vMcLBXRgOJsbXpdN9HzU/A==
+
+Hashes of the two files as they sit here, so each can be checked on its own
+without fetching the tarball again:
+
+  jsQR.js       sha256 bc40c8a15196236b2314db0856f72ca0b49980cd5413b8c852a7349f5fee0859
+  jsQR.LICENSE  sha256 c6596eb7be8581c18be736c846fb9173b69eccf6ef94c5135893ec56bd92ba08
+
+It is **not modified**. Not minified, not reformatted, not repackaged: an
+audit of this file is an audit of the published artifact, and any edit of ours
+would make the two impossible to compare. It carries no source map reference,
+so nothing 404s when a browser opens it.
+
+It is loaded only when somebody chooses a picture to read a code from, never
+on page load. See `qrDecoderPromise` in the view.

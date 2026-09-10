@@ -24,11 +24,18 @@ SYSFS_ROOT="${APN_AUTOCONFIG_MODEM_SYSFS_ROOT:-/sys}"
 STATE_DIR="/var/run/apn-autoconfig-modem"
 # Identity evidence outlives the boot that learned it; see at_identity_dir.
 IDENTITY_DIR="/etc/apn-autoconfig-modem/identity"
+# Baselines for interfaces the user created and explicitly handed to this
+# package. Unlike volatile provisioning journals, these must survive reboot and
+# package upgrades so "stop managing" can restore the exact pre-adoption state.
+ADOPTION_DIR="/etc/apn-autoconfig-modem/adoption"
 LOCK_ROOT="/var/lock/apn-autoconfig-modem"
 APN_LOCK_DIR="/var/lock/apn-autoconfig.lock"
 ACTION_STATE_DIR="/tmp/apn-autoconfig-modem-action"
 QMI_IDENTITY_LOCK_ROOT="/var/lock/apn-autoconfig-qmi-identity"
 ACTION_WORKER="${APN_AUTOCONFIG_MODEM_ACTION_WORKER:-/usr/libexec/apn-autoconfig-modem-action}"
+SETSID="${APN_AUTOCONFIG_SETSID:-setsid}"
+JOB_SLEEP="${APN_AUTOCONFIG_JOB_SLEEP:-sleep}"
+SHA256="${APN_AUTOCONFIG_MODEM_SHA256:-sha256sum}"
 HOTPLUG_COALESCE_SECONDS="3"
 MODEM_POWER_PATH="/sys/class/gpio/modem_power/value"
 MODEM_POWER_OFF_VALUE="1"
@@ -47,6 +54,10 @@ MODEM_WAIT_SECONDS="90"
 MODEM_DEPART_SECONDS="90"
 MODEM_POLL_SECONDS="2"
 CONNECT_WAIT_SECONDS="60"
+# The bound on asking ModemManager to change its own primary slot. Named because
+# the plan publishes it: a number a user consents to may not be a literal buried
+# in the call it bounds.
+SLOT_SWITCH_MM_SECONDS="30"
 # Convergence bounds. Every one of these is waited out through $SLEEP, which the
 # fixtures can replace with a real sleep so a bound is proved in both
 # directions: an upper bound alone passes in zero seconds.
@@ -71,9 +82,19 @@ PROVISION_METRIC="1024"
 HARDWARE_INTEGRATION_FILE="/usr/share/apn-autoconfig/integrations/huasifei-wh3000"
 QUIRK_TABLE="/usr/share/apn-autoconfig-modem/quirks"
 RESET_MODEM_ID=""
+# How long one inventory scan may be served to a *display* read made by another
+# process. Zero disables the cache entirely and every read scans, which is the
+# behaviour of every release before 0.16.0.
+#
+# Five seconds is chosen from the measurement in
+# docs/work-items/P7-the-page-a-user-waits-for.md: one LuCI page load issues its
+# level-0 inventory and its level-1 per-target status about 3.4 s apart, so one
+# window covers one page and no more. It is deliberately far shorter than any
+# interval at which a human changes hardware, and a change to the hardware
+# invalidates the entry regardless of the clock -- see scan_cache_try_serve.
+SCAN_CACHE_SECONDS="5"
 
 UQMI="${APN_AUTOCONFIG_MODEM_UQMI:-uqmi}"
-TIMEOUT="${APN_AUTOCONFIG_MODEM_TIMEOUT:-timeout}"
 MMCLI="${APN_AUTOCONFIG_MODEM_MMCLI:-mmcli}"
 SMS_TOOL="${APN_AUTOCONFIG_MODEM_SMS_TOOL:-sms_tool}"
 # Only the bounded watchdog uses this, and only so the fixtures can give that
@@ -96,7 +117,20 @@ AT_LOCK_WAIT_SECONDS="${APN_AUTOCONFIG_AT_LOCK_WAIT_SECONDS:-15}"
 
 COMMAND_NAME=""
 REQUESTED_MODEM=""
+# Whether this read may ask a modem a question. Off by default and set by one
+# flag on one verb: discovery never probes, and the page polls discovery.
+REQUESTED_PROBE=0
+REQUESTED_SLOT=""
+# Whether this slot change reconciles the APN it invalidates. It does by
+# default; a caller that drives its own convergence and reports it in its own
+# vocabulary turns it off.
+REQUESTED_NO_CONVERGE=0
 REQUESTED_INTERFACE=""
+# Whether this read may be answered from a recent scan another process already
+# paid for. Off by default, accepted by three read verbs only, and never set by
+# anything that can write. It is a caller's statement about *why* it is reading
+# -- "I am drawing a page" -- not a statement about the hardware.
+REQUESTED_CACHED_SCAN=0
 # Scratch paths are fixed here rather than inside scan_inventory, because that
 # function is often reached through a command substitution: the assignment would
 # then live only in the subshell, the parent's exit trap would see an empty
@@ -113,6 +147,7 @@ CANDIDATES_FILE="$TMP_BASE.candidates"
 AT_OUTPUT_FILE="$TMP_BASE.at-output"
 AT_CANDIDATES_FILE="$TMP_BASE.at-candidates"
 BOUNDED_TIMEOUT_MARKER="$TMP_BASE.bounded-timeout"
+BEARER_STATE_FILE="$TMP_BASE.bearer-state"
 # Which modem_ids gained an attachment generation during *this* process's scan.
 # Per-process, so nothing another command does can truncate it — but on its own
 # it is not enough to decide what to converge, because the process that sees a
@@ -127,7 +162,7 @@ CONVERGE_PLAN_FILE="$TMP_BASE.converge-plan"
 # names. A suffix added to only one of the two leaks again. The four derived
 # from INVENTORY_FILE are here for the same reason as the eight base paths: the
 # sweep sees names, not variables.
-TMP_SUFFIXES="inventory inventory.display inventory.merged inventory.dupes inventory.weak-dupes mm-usb-paths mm-indexes mm-identity mm-slots candidates at-output at-candidates bounded-timeout attachment-changed converge-plan"
+TMP_SUFFIXES="bearer-state inventory inventory.display inventory.merged inventory.dupes inventory.weak-dupes mm-usb-paths mm-indexes mm-identity mm-slots candidates at-output at-candidates bounded-timeout attachment-changed converge-plan"
 MM_DISCOVERY_UNCERTAIN=0
 # One scan's correlation of class devices to physical USB devices. Every
 # candidate needs the same two answers — which netdev and which tty belong to
@@ -154,6 +189,20 @@ NETWORK_UCI_SNAPSHOT=""
 NETWORK_UCI_SECTIONS=""
 NETWORK_UCI_SNAPSHOT_ACTIVE=0
 
+# The cross-process, display-only inventory scan cache. See the block above
+# scan_cache_try_serve for the whole argument; the short version is that
+# SCAN_CACHE_ALLOWED is 1 only for a read verb that was *explicitly* told by its
+# caller that it is drawing a page, so no mutating path in this process or any
+# other can reach a cached record.
+SCAN_CACHE_FILE=""
+SCAN_CACHE_ALLOWED=0
+SCAN_CACHE_INVALIDATE_ARMED=0
+SCAN_CACHE_SERVED=0
+SCAN_CACHE_TMP=""
+SCAN_CACHE_NODES=""
+SCAN_CACHE_DEVS=""
+SCAN_CACHE_ATTR=""
+
 LOCK_HELD=0
 LOCK_PATH=""
 APN_LOCK_HELD=0
@@ -166,6 +215,9 @@ PROVISION_CREATED_SECTION=""
 PROVISION_CREATED_ZONE=""
 PROVISION_BASELINE_FILE=""
 PROVISION_CHILD_PID=""
+ADOPTION_ROLLBACK_ARMED=0
+ADOPTION_ROLLBACK_SECTION=""
+ADOPTION_ROLLBACK_BASELINE=""
 REQUESTED_AUTOCONNECT=1
 BOUNDED_CHILD_PID=""
 BOUNDED_WATCHDOG_PID=""
@@ -244,32 +296,43 @@ command_exists() {
 	command -v "$1" >/dev/null 2>&1
 }
 
-cleanup_files() {
+stop_bounded_command() {
+	# Stop transport access before any profile/interface restoration. Retain the
+	# watchdog until its child has been reaped, including a TERM-resistant child.
+	if [ -n "$BOUNDED_CHILD_PID" ]; then
+		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		"$SLEEP" 1
+		kill -KILL "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
+		BOUNDED_CHILD_PID=""
+	fi
 	if [ -n "$BOUNDED_WATCHDOG_PID" ]; then
 		kill -TERM "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 		wait "$BOUNDED_WATCHDOG_PID" 2>/dev/null || :
 		BOUNDED_WATCHDOG_PID=""
 	fi
-	if [ -n "$BOUNDED_CHILD_PID" ]; then
-		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || :
-		wait "$BOUNDED_CHILD_PID" 2>/dev/null || :
-		BOUNDED_CHILD_PID=""
-	fi
+}
+
+cleanup_files() {
+	stop_bounded_command
 	if [ "$MODEM_POWER_OFF_ARMED" -eq 1 ]; then
 		write_modem_power "$MODEM_POWER_ON_VALUE" || \
 			log err "failed to restore modem power during cleanup"
 		MODEM_POWER_OFF_ARMED=0
-	fi
-	if [ "$RESET_INTERFACE_RESTORE_ARMED" -eq 1 ] && [ -n "$RESET_INTERFACE" ]; then
-		ifup "$RESET_INTERFACE" >/dev/null 2>&1 || \
-			log err "failed to restart interface $RESET_INTERFACE during cleanup"
-		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
 	if [ -n "$PROVISION_CHILD_PID" ]; then
 		kill -TERM "$PROVISION_CHILD_PID" 2>/dev/null || :
 		wait "$PROVISION_CHILD_PID" 2>/dev/null || :
 		PROVISION_CHILD_PID=""
 	fi
+	if [ "$RESET_INTERFACE_RESTORE_ARMED" -eq 1 ] && [ -n "$RESET_INTERFACE" ]; then
+		run_bounded_to_file 30 /dev/null ifup "$RESET_INTERFACE" >/dev/null 2>&1 || \
+			log err "failed to restart interface $RESET_INTERFACE during cleanup"
+		RESET_INTERFACE_RESTORE_ARMED=0
+	fi
+	# Unwind adoption before the locks are released, so no other operation can
+	# observe ownership markers without their durable restoration baseline.
+	adoption_rollback
 	# Unwind provisioning before the locks are released, so no other operation
 	# can observe a half-created staging section.
 	provisioning_rollback
@@ -286,6 +349,27 @@ cleanup_files() {
 	for tmp_suffix in $TMP_SUFFIXES; do
 		rm -f "$TMP_BASE.$tmp_suffix"
 	done
+	# The scan cache lives outside TMP_DIR, so it needs its own two lines here.
+	#
+	# The half-written publication temporary goes by its exact name rather than
+	# through SCAN_CACHE_TMP, because scan_inventory is reached through a command
+	# substitution on several paths: the assignment can live only in a subshell,
+	# which is the defect that leaked scratch files in 0.13.2 wearing new
+	# clothes. `$$` is this shell's PID inside such a subshell too, so the name
+	# is the same whoever wrote it.
+	#
+	# The entry itself is retired only when this command armed it. That is what
+	# makes a mutation interrupted by HUP, INT, TERM or PIPE leave behind no
+	# display read describing the router as it was before the mutation started,
+	# and it happens before the locks below are released, so a waiter that
+	# acquires one immediately afterwards cannot find the old answer.
+	SCAN_CACHE_TMP=""
+	if [ -n "$SCAN_CACHE_FILE" ]; then
+		rm -f "${SCAN_CACHE_FILE%/*}/.scan.$$" 2>/dev/null || :
+	fi
+	if [ "$SCAN_CACHE_INVALIDATE_ARMED" -eq 1 ]; then
+		scan_cache_invalidate
+	fi
 	# The AT port lock is the innermost level, so it is released before the
 	# per-modem and global locks below.
 	if [ "$AT_PORT_LOCK_HELD" -eq 1 ] && [ -n "$AT_PORT_LOCK_PATH" ]; then
@@ -347,14 +431,30 @@ sweep_dead_scratch_files() {
 		log notice "removed $sweep_count scratch file(s) left by an interrupted earlier run"
 }
 
+# An asynchronous subshell can receive a signal before resetting inherited
+# traps. Its $$ still names this operation, but it owns none of our resources.
+# Read procfs with the shell builtin: an external cat would identify cat itself.
+cleanup_owner_is_current() {
+	if [ -r /proc/self/stat ]; then
+		IFS=' ' read -r cleanup_current_pid cleanup_stat_rest </proc/self/stat || return 1
+		[ "$cleanup_current_pid" = "$$" ]
+		return $?
+	fi
+	# Development on macOS uses bash, including the system version without
+	# BASHPID. Deployment always uses the Linux procfs check above.
+	[ "${BASH_SUBSHELL:-0}" -eq 0 ]
+}
+
 on_exit() {
 	on_exit_status=$?
-	trap - 0 HUP INT TERM
+	trap - 0
+	trap '' HUP INT TERM
 	# PIPE is ignored rather than restored for the duration of the cleanup: the
 	# reader that went away may have been reading stderr too, and a reset that
 	# logs its way back through modem power-on, ifup and provisioning rollback
 	# must not be killed halfway by a second SIGPIPE.
 	trap '' PIPE
+	cleanup_owner_is_current || exit "$on_exit_status"
 	cleanup_files
 	exit "$on_exit_status"
 }
@@ -387,6 +487,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.sysfs_root")" && [ -n "$value" ] && SYSFS_ROOT="$value"
 	value="$(uci -q get "${CONFIG}.main.state_dir")" && [ -n "$value" ] && STATE_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.identity_dir")" && [ -n "$value" ] && IDENTITY_DIR="$value"
+	value="$(uci -q get "${CONFIG}.main.adoption_dir")" && [ -n "$value" ] && ADOPTION_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.lock_root")" && [ -n "$value" ] && LOCK_ROOT="$value"
 	value="$(uci -q get apn-autoconfig.main.lock_dir)" && [ -n "$value" ] && APN_LOCK_DIR="$value"
 	value="$(uci -q get "${CONFIG}.main.action_state_dir")" && [ -n "$value" ] && ACTION_STATE_DIR="$value"
@@ -421,6 +522,7 @@ load_config() {
 	value="$(uci -q get "${CONFIG}.main.quirk_table")" && [ -n "$value" ] && QUIRK_TABLE="$value"
 	value="$(uci -q get "${CONFIG}.main.reset_modem_id")" && RESET_MODEM_ID="$value"
 	value="$(uci -q get "${CONFIG}.main.provision_metric")" && PROVISION_METRIC="$value"
+	value="$(uci -q get "${CONFIG}.main.scan_cache_seconds")" && [ -n "$value" ] && SCAN_CACHE_SECONDS="$value"
 }
 
 hardware_integration_name() {
@@ -433,6 +535,7 @@ validate_config() {
 	case "$SYSFS_ROOT" in /|*/../*|*/..) die "unsafe sysfs_root" ;; /*) : ;; *) die "sysfs_root must be absolute" ;; esac
 	case "$STATE_DIR" in /|*/../*|*/..) die "unsafe state_dir" ;; /*) : ;; *) die "state_dir must be absolute" ;; esac
 	case "$IDENTITY_DIR" in /|*/../*|*/..) die "unsafe identity_dir" ;; /*) : ;; *) die "identity_dir must be absolute" ;; esac
+	case "$ADOPTION_DIR" in /|*/../*|*/..) die "unsafe adoption_dir" ;; /*) : ;; *) die "adoption_dir must be absolute" ;; esac
 	case "$LOCK_ROOT" in /|*/../*|*/..) die "unsafe lock_root" ;; /*) : ;; *) die "lock_root must be absolute" ;; esac
 	case "$APN_LOCK_DIR" in /|*/../*|*/..) die "unsafe APN lock_dir" ;; /*) : ;; *) die "APN lock_dir must be absolute" ;; esac
 	case "$ACTION_STATE_DIR" in /tmp/?*) : ;; *) die "action_state_dir must be a child of /tmp" ;; esac
@@ -464,6 +567,11 @@ validate_config() {
 	[ "$CONVERGE_ATTEMPTS" -gt 0 ] || die "converge_attempts must be greater than zero"
 	[ "$CONVERGE_RESULT_WAIT_SECONDS" -gt 0 ] || die "converge_result_wait_seconds must be greater than zero"
 	case "$PROVISION_METRIC" in ''|*[!0-9]*) [ -z "$PROVISION_METRIC" ] || die "provision_metric must be numeric" ;; esac
+	# Zero is legitimate and means "never serve a display read from another
+	# process's scan". There is no upper bound to enforce here: the window only
+	# governs how long a *quiet* router may reuse an answer, and any change to
+	# the hardware retires the entry whatever the number says.
+	case "$SCAN_CACHE_SECONDS" in ''|*[!0-9]*) die "scan_cache_seconds must be a non-negative integer" ;; esac
 	if [ -n "$RESET_MODEM_ID" ]; then
 		safe_token "$RESET_MODEM_ID" || die "reset_modem_id contains unsafe characters"
 		case "$RESET_MODEM_ID" in usb-serial:*|imei:*) : ;; *) die "reset_modem_id must use strong usb-serial or imei evidence" ;; esac
@@ -960,17 +1068,8 @@ run_bounded_to_file() {
 	output_file="$2"
 	shift 2
 	BOUNDED_TIMED_OUT=0
-	if command_exists "$TIMEOUT"; then
-		bounded_status=0
-		"$TIMEOUT" "$seconds" "$@" >"$output_file" 2>/dev/null || bounded_status=$?
-		[ "$bounded_status" -ne 124 ] || BOUNDED_TIMED_OUT=1
-		return "$bounded_status"
-	fi
-	# This branch is not a fallback for exotic minimal images. The reference
-	# router has no `timeout` executable at all, so it is the branch that
-	# actually runs there — including for the QMI adapter's AT fallback that is
-	# already marked hardware-validated. It gets the same care as the other one.
-	#
+	# Always track the actual child so cleanup can bound even a TERM-resistant
+	# command on systems with or without an external timeout utility.
 	# The timeout is carried by a marker file rather than by the child's exit
 	# status, because a child killed by the watchdog reports 143 exactly like a
 	# child killed by an external TERM. Callers that must tell "this port is not
@@ -984,12 +1083,25 @@ run_bounded_to_file() {
 	# running to the end of the budget, one stray process per bounded call.
 	(
 		watchdog_sleep_pid=""
-		trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		# `$!` rather than the recorded PID alone. `$!` is set when the sleep is
+		# forked, so it names the sleep one command before the assignment does,
+		# and a TERM arriving in between would otherwise find the variable empty,
+		# kill nothing, and leave the sleep to run out the whole budget as an
+		# orphan -- one per bounded call, on an image where this is the branch
+		# every call takes. Linux CI caught that; this suite, on a shell that
+		# schedules the two differently, never did.
+		#
+		# Before the first fork `$!` still names the caller's own child, which
+		# this must never kill, so it is compared rather than trusted. The
+		# variable is cleared before each fork so the second sleep is covered by
+		# the same reasoning as the first.
+		trap 'watchdog_target="${watchdog_sleep_pid:-$!}"; [ "$watchdog_target" = "$BOUNDED_CHILD_PID" ] || kill -TERM "$watchdog_target" 2>/dev/null; exit 0' TERM
 		"$SLEEP" "$seconds" &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
 		: >"$BOUNDED_TIMEOUT_MARKER" 2>/dev/null || :
 		kill -TERM "$BOUNDED_CHILD_PID" 2>/dev/null || exit 0
+		watchdog_sleep_pid=""
 		"$SLEEP" 1 &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
@@ -1385,6 +1497,111 @@ at_probe_port() {
 # the environment, the GUI or another caller. See docs/backend-contract-v1.md
 # for the field mapping and why operator_id is deliberately left empty.
 
+# ---- slots a modem knows about and ModemManager does not ----
+#
+# ModemManager is the only slot source this package had, so a modem it does not
+# own -- direct QMI, direct MBIM, or one that speaks only AT -- published no slot
+# table at all. That is not a modem with one slot; it is a modem nobody asked,
+# and it left the eSIM feature with nothing to offer a slot change against.
+#
+# The commands are vendor-specific and therefore live in the quirk table, which
+# names a *dialect* rather than a command string: the shapes of the query, the
+# range and the switch differ together, and three separate table keys would let
+# them be mixed. An absent entry means "not tested here" and gets nothing.
+#
+# Read only when a caller asks for it. Discovery never probes -- that rule is
+# older than this and the page that polls discovery is fork-bound -- so the
+# answer is cached against the current enumeration and the query happens on an
+# explicit `sim-slots --probe`.
+at_slot_table_file() {
+	printf '%s/slots.%s\n' "$(at_cache_dir)" "$1"
+}
+
+# `+GTDUALSIM : 0, "SUB1", "NR"` and `+GTDUALSIM: (0-1)` on the reference
+# FM350-GL, observed 2026-08-30. Note the space before the colon in the query
+# reply and its absence in the range reply: the parser matches the prefix and
+# then takes numbers, rather than matching a fixed string.
+#
+# The vendor's slots are numbered from zero and everything above this counts
+# from one, as ModemManager does. The dialect owns that mapping; nothing else
+# should know about it.
+at_read_slot_table_gtdualsim() {
+	slot_read_device="$1"
+	AT_SLOT_COUNT=""
+	AT_SLOT_ACTIVE=""
+	slot_read_status=0
+	run_at "$slot_read_device" 'AT+GTDUALSIM=?' || slot_read_status=$?
+	[ "$slot_read_status" -eq 0 ] || return 1
+	slot_read_range="$(printf '%s\n' "$AT_RESULT" | sed -n 's/^+GTDUALSIM[[:space:]]*:[[:space:]]*(\([0-9]*\)-\([0-9]*\)).*$/\1 \2/p' | sed -n '1p')"
+	[ -n "$slot_read_range" ] || return 1
+	slot_read_low="${slot_read_range%% *}"
+	slot_read_high="${slot_read_range##* }"
+	case "$slot_read_low$slot_read_high" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$slot_read_high" -ge "$slot_read_low" ] || return 1
+	AT_SLOT_COUNT=$((slot_read_high - slot_read_low + 1))
+	[ "$AT_SLOT_COUNT" -ge 1 ] && [ "$AT_SLOT_COUNT" -le 8 ] || { AT_SLOT_COUNT=""; return 1; }
+	slot_read_status=0
+	run_at "$slot_read_device" 'AT+GTDUALSIM?' || slot_read_status=$?
+	[ "$slot_read_status" -eq 0 ] || { AT_SLOT_COUNT=""; return 1; }
+	slot_read_current="$(printf '%s\n' "$AT_RESULT" | sed -n 's/^+GTDUALSIM[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*$/\1/p' | sed -n '1p')"
+	case "$slot_read_current" in ''|*[!0-9]*) AT_SLOT_COUNT=""; return 1 ;; esac
+	[ "$slot_read_current" -ge "$slot_read_low" ] && [ "$slot_read_current" -le "$slot_read_high" ] || {
+		AT_SLOT_COUNT=""
+		return 1
+	}
+	AT_SLOT_ACTIVE=$((slot_read_current - slot_read_low + 1))
+	return 0
+}
+
+# Which dialect this modem speaks, or nothing. Keyed by what the modem says
+# about itself, which is what the quirk table is for.
+at_slot_dialect() {
+	quirk_value "$1" "$2" "$3" sim_slots 2>/dev/null || return 1
+}
+
+at_read_slot_table() {
+	AT_SLOT_COUNT=""
+	AT_SLOT_ACTIVE=""
+	case "$2" in
+		gtdualsim) at_read_slot_table_gtdualsim "$1" ;;
+		*) return 1 ;;
+	esac
+}
+
+# The switch half of a dialect. Separate from the read half because it is a
+# mutation and answers to different rules: it is refused unless a caller has
+# proved the slot exists and is not the one already selected, and the modem may
+# never answer at all -- a slot change usually resets the modem, so the port can
+# vanish under the command that caused it. That is a success this cannot
+# confirm, not a failure, and the caller verifies by re-reading rather than by
+# believing an OK it may never receive.
+at_switch_slot_gtdualsim() {
+	slot_switch_device="$1"
+	slot_switch_target="$2"
+	# The dialect owns the numbering: one above becomes zero here.
+	slot_switch_index=$((slot_switch_target - 1))
+	slot_switch_status=0
+	run_at "$slot_switch_device" "AT+GTDUALSIM=$slot_switch_index" || slot_switch_status=$?
+	[ "$slot_switch_status" -eq 0 ] && return 0
+	# Silence, and only silence, is the shape of a slot change that worked: the
+	# modem goes off the bus under the command that caused it, so the bounded
+	# read times out. That is 124 and nothing else. Every other nonzero status
+	# is the modem having answered something -- an ERROR it spoke -- and a
+	# refusal must not be reported as a change that probably happened.
+	#
+	# The reply text cannot decide this: `at_clean_reply` strips the final
+	# result code, so an explicit ERROR leaves no trace in it.
+	[ "$slot_switch_status" -eq 124 ] && return 2
+	return 1
+}
+
+at_switch_slot() {
+	case "$3" in
+		gtdualsim) at_switch_slot_gtdualsim "$1" "$2" ;;
+		*) return 1 ;;
+	esac
+}
+
 at_identity_cache_file() {
 	printf '%s/identity.%s\n' "$(at_identity_dir)" "$(sanitize_token "$1")"
 }
@@ -1588,7 +1805,23 @@ at_read_identity() {
 
 	# A valid ICCID is the floor. Without it there is no SIM identity to match
 	# a provider against, and a partial record would look like a working one.
-	[ -n "$AT_ICCID" ] || return 1
+	#
+	# "No ICCID" has two causes that must not be collapsed, and collapsing them
+	# cost a user the ability to delete the last subscription they were using:
+	# disabling a profile leaves the modem with no SIM, the identity read then
+	# fails, and every consumer reads that failure as "I could not find out"
+	# rather than as "there is nothing there". A modem that answered and holds
+	# no SIM is a fact; a port that said nothing at all is an absence of one.
+	#
+	# The IMEI is the proof of life. It is validated before it is kept, it
+	# belongs to the modem rather than to the card, and it is readable with no
+	# SIM present -- so a port that produced one was certainly talking.
+	if [ -z "$AT_ICCID" ]; then
+		if [ -n "$AT_IMEI" ]; then
+			return 5
+		fi
+		return 1
+	fi
 	return 0
 }
 
@@ -1691,6 +1924,22 @@ mm_index_for_usb_path() {
 	mm_index_value="$(awk -F '\t' -v want="$1" '$1 == want { print $2; exit }' "$MM_INDEX_FILE")"
 	case "$mm_index_value" in ''|*[!0-9]*) return 1 ;; esac
 	printf '%s\n' "$mm_index_value"
+}
+
+# How long a reset by this method can take, as the sum of the bounds reset_cmd
+# enforces for it. Published so a caller that has to ask a user for consent can
+# state it, and computed here so the number in a plan and the number the
+# operation spends cannot drift apart.
+#
+# Board power is cut synchronously, so it has no departure wait; the in-band
+# methods have to be observed leaving the bus before their return means
+# anything, and that wait is theirs.
+reset_bound_seconds() {
+	case "${1:-}" in
+		gpio) printf '%s\n' "$((MODEM_POWER_OFF_SECONDS + MODEM_WAIT_SECONDS))" ;;
+		at|modemmanager) printf '%s\n' "$((MODEM_DEPART_SECONDS + MODEM_WAIT_SECONDS))" ;;
+		*) printf '%s\n' 0 ;;
+	esac
 }
 
 reset_method_for_record() {
@@ -2241,7 +2490,7 @@ record_attachment() {
 		at_identity_write "$attachment_path" \
 			"$(printf 'v1\t%s\t%s\t%s' \
 				"$attachment_generation" "$attachment_evidence" "$attachment_since")" || \
-			log warning "cannot persist the attachment counter for $attachment_modem_id"
+			log warning "cannot persist the attachment counter for $(mask_modem_id "$attachment_modem_id")"
 	fi
 	if [ "$attachment_changed" -eq 1 ]; then
 		if [ -n "$ATTACHMENT_CHANGED_FILE" ]; then
@@ -2272,14 +2521,29 @@ SCAN_DONE=0
 # with an empty cache, so nothing here makes a stale answer durable.
 scan_inventory() {
 	[ "$SCAN_DONE" -eq 0 ] || return 0
+	# The same argument one step wider: a display read may also be answered from
+	# a scan another process paid for moments ago, but only when its caller
+	# asked for that in so many words. See the block below scan_inventory_now.
+	if scan_cache_try_serve; then
+		SCAN_DONE=1
+		return 0
+	fi
 	scan_inventory_now
+	scan_cache_store
 	SCAN_DONE=1
 }
 
-# Explicitly re-reads the hardware, whatever this process has already done.
+# Explicitly re-reads the hardware, whatever this process or any other has
+# already done. It deliberately does not go through scan_inventory: a caller
+# that forces a scan is saying the hardware may have just changed, and a cached
+# answer is the one thing it must not receive. The shared entry is retired for
+# the same reason -- whoever forced this knows something the entry does not.
 force_scan_inventory() {
 	SCAN_DONE=0
-	scan_inventory
+	SCAN_CACHE_SERVED=0
+	scan_cache_invalidate
+	scan_inventory_now
+	SCAN_DONE=1
 }
 
 scan_inventory_now() {
@@ -2291,6 +2555,19 @@ scan_inventory_now() {
 	: >"$MM_USB_PATHS_FILE"
 	: >"$MM_SLOTS_FILE"
 	: >"$ATTACHMENT_CHANGED_FILE"
+	# These two for a sharper reason than the rest. Discovery *appends* a record
+	# keyed on the usb_path, and both readers -- mm_index_for_usb_path and the
+	# identity lookup in print_modem_json -- take the first match and stop. A
+	# second scan in one process that left them alone would therefore file the
+	# new record behind the old one and go on answering with the old one, which
+	# is precisely backwards: the caller who forced a rescan is the caller who
+	# knows the hardware moved. It moves most visibly across a reset, where
+	# ModemManager re-enumerates the modem under a new object index and the
+	# stale answer addresses an object that is gone. The display cache restores
+	# both maps, so a process that was served and then forced a rescan is
+	# exactly that shape.
+	: >"$MM_INDEX_FILE"
+	: >"$MM_IDENTITY_FILE"
 	mkdir -p "$STATE_DIR" 2>/dev/null || :
 
 	# Built here rather than on first use: the finders are reached through
@@ -2456,6 +2733,346 @@ scan_inventory_now() {
 		"$INVENTORY_FILE.dupes" "$INVENTORY_FILE.weak-dupes"
 }
 
+# ---- the display-only inventory scan cache ----
+#
+# The problem, measured on the reference router and recorded in
+# docs/work-items/P7-the-page-a-user-waits-for.md: `resolve --interface` is a
+# full inventory scan, so opening the LuCI page scans the same USB tree once for
+# its own `inventory-json` and again inside the status read of every AT-dial
+# target. About 2.9 s of a 6.6 s page is one scan repeated, for facts that
+# changed at most when the modem or the card did.
+#
+# `scan_inventory` already refuses to scan twice inside one process. This is the
+# same idea across processes, and it is the one place in this file where being
+# approximately right would be dangerous, because `resolve` is not only a read
+# path: `apn-autoconfig` resolves an interface before a modem reset, and the
+# AT-dial protocol handler reads `inventory-json` and `status-json` during a
+# bring-up. A cache those could reach would be a cache that authorises a
+# mutation, which docs/plan-1.0.md forbids outright.
+#
+# So the cache has four locks on it, and each one alone would be enough to keep
+# a mutation away from it:
+#
+# 1. **Opt-in by the caller, per invocation.** SCAN_CACHE_ALLOWED is set only by
+#    `--allow-cached-scan`, which is accepted only by `inventory-json`,
+#    `status-json` and `resolve`, and is passed only by the two display callers
+#    in the project: the rpcd query wrapper beside this script, and the APN
+#    engine's own strictly read-only verbs. Nothing infers it; there is no
+#    environment variable to inherit by accident.
+# 2. **A mutating verb retires the entry, before and after.** `main` invalidates
+#    for every verb that provisions, adopts, connects, resets, switches a slot
+#    or converges, and `cleanup_files` invalidates again on the way out --
+#    including on HUP, INT, TERM and PIPE.
+# 3. **`force_scan_inventory` retires it too.** Every path that re-reads the
+#    hardware because it has just changed it -- the reset departure and return
+#    loops, convergence revalidation, `rescan` -- says so to every other process
+#    as well as to itself.
+# 4. **The key is physical evidence, not a clock.** The stamp bounds how long a
+#    quiet router may reuse an answer; the fingerprint decides whether the
+#    answer is still about the same hardware. A modem that arrives, leaves, is
+#    reset or is replaced changes the fingerprint, so it can never be served
+#    from an entry that predates it, however recent that entry is.
+#
+# What is stored is exactly the three per-scan artifacts a display read consumes
+# after the scan: the merged records, ModemManager's slot table and
+# ModemManager's manufacturer/model strings. What is *not* stored is anything
+# computed after the scan -- the operation overlay and the provisioning
+# evaluation are recomputed on every read, from state and configuration this
+# process opens itself, so a cached record never carries a stale answer about a
+# running operation or about whether a section is already ours.
+#
+# The netifd binding on a record is the exception, because the scan derives it:
+# a record says which section claims the modem and what that makes its owner
+# state. That is why the key carries the network section list and the size of
+# the `uci show network` snapshot as well as the hardware, and why every verb
+# that writes network configuration retires the entry.
+#
+# What a cached read therefore does *not* do is advance `last_seen` and the
+# attachment counter, because it did not look. That is a delay, never a loss:
+# the counter is compared against persistent state rather than against the
+# previous scan, and an attachment change moves busnum/devnum, which changes the
+# fingerprint, which means the very read that would have missed it scans for
+# real instead.
+
+# The evidence half of the key that costs nothing: every class device discovery
+# enumerates, by name, plus the network configuration this scan's netifd
+# bindings were derived from.
+#
+# Names only and no `readlink`: resolving these symlinks is what P1 removed from
+# the scan, and paying it back to decide whether to skip a scan would be absurd.
+# A node appearing or disappearing is what a modem arriving or leaving looks
+# like from here, and that is the question this half answers.
+scan_cache_nodes() {
+	SCAN_CACHE_NODES="sysfs=$SYSFS_ROOT"
+	for cache_node in "$SYSFS_ROOT"/class/usbmisc/* "$SYSFS_ROOT"/class/wwan/* \
+		"$SYSFS_ROOT"/class/net/* "$SYSFS_ROOT"/class/tty/ttyUSB* \
+		"$SYSFS_ROOT"/class/tty/ttyACM*; do
+		[ -e "$cache_node" ] || continue
+		SCAN_CACHE_NODES="$SCAN_CACHE_NODES,${cache_node#"$SYSFS_ROOT"/class/}"
+	done
+	# The netifd binding and the owner state on every record are derived from
+	# the network configuration, so a cached record is only about this router
+	# while that configuration is the one it was derived from. Section names are
+	# exact, which is what catches an interface created or removed; the length
+	# is a fingerprint rather than a proof, and it is honest about that -- an
+	# edit that replaces an option value with one of the same length is caught
+	# by the stamp and by rule 2 above rather than here.
+	SCAN_CACHE_NODES="$SCAN_CACHE_NODES|uci=${#NETWORK_UCI_SNAPSHOT}"
+	for cache_section in $NETWORK_UCI_SECTIONS; do
+		SCAN_CACHE_NODES="$SCAN_CACHE_NODES,$cache_section"
+	done
+}
+
+# Whether the hardware this router can see has changed, cheaply enough to ask
+# every few seconds.
+#
+# A page that never asks this shows a modem that has been unplugged until
+# somebody reloads the window -- observed on the reference router 2026-09-02,
+# where a detached modem kept its card, its "Connected" line and its Disconnect
+# button. Asking by re-reading the inventory is not an answer: that is the
+# 1.5 s scan the whole of P7 exists to stop paying for.
+#
+# So this publishes the class-device half of the scan fingerprint and nothing
+# else. It is built from globs and shell reads with no fork, no `mmcli`, no AT
+# traffic and no device opened, which is what makes it affordable on a poll. It
+# names class nodes and network section names, both of which the inventory
+# already publishes, so it discloses nothing new -- and it deliberately carries
+# no identifier, because a value polled every few seconds is the last place one
+# should appear.
+#
+# It answers "look again", never "here is what changed". A consumer that sees a
+# different value pays for one real scan and learns the truth from that.
+hardware_generation_json_cmd() {
+	# No deadline to arm: this package has none, and nothing here can block.
+	# Every read is a glob or a file, and `uci show network` is the same single
+	# read the rest of the read path already makes.
+	network_uci_snapshot_open
+	scan_cache_nodes
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string generation "$SCAN_CACHE_NODES"
+	printf '}\n'
+}
+
+# One sysfs attribute, without a fork, for the fingerprint only.
+#
+# `usb_attr` answers on standard output, which costs a command substitution per
+# attribute; this runs five times per modem on a path whose whole purpose is to
+# be cheaper than the scan it may skip. A value carrying a separator is replaced
+# by `?` rather than escaped: the fingerprint is compared, never parsed back
+# into a value, so an unusual attribute only has to compare equal to itself.
+scan_cache_attr() {
+	SCAN_CACHE_ATTR=""
+	[ -r "$1/$2" ] || return 0
+	IFS= read -r SCAN_CACHE_ATTR <"$1/$2" 2>/dev/null || :
+	case "$SCAN_CACHE_ATTR" in
+		*"$TAB"*|*"$CR"*|*'|'*|*:*|*,*) SCAN_CACHE_ATTR="?" ;;
+	esac
+}
+
+# The evidence half that says the modems are the same modems.
+#
+# idVendor, idProduct and serial identify the device; busnum and devnum are the
+# pair record_attachment already uses to tell one attachment from the next, and
+# are reused here deliberately so that "the cache is stale" and "this is a new
+# attachment" cannot disagree.
+scan_cache_dev_append() {
+	cache_dev_path="$1"
+	[ -n "$cache_dev_path" ] || return 0
+	case "$SCAN_CACHE_DEVS" in *"|dev=$cache_dev_path:"*) return 0 ;; esac
+	SCAN_CACHE_DEVS="$SCAN_CACHE_DEVS|dev=$cache_dev_path"
+	for cache_attr in idVendor idProduct serial busnum devnum; do
+		scan_cache_attr "$cache_dev_path" "$cache_attr"
+		SCAN_CACHE_DEVS="$SCAN_CACHE_DEVS:$SCAN_CACHE_ATTR"
+	done
+}
+
+# Writing side: the devices this scan actually found, in record order. Field 3
+# is extracted in the shell rather than through `field`, because a command
+# substitution here is the fork this whole function exists to avoid.
+scan_cache_devs_from_inventory() {
+	SCAN_CACHE_DEVS=""
+	while IFS= read -r cache_line; do
+		cache_rest="${cache_line#*"$TAB"}"
+		cache_rest="${cache_rest#*"$TAB"}"
+		scan_cache_dev_append "${cache_rest%%"$TAB"*}"
+	done <"$INVENTORY_FILE"
+}
+
+# Reading side: the devices the stored entry claims, re-read now.
+#
+# The paths come from the stored fingerprint rather than from a fresh scan,
+# which is the point: rebuilding the same string from the same paths and
+# comparing it is how "still the same hardware" is decided without scanning. A
+# path that has gone away reads back empty and therefore compares unequal.
+scan_cache_devs_from_fingerprint() {
+	SCAN_CACHE_DEVS=""
+	cache_rest="$1"
+	while :; do
+		case "$cache_rest" in
+			*"|dev="*) cache_rest="${cache_rest#*"|dev="}" ;;
+			*) break ;;
+		esac
+		cache_entry="${cache_rest%%"|"*}"
+		scan_cache_dev_append "${cache_entry%%:*}"
+	done
+}
+
+# Exact path, never a wildcard and never a recursive removal: the cache lives in
+# the same state root as the modem registry, and the rule this project applies
+# to lock roots applies here for the same reason.
+scan_cache_invalidate() {
+	[ -n "$SCAN_CACHE_FILE" ] || return 0
+	rm -f "$SCAN_CACHE_FILE" 2>/dev/null || :
+	return 0
+}
+
+# Serve this process's scan from the shared entry, or fail and let it scan.
+#
+# Every refusal below is a plain `return 1`, and a `return 1` costs one real
+# scan and nothing else. There is no failure mode here that can produce a wrong
+# answer more cheaply than a right one.
+scan_cache_try_serve() {
+	[ "$SCAN_CACHE_ALLOWED" -eq 1 ] || return 1
+	[ "$SCAN_CACHE_SECONDS" -gt 0 ] || return 1
+	[ -n "$SCAN_CACHE_FILE" ] || return 1
+	# A symlink under the state root is not an entry of ours. The root is
+	# root-only, so this is belt and braces rather than a threat model.
+	[ ! -L "$SCAN_CACHE_FILE" ] || return 1
+	[ -f "$SCAN_CACHE_FILE" ] || return 1
+
+	cache_header=""
+	IFS= read -r cache_header <"$SCAN_CACHE_FILE" 2>/dev/null || :
+	case "$cache_header" in "v2$TAB"*) : ;; *) return 1 ;; esac
+	cache_rest="${cache_header#*"$TAB"}"
+	cache_stamp="${cache_rest%%"$TAB"*}"
+	case "$cache_stamp" in ''|*[!0-9]*) return 1 ;; esac
+	cache_stored_fingerprint="${cache_rest#*"$TAB"}"
+
+	cache_now="$(date +%s 2>/dev/null || printf '%s' 0)"
+	case "$cache_now" in ''|*[!0-9]*) return 1 ;; esac
+	cache_age=$((cache_now - cache_stamp))
+	# A negative age is a clock that moved -- an NTP sync on a router that boots
+	# without one moves it by decades -- and an entry we cannot place in time is
+	# not an entry we may serve.
+	[ "$cache_age" -ge 0 ] || return 1
+	[ "$cache_age" -le "$SCAN_CACHE_SECONDS" ] || return 1
+
+	scan_cache_nodes
+	scan_cache_devs_from_fingerprint "$cache_stored_fingerprint"
+	[ "$SCAN_CACHE_NODES$SCAN_CACHE_DEVS" = "$cache_stored_fingerprint" ] || return 1
+
+	# Only now is anything written, and the four files are truncated first so
+	# that a section the entry does not carry leaves an empty file rather than
+	# whatever a previous scan in this process left there.
+	: >"$INVENTORY_FILE"
+	: >"$MM_SLOTS_FILE"
+	: >"$MM_IDENTITY_FILE"
+	: >"$MM_INDEX_FILE"
+	awk -v inventory="$INVENTORY_FILE" -v slots="$MM_SLOTS_FILE" \
+		-v identity="$MM_IDENTITY_FILE" -v index_map="$MM_INDEX_FILE" '
+		NR == 1 { next }
+		index($0, "#section\t") == 1 {
+			section = substr($0, index($0, "\t") + 1)
+			next
+		}
+		section == "inventory" { print > inventory; next }
+		section == "mm-slots" { print > slots; next }
+		section == "mm-identity" { print > identity; next }
+		section == "mm-index" { print > index_map; next }
+	' "$SCAN_CACHE_FILE" 2>/dev/null || return 1
+
+	# The header is read again, because the entry is validated by one read and
+	# split by another, and a concurrent publication renames a new file into
+	# place between the two. Both would be honest scans, but the records would
+	# then be ones this process never checked the fingerprint of, and "checked"
+	# is the whole claim. A header that moved is a miss, which costs a scan.
+	cache_recheck=""
+	IFS= read -r cache_recheck <"$SCAN_CACHE_FILE" 2>/dev/null || :
+	[ "$cache_recheck" = "$cache_header" ] || return 1
+
+	# The per-scan class-device maps are deliberately *not* restored. Nothing
+	# above needs them, and a later consumer that does will resolve them itself
+	# against the hardware as it is now, which is the only correct answer. The
+	# ModemManager object index is the opposite case and is carried: it is not a
+	# way of resolving the hardware but an answer *about* the modems in these
+	# records, and a document is written from it after the serve.
+	SCAN_CACHE_SERVED=1
+	return 0
+}
+
+# Publish this process's scan for the next display read.
+#
+# Two scans are never published. An uncertain ModemManager discovery produces
+# records that are weaker than the hardware really is, and serving that for the
+# whole window would spread one bad answer across several reads; and a scan that
+# saw an attachment change is the moment the hardware is least settled, which is
+# exactly when the next reader should look for itself.
+scan_cache_store() {
+	[ "$SCAN_CACHE_ALLOWED" -eq 1 ] || return 0
+	[ "$SCAN_CACHE_SECONDS" -gt 0 ] || return 0
+	[ -n "$SCAN_CACHE_FILE" ] || return 0
+	# Declining to publish also retires whatever is there. Such an entry could
+	# never be served again -- its fingerprint describes hardware that has since
+	# changed -- but leaving it would mean the state directory keeps a record of
+	# a router that no longer exists, and a reader of that directory should not
+	# have to know that it is unreachable to know that it is wrong.
+	if [ "$MM_DISCOVERY_UNCERTAIN" -ne 0 ] || [ -s "$ATTACHMENT_CHANGED_FILE" ]; then
+		scan_cache_invalidate
+		return 0
+	fi
+
+	cache_dir="${SCAN_CACHE_FILE%/*}"
+	mkdir -p "$cache_dir" 2>/dev/null || return 0
+	# A predecessor SIGKILLed between opening its temporary and renaming it left
+	# one behind -- rpcd kills a LuCI helper that exceeds its exec timeout, and
+	# no trap covers that. The directory is this package's alone, so the glob
+	# only finds candidates: every path removed is rebuilt from a validated PID
+	# and the one name this function writes, exactly as sweep_dead_scratch_files
+	# does for /tmp. Done here rather than at start-up because a publication has
+	# just paid for a whole scan and a directory read beside it is free.
+	for cache_stale in "$cache_dir"/.scan.[0-9]*; do
+		[ -f "$cache_stale" ] || continue
+		[ ! -L "$cache_stale" ] || continue
+		cache_stale_pid="${cache_stale##*/.scan.}"
+		case "$cache_stale_pid" in ''|*[!0-9]*) continue ;; esac
+		if [ "$cache_stale_pid" != "$$" ] && kill -0 "$cache_stale_pid" 2>/dev/null; then
+			continue
+		fi
+		rm -f "$cache_dir/.scan.$cache_stale_pid" 2>/dev/null || :
+	done
+	cache_stamp="$(date +%s 2>/dev/null || printf '%s' 0)"
+	case "$cache_stamp" in ''|*[!0-9]*) return 0 ;; esac
+	scan_cache_nodes
+	scan_cache_devs_from_inventory
+
+	# One file and one rename, so a reader can never pair one scan's header with
+	# another scan's records. The temporary is in the same directory because a
+	# rename across filesystems is a copy, and a copy is not atomic; it carries
+	# this PID and is removed by the exit trap for the reason every other
+	# scratch path in this script is.
+	SCAN_CACHE_TMP="$cache_dir/.scan.$$"
+	{
+		printf 'v2\t%s\t%s\n' "$cache_stamp" "$SCAN_CACHE_NODES$SCAN_CACHE_DEVS"
+		printf '#section\tinventory\n'
+		cat "$INVENTORY_FILE" 2>/dev/null || :
+		printf '#section\tmm-slots\n'
+		cat "$MM_SLOTS_FILE" 2>/dev/null || :
+		printf '#section\tmm-identity\n'
+		cat "$MM_IDENTITY_FILE" 2>/dev/null || :
+		printf '#section\tmm-index\n'
+		cat "$MM_INDEX_FILE" 2>/dev/null || :
+	} >"$SCAN_CACHE_TMP" 2>/dev/null || {
+		rm -f "$SCAN_CACHE_TMP" 2>/dev/null || :
+		SCAN_CACHE_TMP=""
+		return 0
+	}
+	mv "$SCAN_CACHE_TMP" "$SCAN_CACHE_FILE" 2>/dev/null || \
+		rm -f "$SCAN_CACHE_TMP" 2>/dev/null || :
+	SCAN_CACHE_TMP=""
+	return 0
+}
+
 # The slot table for one modem, as an additive object on the modem record.
 #
 # Absent information is `null` and an empty list, never a fabricated slot: a
@@ -2465,9 +3082,18 @@ scan_inventory_now() {
 # "the answer was that nothing is known".
 print_sim_slots_json() {
 	sim_usb_path="$1"
+	sim_line="${2:-}"
 	sim_record=""
 	[ -z "$sim_usb_path" ] || sim_record="$(awk -F '\t' -v path="$sim_usb_path" \
 		'$1 == path { printf "%s\t%s\t%s", $2, $3, $4; exit }' "$MM_SLOTS_FILE" 2>/dev/null || :)"
+	sim_source=modemmanager
+	if [ -z "$sim_record" ] && [ -n "$sim_line" ]; then
+		# Whatever the modem said about itself last time it was asked. This
+		# path reads the cache and never fills it: `inventory-json` is what the
+		# page polls, and probing here is the cost P1 removed.
+		sim_record="$(at_slot_table_record "$sim_line" "$sim_usb_path")"
+		sim_source=vendor
+	fi
 	printf '"sim":{'
 	if [ -z "$sim_record" ]; then
 		printf '"source":"none","slot_count":null,"active_slot":null,"slots":[]}'
@@ -2478,8 +3104,8 @@ print_sim_slots_json() {
 	sim_spec="$(field "$sim_record" 3)"
 	case "$sim_count" in ''|*[!0-9]*) sim_count=null ;; esac
 	case "$sim_active" in ''|*[!0-9]*) sim_active=null ;; esac
-	printf '"source":"modemmanager","slot_count":%s,"active_slot":%s,"slots":[' \
-		"$sim_count" "$sim_active"
+	printf '"source":"%s","slot_count":%s,"active_slot":%s,"slots":[' \
+		"$sim_source" "$sim_count" "$sim_active"
 	sim_separator=""
 	sim_rest="$sim_spec"
 	while [ -n "$sim_rest" ]; do
@@ -2602,12 +3228,45 @@ print_modem_json() {
 	# that would run.
 	capable_any_reset=0
 	[ "$reset_method" = none ] || capable_any_reset=1
-	json_key_boolean reset "$capable_any_reset"
+	json_key_boolean reset "$capable_any_reset"; printf ','
+	# Whether this modem's active slot can be changed, which is a property of
+	# the modem and not of what is in any slot. Two things have to hold: a slot
+	# table naming somewhere else to go, and an owner with a mechanism to get
+	# there. Neither is about eSIM -- a modem with two ordinary SIMs is exactly
+	# the case this exists for.
+	#
+	# Never probes. `slot_table_for` reads the cached vendor answer on this
+	# path, because REQUESTED_PROBE is 0 for every discovery read, and asking a
+	# modem on a page load is the cost this project already refuses. A modem
+	# nobody has asked reports false and stays false until somebody does, which
+	# is `sim-slots --probe`.
+	#
+	# The mechanism half below is defensive rather than a second gate with a
+	# life of its own: a probe that finds no dialect caches no table, so a
+	# vendor table without a dialect needs the identity to have changed after
+	# the table was cached. It is kept because that is a firmware upgrade away
+	# and the cost is one cache read.
+	capable_slot_switch=0
+	if [ "$ambiguous" -eq 0 ]; then
+		capable_slot_table="$(slot_table_for "$line" "$usb_path" 2>/dev/null || :)"
+		capable_slot_count="$(field "$capable_slot_table" 2)"
+		case "$capable_slot_count" in
+			''|*[!0-9]*) : ;;
+			*)
+				if [ "$capable_slot_count" -gt 1 ] && \
+					slot_switch_mechanism_ok "$usb_path" \
+						"$(field "$capable_slot_table" 1)"; then
+					capable_slot_switch=1
+				fi
+			;;
+		esac
+	fi
+	json_key_boolean slot_switch "$capable_slot_switch"
 	printf '},'
 	# What each slot of this modem holds, as far as its owner will say. Purely
 	# additive: no existing field changes shape or meaning, and a consumer that
 	# does not know this key is unaffected.
-	print_sim_slots_json "$usb_path"; printf ','
+	print_sim_slots_json "$usb_path" "$line"; printf ','
 	json_key_string first_seen "$first_seen"; printf ','
 	json_key_string last_seen "$last_seen"; printf ','
 	# Presence evidence, defined by docs/convergence-contract-v1.md. The counter
@@ -2661,6 +3320,17 @@ print_provisioning_fields() {
 	provision_evaluate "$plan_modem" || plan_status=$?
 	plan_connection=0
 	connection_resolve_section "$plan_modem" connect "$PROVISION_RECORD" || plan_connection=$?
+	plan_connection_section="$CONNECTION_SECTION"
+	plan_connection_owned="$CONNECTION_OWNED"
+	if [ -n "$plan_connection_section" ]; then
+		plan_connection_origin="$(section_origin "$plan_connection_section")"
+	else
+		plan_connection_origin=none
+	fi
+	plan_adoption=0
+	adoption_evaluate "$plan_modem" || plan_adoption=$?
+	plan_release_adoption=0
+	adoption_release_ready "$plan_modem" "$plan_connection_section" || plan_release_adoption=$?
 
 	printf '"can_provision":%s,' \
 		"$([ "$plan_status" -eq 0 ] && [ "$PROVISION_REASON" = ok ] && printf true || printf false)"
@@ -2671,8 +3341,13 @@ print_provisioning_fields() {
 	printf '"netifd_restart_required":%s,' \
 		"$([ "$PROVISION_PROTOCOL" = "$ATDIAL_PROTO" ] && netifd_restart_required && printf true || printf false)"
 	printf '"can_control_bearer":%s,' "$([ "$plan_connection" -eq 0 ] && printf true || printf false)"
-	json_key_string connection_section "$CONNECTION_SECTION"; printf ','
-	printf '"connection_owned":%s' "$([ "$CONNECTION_OWNED" = 1 ] && printf true || printf false)"
+	json_key_string connection_section "$plan_connection_section"; printf ','
+	printf '"connection_owned":%s,' "$([ "$plan_connection_owned" = 1 ] && printf true || printf false)"
+	json_key_string connection_origin "$plan_connection_origin"; printf ','
+	printf '"can_adopt":%s,' "$([ "$plan_adoption" -eq 0 ] && printf true || printf false)"
+	json_key_string adoption_reason "$ADOPTION_REASON"; printf ','
+	json_key_string adoption_section "$ADOPTION_SECTION"; printf ','
+	printf '"can_release_adoption":%s' "$([ "$plan_release_adoption" -eq 0 ] && printf true || printf false)"
 }
 
 # The slot table and the reachability attributes around it, as a v1 key/value
@@ -2692,6 +3367,410 @@ print_provisioning_fields() {
 # of what a slot row says about one, and the package that needs the value reads
 # it itself -- which keeps the identifier inside the one package that is allowed
 # to hold it instead of putting it in a document other things will copy.
+# The modem's own slot table, from cache or -- on an explicit probe -- from the
+# modem. Returns the same three-field record ModemManager's path produces, so
+# the publisher above does not have to know which source answered.
+at_slot_table_record() {
+	slot_rec_line="$1"
+	slot_rec_usb="$2"
+	[ -n "$slot_rec_usb" ] || return 0
+	slot_rec_scope="$(at_cache_scope "$slot_rec_usb" 2>/dev/null || :)"
+	[ -n "$slot_rec_scope" ] || return 0
+	slot_rec_stamp="$(at_enumeration_stamp "$slot_rec_usb")"
+	slot_rec_cached="$(at_cache_read_stamped \
+		"$(at_slot_table_file "$slot_rec_scope")" "$slot_rec_stamp" 2>/dev/null || :)"
+	if [ -z "$slot_rec_cached" ] && [ "$REQUESTED_PROBE" -eq 1 ]; then
+		slot_rec_cached="$(at_probe_slot_table "$slot_rec_line" "$slot_rec_usb" \
+			"$slot_rec_scope" "$slot_rec_stamp")"
+	fi
+	[ -n "$slot_rec_cached" ] || return 0
+	slot_rec_count="${slot_rec_cached%%:*}"
+	slot_rec_active="${slot_rec_cached##*:}"
+	case "$slot_rec_count" in ''|*[!0-9]*) return 0 ;; esac
+	case "$slot_rec_active" in ''|*[!0-9]*) return 0 ;; esac
+	slot_rec_spec=""
+	slot_rec_n=1
+	while [ "$slot_rec_n" -le "$slot_rec_count" ]; do
+		slot_rec_is_active=0
+		[ "$slot_rec_active" != "$slot_rec_n" ] || slot_rec_is_active=1
+		slot_rec_spec="${slot_rec_spec}${slot_rec_spec:+;}${slot_rec_n}:unknown:${slot_rec_is_active}:0::"
+		slot_rec_n=$((slot_rec_n + 1))
+	done
+	printf '%s\t%s\t%s' "$slot_rec_count" "$slot_rec_active" "$slot_rec_spec"
+}
+
+# The one place a slot table is read from a modem. Every refusal is here, and
+# each of them is the same rule that governs every other AT read in this
+# package: one unambiguous modem, an owner that permits it, a port resolved by
+# role, and a quirk entry that names what to ask.
+at_probe_slot_table() {
+	slot_probe_line="$1"
+	slot_probe_usb="$2"
+	slot_probe_scope="$3"
+	slot_probe_stamp="$4"
+	[ "$(field "$slot_probe_line" 12)" = 0 ] || return 0
+	case "$(field "$slot_probe_line" 8)" in
+		modemmanager|conflicting|transitioning) return 0 ;;
+	esac
+	command_exists "$SMS_TOOL" || return 0
+	at_resolve_port "$slot_probe_usb" >/dev/null 2>&1 || return 0
+	# Which dialect a modem speaks is keyed by what the modem says about
+	# itself, and that evidence may not have been read yet -- discovery never
+	# reads it, deliberately. So it is read here when it is missing, before the
+	# port lock is taken: `at_read_identity` takes that lock itself, and taking
+	# it first would make this refuse its own read.
+	slot_probe_identity="$(at_identity_read \
+		"$(at_identity_cache_file "$slot_probe_scope")" 2>/dev/null || :)"
+	if [ -z "$(field "$slot_probe_identity" 2)" ]; then
+		if at_read_identity "$AT_RESOLVED_PORT" >/dev/null 2>&1; then
+			at_cache_identity_evidence "$slot_probe_usb"
+			slot_probe_identity="$(printf '%s\t%s\t%s' \
+				"$AT_MANUFACTURER" "$AT_MODEL" "$AT_FIRMWARE")"
+		fi
+	fi
+	slot_probe_dialect="$(at_slot_dialect "$(field "$slot_probe_identity" 1)" \
+		"$(field "$slot_probe_identity" 2)" "$(field "$slot_probe_identity" 3)" 2>/dev/null || :)"
+	[ -n "$slot_probe_dialect" ] || return 0
+	at_port_lock_acquire "$AT_RESOLVED_PORT" || return 0
+	slot_probe_status=0
+	at_read_slot_table "$AT_RESOLVED_PORT" "$slot_probe_dialect" || slot_probe_status=$?
+	at_port_lock_release
+	[ "$slot_probe_status" -eq 0 ] || return 0
+	[ -n "$AT_SLOT_COUNT" ] && [ -n "$AT_SLOT_ACTIVE" ] || return 0
+	# Stamped by enumeration, deliberately. A slot change and a replug both
+	# alter this answer, and both move the stamp.
+	at_cache_write_stamped "$(at_slot_table_file "$slot_probe_scope")" \
+		"${AT_SLOT_COUNT}:${AT_SLOT_ACTIVE}" "$slot_probe_stamp" || :
+	printf '%s:%s' "$AT_SLOT_COUNT" "$AT_SLOT_ACTIVE"
+}
+
+# Whether the owner of this modem has a mechanism to change its slot at all.
+#
+# Deliberately separate from "is there anywhere to go". The capability needs
+# both and reports one boolean; the plan reports them apart, so a refusal can
+# say which half is missing. One implementation, because two would drift.
+#
+# Reads only caches: no probe, no command, safe on every discovery path.
+slot_switch_mechanism_ok() {
+	mech_usb="$1"
+	case "${2:-}" in
+		modemmanager)
+			command_exists "$MMCLI" || return 1
+			mm_index_for_usb_path "$mech_usb" >/dev/null 2>&1 || return 1
+			return 0
+		;;
+		vendor)
+			mech_scope="$(at_cache_scope "$mech_usb" 2>/dev/null || :)"
+			[ -n "$mech_scope" ] || return 1
+			mech_identity="$(at_identity_read \
+				"$(at_identity_cache_file "$mech_scope")" 2>/dev/null || :)"
+			at_slot_dialect "$(field "$mech_identity" 1)" \
+				"$(field "$mech_identity" 2)" \
+				"$(field "$mech_identity" 3)" >/dev/null 2>&1 || return 1
+			return 0
+		;;
+	esac
+	return 1
+}
+
+# ---- the slot change, described before it is offered ----
+#
+# The read-only half. A frontend that cannot get a plan does not offer the
+# operation, exactly as it does not offer a read takeover without one, and the
+# consent a user gives is given against these numbers.
+#
+# The durations are the sums of the bounds the operation actually enforces, not
+# a guess at how long it usually takes, and each component is published beside
+# the total because "up to eleven minutes" is unreadable without knowing which
+# part of it is the outage and which part is waiting for a network to come back.
+#
+# It never probes. A modem nobody has asked about its slots has no table to
+# prove a destination against, and the plan says so rather than asking on the
+# caller's behalf -- `sim-slots --probe` is the deliberate act that answers it.
+# Everything the plan reports and the background action refuses on, computed
+# once. Two copies of this would drift, and the first symptom of that is a
+# control a page offers and the operation then refuses.
+#
+# Sets SLOT_PLAN_*; returns 0 when the change can be performed.
+SLOT_PLAN_AVAILABLE=0
+SLOT_PLAN_REASON=""
+SLOT_PLAN_OWNER=""
+SLOT_PLAN_SOURCE=""
+SLOT_PLAN_COUNT=""
+SLOT_PLAN_ACTIVE=""
+SLOT_PLAN_INTERFACE=""
+
+slot_switch_evaluate() {
+	SLOT_PLAN_AVAILABLE=0
+	SLOT_PLAN_REASON=""
+	SLOT_PLAN_OWNER=""
+	SLOT_PLAN_SOURCE=""
+	SLOT_PLAN_COUNT=""
+	SLOT_PLAN_ACTIVE=""
+	SLOT_PLAN_INTERFACE=""
+	plan_line="$(find_record "$1" 2>/dev/null || :)"
+	[ -n "$plan_line" ] || { SLOT_PLAN_REASON=modem-absent; return 1; }
+	SLOT_PLAN_OWNER="$(field "$plan_line" 8)"
+	SLOT_PLAN_INTERFACE="$(field "$plan_line" 9)"
+	[ "$(field "$plan_line" 12)" = 0 ] || { SLOT_PLAN_REASON=modem-ambiguous; return 1; }
+	case "$SLOT_PLAN_OWNER" in
+		modemmanager|netifd-direct|none) : ;;
+		*) SLOT_PLAN_REASON=owner-unsettled; return 1 ;;
+	esac
+	plan_table="$(slot_table_for "$plan_line" "$(field "$plan_line" 3)" 2>/dev/null || :)"
+	[ -n "$plan_table" ] || { SLOT_PLAN_REASON=slot-table-unavailable; return 1; }
+	SLOT_PLAN_SOURCE="$(field "$plan_table" 1)"
+	SLOT_PLAN_COUNT="$(field "$plan_table" 2)"
+	SLOT_PLAN_ACTIVE="$(field "$plan_table" 3)"
+	[ "$2" -le "$SLOT_PLAN_COUNT" ] || { SLOT_PLAN_REASON=slot-absent; return 1; }
+	[ "$2" != "$SLOT_PLAN_ACTIVE" ] || { SLOT_PLAN_REASON=slot-already-active; return 1; }
+	slot_switch_mechanism_ok "$(field "$plan_line" 3)" "$SLOT_PLAN_SOURCE" || {
+		SLOT_PLAN_REASON=mechanism-unavailable
+		return 1
+	}
+	SLOT_PLAN_AVAILABLE=1
+	return 0
+}
+
+slot_switch_plan_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "slot-switch-plan requires --modem"
+	case "$REQUESTED_SLOT" in
+		''|*[!0-9]*|0) die_code 2 "slot-switch-plan requires a positive numeric --slot" ;;
+	esac
+	scan_inventory
+	slot_switch_evaluate "$REQUESTED_MODEM" "$REQUESTED_SLOT" || :
+	# What the operation holds the modem for, and what it then waits for.
+	plan_mutate="$AT_TIMEOUT_SECONDS"
+	[ "$SLOT_PLAN_SOURCE" != modemmanager ] || plan_mutate="$SLOT_SWITCH_MM_SECONDS"
+	plan_settle="$CONVERGE_SIM_WAIT_SECONDS"
+	plan_reconcile="$CONVERGE_RESULT_WAIT_SECONDS"
+	plan_bearer="$CONNECT_WAIT_SECONDS"
+	plan_worst=$((plan_mutate + plan_settle + plan_reconcile + plan_bearer))
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$REQUESTED_MODEM"; printf ','
+	printf '"slot":%s,' "$REQUESTED_SLOT"
+	json_key_boolean available "$SLOT_PLAN_AVAILABLE"; printf ','
+	json_key_string unavailable_reason "$SLOT_PLAN_REASON"; printf ','
+	# Always. A slot change interrupts a bearer, and no poll, page load or
+	# refresh may start one.
+	json_key_boolean consent_required 1; printf ','
+	json_key_boolean changes_slot 1; printf ','
+	json_key_string owner_state "$SLOT_PLAN_OWNER"; printf ','
+	json_key_string slot_source "$SLOT_PLAN_SOURCE"; printf ','
+	printf '"slot_count":%s,' "${SLOT_PLAN_COUNT:-null}"
+	printf '"active_slot":%s,' "${SLOT_PLAN_ACTIVE:-null}"
+	json_key_string interrupts_interface "$SLOT_PLAN_INTERFACE"; printf ','
+	# The APN is reconciled for the new subscription by default, because a
+	# different slot is a different subscription and leaving that to the caller
+	# was the defect this operation was given a reconcile to fix.
+	json_key_boolean reconciles 1; printf ','
+	printf '"worst_case_seconds":%s,' "$plan_worst"
+	printf '"mutate_seconds":%s,' "$plan_mutate"
+	printf '"settle_seconds":%s,' "$plan_settle"
+	printf '"reconcile_seconds":%s,' "$plan_reconcile"
+	printf '"bearer_seconds":%s' "$plan_bearer"
+	printf '}\n'
+	return 0
+}
+
+# ---- the slot table of one modem, whoever answered for it ----
+#
+# Two owners publish slots and the pairing between owner and table is exact: an
+# owner may only act on a table its own kind produced. ModemManager's describes
+# a modem it holds; a vendor table is the answer of a modem that answers for
+# itself. A modem nobody has asked about its slots is not a modem with one slot,
+# and no slot change can be proven against a table that does not exist.
+#
+# Returns `<source><TAB><count><TAB><active>`; nonzero when there is no table.
+slot_table_for() {
+	slot_table_line="$1"
+	slot_table_usb="$2"
+	[ -n "$slot_table_usb" ] || return 1
+	if [ "$(field "$slot_table_line" 8)" = modemmanager ]; then
+		slot_table_rec="$(awk -F '\t' -v path="$slot_table_usb" \
+			'$1 == path { printf "%s\t%s", $2, $3; exit }' \
+			"$MM_SLOTS_FILE" 2>/dev/null || :)"
+		[ -n "$slot_table_rec" ] || return 1
+		slot_table_count="$(field "$slot_table_rec" 1)"
+		slot_table_active="$(field "$slot_table_rec" 2)"
+		case "$slot_table_count" in ''|*[!0-9]*) return 1 ;; esac
+		case "$slot_table_active" in ''|*[!0-9]*) return 1 ;; esac
+		printf 'modemmanager\t%s\t%s\n' "$slot_table_count" "$slot_table_active"
+		return 0
+	fi
+	slot_table_rec="$(at_slot_table_record "$slot_table_line" "$slot_table_usb")"
+	[ -n "$slot_table_rec" ] || return 1
+	printf 'vendor\t%s\t%s\n' "$(field "$slot_table_rec" 1)" "$(field "$slot_table_rec" 2)"
+	return 0
+}
+
+# ---- changing the active slot, through whichever owner holds the modem ----
+#
+# One operation, two dialects, chosen by who owns the modem -- and neither of
+# them is an eSIM matter. A modem has slots whether or not either holds an
+# eUICC, both may hold ordinary SIMs, and an eUICC may equally sit in a
+# removable card in a physical slot. "eSIM" and "which slot is active" are
+# logically unrelated, so the slot change lives here, with the modem, and the
+# eSIM package asks for it like any other caller.
+#
+#   modemmanager  the daemon's own `--set-primary-sim-slot`, asked of the
+#                 daemon, because a modem it holds is not one to reach around
+#   vendor        the AT command named by the quirk table's `sim_slots`
+#                 dialect, for a modem that answers for itself
+#
+# The pairing is exact: an owner may only act on a table its own kind produced.
+# It is a mutation either way -- full operation locks, revalidation under them,
+# and a refusal for every precondition that is not proven rather than an attempt
+# that finds out.
+#
+# Three outcomes, not two. `switched` is an answer; `unconfirmed` is silence,
+# which is what a slot change looks like on a modem that leaves the bus under
+# the command that causes it; and only a refusal the owner actually spoke is a
+# failure. The reference FM350-GL answers `OK` and stays on the bus, so both
+# paths are real and neither may be treated as the exception.
+#
+# **A slot change always invalidates the APN, so this converges by default.**
+# The active subscription is a different one afterwards: a different operator, a
+# different APN, possibly a different roaming posture. Leaving that to whoever
+# happened to call was a mistake -- the eSIM switch verb drove convergence, and
+# it can only switch *toward* an eUICC endpoint, so a change toward an ordinary
+# SIM had no reconciling caller at all and the APN silently stayed as it was.
+#
+# What it does not do is reimplement any of it. Convergence already waits for
+# the modem, refreshes identity, reconciles that one target and restores the
+# bearer it is entitled to; this launches it for the bound target and nothing
+# more. A caller that drives its own recovery and reports the stages in its own
+# vocabulary passes `--no-converge` and owns it instead.
+slot_switch_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "slot-switch requires --modem"
+	case "$REQUESTED_SLOT" in
+		''|*[!0-9]*|0) die_code 2 "slot-switch requires a positive numeric --slot" ;;
+	esac
+	acquire_apn_lock
+	acquire_modem_lock "$REQUESTED_MODEM"
+
+	# After the locks, never before: the caller proved this a moment ago under
+	# none of them.
+	force_scan_inventory
+	slot_switch_line="$(find_inventory_record "$REQUESTED_MODEM" 2>/dev/null || :)"
+	[ -n "$slot_switch_line" ] || die_code 3 "modem $(mask_modem_id "$REQUESTED_MODEM") is not currently present"
+	[ "$(field "$slot_switch_line" 12)" = 0 ] || \
+		die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") is ambiguous; refusing to change its slot"
+	slot_switch_owner="$(field "$slot_switch_line" 8)"
+	case "$slot_switch_owner" in
+		modemmanager|netifd-direct|none) : ;;
+		*)
+			# `conflicting` and `transitioning` are not owners. There is nobody
+			# to ask, and asking anyway is the guess this project refuses.
+			die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") has no settled control owner"
+		;;
+	esac
+	slot_switch_usb="$(field "$slot_switch_line" 3)"
+	# The table whoever owns this modem published, from the cache or from the
+	# modem. Without one there is no proof the requested slot exists, and
+	# switching to a slot whose existence is unproven is the guess this project
+	# refuses everywhere.
+	REQUESTED_PROBE=1
+	slot_switch_table="$(slot_table_for "$slot_switch_line" "$slot_switch_usb" 2>/dev/null || :)"
+	[ -n "$slot_switch_table" ] || \
+		die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") publishes no slot table; no slot change can be proven"
+	slot_switch_source="$(field "$slot_switch_table" 1)"
+	slot_switch_count="$(field "$slot_switch_table" 2)"
+	slot_switch_active="$(field "$slot_switch_table" 3)"
+	[ "$REQUESTED_SLOT" -le "$slot_switch_count" ] || \
+		die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") has no slot $REQUESTED_SLOT"
+	[ "$REQUESTED_SLOT" != "$slot_switch_active" ] || \
+		die_code 4 "slot $REQUESTED_SLOT is already the active one"
+	# Everything above was proven under the locks this operation holds, which is
+	# what `prove_target` means here and not merely that a caller asked.
+	stage_reached prove_target
+
+	slot_switch_status=0
+	if [ "$slot_switch_source" = modemmanager ]; then
+		# ModemManager's own mechanism, asked of ModemManager. This is the
+		# single-owner invariant honoured rather than an exception to it: a
+		# modem the daemon holds is not one this package may reach around.
+		#
+		# It takes no AT port and no port lock, deliberately -- there is no
+		# vendor command here to serialise against.
+		command_exists "$MMCLI" || \
+			die_code 4 "ModemManager owns modem $(mask_modem_id "$REQUESTED_MODEM") but mmcli is not installed"
+		slot_switch_index="$(mm_index_for_usb_path "$slot_switch_usb" 2>/dev/null || :)"
+		case "$slot_switch_index" in
+			''|*[!0-9]*)
+				die_code 4 "ModemManager owns modem $(mask_modem_id "$REQUESTED_MODEM") but no longer reports an object for it"
+			;;
+		esac
+		slot_switch_out="$STATE_DIR/.slot-switch.$$"
+		run_bounded_to_file "$SLOT_SWITCH_MM_SECONDS" "$slot_switch_out" \
+			"$MMCLI" -m "$slot_switch_index" --set-primary-sim-slot="$REQUESTED_SLOT" || \
+			slot_switch_status=$?
+		rm -f "$slot_switch_out"
+		# A timeout is silence, and silence is the shape of a slot change that
+		# took the modem off the bus under the command that caused it -- which
+		# takes ModemManager's object with it. Only an answer the daemon
+		# actually gave is a failure. Same three-valued rule as the vendor
+		# dialect, for the same reason.
+		[ "$slot_switch_status" -ne 124 ] || slot_switch_status=2
+	else
+		slot_switch_scope="$(at_cache_scope "$slot_switch_usb" 2>/dev/null || :)"
+		[ -n "$slot_switch_scope" ] || \
+			die_code 3 "modem $(mask_modem_id "$REQUESTED_MODEM") has no resolvable device path"
+		slot_switch_identity="$(at_identity_read \
+			"$(at_identity_cache_file "$slot_switch_scope")" 2>/dev/null || :)"
+		slot_switch_dialect="$(at_slot_dialect "$(field "$slot_switch_identity" 1)" \
+			"$(field "$slot_switch_identity" 2)" "$(field "$slot_switch_identity" 3)" 2>/dev/null || :)"
+		[ -n "$slot_switch_dialect" ] || \
+			die_code 4 "no slot-change command is known for modem $(mask_modem_id "$REQUESTED_MODEM")"
+		at_resolve_port "$slot_switch_usb" >/dev/null 2>&1 || \
+			die_code 3 "no AT port could be resolved for modem $(mask_modem_id "$REQUESTED_MODEM")"
+		at_port_lock_acquire "$AT_RESOLVED_PORT" || \
+			die_code 3 "the AT port for modem $(mask_modem_id "$REQUESTED_MODEM") is busy"
+		# The cached table describes the slot that is about to stop being
+		# active, so it is dropped before the command rather than after it: a
+		# command that takes the modem away leaves nothing to run an "after".
+		rm -f "$(at_slot_table_file "$slot_switch_scope")" 2>/dev/null || :
+		at_switch_slot "$AT_RESOLVED_PORT" "$REQUESTED_SLOT" "$slot_switch_dialect" || \
+			slot_switch_status=$?
+		at_port_lock_release
+	fi
+	release_modem_lock
+	release_apn_lock
+	# Convergence after the locks are released, never while they are held: it
+	# takes the same two by the same paths, and the engine takes the global one
+	# for the reconcile itself.
+	[ "$slot_switch_status" -eq 1 ] || stage_reached mutate
+	slot_switch_converged=skipped
+	if [ "$REQUESTED_NO_CONVERGE" -eq 0 ] && [ "$slot_switch_status" -ne 1 ]; then
+		slot_switch_section="$(field "$slot_switch_line" 9)"
+		if [ -n "$slot_switch_section" ]; then
+			slot_switch_converged=requested
+			converge_target "$slot_switch_section" "$REQUESTED_MODEM" || :
+			stage_reached reconcile
+		else
+			# No netifd section is bound to this modem, so there is no APN
+			# target to reconcile. That is an answer, not a failure.
+			slot_switch_converged=no-target
+		fi
+	fi
+	case "$slot_switch_status" in
+		0) printf 'v1\nresult\tswitched\nslot\t%s\nconverged\t%s\n' \
+			"$REQUESTED_SLOT" "$slot_switch_converged" ;;
+		2)
+			# Sent, and the modem did not answer. On this hardware that is what
+			# a slot change looks like when it works, so it is reported as
+			# unconfirmed rather than as either outcome -- and it is converged
+			# either way, because an unconfirmed change that took effect leaves
+			# exactly the wrong APN behind.
+			printf 'v1\nresult\tunconfirmed\nslot\t%s\nconverged\t%s\n' \
+				"$REQUESTED_SLOT" "$slot_switch_converged"
+		;;
+		*) die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") refused the slot change" ;;
+	esac
+	return 0
+}
+
 sim_slots_cmd() {
 	scan_inventory
 	printf 'v1\n'
@@ -2738,6 +3817,14 @@ sim_slots_cmd() {
 		printf 'usb\t%s\t%s\t%s\n' \
 			"${slots_vendor_product%%:*}" "${slots_vendor_product#*:}" "$slots_usb_path"
 		printf 'interface\t%s\n' "$slots_interface"
+		# The reset this modem would get, for a caller that has to decide
+		# whether to ask for one and to say how long it could take. `none` is a
+		# real answer: a modem with no method cannot be reset, and a caller
+		# that plans one anyway is planning an outage it cannot spend.
+		slots_reset_method="$(field "$slots_line" 16)"
+		[ -n "$slots_reset_method" ] || slots_reset_method=none
+		printf 'reset\t%s\t%s\n' \
+			"$slots_reset_method" "$(reset_bound_seconds "$slots_reset_method")"
 		printf 'operation\t%s\n' "$ACTION_OPERATION_ID"
 		slots_mm_index="$(mm_index_for_usb_path "$slots_usb_path" 2>/dev/null || :)"
 		printf 'mm\t%s\n' "$slots_mm_index"
@@ -2754,12 +3841,22 @@ sim_slots_cmd() {
 		slots_record=""
 		[ -z "$slots_usb_path" ] || slots_record="$(awk -F '\t' -v path="$slots_usb_path" \
 			'$1 == path { printf "%s\t%s\t%s", $2, $3, $4; exit }' "$MM_SLOTS_FILE" 2>/dev/null || :)"
+		slots_source=modemmanager
+		if [ -z "$slots_record" ]; then
+			# The modem's own answer, where it has one and somebody asked for
+			# it. Every class here is `unknown`: this dialect reports how many
+			# slots there are and which is active, and says nothing whatever
+			# about what is in them. Reporting `empty` from an absence would be
+			# the one error in this table a consumer cannot recover from.
+			slots_record="$(at_slot_table_record "$slots_line" "$slots_usb_path")"
+			slots_source=vendor
+		fi
 		if [ -z "$slots_record" ]; then
 			printf 'slots\tnone\t\t\n'
 			continue
 		fi
-		printf 'slots\tmodemmanager\t%s\t%s\n' \
-			"$(field "$slots_record" 1)" "$(field "$slots_record" 2)"
+		printf 'slots\t%s\t%s\t%s\n' \
+			"$slots_source" "$(field "$slots_record" 1)" "$(field "$slots_record" 2)"
 		slots_spec="$(field "$slots_record" 3)"
 		slots_rest="$slots_spec"
 		while [ -n "$slots_rest" ]; do
@@ -2781,7 +3878,7 @@ sim_slots_cmd() {
 		done
 	done <"$INVENTORY_FILE"
 	if [ -n "$REQUESTED_MODEM" ] && [ "$sim_slots_found" -eq 0 ]; then
-		die_code 3 "modem $REQUESTED_MODEM is not present"
+		die_code 3 "modem $(mask_modem_id "$REQUESTED_MODEM") is not present"
 	fi
 	return 0
 }
@@ -3093,7 +4190,7 @@ firewall_remove_interface() {
 # dropping an interface.
 firewall_reload() {
 	[ -x "$FIREWALL_INIT" ] || return 0
-	"$FIREWALL_INIT" reload >/dev/null 2>&1 || \
+	run_bounded_to_file 30 /dev/null "$FIREWALL_INIT" reload >/dev/null 2>&1 || \
 		log warning "could not reload the firewall; the provisioned interface may not forward yet"
 	return 0
 }
@@ -3239,7 +4336,7 @@ provision_evaluate() {
 			# expected read-only post-reboot state, so logging it on every poll
 			# turns a useful diagnostic into unbounded journal noise.
 			[ "$COMMAND_NAME" = inventory-json ] || \
-				log notice "section $PROVISION_EXISTING was provisioned as $(uci -q get "network.${PROVISION_EXISTING}.apn_autoconfig_modem_id" 2>/dev/null || printf '?'); the modem on its path is now $1"
+				log notice "section $PROVISION_EXISTING was provisioned as $(mask_modem_id "$(uci -q get "network.${PROVISION_EXISTING}.apn_autoconfig_modem_id" 2>/dev/null || printf '?')"); the modem on its path is now $(mask_modem_id "$1")"
 		fi
 	fi
 	if [ -n "$PROVISION_EXISTING" ]; then
@@ -3287,6 +4384,161 @@ provisioning_baseline_file() {
 	printf '%s/provisioning/%s.tsv\n' "$STATE_DIR" "$(sanitize_token "$1")"
 }
 
+adoption_baseline_file() {
+	printf '%s/%s.tsv\n' "$ADOPTION_DIR" "$1"
+}
+
+section_origin() {
+	origin_section="$1"
+	origin_owner="$(network_uci_get "$origin_section" apn_autoconfig_owner 2>/dev/null || :)"
+	if [ "$origin_owner" != "$PROVISION_OWNER" ]; then
+		printf '%s\n' external
+		return 0
+	fi
+	origin_value="$(network_uci_get "$origin_section" apn_autoconfig_origin 2>/dev/null || :)"
+	# Sections created before the origin marker was introduced are ours and may
+	# be removed. Treating the absent legacy value as adopted would preserve a
+	# section the package itself created and change deprovision semantics during
+	# an upgrade.
+	case "$origin_value" in adopted) printf '%s\n' adopted ;; *) printf '%s\n' created ;; esac
+}
+
+adoption_markers_absent() {
+	marker_section="$1"
+	for marker_name in apn_autoconfig_owner apn_autoconfig_modem_id \
+		apn_autoconfig_provisioned apn_autoconfig_origin \
+		apn_autoconfig_mm_uid apn_autoconfig_firewall_zone; do
+		if network_uci_get "$marker_section" "$marker_name" >/dev/null 2>&1; then
+			return 1
+		fi
+	done
+	return 0
+}
+
+# A predecessor may die between marker writes. Owner is written last, so a
+# recoverable partial transaction has never become managed: every marker that
+# does exist must be one adoption would have written for this exact modem, and
+# the durable baseline must still validate before a successor may clear it.
+adoption_markers_recoverable() {
+	recover_marker_section="$1"
+	recover_marker_modem="$2"
+	[ -z "$(network_uci_get "$recover_marker_section" apn_autoconfig_owner 2>/dev/null || :)" ] || return 1
+	[ -z "$(network_uci_get "$recover_marker_section" apn_autoconfig_mm_uid 2>/dev/null || :)" ] || return 1
+	[ -z "$(network_uci_get "$recover_marker_section" apn_autoconfig_firewall_zone 2>/dev/null || :)" ] || return 1
+	recover_marker_value="$(network_uci_get "$recover_marker_section" apn_autoconfig_modem_id 2>/dev/null || :)"
+	[ -z "$recover_marker_value" ] || [ "$recover_marker_value" = "$recover_marker_modem" ] || return 1
+	recover_marker_value="$(network_uci_get "$recover_marker_section" apn_autoconfig_origin 2>/dev/null || :)"
+	[ -z "$recover_marker_value" ] || [ "$recover_marker_value" = adopted ] || return 1
+	recover_marker_value="$(network_uci_get "$recover_marker_section" apn_autoconfig_provisioned 2>/dev/null || :)"
+	[ -z "$recover_marker_value" ] || safe_single_line "$recover_marker_value" || return 1
+	return 0
+}
+
+# The exact scalar fields provisioning is allowed to own. Adoption does not
+# rewrite any of them; it records them first so a future managed change can be
+# undone without deleting the user's section.
+ADOPTION_OPTIONS="proto device devpath usbpath modem_id disabled auto metric"
+
+adoption_baseline_capture() {
+	capture_modem="$1"
+	capture_section="$2"
+	capture_file="$(adoption_baseline_file "$capture_section")"
+	[ ! -e "$capture_file" ] || return 3
+	mkdir -p "$ADOPTION_DIR" || return 1
+	capture_tmp="$capture_file.$$"
+	capture_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+	printf 'v1\t%s\t%s\t%s\n' "$capture_modem" "$capture_section" "$capture_now" >"$capture_tmp" || return 1
+	for capture_option in $ADOPTION_OPTIONS; do
+		if capture_value="$(network_uci_get "$capture_section" "$capture_option" 2>/dev/null)"; then
+			safe_single_line "$capture_value" || { rm -f "$capture_tmp"; return 4; }
+			printf 'option\t%s\t1\t%s\n' "$capture_option" "$capture_value" >>"$capture_tmp" || {
+				rm -f "$capture_tmp"; return 1;
+			}
+		else
+			printf 'option\t%s\t0\t\n' "$capture_option" >>"$capture_tmp" || {
+				rm -f "$capture_tmp"; return 1;
+			}
+		fi
+	done
+	mv "$capture_tmp" "$capture_file" || { rm -f "$capture_tmp"; return 1; }
+	ADOPTION_ROLLBACK_BASELINE="$capture_file"
+	return 0
+}
+
+adoption_baseline_validate() {
+	baseline_file="$1"
+	baseline_modem="$2"
+	baseline_section="$3"
+	[ -f "$baseline_file" ] || return 1
+	baseline_header="$(sed -n '1p' "$baseline_file" 2>/dev/null || :)"
+	[ "$(field "$baseline_header" 1)" = v1 ] || return 1
+	[ "$(field "$baseline_header" 2)" = "$baseline_modem" ] || return 1
+	[ "$(field "$baseline_header" 3)" = "$baseline_section" ] || return 1
+	baseline_seen=""
+	baseline_count=0
+	while IFS="$TAB" read -r baseline_kind baseline_name baseline_present baseline_value; do
+		[ "$baseline_kind" = option ] || return 1
+		case " $ADOPTION_OPTIONS " in *" $baseline_name "*) : ;; *) return 1 ;; esac
+		case " $baseline_seen " in *" $baseline_name "*) return 1 ;; esac
+		case "$baseline_present" in 0) [ -z "$baseline_value" ] || return 1 ;; 1) safe_single_line "$baseline_value" || return 1 ;; *) return 1 ;; esac
+		baseline_seen="$baseline_seen $baseline_name"
+		baseline_count=$((baseline_count + 1))
+	done <<EOF
+$(sed -n '2,$p' "$baseline_file" 2>/dev/null)
+EOF
+	[ "$baseline_count" -eq 8 ] || return 1
+	for baseline_name in $ADOPTION_OPTIONS; do
+		case " $baseline_seen " in *" $baseline_name "*) : ;; *) return 1 ;; esac
+	done
+	return 0
+}
+
+adoption_baseline_restore() {
+	restore_file="$1"
+	restore_section="$2"
+	while IFS="$TAB" read -r restore_kind restore_name restore_present restore_value; do
+		[ "$restore_kind" = option ] || return 1
+		if [ "$restore_present" = 1 ]; then
+			uci set "network.${restore_section}.${restore_name}=${restore_value}" || return 1
+		else
+			uci -q delete "network.${restore_section}.${restore_name}" >/dev/null 2>&1 || :
+		fi
+	done <<EOF
+$(sed -n '2,$p' "$restore_file" 2>/dev/null)
+EOF
+}
+
+adoption_release_ready() {
+	release_ready_modem="$1"
+	release_ready_section="$2"
+	[ -n "$release_ready_section" ] || return 1
+	[ "$(section_origin "$release_ready_section")" = adopted ] || return 1
+	release_ready_baseline="$(adoption_baseline_file "$release_ready_section")"
+	adoption_baseline_validate "$release_ready_baseline" "$release_ready_modem" "$release_ready_section"
+}
+
+adoption_remove_markers() {
+	remove_section="$1"
+	for remove_marker in apn_autoconfig_owner apn_autoconfig_modem_id \
+		apn_autoconfig_provisioned apn_autoconfig_origin; do
+		uci -q delete "network.${remove_section}.${remove_marker}" >/dev/null 2>&1 || :
+	done
+}
+
+adoption_rollback() {
+	[ "$ADOPTION_ROLLBACK_ARMED" -eq 1 ] || return 0
+	ADOPTION_ROLLBACK_ARMED=0
+	if [ -n "$ADOPTION_ROLLBACK_SECTION" ]; then
+		log warning "rolling back adoption markers on $ADOPTION_ROLLBACK_SECTION"
+		adoption_remove_markers "$ADOPTION_ROLLBACK_SECTION"
+		uci commit network >/dev/null 2>&1 || \
+			log err "failed to commit adoption rollback for $ADOPTION_ROLLBACK_SECTION"
+	fi
+	[ -z "$ADOPTION_ROLLBACK_BASELINE" ] || rm -f "$ADOPTION_ROLLBACK_BASELINE"
+	ADOPTION_ROLLBACK_SECTION=""
+	ADOPTION_ROLLBACK_BASELINE=""
+}
+
 # Removes exactly the section this process created and nothing else. Armed
 # before the first write so a failure or signal in any later step unwinds it.
 provisioning_rollback() {
@@ -3295,7 +4547,7 @@ provisioning_rollback() {
 	PROVISION_ROLLBACK_SECTION="$PROVISION_CREATED_SECTION"
 	if [ -n "$PROVISION_CREATED_SECTION" ]; then
 		log warning "rolling back staging section $PROVISION_CREATED_SECTION"
-		ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
+		run_bounded_to_file 30 /dev/null ifdown "$PROVISION_CREATED_SECTION" >/dev/null 2>&1 || :
 		if ! uci -q get "network.$PROVISION_CREATED_SECTION" >/dev/null 2>&1; then
 			# Rollback is armed before the section is written, which is the
 			# required order: an interruption in the gap must not find the
@@ -3344,9 +4596,9 @@ provision_cmd() {
 	case "$PROVISION_REASON" in
 		ok) : ;;
 		already_provisioned)
-			die_code 4 "modem $prov_modem already owns section $PROVISION_EXISTING; deprovision it first"
+			die_code 4 "modem $(mask_modem_id "$prov_modem") already owns section $PROVISION_EXISTING; deprovision it first"
 		;;
-		*) die_code "$prov_status" "modem $prov_modem cannot be provisioned: $PROVISION_REASON" ;;
+		*) die_code "$prov_status" "modem $(mask_modem_id "$prov_modem") cannot be provisioned: $PROVISION_REASON" ;;
 	esac
 
 	# One global order, same as every other composite operation: the APN
@@ -3360,7 +4612,7 @@ provision_cmd() {
 	provision_evaluate "$prov_modem"
 	prov_status=$?
 	[ "$PROVISION_REASON" = ok ] || \
-		die_code "$prov_status" "modem $prov_modem stopped being provisionable: $PROVISION_REASON"
+		die_code "$prov_status" "modem $(mask_modem_id "$prov_modem") stopped being provisionable: $PROVISION_REASON"
 
 	prov_section="$PROVISION_SECTION"
 	prov_protocol="$PROVISION_PROTOCOL"
@@ -3392,7 +4644,7 @@ provision_cmd() {
 	PROVISION_ROLLBACK_ARMED=1
 	PROVISION_CREATED_SECTION="$prov_section"
 
-	log notice "provisioning modem $prov_modem as $prov_protocol section $prov_section"
+	log notice "provisioning modem $(mask_modem_id "$prov_modem") as $prov_protocol section $prov_section"
 	# Staged: administratively disabled and carrying no apn option, so netifd
 	# cannot dial a vendor default before reconciliation chooses a profile.
 	uci set "network.${prov_section}=interface" || die "cannot create section $prov_section"
@@ -3423,9 +4675,10 @@ provision_cmd() {
 	# still becomes the default one.
 	[ -z "$PROVISION_METRIC" ] || \
 		uci set "network.${prov_section}.metric=${PROVISION_METRIC}" || die "cannot set the route metric"
-	uci set "network.${prov_section}.apn_autoconfig_owner=apn-autoconfig-modem" || die "cannot mark ownership"
-	uci set "network.${prov_section}.apn_autoconfig_modem_id=${prov_modem}" || die "cannot mark modem identity"
 	uci set "network.${prov_section}.apn_autoconfig_provisioned=${prov_now}" || die "cannot mark provisioning time"
+	uci set "network.${prov_section}.apn_autoconfig_origin=created" || die "cannot mark created origin"
+	uci set "network.${prov_section}.apn_autoconfig_modem_id=${prov_modem}" || die "cannot mark modem identity"
+	uci set "network.${prov_section}.apn_autoconfig_owner=apn-autoconfig-modem" || die "cannot mark ownership"
 	uci commit network || die "cannot commit the staging section"
 
 	# Clear "disabled" so the APN engine is able to start the section, but do
@@ -3505,7 +4758,7 @@ provision_cmd() {
 	PROVISION_CREATED_SECTION=""
 	PROVISION_BASELINE_FILE=""
 	release_modem_lock
-	log notice "modem $prov_modem provisioned as $prov_section"
+	log notice "modem $(mask_modem_id "$prov_modem") provisioned as $prov_section"
 
 	printf '{'
 	json_key_string version v1; printf ','
@@ -3521,11 +4774,135 @@ provision_cmd() {
 
 # netifd stays the bearer owner. These verbs only ask it to act on a section
 # this package created, and report what netifd then reports.
+bearer_attachment() {
+	bearer_path="$1"
+	case "$bearer_path" in ''|*/*|*..*|*[!0-9A-Za-z.:_-]*) return 1 ;; esac
+	bearer_device_dir="$SYSFS_ROOT/bus/usb/devices/$bearer_path"
+	bearer_devnum="$(cat "$bearer_device_dir/devnum" 2>/dev/null || :)"
+	bearer_inode="$(ls -idL "$bearer_device_dir" 2>/dev/null | awk '{print $1}')"
+	case "$bearer_devnum:$bearer_inode" in :*|*:|*[!0-9:]*) return 1 ;; esac
+	printf '%s:%s\n' "$bearer_devnum" "$bearer_inode"
+}
+
+# Optional physical proof for an already-down interface whose current
+# protocol handler has not yet written a teardown record. This is a read,
+# never a second bearer lifecycle implementation. Only a caller holding the
+# selected modem lock may ask, and every active PDP context blocks it.
+bearer_probe_inactive() {
+	[ -n "$REQUESTED_MODEM" ] || return 1
+	bearer_caller="${APN_AUTOCONFIG_MODEM_LOCK_OWNER_PID:-}"
+	process_is_alive "$bearer_caller" || return 1
+	bearer_caller_lock="${LOCK_ROOT}.$(sanitize_token "$REQUESTED_MODEM")"
+	[ "$(lock_owner_pid "$bearer_caller_lock" 2>/dev/null || :)" = "$bearer_caller" ] || return 1
+	# No cached display record or uncertain owner discovery authorizes a read.
+	REQUESTED_CACHED_SCAN=0
+	scan_inventory
+	[ "$MM_DISCOVERY_UNCERTAIN" -eq 0 ] || return 1
+	bearer_probe_line="$(awk -F '\t' -v id="$REQUESTED_MODEM" '$1 == id {print; n++} END {if(n != 1) exit 1}' "$INVENTORY_FILE")" || return 1
+	[ "$(field "$bearer_probe_line" 12)" = 0 ] || return 1
+	[ "$(field "$bearer_probe_line" 8)" = netifd-direct ] || return 1
+	[ "$(field "$bearer_probe_line" 9)" = "$REQUESTED_INTERFACE" ] || return 1
+	bearer_probe_usb="$(field "$bearer_probe_line" 3)"
+	[ "${bearer_probe_usb##*/}" = "$(network_uci_get "$REQUESTED_INTERFACE" usbpath 2>/dev/null || :)" ] || return 1
+	[ "$(bearer_attachment "${bearer_probe_usb##*/}" 2>/dev/null || :)" = "$bearer_current_attachment" ] || return 1
+	[ -n "$bearer_current_attachment" ] || return 1
+	# Resolve on this physical modem, never on the first enumerated tty.
+	bearer_read_runtime && [ "$bearer_up:$bearer_pending:$bearer_autostart" = false:false:false ] || return 1
+	at_resolve_port "$bearer_probe_usb" || return 1
+	bearer_probe_port="$AT_RESOLVED_PORT"
+	at_port_lock_acquire "$bearer_probe_port" || return 1
+	bearer_probe_result=1
+	# The AT lock also excludes a concurrent protocol setup or teardown.
+	# Re-read netifd while holding it before sending the read-only command.
+	if bearer_read_runtime && [ "$bearer_up:$bearer_pending:$bearer_autostart" = false:false:false ] && \
+		[ "$(resolve_class_device_usb_path "$SYSFS_ROOT/class/tty/${bearer_probe_port#/dev/}/device" 2>/dev/null || :)" = "$bearer_probe_usb" ] && \
+		run_at "$bearer_probe_port" 'AT+CGACT?'; then
+		if printf '%s\n' "$AT_RESULT" | awk '
+			/^[ \t]*$/ {next}
+			/^\+CGACT:[ \t]*[0-9]+,[ \t]*[01]$/ {
+				line=$0; sub(/^\+CGACT:[ \t]*/, "", line)
+				split(line, pair, ","); gsub(/[ \t]/, "", pair[2])
+				if (seen[pair[1]]++ || pair[2] != "0") bad=1
+				if (pair[1] == "1") primary=1
+				n++; next
+			}
+			{bad=1}
+			# A successful empty list is the never-dialled case: there is no
+			# defined context that could still be active. If contexts do exist,
+			# CID 1 must be present and every context must be inactive.
+			END {exit !(!bad && (n == 0 || primary))}
+		'; then
+			# A reconnect or a new administrative request invalidates the answer.
+			if [ "$(bearer_attachment "${bearer_probe_usb##*/}" 2>/dev/null || :)" = "$bearer_current_attachment" ] && \
+				[ "$(network_uci_get "$REQUESTED_INTERFACE" proto 2>/dev/null || :)" = apn_atdial ] && \
+				[ "$(bearer_config_fingerprint)" = "$bearer_fingerprint" ] && \
+				bearer_read_runtime && [ "$bearer_up:$bearer_pending:$bearer_autostart" = false:false:false ]; then
+				bearer_probe_result=0
+			fi
+		fi
+	fi
+	at_port_lock_release
+	return "$bearer_probe_result"
+}
+
+bearer_read_runtime() {
+	run_bounded_to_file 5 "$BEARER_STATE_FILE" "$UBUS" call "network.interface.$REQUESTED_INTERFACE" status || return 1
+	bearer_up="$(jsonfilter -i "$BEARER_STATE_FILE" -e '@.up' 2>/dev/null || :)"
+	bearer_pending="$(jsonfilter -i "$BEARER_STATE_FILE" -e '@.pending' 2>/dev/null || :)"
+	bearer_autostart="$(jsonfilter -i "$BEARER_STATE_FILE" -e '@.autostart' 2>/dev/null || :)"
+	for bearer_bool in "$bearer_up" "$bearer_pending" "$bearer_autostart"; do
+		case "$bearer_bool" in true|false) : ;; *) return 1 ;; esac
+	done
+}
+
+bearer_config_fingerprint() {
+	{
+		for bearer_option in modem_id usbpath atport; do
+			printf '%s\n' "$(network_uci_get "$REQUESTED_INTERFACE" "$bearer_option" 2>/dev/null || :)"
+		done
+		printf '%s\n' "$bearer_current_attachment"
+	} | "$SHA256" | awk 'NF {print $1; found=1} END {exit !found}'
+}
+
+bearer_state_cmd() {
+	case "$REQUESTED_INTERFACE" in ''|*[!A-Za-z0-9_]*) die_code 2 "bearer-state requires a safe --interface" ;; esac
+	bearer_read_runtime || die_code 3 "the selected interface state is unavailable or incomplete"
+	bearer_proto="$(network_uci_get "$REQUESTED_INTERFACE" proto 2>/dev/null || :)"
+	bearer_quiet=false
+	bearer_reason=teardown-unconfirmed
+	bearer_root="${APN_AUTOCONFIG_BEARER_STATE_DIR:-$STATE_DIR/bearer}"
+	case "$bearer_root" in /|*/../*|*/..|*[[:space:]]*) die_code 2 "unsafe bearer state directory" ;; /*) : ;; *) die_code 2 "unsafe bearer state directory" ;; esac
+	if [ "$bearer_proto" = apn_atdial ] && [ "$bearer_up" = false ] && \
+		[ "$bearer_pending" = false ] && [ "$bearer_autostart" = false ]; then
+		bearer_current_attachment="$(bearer_attachment "$(network_uci_get "$REQUESTED_INTERFACE" usbpath 2>/dev/null || :)" || :)"
+		bearer_fingerprint="$(bearer_config_fingerprint)"
+		bearer_record="$(cat "$bearer_root/$REQUESTED_INTERFACE" 2>/dev/null || :)"
+		if [ -n "$bearer_current_attachment" ] && \
+			[ -n "$bearer_fingerprint" ] && \
+			[ "$bearer_record" = "$(printf 'v2\tdown\t%s' "$bearer_fingerprint")" ]; then
+			bearer_quiet=true
+			bearer_reason=""
+		elif [ "${REQUESTED_PROBE:-0}" -eq 1 ] && bearer_probe_inactive; then
+			bearer_quiet=true
+			bearer_reason=""
+		fi
+	fi
+	for bearer_bool in "$bearer_up" "$bearer_pending" "$bearer_autostart"; do
+		case "$bearer_bool" in true|false) : ;; *) die_code 3 "the selected interface state became incomplete" ;; esac
+	done
+	printf '{"version":"v1",'
+	json_key_string interface "$REQUESTED_INTERFACE"; printf ','
+	printf '"up":%s,"pending":%s,"autostart":%s,"quiescent":%s,' \
+		"$bearer_up" "$bearer_pending" "$bearer_autostart" "$bearer_quiet"
+	json_key_string reason "$bearer_reason"
+	printf '}\n'
+}
+
 interface_is_up() {
-	command_exists ubus || return 1
+	command_exists "$UBUS" || return 1
 	command_exists jsonfilter || return 1
-	conn_state="$(ubus call "network.interface.$1" status 2>/dev/null | \
-		jsonfilter -e '@.up' 2>/dev/null || :)"
+	run_bounded_to_file 5 "$BEARER_STATE_FILE" "$UBUS" call "network.interface.$1" status || return 1
+	conn_state="$(jsonfilter -i "$BEARER_STATE_FILE" -e '@.up' 2>/dev/null || :)"
 	[ "$conn_state" = true ]
 }
 
@@ -3573,15 +4950,15 @@ connection_resolve_section() {
 	[ -n "$conn_record" ] || \
 		conn_record="$(find_inventory_record "$conn_resolve_modem" 2>/dev/null || :)"
 	if [ -z "$conn_record" ]; then
-		CONNECTION_REASON="modem $conn_resolve_modem is not currently present"
+		CONNECTION_REASON="modem $(mask_modem_id "$conn_resolve_modem") is not currently present"
 		return 3
 	fi
 	if [ "$(field "$conn_record" 12)" = 1 ]; then
-		CONNECTION_REASON="modem $conn_resolve_modem is ambiguous; refusing to drive any interface"
+		CONNECTION_REASON="modem $(mask_modem_id "$conn_resolve_modem") is ambiguous; refusing to drive any interface"
 		return 4
 	fi
 	if [ "$(field "$conn_record" 8)" = conflicting ]; then
-		CONNECTION_REASON="modem $conn_resolve_modem has a conflicting control-owner state"
+		CONNECTION_REASON="modem $(mask_modem_id "$conn_resolve_modem") has a conflicting control-owner state"
 		return 4
 	fi
 
@@ -3597,7 +4974,7 @@ connection_resolve_section() {
 	else
 		CONNECTION_SECTION="$(field "$conn_record" 9)"
 		if [ -z "$CONNECTION_SECTION" ]; then
-			CONNECTION_REASON="no cellular interface is bound to modem $conn_resolve_modem"
+			CONNECTION_REASON="no cellular interface is bound to modem $(mask_modem_id "$conn_resolve_modem")"
 			return 4
 		fi
 	fi
@@ -3629,6 +5006,177 @@ connection_resolve_section() {
 
 	CONNECTION_REASON=ok
 	return 0
+}
+
+# Read-only decision for an explicit takeover of an existing cellular section.
+# It deliberately uses the same binding resolver as bearer control, then adds
+# the stronger requirements needed before configuration ownership changes.
+adoption_evaluate() {
+	adopt_modem="$1"
+	ADOPTION_REASON=""
+	ADOPTION_SECTION=""
+	ADOPTION_PROTOCOL=""
+	ADOPTION_ORIGIN=none
+
+	adopt_record="$(find_inventory_record "$adopt_modem" 2>/dev/null || :)"
+	if [ -z "$adopt_record" ]; then ADOPTION_REASON=not_present; return 3; fi
+	if [ "$(field "$adopt_record" 12)" = 1 ]; then ADOPTION_REASON=ambiguous; return 4; fi
+	if [ "$(field "$adopt_record" 8)" = conflicting ]; then ADOPTION_REASON=conflicting_owner; return 4; fi
+	case "$adopt_modem" in usb-serial:*|imei:*) : ;; *) ADOPTION_REASON=weak_identity; return 4 ;; esac
+
+	adopt_connection_status=0
+	connection_resolve_section "$adopt_modem" connect "$adopt_record" || adopt_connection_status=$?
+	if [ "$adopt_connection_status" -ne 0 ]; then
+		case "$CONNECTION_REASON" in
+			no\ cellular\ interface*) ADOPTION_REASON=no_interface ;;
+			interface*not\ a\ cellular*) ADOPTION_REASON=unsupported_interface ;;
+			*) ADOPTION_REASON=unavailable ;;
+		esac
+		return "$adopt_connection_status"
+	fi
+	ADOPTION_SECTION="$CONNECTION_SECTION"
+	ADOPTION_PROTOCOL="$(network_uci_get "$ADOPTION_SECTION" proto 2>/dev/null || :)"
+	ADOPTION_ORIGIN="$(section_origin "$ADOPTION_SECTION")"
+	if [ "$CONNECTION_OWNED" = 1 ]; then
+		ADOPTION_REASON=already_owned
+		return 4
+	fi
+	adopt_baseline="$(adoption_baseline_file "$ADOPTION_SECTION")"
+	if adoption_markers_absent "$ADOPTION_SECTION" && [ ! -e "$adopt_baseline" ]; then
+		ADOPTION_REASON=ok
+		return 0
+	fi
+	if [ -e "$adopt_baseline" ] && \
+		adoption_baseline_validate "$adopt_baseline" "$adopt_modem" "$ADOPTION_SECTION" && \
+		adoption_markers_recoverable "$ADOPTION_SECTION" "$adopt_modem"; then
+		ADOPTION_REASON=resume_interrupted
+		return 0
+	fi
+	ADOPTION_REASON=marker_conflict
+	return 4
+}
+
+adopt_plan_cmd() {
+	[ -n "$REQUESTED_MODEM" ] || die_code 2 "adopt-plan requires --modem"
+	adopt_plan_status=0
+	adoption_evaluate "$REQUESTED_MODEM" || adopt_plan_status=$?
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$REQUESTED_MODEM"; printf ','
+	printf '"can_adopt":%s,' "$([ "$adopt_plan_status" -eq 0 ] && printf true || printf false)"
+	json_key_string reason "$ADOPTION_REASON"; printf ','
+	json_key_string section "$ADOPTION_SECTION"; printf ','
+	json_key_string protocol "$ADOPTION_PROTOCOL"; printf ','
+	json_key_string origin "$ADOPTION_ORIGIN"; printf ','
+	printf '"preserves_section":true'
+	printf '}\n'
+	return "$adopt_plan_status"
+}
+
+adopt_cmd() {
+	adopt_modem="$REQUESTED_MODEM"
+	[ -n "$adopt_modem" ] || die_code 2 "adopt requires --modem"
+	command_exists uci || die "uci is required"
+	adopt_status=0
+	adoption_evaluate "$adopt_modem" || adopt_status=$?
+	[ "$adopt_status" -eq 0 ] || \
+		die_code "$adopt_status" "modem $(mask_modem_id "$adopt_modem") cannot be adopted: $ADOPTION_REASON"
+	adopt_expected_section="$ADOPTION_SECTION"
+
+	acquire_apn_lock
+	acquire_modem_lock "$adopt_modem"
+	adopt_status=0
+	adoption_evaluate "$adopt_modem" || adopt_status=$?
+	[ "$adopt_status" -eq 0 ] || \
+		die_code "$adopt_status" "modem $(mask_modem_id "$adopt_modem") stopped being adoptable: $ADOPTION_REASON"
+	[ "$ADOPTION_SECTION" = "$adopt_expected_section" ] || \
+		die_code 4 "modem $(mask_modem_id "$adopt_modem") changed its bound interface before adoption"
+	adopt_section="$ADOPTION_SECTION"
+	case "$adopt_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+
+	if [ "$ADOPTION_REASON" = resume_interrupted ]; then
+		# The caller explicitly repeated adoption. The earlier attempt never
+		# published owner (it is the last marker), so discard only its compatible
+		# partial markers and baseline, then capture the current external state.
+		adoption_remove_markers "$adopt_section"
+		uci commit network || die "cannot clear an interrupted adoption of $adopt_section"
+		rm -f "$(adoption_baseline_file "$adopt_section")" || \
+			die "cannot replace an interrupted adoption baseline for $adopt_section"
+	fi
+	adopt_capture_status=0
+	adoption_baseline_capture "$adopt_modem" "$adopt_section" || adopt_capture_status=$?
+	case "$adopt_capture_status" in
+		0) : ;;
+		3) die_code 4 "a restoration baseline already exists for $adopt_section" ;;
+		4) die_code 4 "$adopt_section contains a multiline value that cannot be adopted safely" ;;
+		*) die "cannot persist the restoration baseline for $adopt_section" ;;
+	esac
+	ADOPTION_ROLLBACK_SECTION="$adopt_section"
+	ADOPTION_ROLLBACK_ARMED=1
+	adopt_now="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date)"
+
+	# Ownership changes only. The section keeps its name, protocol, device,
+	# firewall membership, route policy, current bearer and APN at this point.
+	uci set "network.${adopt_section}.apn_autoconfig_provisioned=${adopt_now}" || die "cannot mark adoption time"
+	uci set "network.${adopt_section}.apn_autoconfig_origin=adopted" || die "cannot mark adopted origin"
+	uci set "network.${adopt_section}.apn_autoconfig_modem_id=${adopt_modem}" || die "cannot mark modem identity"
+	# Owner is the commit point for every reader in this package, so it is
+	# written last. A SIGKILL before this line leaves a recoverable partial
+	# transaction, never a user section mistaken for a project-created one.
+	uci set "network.${adopt_section}.apn_autoconfig_owner=${PROVISION_OWNER}" || die "cannot mark ownership"
+	uci commit network || die "cannot commit adoption of $adopt_section"
+
+	ADOPTION_ROLLBACK_ARMED=0
+	ADOPTION_ROLLBACK_SECTION=""
+	ADOPTION_ROLLBACK_BASELINE=""
+	release_modem_lock
+	log notice "adopted existing section $adopt_section for modem $(mask_modem_id "$adopt_modem")"
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$adopt_modem"; printf ','
+	json_key_string section "$adopt_section"; printf ','
+	json_key_string state adopted; printf ','
+	printf '"preserved_in_place":true'
+	printf '}\n'
+}
+
+release_adoption_cmd() {
+	release_modem="$REQUESTED_MODEM"
+	[ -n "$release_modem" ] || die_code 2 "release-adoption requires --modem"
+	command_exists uci || die "uci is required"
+	release_section="$(provision_existing_section "$release_modem" 2>/dev/null || :)"
+	[ -n "$release_section" ] || die_code 4 "no managed section is bound to modem $(mask_modem_id "$release_modem")"
+	[ "$(section_origin "$release_section")" = adopted ] || \
+		die_code 4 "section $release_section was created by this package; use deprovision"
+
+	acquire_apn_lock
+	acquire_modem_lock "$release_modem"
+	release_section="$(provision_existing_section "$release_modem" 2>/dev/null || :)"
+	[ -n "$release_section" ] || die_code 4 "the adopted section is no longer owned by this package"
+	[ "$(section_origin "$release_section")" = adopted ] || \
+		die_code 4 "section $release_section is no longer an adopted section"
+	case "$release_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+	release_baseline="$(adoption_baseline_file "$release_section")"
+	adoption_baseline_validate "$release_baseline" "$release_modem" "$release_section" || \
+		die_code 4 "the restoration baseline for $release_section is missing or invalid"
+
+	# Validate the whole document before the first write. Restoration removes
+	# only our markers and restores only the fields captured at takeover; the
+	# section itself and all unrelated user options remain in place.
+	adoption_baseline_restore "$release_baseline" "$release_section" || \
+		die "cannot restore the pre-adoption options for $release_section"
+	adoption_remove_markers "$release_section"
+	uci commit network || die "cannot commit release of $release_section"
+	rm -f "$release_baseline" || die "cannot remove the consumed restoration baseline"
+	release_modem_lock
+	log notice "released adopted section $release_section for modem $(mask_modem_id "$release_modem")"
+	printf '{'
+	json_key_string version v1; printf ','
+	json_key_string modem_id "$release_modem"; printf ','
+	json_key_string section "$release_section"; printf ','
+	json_key_string state released; printf ','
+	printf '"preserved_in_place":true'
+	printf '}\n'
 }
 
 # The APN engine owns the per-target intention; this package only reports the
@@ -3666,22 +5214,22 @@ connection_cmd() {
 	connection_resolve_section "$conn_modem" "$conn_action" || conn_status=$?
 	[ "$conn_status" -eq 0 ] || die_code "$conn_status" "$CONNECTION_REASON"
 	[ "$CONNECTION_SECTION" = "$conn_expected_section" ] || \
-		die_code 4 "modem $conn_modem changed its bound interface before $conn_action"
+		die_code 4 "modem $(mask_modem_id "$conn_modem") changed its bound interface before $conn_action"
 	[ "$CONNECTION_OWNED" = "$conn_expected_owned" ] || \
-		die_code 4 "modem $conn_modem changed section ownership before $conn_action"
+		die_code 4 "modem $(mask_modem_id "$conn_modem") changed section ownership before $conn_action"
 	conn_section="$CONNECTION_SECTION"
 
 	conn_result=up
 	case "$conn_action" in
 		disconnect)
-			ifdown "$conn_section" >/dev/null 2>&1 || die "failed to stop $conn_section"
+			run_bounded_to_file 30 /dev/null ifdown "$conn_section" >/dev/null 2>&1 || die "failed to stop $conn_section"
 			conn_result=down
 		;;
 		connect|reconnect)
 			if [ "$conn_action" = reconnect ]; then
-				ifdown "$conn_section" >/dev/null 2>&1 || :
+				run_bounded_to_file 30 /dev/null ifdown "$conn_section" >/dev/null 2>&1 || :
 			fi
-			ifup "$conn_section" >/dev/null 2>&1 || die "failed to start $conn_section"
+			run_bounded_to_file 30 /dev/null ifup "$conn_section" >/dev/null 2>&1 || die "failed to start $conn_section"
 			if ! wait_for_interface_up "$conn_section"; then
 				die_code 3 "$conn_section did not come up within ${CONNECT_WAIT_SECONDS}s"
 			fi
@@ -3716,7 +5264,7 @@ connection_cmd() {
 # recoverable state rather than a corrupt one.
 reload_inhibitors() {
 	[ -x "$SERVICE_INIT" ] || return 0
-	"$SERVICE_INIT" reload >/dev/null 2>&1 || \
+	run_bounded_to_file 30 /dev/null "$SERVICE_INIT" reload >/dev/null 2>&1 || \
 		log warning "could not reconcile ModemManager inhibitions; check ${SERVICE_INIT##*/}"
 	return 0
 }
@@ -3728,7 +5276,9 @@ deprovision_cmd() {
 
 	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
 	[ -n "$deprov_section" ] || \
-		die_code 4 "no section owned by this package is bound to modem $deprov_modem"
+		die_code 4 "no section owned by this package is bound to modem $(mask_modem_id "$deprov_modem")"
+	[ "$(section_origin "$deprov_section")" != adopted ] || \
+		die_code 4 "section $deprov_section was adopted in place; use release-adoption so it is restored, not deleted"
 
 	acquire_apn_lock
 	acquire_modem_lock "$deprov_modem"
@@ -3737,11 +5287,13 @@ deprovision_cmd() {
 	# marker is never deleted, however much it looks like one of ours.
 	deprov_section="$(provision_existing_section "$deprov_modem" 2>/dev/null || :)"
 	[ -n "$deprov_section" ] || \
-		die_code 4 "modem $deprov_modem no longer owns a project-created section"
+		die_code 4 "modem $(mask_modem_id "$deprov_modem") no longer owns a project-created section"
 	case "$deprov_section" in ''|*[!A-Za-z0-9_]*) die "refusing an unsafe section name" ;; esac
+	[ "$(section_origin "$deprov_section")" != adopted ] || \
+		die_code 4 "section $deprov_section became adopted; refusing to delete it"
 
-	log notice "removing project-owned section $deprov_section for modem $deprov_modem"
-	ifdown "$deprov_section" >/dev/null 2>&1 || :
+	log notice "removing project-owned section $deprov_section for modem $(mask_modem_id "$deprov_modem")"
+	run_bounded_to_file 30 /dev/null ifdown "$deprov_section" >/dev/null 2>&1 || :
 	# Only the zone provisioning recorded. A zone the administrator put this
 	# interface in themselves was never recorded here and is never touched.
 	deprov_zone="$(uci -q get "network.${deprov_section}.apn_autoconfig_firewall_zone" 2>/dev/null || :)"
@@ -3812,6 +5364,17 @@ provision_plan_cmd() {
 	# the strictest verb, which makes it the right question to answer here.
 	connection_status=0
 	connection_resolve_section "$REQUESTED_MODEM" connect "$PROVISION_RECORD" || connection_status=$?
+	plan_connection_section="$CONNECTION_SECTION"
+	plan_connection_owned="$CONNECTION_OWNED"
+	if [ -n "$plan_connection_section" ]; then
+		plan_connection_origin="$(section_origin "$plan_connection_section")"
+	else
+		plan_connection_origin=none
+	fi
+	adopt_status=0
+	adoption_evaluate "$REQUESTED_MODEM" || adopt_status=$?
+	release_adoption_status=0
+	adoption_release_ready "$REQUESTED_MODEM" "$plan_connection_section" || release_adoption_status=$?
 
 	printf '{'
 	json_key_string version v1; printf ','
@@ -3825,8 +5388,13 @@ provision_plan_cmd() {
 	printf '"netifd_restart_required":%s,' \
 		"$([ "$PROVISION_PROTOCOL" = "$ATDIAL_PROTO" ] && netifd_restart_required && printf true || printf false)"
 	printf '"can_control_bearer":%s,' "$([ "$connection_status" -eq 0 ] && printf true || printf false)"
-	json_key_string connection_section "$CONNECTION_SECTION"; printf ','
-	printf '"connection_owned":%s' "$([ "$CONNECTION_OWNED" = 1 ] && printf true || printf false)"
+	json_key_string connection_section "$plan_connection_section"; printf ','
+	printf '"connection_owned":%s,' "$([ "$plan_connection_owned" = 1 ] && printf true || printf false)"
+	json_key_string connection_origin "$plan_connection_origin"; printf ','
+	printf '"can_adopt":%s,' "$([ "$adopt_status" -eq 0 ] && printf true || printf false)"
+	json_key_string adoption_reason "$ADOPTION_REASON"; printf ','
+	json_key_string adoption_section "$ADOPTION_SECTION"; printf ','
+	printf '"can_release_adoption":%s' "$([ "$release_adoption_status" -eq 0 ] && printf true || printf false)"
 	printf '}\n'
 	return "$plan_status"
 }
@@ -3839,9 +5407,9 @@ at_resolve_target_port() {
 	# finished probing every port, so unowned-then-owned is the normal sequence.
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "$COMMAND_NAME requires --modem"
 	line="$(find_inventory_record "$REQUESTED_MODEM")" || \
-		die_code 3 "modem $REQUESTED_MODEM is not present"
+		die_code 3 "modem $(mask_modem_id "$REQUESTED_MODEM") is not present"
 	[ "$(field "$line" 12)" = 0 ] || \
-		die_code 4 "modem $REQUESTED_MODEM is ambiguous; no AT operation may target it"
+		die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") is ambiguous; no AT operation may target it"
 	record_owner="$(field "$line" 8)"
 	case "$record_owner" in
 		modemmanager|conflicting)
@@ -3849,13 +5417,13 @@ at_resolve_target_port() {
 			# typically leaves a second AT port apparently free, and probing it
 			# usually appears to work. Ownership is of the modem, not of one
 			# node. See docs/modem-contract-v1.md.
-			die_code 4 "modem $REQUESTED_MODEM is owned by $record_owner; AT access is refused"
+			die_code 4 "modem $(mask_modem_id "$REQUESTED_MODEM") is owned by $record_owner; AT access is refused"
 		;;
 	esac
 	command_exists "$SMS_TOOL" || die_code 3 "$SMS_TOOL is not installed"
 	AT_TARGET_USB_PATH="$(field "$line" 3)"
 	at_resolve_port "$AT_TARGET_USB_PATH" || \
-		die_code 3 "no AT control port could be resolved for modem $REQUESTED_MODEM"
+		die_code 3 "no AT control port could be resolved for modem $(mask_modem_id "$REQUESTED_MODEM")"
 }
 
 at_port_cmd() {
@@ -3891,9 +5459,15 @@ at_identity_cmd() {
 	identity_status=0
 	at_read_identity "$AT_RESOLVED_PORT" || identity_status=$?
 	[ "$identity_status" -eq 3 ] && \
-		die_code 3 "the AT port for modem $REQUESTED_MODEM is busy"
+		die_code 3 "the AT port for modem $(mask_modem_id "$REQUESTED_MODEM") is busy"
+	# Exit 5 is the modem's own answer, not a failure to get one: it spoke, and
+	# it has no SIM. A caller that must tell "nothing is there" from "I could
+	# not look" -- a deletion plan asking whether a profile is in use, above
+	# all -- can only do that if this distinction survives the boundary.
+	[ "$identity_status" -eq 5 ] && \
+		die_code 5 "modem $(mask_modem_id "$REQUESTED_MODEM") answered and reports no SIM"
 	[ "$identity_status" -eq 0 ] || \
-		die_code 3 "no usable SIM identity was read from modem $REQUESTED_MODEM"
+		die_code 3 "no usable SIM identity was read from modem $(mask_modem_id "$REQUESTED_MODEM")"
 
 	at_cache_identity_evidence "$AT_TARGET_USB_PATH"
 
@@ -3952,7 +5526,7 @@ attachment_cmd() {
 	attachment_tab="$(printf '\t')"
 	case "$attachment_line" in
 		"v1${attachment_tab}"*) : ;;
-		*) die_code 3 "no attachment record exists for modem $attachment_target" ;;
+		*) die_code 3 "no attachment record exists for modem $(mask_modem_id "$attachment_target")" ;;
 	esac
 	attachment_generation="$(field "$attachment_line" 2)"
 	case "$attachment_generation" in
@@ -4112,7 +5686,7 @@ reset_cmd() {
 	# Reset decisions use the discovered owner, not the public
 	# action-status overlay that deliberately reports this worker as
 	# "transitioning" while a background reset is active.
-	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $reset_target_id is not currently present"
+	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $(mask_modem_id "$reset_target_id") is not currently present"
 	reset_chosen_method="$(printf '%s' "$line" | awk -F '\t' '{ print $16 }')"
 	[ -n "$reset_chosen_method" ] && [ "$reset_chosen_method" != none ] || \
 		die_code 4 "no reset method is available for modem $(mask_modem_id "$reset_target_id")"
@@ -4123,7 +5697,7 @@ reset_cmd() {
 	fi
 	reset_owner_state="$(printf '%s' "$line" | awk -F '\t' '{ print $8 }')"
 	case "$reset_owner_state" in
-		conflicting) die_code 4 "modem $reset_target_id has a conflicting control-owner state; refusing to reset" ;;
+		conflicting) die_code 4 "modem $(mask_modem_id "$reset_target_id") has a conflicting control-owner state; refusing to reset" ;;
 	esac
 	expected_owner_state="$reset_owner_state"
 	reset_bound_interface="$(printf '%s' "$line" | awk -F '\t' '{ print $9 }')"
@@ -4133,14 +5707,14 @@ reset_cmd() {
 	# APN lock only after proving the owner PID above.
 	acquire_apn_lock
 	acquire_modem_lock "$reset_target_id"
-	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $reset_target_id disappeared before reset could start"
+	line="$(find_inventory_record "$reset_target_id")" || die_code 4 "modem $(mask_modem_id "$reset_target_id") disappeared before reset could start"
 	current_reset_method="$(field "$line" 16)"
 	current_owner_state="$(field "$line" 8)"
 	[ -n "$current_reset_method" ] && [ "$current_reset_method" != none ] || \
 		die_code 4 "modem $(mask_modem_id "$reset_target_id") is no longer safely reset-capable"
 	[ "$current_reset_method" = "$reset_chosen_method" ] || \
 		die_code 4 "modem $(mask_modem_id "$reset_target_id") changed reset method before reset could start"
-	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $reset_target_id acquired a conflicting owner before reset"
+	[ "$current_owner_state" != conflicting ] || die_code 4 "modem $(mask_modem_id "$reset_target_id") acquired a conflicting owner before reset"
 	[ "$current_owner_state" = "$expected_owner_state" ] || \
 		die_code 4 "modem $(mask_modem_id "$reset_target_id") changed control owner before reset"
 	reset_bound_interface="$(field "$line" 9)"
@@ -4151,7 +5725,7 @@ reset_cmd() {
 		restore_armed=1
 		RESET_INTERFACE="$reset_bound_interface"
 		RESET_INTERFACE_RESTORE_ARMED=1
-		ifdown "$reset_bound_interface" >/dev/null 2>&1 || :
+		run_bounded_to_file 30 /dev/null ifdown "$reset_bound_interface" >/dev/null 2>&1 || :
 	else
 		log notice "modem reset requested for $(mask_modem_id "$reset_target_id") (no bound netifd interface)"
 	fi
@@ -4208,11 +5782,23 @@ reset_cmd() {
 	fi
 
 	if [ "$restore_armed" -eq 1 ]; then
-		ifup "$reset_bound_interface" >/dev/null 2>&1 || die "failed to restart interface $reset_bound_interface after modem reset"
+		run_bounded_to_file 30 /dev/null ifup "$reset_bound_interface" >/dev/null 2>&1 || die "failed to restart interface $reset_bound_interface after modem reset"
 		RESET_INTERFACE_RESTORE_ARMED=0
 	fi
 	release_modem_lock
 	log notice "modem $(mask_modem_id "$reset_target_id") reset completed; stable identity and control owner are available again"
+}
+
+# The stages one background operation completed, appended as they pass.
+#
+# The worker owns state.tsv and names this file in the environment; the command
+# doing the work appends to it. One writer each, so a long operation can report
+# progress without two processes racing for the same record. A command run
+# outside the action API sees no variable and writes nothing.
+stage_reached() {
+	[ -n "${APN_AUTOCONFIG_MODEM_STAGE_FILE:-}" ] || return 0
+	printf '%s\n' "$1" >>"$APN_AUTOCONFIG_MODEM_STAGE_FILE" 2>/dev/null || :
+	return 0
 }
 
 action_state_dir_for() {
@@ -4229,17 +5815,24 @@ action_status_values() {
 	ACTION_EXIT_CODE=""
 	ACTION_MESSAGE=""
 	ACTION_OPERATION_ID=""
+	ACTION_STAGES=""
 	ACTION_BUSY=false
 	state_dir="$(action_state_dir_for "$modem_id")"
-	if [ -r "$state_dir/state.tsv" ]; then
-		ACTION_STATUS="$(awk -F '\t' 'NR==1{print $2}' "$state_dir/state.tsv")"
-		ACTION_NAME="$(awk -F '\t' 'NR==1{print $3}' "$state_dir/state.tsv")"
-		ACTION_PID="$(awk -F '\t' 'NR==1{print $4}' "$state_dir/state.tsv")"
-		ACTION_STARTED="$(awk -F '\t' 'NR==1{print $5}' "$state_dir/state.tsv")"
-		ACTION_FINISHED="$(awk -F '\t' 'NR==1{print $6}' "$state_dir/state.tsv")"
-		ACTION_EXIT_CODE="$(awk -F '\t' 'NR==1{print $7}' "$state_dir/state.tsv")"
-		ACTION_MESSAGE="$(awk -F '\t' 'NR==1{print $8}' "$state_dir/state.tsv")"
-		ACTION_OPERATION_ID="$(awk -F '\t' 'NR==1{print $10}' "$state_dir/state.tsv")"
+	status_snapshot_attempt=0
+	status_line="$(sed -n '1p' "$state_dir/state.tsv" 2>/dev/null || :)"
+	while [ -n "$status_line" ]; do
+		ACTION_STATUS="$(field "$status_line" 2)"
+		ACTION_NAME="$(field "$status_line" 3)"
+		ACTION_PID="$(field "$status_line" 4)"
+		ACTION_STARTED="$(field "$status_line" 5)"
+		ACTION_FINISHED="$(field "$status_line" 6)"
+		ACTION_EXIT_CODE="$(field "$status_line" 7)"
+		ACTION_MESSAGE="$(field "$status_line" 8)"
+		ACTION_OPERATION_ID="$(field "$status_line" 10)"
+		# Appended by the command as it goes, in its own file so the worker
+		# stays the only writer of state.tsv.
+		[ ! -r "$state_dir/stages" ] || \
+			ACTION_STAGES="$(tr '\n' ' ' <"$state_dir/stages" 2>/dev/null || :)"
 		case "$ACTION_STATUS" in
 			starting|queued|running)
 				# The launcher records "starting" under its own PID and then
@@ -4257,13 +5850,28 @@ action_status_values() {
 				elif process_is_alive "$handoff_pid"; then
 					ACTION_BUSY=true
 				else
+					# The worker publishes its terminal record before exiting. A
+					# dead PID invalidates our earlier running snapshot: read
+					# again before inventing an unexpected-exit result. Repeated
+					# replacements are busy uncertainty, with a bounded reader.
+					status_latest="$(sed -n '1p' "$state_dir/state.tsv" 2>/dev/null || :)"
+					if [ -n "$status_latest" ] && [ "$status_latest" != "$status_line" ]; then
+						status_snapshot_attempt=$((status_snapshot_attempt + 1))
+						if [ "$status_snapshot_attempt" -lt 3 ]; then
+							status_line="$status_latest"
+							continue
+						fi
+						ACTION_BUSY=true
+						break
+					fi
 					ACTION_STATUS="failed"
 					ACTION_EXIT_CODE="1"
 					ACTION_MESSAGE="background worker stopped unexpectedly"
 				fi
 			;;
 		esac
-	fi
+		break
+	done
 	if [ "$ACTION_BUSY" = false ]; then
 		external_lock="${LOCK_ROOT}.$(sanitize_token "$modem_id")"
 		external_pid="$(lock_owner_pid "$external_lock" 2>/dev/null || :)"
@@ -4308,11 +5916,53 @@ print_action_json() {
 	json_key_string state "$ACTION_STATUS"; printf ','
 	json_key_string action "$ACTION_NAME"; printf ','
 	json_key_string operation_id "$ACTION_OPERATION_ID"; printf ','
+	# Which stages of this operation completed. Additive: a consumer that does
+	# not know the key is unaffected, and an action that records none publishes
+	# an empty list rather than nothing.
+	printf '"stages":['
+	stages_sep=""
+	for stages_name in $ACTION_STAGES; do
+		printf '%s' "$stages_sep"
+		json_string "$stages_name"
+		stages_sep=","
+	done
+	printf '],'
 	json_key_string pid "$ACTION_PID"; printf ','
 	json_key_string started_at "$ACTION_STARTED"; printf ','
 	json_key_string finished_at "$ACTION_FINISHED"; printf ','
 	json_key_string exit_code "$ACTION_EXIT_CODE"; printf ','
 	json_key_string message "$ACTION_MESSAGE"
+	printf '}\n'
+}
+
+# A launch-time refusal is still an action-start document. No worker exists to
+# publish a state record, so build the response directly rather than falling
+# back to a diagnostic line that JSON callers cannot interpret. The non-zero
+# exit is preserved for shell callers; structured callers receive the same
+# reason in `message`.
+print_action_refusal_json() {
+	refusal_code="$1"
+	refusal_action="$2"
+	refusal_modem="$3"
+	refusal_message="$4"
+	case "$refusal_code" in
+		4) refusal_state=blocked ;;
+		3) refusal_state=retryable ;;
+		*) refusal_state=failed ;;
+	esac
+	printf '{'
+	json_key_string version v2; printf ','
+	printf '"accepted":false,"busy":false,'
+	json_key_string modem_id "$refusal_modem"; printf ','
+	json_key_string state "$refusal_state"; printf ','
+	json_key_string action "$refusal_action"; printf ','
+	json_key_string operation_id ""; printf ','
+	printf '"stages":[],'
+	json_key_string pid ""; printf ','
+	json_key_string started_at ""; printf ','
+	json_key_string finished_at ""; printf ','
+	json_key_string exit_code "$refusal_code"; printf ','
+	json_key_string message "$refusal_message"
 	printf '}\n'
 }
 
@@ -4330,19 +5980,63 @@ action_precondition() {
 	case "$precondition_action" in
 		reset)
 			line="$(find_record "$precondition_modem")" || \
-				die_code 4 "modem $precondition_modem is not currently present"
-			[ "$(field "$line" 14)" = 1 ] || \
-				die_code 4 "modem $precondition_modem is not bound to the supported board reset integration"
+				die_code 4 "modem $(mask_modem_id "$precondition_modem") is not currently present"
+			# The gate is having a method, not being bound to the board.
+			#
+			# This used to require field 14, the GPIO board binding, for every
+			# background reset -- while `reset_cmd` right below dispatches by
+			# `reset_method` and only its own `gpio` branch needs that binding.
+			# So `action-start reset` refused a modem that `reset` would have
+			# reset happily by `at` or by asking ModemManager, and refused it
+			# with a message reading "this modem cannot be reset" when it can,
+			# by another method, through another entry point. The compatibility
+			# shim that both the case button and the LuCI control reach already
+			# gates on `capabilities.reset`, and the frontend contract offers
+			# the control on exactly that while displaying `reset_method`
+			# beside it. The stricter gate was the odd one out.
+			#
+			# Every GPIO-specific precondition -- the board marker and a
+			# writable power path -- stays where it belongs, inside the branch
+			# that uses them, and is revalidated there under the locks.
+			precondition_reset_method="$(field "$line" 16)"
+			[ -n "$precondition_reset_method" ] && \
+				[ "$precondition_reset_method" != none ] || \
+				die_code 4 "no reset method is available for modem $(mask_modem_id "$precondition_modem")"
+		;;
+		slot-switch)
+			case "$REQUESTED_SLOT" in
+				''|*[!0-9]*|0) die_code 2 "slot-switch requires a positive numeric --slot" ;;
+			esac
+			# The same evaluation the plan publishes. A caller must never learn
+			# from a terminal failure that the operation was never possible.
+			slot_switch_evaluate "$precondition_modem" "$REQUESTED_SLOT" || \
+				die_code 4 "modem $(mask_modem_id "$precondition_modem") cannot change to slot $REQUESTED_SLOT: $SLOT_PLAN_REASON"
 		;;
 		provision)
 			provision_evaluate "$precondition_modem"
 			precondition_status=$?
 			[ "$PROVISION_REASON" = ok ] || \
-				die_code "$precondition_status" "modem $precondition_modem cannot be provisioned: $PROVISION_REASON"
+				die_code "$precondition_status" "modem $(mask_modem_id "$precondition_modem") cannot be provisioned: $PROVISION_REASON"
+		;;
+		adopt)
+			precondition_status=0
+			adoption_evaluate "$precondition_modem" || precondition_status=$?
+			[ "$precondition_status" -eq 0 ] || \
+				die_code "$precondition_status" "modem $(mask_modem_id "$precondition_modem") cannot be adopted: $ADOPTION_REASON"
 		;;
 		deprovision)
-			[ -n "$(provision_existing_section "$precondition_modem" 2>/dev/null || :)" ] || \
-				die_code 4 "no section owned by this package is bound to modem $precondition_modem"
+			precondition_section="$(provision_existing_section "$precondition_modem" 2>/dev/null || :)"
+			[ -n "$precondition_section" ] || \
+				die_code 4 "no section owned by this package is bound to modem $(mask_modem_id "$precondition_modem")"
+			[ "$(section_origin "$precondition_section")" != adopted ] || \
+				die_code 4 "section $precondition_section was adopted; release it instead"
+		;;
+		release-adoption)
+			precondition_section="$(provision_existing_section "$precondition_modem" 2>/dev/null || :)"
+			[ -n "$precondition_section" ] && [ "$(section_origin "$precondition_section")" = adopted ] || \
+				die_code 4 "no adopted section is bound to modem $(mask_modem_id "$precondition_modem")"
+			adoption_release_ready "$precondition_modem" "$precondition_section" || \
+				die_code 4 "the restoration baseline for $precondition_section is missing or invalid"
 		;;
 		connect|disconnect|reconnect)
 			precondition_status=0
@@ -4354,15 +6048,59 @@ action_precondition() {
 	esac
 }
 
+# State from the actual worker acknowledges an isolated launch, even if a
+# short operation has already finished and released its start lock.
+wait_action_handoff() {
+	job_pid="$1"
+	job_lock="$2"
+	job_state="$3"
+	job_waited=0
+	while :; do
+		job_owner="$(lock_owner_pid "$job_lock" 2>/dev/null || :)"
+		case "$job_owner" in ''|*[!0-9]*) : ;; *) [ "$job_owner" = "$$" ] || job_pid="$job_owner" ;; esac
+		if awk -F '\t' -v parent="$$" '$1 == "v2" && $4 != parent && $2 != "starting" {ok=1} END {exit !ok}' "$job_state" 2>/dev/null; then
+			return 0
+		fi
+		# The supervisor can exit between the lock and state reads.
+		# Wait for the child acknowledgment up to the same bounded deadline.
+		[ "$job_waited" -lt 5 ] || break
+		"$JOB_SLEEP" 1 2>/dev/null || break
+		job_waited=$((job_waited + 1))
+	done
+	kill -TERM "$job_pid" 2>/dev/null || :
+	"$JOB_SLEEP" 1 2>/dev/null || :
+	kill -KILL "$job_pid" 2>/dev/null || :
+	wait "$job_pid" 2>/dev/null || :
+	job_owner="$(lock_owner_pid "$job_lock" 2>/dev/null || :)"
+	case "$job_owner" in "$job_pid"|"$$") lock_release "$job_lock" ;; esac
+	return 1
+}
+
 action_start_cmd() {
 	action="$1"
 	case "$action" in
-		reset|provision|deprovision|connect|disconnect|reconnect) : ;;
+		reset|provision|adopt|deprovision|release-adoption|connect|disconnect|reconnect|slot-switch) : ;;
 		*) die_code 2 "unsupported background action: $action" ;;
 	esac
 	[ -n "$REQUESTED_MODEM" ] || die_code 2 "action-start requires --modem"
+	# A slot number belongs to the one action that changes a slot. Accepting it
+	# anywhere else would let a caller believe it had been read.
+	case "$action:$REQUESTED_SLOT" in
+		slot-switch:*|*:) : ;;
+		*) die_code 2 "--slot belongs to slot-switch alone" ;;
+	esac
 	[ -x "$ACTION_WORKER" ] || die "action worker is not executable: $ACTION_WORKER"
-	action_precondition "$action" "$REQUESTED_MODEM"
+	command_exists "$SETSID" || die "session isolation is unavailable; no job was started"
+	precondition_output="$(action_precondition "$action" "$REQUESTED_MODEM" 2>&1)"
+	precondition_status=$?
+	if [ "$precondition_status" -ne 0 ]; then
+		precondition_message="${precondition_output##*"$NEWLINE"}"
+		precondition_message="${precondition_message#"$PROG: "}"
+		[ -n "$precondition_message" ] || precondition_message="the operation cannot be started"
+		print_action_refusal_json "$precondition_status" "$action" \
+			"$REQUESTED_MODEM" "$precondition_message"
+		return "$precondition_status"
+	fi
 
 	state_dir="$(action_state_dir_for "$REQUESTED_MODEM")"
 	mkdir -p "$ACTION_STATE_DIR" || die "cannot create action state parent"
@@ -4390,13 +6128,27 @@ action_start_cmd() {
 	operation_id="$(date -u +%s 2>/dev/null || printf '%s' 0)-$$"
 	printf 'v2\tstarting\t%s\t%s\t%s\t\t\tstarting background worker\t%s\t%s\n' \
 		"$action" "$$" "$started" "$REQUESTED_MODEM" "$operation_id" >"$state_dir/state.tsv"
-	"$ACTION_WORKER" "$action" "$state_dir" "$started" "$REQUESTED_MODEM" "$operation_id" "$start_lock" \
-		</dev/null >/dev/null 2>&1 &
+	APN_AUTOCONFIG_JOB_DETACHED=launch
+	export APN_AUTOCONFIG_JOB_DETACHED
+	"$SETSID" /bin/sh "$ACTION_WORKER" "$action" "$state_dir" "$started" "$REQUESTED_MODEM" "$operation_id" "$start_lock" \
+		"$REQUESTED_SLOT" </dev/null >/dev/null 2>&1 &
 	worker_pid=$!
 	# The worker now owns the start lock and clears it when it reaches a
 	# terminal state, so action-status can still see a live owner after this
 	# launcher exits.
-	lock_set_owner "$start_lock" "$worker_pid" || :
+	unset APN_AUTOCONFIG_JOB_DETACHED
+	if ! wait_action_handoff "$worker_pid" "$start_lock" "$state_dir/state.tsv"; then
+		# Acceptance belongs to the worker acknowledgment, not to whether the
+		# launcher happened to observe it before its final timeout check.
+		if awk -F '\t' -v parent="$$" -v op="$operation_id" \
+			'$1 == "v2" && $2 != "starting" && $4 != parent && $10 == op {ok=1} END {exit !ok}' \
+			"$state_dir/state.tsv" 2>/dev/null; then
+			print_action_json true "$REQUESTED_MODEM"
+			return 0
+		fi
+		print_action_json false "$REQUESTED_MODEM"
+		return 3
+	fi
 	print_action_json true "$REQUESTED_MODEM"
 }
 
@@ -4609,15 +6361,15 @@ converge_revalidate() {
 	force_scan_inventory
 	converge_line="$(find_inventory_record "$1" 2>/dev/null || :)"
 	if [ -z "$converge_line" ]; then
-		CONVERGE_REASON="modem $1 is no longer present"
+		CONVERGE_REASON="modem $(mask_modem_id "$1") is no longer present"
 		return 3
 	fi
 	if [ "$(field "$converge_line" 12)" != 0 ]; then
-		CONVERGE_REASON="modem $1 became ambiguous between the scan and the lock"
+		CONVERGE_REASON="modem $(mask_modem_id "$1") became ambiguous between the scan and the lock"
 		return 4
 	fi
 	if [ "$(field "$converge_line" 8)" = conflicting ]; then
-		CONVERGE_REASON="modem $1 has a conflicting control-owner state"
+		CONVERGE_REASON="modem $(mask_modem_id "$1") has a conflicting control-owner state"
 		return 4
 	fi
 	converge_status=0
@@ -4627,7 +6379,7 @@ converge_revalidate() {
 		return "$converge_status"
 	fi
 	if [ "$CONNECTION_SECTION" != "$2" ]; then
-		CONVERGE_REASON="modem $1 is no longer bound to interface $2"
+		CONVERGE_REASON="modem $(mask_modem_id "$1") is no longer bound to interface $2"
 		return 4
 	fi
 	CONVERGE_RECORD="$converge_line"
@@ -4657,7 +6409,7 @@ converge_refresh_identity() {
 			return 0
 		fi
 		if [ "$converge_sim_remaining" -le 0 ]; then
-			log warning "modem $converge_sim_modem did not present a readable SIM within ${CONVERGE_SIM_WAIT_SECONDS}s; reconciling anyway"
+			log warning "modem $(mask_modem_id "$converge_sim_modem") did not present a readable SIM within ${CONVERGE_SIM_WAIT_SECONDS}s; reconciling anyway"
 			return 1
 		fi
 		"$SLEEP" "$MODEM_POLL_SECONDS"
@@ -4750,7 +6502,7 @@ converge_restore_bearer() {
 		return 0
 	fi
 	log notice "restoring the bearer on $converge_bearer_section, which was explicitly requested up"
-	if ifup "$converge_bearer_section" >/dev/null 2>&1; then
+	if run_bounded_to_file 30 /dev/null ifup "$converge_bearer_section" >/dev/null 2>&1; then
 		wait_for_interface_up "$converge_bearer_section" || \
 			log warning "$converge_bearer_section did not come up within ${CONNECT_WAIT_SECONDS}s"
 	else
@@ -4768,7 +6520,14 @@ converge_target() {
 	# An operation the user started is not interrupted by one nobody asked for.
 	action_status_values "$converge_modem"
 	if [ "$ACTION_BUSY" = true ]; then
-		log notice "convergence for modem $converge_modem deferred: $ACTION_NAME is already running"
+		# The name is empty exactly when the operation was started outside the
+		# background action API, which action_status_values distinguishes on
+		# purpose. Interpolating it produced a notice with a hole in it.
+		if [ -n "$ACTION_NAME" ]; then
+			log notice "convergence for modem $(mask_modem_id "$converge_modem") deferred: $ACTION_NAME is already running"
+		else
+			log notice "convergence for modem $(mask_modem_id "$converge_modem") deferred: an operation this API did not start is already running"
+		fi
 		return 0
 	fi
 
@@ -4780,7 +6539,7 @@ converge_target() {
 	converge_publish running "" "waiting for SIM"
 
 	if ! converge_acquire_locks "$converge_modem"; then
-		log notice "convergence for modem $converge_modem deferred: another operation holds the locks"
+		log notice "convergence for modem $(mask_modem_id "$converge_modem") deferred: another operation holds the locks"
 		converge_finish retryable 3 "convergence was deferred; another operation is running"
 		return 0
 	fi
@@ -4788,7 +6547,7 @@ converge_target() {
 	converge_status=0
 	converge_revalidate "$converge_modem" "$converge_section" || converge_status=$?
 	if [ "$converge_status" -ne 0 ]; then
-		log warning "convergence stopped for modem $converge_modem: $CONVERGE_REASON"
+		log warning "convergence stopped for modem $(mask_modem_id "$converge_modem"): $CONVERGE_REASON"
 		converge_release_locks
 		case "$converge_status" in
 			3) converge_finish retryable 3 "$CONVERGE_REASON" ;;
@@ -4797,7 +6556,7 @@ converge_target() {
 		return 0
 	fi
 
-	log notice "modem $converge_modem returned; refreshing identity for $converge_target_id"
+	log notice "modem $(mask_modem_id "$converge_modem") returned; refreshing identity for $converge_target_id"
 	converge_refresh_identity "$converge_modem" || :
 
 	# Reverse order, and before the reconcile: the engine takes the global lock
@@ -4887,7 +6646,16 @@ rescan_async_cmd() {
 usage() {
 	cat <<EOF
 Usage: $PROG <command> [--modem <modem_id>] [--interface <network-section>]
-                       [--autoconnect 0|1]
+                       [--autoconnect 0|1] [--allow-cached-scan]
+
+Options:
+  --allow-cached-scan  Permit inventory-json, status-json and resolve to be
+                    answered from an inventory scan another process made in the
+                    last scan_cache_seconds, instead of scanning again. For
+                    drawing a page and nothing else: the entry is retired by
+                    any change to the USB devices it describes, by any mutating
+                    command and by any forced rescan, and no command that can
+                    write ever reads it
 
 Commands:
   inventory-json    Read-only scan of currently present modems (JSON)
@@ -4896,13 +6664,27 @@ Commands:
   attachment        Print the attachment record for --modem (no scan) or for
                     the one modem bound to --interface. Read-only
   provision-plan    Read-only check of whether --modem can be provisioned
+  adopt-plan        Read-only check of whether an existing section bound to
+                    --modem can be explicitly adopted in place
   provision         Create a project-owned section for --modem, reconcile its
                     APN through apn-autoconfig and promote autoconnect
+  adopt             Mark the existing user-created cellular section for
+                    --modem as managed, preserving an exact restoration baseline
   deprovision       Remove the project-owned section created for --modem
-  connect           Bring the project-owned section for --modem up
-  disconnect        Bring the project-owned section for --modem down
-  reconnect         Cycle the project-owned section for --modem
-  action-start reset  Start a bounded power-cycle in background; requires --modem
+  release-adoption  Restore and stop managing an adopted section without
+                    deleting it
+  connect           Bring the bound cellular section for --modem up
+  disconnect        Bring the bound cellular section for --modem down
+  reconnect         Cycle the bound cellular section for --modem
+  bearer-state      Confirm netifd state and AT-dial teardown evidence for
+                    --interface. Missing evidence never authorizes card access
+  action-start reset  Start a bounded reset in background by whichever method
+                    reset_method names; requires --modem
+  action-start slot-switch
+                    Start a bounded slot change in background; requires --modem
+                    and --slot. Describe it with slot-switch-plan first: it
+                    interrupts the bearer, and the plan is what a consent
+                    dialog is built from
   action-status     Show background/external reset operation state; requires --modem
   reset             Synchronous power-cycle and re-enumeration wait; requires --modem
   at-port           Resolve and print the AT control port for --modem, probing
@@ -4911,7 +6693,21 @@ Commands:
                     print the v1 identity contract. Read-only
   migrate-identity-cache  Preserve pre-0.15.2 volatile AT identity evidence
   sim-slots         Print what each slot of --modem holds, or of every modem,
-                    as a v1 key/value document. Read-only, probes nothing
+                    as a v1 key/value document. Read-only. Probes nothing
+                    unless --probe is given, which permits one bounded vendor
+                    query per modem whose slots ModemManager does not publish
+                    and whose quirk entry names a dialect. A poll must not
+                    pass it
+  slot-switch       Change the active SIM slot of --modem to --slot, through
+                    whichever owner holds the modem: ModemManager's own
+                    mechanism, or the vendor command the quirk table names.
+                    Mutating. It reconciles the APN afterwards, because a
+                    different slot is a different subscription; --no-converge
+                    leaves that to a caller that reports it itself
+  slot-switch-plan  What that change would do, what it would interrupt and for
+                    how long, and whether it can be performed at all. Requires
+                    --modem and --slot. Read-only, and it asks the modem
+                    nothing
   inhibit-targets   List the ModemManager inhibitions this package owns, as
                     <device-uid><TAB><modem_id>. Read-only
   register-proto    Register this package's netifd protocol by restarting the
@@ -4945,6 +6741,30 @@ main() {
 				REQUESTED_MODEM="$2"
 				shift 2
 			;;
+			--slot)
+				[ "$#" -ge 2 ] || die_code 2 "--slot requires a value"
+				REQUESTED_SLOT="$2"
+				shift 2
+			;;
+			--no-converge)
+				REQUESTED_NO_CONVERGE=1
+				shift
+			;;
+			--probe)
+				# One verb takes it, and it is what turns a strictly read-only
+				# publication into one that may ask a modem a question. Naming
+				# it is the difference between a poll and a deliberate read.
+				REQUESTED_PROBE=1
+				shift
+			;;
+			--allow-cached-scan)
+				# Permission, not a request: it says this read is drawing a
+				# page and may therefore be answered from a scan another
+				# process paid for. Three read verbs accept it and nothing
+				# else does; see the gate below and scan_cache_try_serve.
+				REQUESTED_CACHED_SCAN=1
+				shift
+			;;
 			--interface)
 				[ "$#" -ge 2 ] || die_code 2 "--interface requires a value"
 				REQUESTED_INTERFACE="$2"
@@ -4974,8 +6794,38 @@ main() {
 	# option by option. Nothing below this line writes it, which is the whole
 	# safety argument: see network_uci_snapshot_open.
 	case "$COMMAND_NAME" in
-		inventory-json|status-json|provision-plan|resolve|attachment|inhibit-targets|sim-slots)
+		inventory-json|status-json|provision-plan|adopt-plan|resolve|attachment|inhibit-targets|sim-slots|slot-switch-plan)
 			network_uci_snapshot_open
+		;;
+	esac
+	# The scan cache, and the two things that decide who may touch it.
+	#
+	# Eligible: the three verbs a page is actually made of, and only when the
+	# caller passed --allow-cached-scan. `provision-plan`, `adopt-plan`,
+	# `slot-switch-plan`, `sim-slots`, `attachment` and `inhibit-targets` are
+	# read-only too and are deliberately *not* here: a plan is read on the way
+	# to a mutation, and this project does not let a cache stand behind one.
+	#
+	# Invalidating: every verb that changes the router or the modem. It runs
+	# before the work as well as after it (cleanup_files), so a concurrent
+	# display read during a long operation scans for itself rather than
+	# describing the state the operation is in the middle of leaving.
+	# `rescan`, `rescan-async` and `converge-plan` are absent only because
+	# force_scan_inventory already invalidates on their behalf.
+	SCAN_CACHE_FILE="$STATE_DIR/scan-cache/scan"
+	case "$COMMAND_NAME" in
+		inventory-json|status-json|resolve)
+			SCAN_CACHE_ALLOWED="$REQUESTED_CACHED_SCAN"
+		;;
+		*)
+			[ "$REQUESTED_CACHED_SCAN" -eq 0 ] || \
+				die_code 2 "--allow-cached-scan is accepted only by inventory-json, status-json and resolve"
+		;;
+	esac
+	case "$COMMAND_NAME" in
+		provision|adopt|deprovision|release-adoption|connect|disconnect|reconnect|reset|slot-switch|register-proto|action-start|converge)
+			SCAN_CACHE_INVALIDATE_ARMED=1
+			scan_cache_invalidate
 		;;
 	esac
 	if [ -n "$REQUESTED_MODEM" ]; then
@@ -4983,17 +6833,24 @@ main() {
 	fi
 	case "$COMMAND_NAME" in
 		inventory-json) inventory_json_cmd ;;
+		hardware-generation-json) hardware_generation_json_cmd ;;
 		status-json) status_json_cmd ;;
+		bearer-state) bearer_state_cmd ;;
 		sim-slots) sim_slots_cmd ;;
+		slot-switch) slot_switch_cmd ;;
+		slot-switch-plan) slot_switch_plan_cmd ;;
 		resolve) resolve_cmd ;;
 		attachment) attachment_cmd ;;
 		at-port) at_port_cmd ;;
 		at-identity) at_identity_cmd ;;
 		migrate-identity-cache) migrate_identity_cache_cmd ;;
 		provision-plan) provision_plan_cmd ;;
+		adopt-plan) adopt_plan_cmd ;;
 		inhibit-targets) inhibit_targets_cmd ;;
 		provision) provision_cmd ;;
+		adopt) adopt_cmd ;;
 		deprovision) deprovision_cmd ;;
+		release-adoption) release_adoption_cmd ;;
 		connect|disconnect|reconnect) connection_cmd "$COMMAND_NAME" ;;
 		action-start) action_start_cmd "$command_argument" ;;
 		action-status) action_status_cmd ;;

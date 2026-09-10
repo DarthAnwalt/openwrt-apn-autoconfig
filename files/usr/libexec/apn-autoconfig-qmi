@@ -335,12 +335,25 @@ run_at() {
 	# the subshell alone leaves the sleep to run out the budget.
 	(
 		watchdog_sleep_pid=""
-		trap 'kill -TERM "$watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		# `$!` rather than the recorded PID alone. `$!` is set when the sleep is
+		# forked, so it names the sleep one command before the assignment does,
+		# and a TERM arriving in between would otherwise find the variable empty,
+		# kill nothing, and leave the sleep to run out the whole budget as an
+		# orphan -- one per bounded call, on an image where this is the branch
+		# every call takes. Linux CI caught that; this suite, on a shell that
+		# schedules the two differently, never did.
+		#
+		# Before the first fork `$!` still names the caller's own child, which
+		# this must never kill, so it is compared rather than trusted. The
+		# variable is cleared before each fork so the second sleep is covered by
+		# the same reasoning as the first.
+		trap 'watchdog_target="${watchdog_sleep_pid:-$!}"; [ "$watchdog_target" = "$at_pid" ] || kill -TERM "$watchdog_target" 2>/dev/null; exit 0' TERM
 		"$SLEEP" "$AT_TIMEOUT_SECONDS" &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0
 		: >"$timeout_marker" 2>/dev/null || :
 		kill "$at_pid" 2>/dev/null || exit 0
+		watchdog_sleep_pid=""
 		"$SLEEP" 1 &
 		watchdog_sleep_pid=$!
 		wait "$watchdog_sleep_pid" 2>/dev/null || exit 0

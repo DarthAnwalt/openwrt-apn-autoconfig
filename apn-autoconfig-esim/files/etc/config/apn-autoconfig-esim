@@ -10,19 +10,62 @@ config apn_autoconfig_esim 'main'
 	# error and the command fails rather than running with an unbounded cache.
 	# Zero disables reuse without disabling the cache's bookkeeping.
 	option esim_cache_ttl_seconds '60'
-	# The outer bound on a read takeover — the consented ModemManager inhibit.
-	# It is a watchdog, not a schedule: the inhibit lasts as long as the process
-	# holding it, and this is how long that process may live before it is
-	# terminated and the modem returned to ModemManager.
-	option esim_inhibit_max_seconds '180'
+	# The outer bound on a consented ModemManager inhibit, and the number the
+	# plan quotes as the worst case. It is a watchdog, not a schedule: the
+	# inhibit lasts as long as the process holding it, and this is how long that
+	# process may live before it is terminated and the modem returned.
+	#
+	# Four minutes, against a measured worst case of roughly eighty seconds.
+	#
+	# The number moved twice and both moves are worth knowing. It was 180 while
+	# a download was one card transaction; when the download grew a notification
+	# delivery it needed 434 s, the watchdog released the modem at 180 on the dot
+	# and the operation carried on against a modem ModemManager had taken back.
+	# It went to 600 to stop that. Then the cost work found what the 434 s
+	# actually were -- a control-port probe borrowing the card budget, repeated
+	# per LPA invocation -- and the same download became 58 s, a read takeover
+	# 23 s, and an interrupted load's asking-again at most twenty seconds more.
+	#
+	# So this is a bound with about three times the margin over what has been
+	# measured, and not a schedule. Overstating it makes the plan promise more
+	# disruption than usually occurs and invites a user to conclude the router
+	# has hung; understating it once meant using a card this package no longer
+	# owned. A download additionally refuses to start unless another uplink is
+	# proven, so the outage is never the router's only path out.
+	option esim_inhibit_max_seconds '240'
 	# Per-exchange bound on the AT transport under the bridge. One APDU is a
 	# single command and a single reply; a card that has not answered in this
 	# long is not going to.
 	option apdu_timeout_seconds '10'
+	# Bound on asking a port whether it is the control channel, which is a much
+	# smaller question than an exchange with a card and used to borrow the
+	# budget above. Measured on the reference router: a live port answers `AT`
+	# in under a second, a silent one costs the whole bound twice over, and four
+	# of that modem's six ports are silent. Too short a value fails closed -- the
+	# port is skipped, and a bridge with no answering candidate refuses rather
+	# than opening a channel it has not proven.
+	option at_probe_timeout_seconds '3'
+	# How long an interrupted profile load waits for the card to finish before
+	# it concludes that nothing happened. Zero, because on the reference card
+	# waiting here cannot work.
+	#
+	# The measurement: the final APDU of every Bound Profile Package load on
+	# this modem is refused with a bare ERROR after three seconds, and the eUICC
+	# installs the profile anyway. Twenty seconds of asking found nothing;
+	# ninety seconds -- twelve looks -- also found nothing; and the very next
+	# operation, after the inhibit was released and ModemManager re-enumerated
+	# the modem, found the profile and both of its notifications. Twice.
+	#
+	# So the card finishes when it is handed back and re-initialised, not while
+	# this operation holds it, and a wait that cannot succeed is pure outage.
+	# The knob stays because this is one card's behaviour and another may
+	# differ; raise it only with a measurement that shows waiting helps there.
+	option install_settle_seconds '0'
 	# The whole of one LPA invocation, including every APDU exchange inside it.
 	option lpa_timeout_seconds '120'
-	# HTTPS to an SM-DP+, on behalf of the LPA. Certificate verification is not
-	# configurable here and there is no option that disables it.
+	# HTTPS to an SM-DP+, on behalf of the LPA. The persistent configuration has
+	# no downgrade switch: the exceptional unverified retry is accepted only as
+	# an explicit input to one download and is never written here.
 	option http_timeout_seconds '60'
 	# How long to wait for a lock before refusing. Contention is normal and
 	# brief: another component of this suite is reading identity over the same
@@ -31,3 +74,14 @@ config apn_autoconfig_esim 'main'
 	# Zero refuses immediately. Failing to acquire is always a refusal and
 	# never a licence to use the port anyway.
 	option lock_wait_seconds '15'
+	# How long a `delete-plan` token stays claimable, and the only knob the
+	# guarded deletion has. Long enough for a person to read a confirmation and
+	# type four digits; short enough that the state the plan bound -- the
+	# attachment generation, the slot, the owner, the profile's own state --
+	# cannot plausibly have changed unobserved while the token sat there.
+	#
+	# Accepted only within 30 and 600, and rejected rather than clamped: a
+	# token that lives ten times as long as the contract allows is a capability
+	# to destroy a subscription lying around for an afternoon, and running
+	# anyway would be obeying a configuration that says that is fine.
+	option delete_plan_ttl_seconds '120'

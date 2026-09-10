@@ -13,6 +13,10 @@
                 "/usr/libexec/apn-autoconfig-modem-query": [
                     "list",
                     "exec"
+                ],
+                "/usr/libexec/apn-autoconfig-esim-query": [
+                    "list",
+                    "exec"
                 ]
             }
         },
@@ -28,6 +32,17 @@
                 "/usr/libexec/apn-autoconfig-modem-control": [
                     "list",
                     "exec"
+                ],
+                "/usr/libexec/apn-autoconfig-esim-control": [
+                    "list",
+                    "exec"
+                ]
+            },
+            "ubus": {
+                "apn-autoconfig": [
+                    "apply_manual",
+                    "esim_download",
+                    "esim_nickname"
                 ]
             }
         }

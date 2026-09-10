@@ -144,12 +144,25 @@ atdial_run_bounded() {
 	# Killing the subshell alone leaves the sleep to run out the bound.
 	(
 		atdial_watchdog_sleep_pid=""
-		trap 'kill -TERM "$atdial_watchdog_sleep_pid" 2>/dev/null; exit 0' TERM
+		# `$!` rather than the recorded PID alone. `$!` is set when the sleep is
+		# forked, so it names the sleep one command before the assignment does,
+		# and a TERM arriving in between would otherwise find the variable empty,
+		# kill nothing, and leave the sleep to run out the whole budget as an
+		# orphan -- one per bounded call, on an image where this is the branch
+		# every call takes. Linux CI caught that; this suite, on a shell that
+		# schedules the two differently, never did.
+		#
+		# Before the first fork `$!` still names the caller's own child, which
+		# this must never kill, so it is compared rather than trusted. The
+		# variable is cleared before each fork so the second sleep is covered by
+		# the same reasoning as the first.
+		trap 'atdial_watchdog_target="${atdial_watchdog_sleep_pid:-$!}"; [ "$atdial_watchdog_target" = "$ATDIAL_CHILD_PID" ] || kill -TERM "$atdial_watchdog_target" 2>/dev/null; exit 0' TERM
 		"$ATDIAL_WATCHDOG_SLEEP" "$atdial_bound" &
 		atdial_watchdog_sleep_pid=$!
 		wait "$atdial_watchdog_sleep_pid" 2>/dev/null || exit 0
 		: >"$ATDIAL_MARKER_FILE" 2>/dev/null || :
 		kill -TERM "$ATDIAL_CHILD_PID" 2>/dev/null || exit 0
+		atdial_watchdog_sleep_pid=""
 		"$ATDIAL_WATCHDOG_SLEEP" 1 &
 		atdial_watchdog_sleep_pid=$!
 		wait "$atdial_watchdog_sleep_pid" 2>/dev/null || exit 0

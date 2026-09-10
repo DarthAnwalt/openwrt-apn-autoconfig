@@ -1,19 +1,47 @@
 #!/bin/sh
 
 # Narrow read-only entry point for rpcd/LuCI ACLs.
+#
+# This wrapper is, by construction, the display caller: everything reached
+# through it is a LuCI page asking what to draw. That is why `inventory` and
+# `status` pass --allow-cached-scan and the two plan verbs do not — a plan is
+# read on the way to a mutation, and this project does not let a cache stand
+# behind one. See scan_cache_try_serve in apn-autoconfig-modem.
 
 COMMAND="${APN_AUTOCONFIG_MODEM_BIN:-/usr/sbin/apn-autoconfig-modem}"
 MODEM_ID="${2:-}"
-[ "$#" -le 2 ] || exit 2
+# The third argument exists for one verb: which slot a change is being asked
+# about. It is checked as a small positive number and never passed through as
+# text.
+SLOT="${3:-}"
+[ "$#" -le 3 ] || exit 2
 
 if [ -n "$MODEM_ID" ]; then
 	case "$MODEM_ID" in *[!A-Za-z0-9_.:-]*) exit 2 ;; esac
 fi
 
 case "${1:-}" in
-	inventory) [ -z "$MODEM_ID" ] || exit 2; exec "$COMMAND" inventory-json ;;
-	status) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" status-json --modem "$MODEM_ID" ;;
-	provision-plan) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" provision-plan --modem "$MODEM_ID" ;;
-	action-status) [ -n "$MODEM_ID" ] || exit 2; exec "$COMMAND" action-status --modem "$MODEM_ID" ;;
+	inventory) [ -z "$MODEM_ID" ] && [ -z "$SLOT" ] || exit 2; exec "$COMMAND" inventory-json --allow-cached-scan ;;
+	# Cheap by construction and asked on a poll, so that a page can notice a
+	# modem arriving or leaving without buying an inventory scan to find out.
+	hardware-generation) [ -z "$MODEM_ID" ] && [ -z "$SLOT" ] || exit 2; exec "$COMMAND" hardware-generation-json ;;
+	status) [ -n "$MODEM_ID" ] || exit 2; [ -z "$SLOT" ] || exit 2; exec "$COMMAND" status-json --modem "$MODEM_ID" --allow-cached-scan ;;
+	provision-plan) [ -n "$MODEM_ID" ] || exit 2; [ -z "$SLOT" ] || exit 2; exec "$COMMAND" provision-plan --modem "$MODEM_ID" ;;
+	adopt-plan) [ -n "$MODEM_ID" ] || exit 2; [ -z "$SLOT" ] || exit 2; exec "$COMMAND" adopt-plan --modem "$MODEM_ID" ;;
+	slot-switch-plan)
+		# What a slot change would interrupt and for how long, so that the
+		# consent a page asks for is built from the backend's own numbers and
+		# never from ones the page chose. It changes nothing: the change itself
+		# is `slot-switch` on the mutating wrapper.
+		#
+		# Zero is not a slot -- this project counts them from one, as
+		# ModemManager does -- and two digits is more than any modem has.
+		[ -n "$MODEM_ID" ] || exit 2
+		case "$SLOT" in ''|*[!0-9]*) exit 2 ;; esac
+		[ "$SLOT" != 0 ] || exit 2
+		[ "${#SLOT}" -le 2 ] || exit 2
+		exec "$COMMAND" slot-switch-plan --modem "$MODEM_ID" --slot "$SLOT"
+	;;
+	action-status) [ -n "$MODEM_ID" ] || exit 2; [ -z "$SLOT" ] || exit 2; exec "$COMMAND" action-status --modem "$MODEM_ID" ;;
 	*) exit 2 ;;
 esac

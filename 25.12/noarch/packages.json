@@ -1,0 +1,176 @@
+{
+  "packages": [
+    {
+      "name": "apn-autoconfig",
+      "version": "0.16.0-r1",
+      "hashes": "f283624da34d4fbe40ce5d83c2d7c92d01470f0784b69250feebca8854bdc99f",
+      "description": "POSIX-shell cellular profile detection and testing engine for OpenWrt. It supports already configured ModemManager, QMI and MBIM netifd targets. QMI uses an installed uqmi command with a same-USB-device identity fallback through sms-tool, and MBIM uses an installed umbim; the core does not install a modem manager. It matches SIM identity against a worldwide local TSV database, verifies real Internet access, caches successful profiles per ICCID and safely rolls back failures.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 237393,
+      "file-size": 64111,
+      "depends": [
+        "apn-autoconfig-providers",
+        "ca-bundle",
+        "curl",
+        "jsonfilter",
+        "libc",
+        "netifd",
+        "sms-tool",
+        "ubus",
+        "uci"
+      ],
+      "provides": [
+        "apn-autoconfig-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-esim",
+      "version": "0.16.0-r1",
+      "hashes": "5232862cf75dc31c231a7ff8ae9873d3cc9e54cf0e87ba8e21f3805bdea18287",
+      "description": "Publishes what each SIM slot of each modem holds, which eUICC is in it, whether it can be reached right now and, when it cannot, what would have to change. It owns the transport that makes those answers real: the stdio bridge between the pinned LPA and a card, driven by code that has already resolved one unambiguous target, proved who owns the modem and taken the locks. Supported endpoints can download, rename, enable and disable profiles, switch supported SIM slots, and process pending notifications. Deletion requires an explicit expiring plan and confirmation for one disabled, unused profile. Existing profiles are never deleted as cleanup or rollback. Operations prove physical card identity and coordinate bounded access with the modem owner. An endpoint the backend could not read reports that it could not read it, with a reason from a fixed list. It never reports an empty profile list, an absent eUICC or a false capability as a way of filling a gap.",
+      "arch": "aarch64_cortex-a53",
+      "license": "MIT AND Apache-2.0",
+      "origin": "feeds/base/apn-autoconfig-esim",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 745595,
+      "file-size": 275573,
+      "depends": [
+        "apn-autoconfig-lpac",
+        "apn-autoconfig-modem",
+        "ca-bundle",
+        "jsonfilter",
+        "libc",
+        "uci"
+      ],
+      "provides": [
+        "apn-autoconfig-esim-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-integration-huasifei-wh3000",
+      "version": "0.16.0-r1",
+      "hashes": "34bf03690a8f103da44d86e56951de43c551eff699f824b32ed67b8314120740",
+      "description": "Optional board integration for the tested Huasifei WH3000 Pro setup. It maps the BTN_0 release event to the guarded GPIO modem power-cycle and APN reconciliation action. It is not a generic router-button implementation.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 4302,
+      "file-size": 2817,
+      "depends": [
+        "apn-autoconfig",
+        "kmod-button-hotplug",
+        "libc"
+      ],
+      "provides": [
+        "apn-autoconfig-integration-huasifei-wh3000-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-lpac",
+      "version": "2.3.0-r1",
+      "hashes": "fb8a374f359f90c95c0682d35919c0a5156d6475678311387e3ba5e11cf84eb1",
+      "description": "The eUICC LPA this project depends on, pinned to lpac 2.3.0 by source hash and carrying four reviewable downstream patches, with a launcher that decides whether the LPA may run at all. It is a private build because the official OpenWrt lpac package fails three requirements this project had already accepted: secrets reach it only through argv, its curl backend disables TLS certificate verification unconditionally with no way to re-enable it, and its AT backend cannot parse the Fibocom FM350-GL's AT+CCHO reply. The comparison that decided this is docs/upstream-esim-review.md. Nothing here replaces, provides or overwrites the official lpac, /usr/bin/lpac or /usr/lib/lpac. Both packages may be installed at once. The build ships the AT and stdio APDU backends and the stdio HTTP backend only. The stdio APDU backend needs a patch to work at all: upstream treats a successfully sent request as an error, so its connect fails before a single reply is read. The curl HTTP backend is not built, so this binary opens no socket and the HTTPS request is made by the caller with verification on; the uqmi APDU backend is not built, because it passes every APDU through the argv of a child process.",
+      "arch": "aarch64_cortex-a53",
+      "license": "AGPL-3.0-only AND LGPL-2.1-only AND MIT",
+      "origin": "feeds/base/apn-autoconfig-lpac",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/estkme-group/lpac",
+      "installed-size": 365485,
+      "file-size": 252774,
+      "depends": [
+        "libc"
+      ],
+      "provides": [
+        "apn-autoconfig-lpac-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-modem",
+      "version": "0.16.0-r1",
+      "hashes": "4c26ef17b66bb3e6703675963f0e5bad12d9d96546728c2571395dd5d45101a3",
+      "description": "POSIX-shell modem-control foundation for apn-autoconfig. Provides read-only modem inventory with stable hardware identity independent of volatile device names, explicit ModemManager/direct-control ownership state and a serialized per-modem operation coordinator. It does not implement APN policy, network provisioning, MBIM profile mutation or eSIM lifecycle; see docs/modem-contract-v1.md. Optional runtime backends (uqmi, sms-tool, mmcli) are detected, not required, so capability stays truthful.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig-modem",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 329716,
+      "file-size": 98300,
+      "depends": [
+        "jsonfilter",
+        "libc",
+        "sms-tool",
+        "ubus",
+        "uci"
+      ],
+      "provides": [
+        "apn-autoconfig-modem-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-proto-atdial",
+      "version": "0.16.0-r1",
+      "hashes": "18123666da27acedae6ec529cc83ab63c3a2eaf15d7ea57d2d49f30add05618f",
+      "description": "netifd protocol `apn_atdial` for modems that expose no cdc-wdm control channel, such as a Fibocom FM350-GL in RNDIS composition. Their data path is an ordinary usbnet interface, so the host defines and activates the PDP context over an AT port and configures the address the modem reports; the modem serves no DHCP. Port resolution, identity and control-owner arbitration stay in apn-autoconfig-modem, and netifd remains the bearer owner. The Intel XMM path used by Fibocom L850/L860 is implemented but has not been validated on hardware; see docs/atdial-contract-v1.md.",
+      "arch": "noarch",
+      "license": "MIT",
+      "origin": "feeds/base/apn-autoconfig-proto-atdial",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 57391,
+      "file-size": 20679,
+      "depends": [
+        "apn-autoconfig-modem",
+        "jsonfilter",
+        "kmod-usb-net-cdc-ether",
+        "kmod-usb-net-cdc-ncm",
+        "kmod-usb-net-rndis",
+        "libc",
+        "sms-tool"
+      ],
+      "provides": [
+        "apn-autoconfig-proto-atdial-any"
+      ]
+    }, {
+      "name": "apn-autoconfig-providers",
+      "version": "2026.08.24-r1",
+      "hashes": "5da55e8ca5b51ebd2cfa903a929dc0fea87ff6fbc48fffd18715081720239742",
+      "description": "Generated worldwide mobile provider and APN profiles for apn-autoconfig. The database can be upgraded independently from the program and LuCI.",
+      "arch": "noarch",
+      "license": "Apache-2.0 AND CC-PDDC",
+      "origin": "feeds/base/apn-autoconfig-providers",
+      "maintainer": "DarthAnwalt",
+      "url": "https://github.com/DarthAnwalt/openwrt-apn-autoconfig",
+      "installed-size": 209281,
+      "file-size": 42122,
+      "depends": [
+        "libc"
+      ],
+      "provides": [
+        "apn-autoconfig-providers-any"
+      ]
+    }, {
+      "name": "luci-app-apn-autoconfig",
+      "version": "0.16.0-r1",
+      "hashes": "e560e024ab0775502b715bd4551ec22c8a3e6d1fd500db028f8cffd42651604e",
+      "description": "Status, safe background actions and configuration for apn-autoconfig.",
+      "arch": "noarch",
+      "license": "MIT AND Apache-2.0",
+      "origin": "feeds/base/luci-app-apn-autoconfig",
+      "maintainer": "DarthAnwalt",
+      "installed-size": 550776,
+      "file-size": 138489,
+      "depends": [
+        "apn-autoconfig",
+        "libc",
+        "luci-base",
+        "rpcd-mod-ucode"
+      ],
+      "provides": [
+        "luci-app-apn-autoconfig-any"
+      ]
+    }
+  ]
+}

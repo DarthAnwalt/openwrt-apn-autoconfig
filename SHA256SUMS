@@ -1,0 +1,12 @@
+1c4bca7449c184185b135a92b62da23e22df8bdd050a7a55fa9cdd1a0800d120  install.sh
+0d4d6d383c84205c8fa16fafdf341ff80de24c63574a1d7d938cfb532fa458d3  public-key.pem
+866cd894bb9274adadd2db21fae029bc53eaa71eb874b062d1014c3fdca988cd  25.12/noarch/apn-autoconfig-0.16.0-r1.apk
+e258c0c97ad720c1f358f5cc348a7063a71c149051159f260c7d218a0556f3ac  25.12/noarch/apn-autoconfig-esim-0.16.0-r1.apk
+a43ebe16d0bb9c917b4a1664600cb50386044e9bdcad89f485576e05e46f3144  25.12/noarch/apn-autoconfig-integration-huasifei-wh3000-0.16.0-r1.apk
+d712ce9b34f9cb2fe0dafc2496341f416f4223866eccc883026bdde1ff7e5224  25.12/noarch/apn-autoconfig-lpac-2.3.0-r1.apk
+db2cd6067a9d7d394c696bc24431b12a3aa0b2fcafcd907ab37041d469d3f328  25.12/noarch/apn-autoconfig-modem-0.16.0-r1.apk
+197bac203a9726b26378cb4c6bc45410fd868c6bfb6fa55d5b817e545298d1bf  25.12/noarch/apn-autoconfig-proto-atdial-0.16.0-r1.apk
+32d34bd18723b570d40fc42e34bd6e1dd3a1ff1f83ae90a96cb2760b30a34cda  25.12/noarch/apn-autoconfig-providers-2026.08.24-r1.apk
+ca34cd0b2f31b467bf8bd5a79a2e0487b2ac96e8dca6dd7bf55ddfcf5495d46f  25.12/noarch/luci-app-apn-autoconfig-0.16.0-r1.apk
+73b732bac7edbe310b21d39262213690a52871f9b271fc0243ccfb1a5fc4a35d  25.12/noarch/packages.adb
+873440d6a14f5700be256ec7b3fb0e961946e96f53d36d6d27561ebecf911d3a  25.12/noarch/packages.json

@@ -4,10 +4,10 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.08.10
+# database-version: 2026.08.24
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
-# revisions: mbpi@70bf4a223ad19d2d23a693967066da3e19494770, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
+# revisions: mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 # '-' means unspecified; x in IMSI/ICCID patterns matches one decimal digit.
@@ -588,18 +588,18 @@
 24201	-	-	-	-	Happybytes (postpaid)	internet	200	-	-	-	-
 24201	-	-	-	-	Telenor (postpaid)	telenor.smart	200	-	-	-	-
 24201	-	-	-	-	Telenor Smart	telenor.smart	1131	-	-	-	ipv4v6
-24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	100200	-	-	-	-
+24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	150200	-	-	-	-
 24202	-	-	-	-	Telia (postpaid)	telia	200	-	-	-	-
 24202	-	-	-	-	Telia	telia	1135	-	-	-	ipv4v6
-24202	-	-	-	-	Chess (postpaid)	netcom	100200	chess	chess	-	-
-24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	100200	netcom	netcom	-	-
-24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	100201	-	-	-	-
+24202	-	-	-	-	Chess (postpaid)	netcom	150200	chess	chess	-	-
+24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	150200	netcom	netcom	-	-
+24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	150201	-	-	-	-
 24204	-	-	-	-	Tele2 Internet	internet.tele2.no	1139	-	-	-	-
-24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	100201	-	-	-	-
+24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	150201	-	-	-	-
 24205	-	-	-	-	OneCall	internet	200	-	-	-	-
 24205	-	-	-	-	OneCall Internet	internet	1140	-	-	pap	ipv4v6
-24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	100200	-	-	-	-
-24208	-	-	-	-	TDC (postpaid)	internet.no	100200	-	-	-	-
+24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	150200	-	-	-	-
+24208	-	-	-	-	TDC (postpaid)	internet.no	150200	-	-	-	-
 24209	-	-	-	-	Com4	com4	1144	-	-	-	-
 24213	-	-	-	-	IXT	ixt	1145	-	-	-	ipv4v6
 24214	-	-	-	-	Ice (postpaid)	ice.net	200	-	-	-	-

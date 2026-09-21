@@ -4,10 +4,10 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.08.24
+# database-version: 2026.09.21
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
-# revisions: mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
+# revisions: mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 # '-' means unspecified; x in IMSI/ICCID patterns matches one decimal digit.
@@ -588,18 +588,18 @@
 24201	-	-	-	-	Happybytes (postpaid)	internet	200	-	-	-	-
 24201	-	-	-	-	Telenor (postpaid)	telenor.smart	200	-	-	-	-
 24201	-	-	-	-	Telenor Smart	telenor.smart	1131	-	-	-	ipv4v6
-24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	150200	-	-	-	-
+24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	200200	-	-	-	-
 24202	-	-	-	-	Telia (postpaid)	telia	200	-	-	-	-
 24202	-	-	-	-	Telia	telia	1135	-	-	-	ipv4v6
-24202	-	-	-	-	Chess (postpaid)	netcom	150200	chess	chess	-	-
-24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	150200	netcom	netcom	-	-
-24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	150201	-	-	-	-
+24202	-	-	-	-	Chess (postpaid)	netcom	200200	chess	chess	-	-
+24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	200200	netcom	netcom	-	-
+24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	200201	-	-	-	-
 24204	-	-	-	-	Tele2 Internet	internet.tele2.no	1139	-	-	-	-
-24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	150201	-	-	-	-
+24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	200201	-	-	-	-
 24205	-	-	-	-	OneCall	internet	200	-	-	-	-
 24205	-	-	-	-	OneCall Internet	internet	1140	-	-	pap	ipv4v6
-24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	150200	-	-	-	-
-24208	-	-	-	-	TDC (postpaid)	internet.no	150200	-	-	-	-
+24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	200200	-	-	-	-
+24208	-	-	-	-	TDC (postpaid)	internet.no	200200	-	-	-	-
 24209	-	-	-	-	Com4	com4	1144	-	-	-	-
 24213	-	-	-	-	IXT	ixt	1145	-	-	-	ipv4v6
 24214	-	-	-	-	Ice (postpaid)	ice.net	200	-	-	-	-
@@ -849,7 +849,7 @@
 26277	-	-	-	-	blau.de (postpaid)	internet.eplus.de	200	blau	blau	-	-
 26277	-	-	-	-	simyo Internet (postpaid)	internet.eplus.de	200	simyo	simyo	-	-
 26277	-	-	-	-	blau.de (postpaid)	tagesflat.eplus.de	201	blau	blau	-	-
-26601	-	-	-	-	Gibtel	www.gibtele.com	1353	-	-	-	-
+26601	-	-	-	-	Gibtelcom (postpaid)	www.gibtele.com	200	-	-	-	-
 26801	-	-	-	-	Vodafone (postpaid/prepaid)	internet.vodafone.pt	200	vodafone	vodafone	-	-
 26801	-	-	-	-	Vodafone (prepaid/postpaid)	net2.vodafone.pt	201	vodafone	vodafone	-	-
 26801	-	-	-	-	Vodafone Net2	net2.vodafone.pt	1355	vodafone	vodafone	pap	ipv4v6
@@ -2322,11 +2322,18 @@
 43406	-	-	-	-	Perfectum Mobile	default	3173	-	-	-	-
 43407	-	-	-	-	UMS (postpaid)	net.ums.uz	200	-	-	-	-
 43407	-	-	-	-	MTS-UZB Internet	net.mts.uz	3174	mts	mts	pap	-
+43601	-	-	-	-	Tcell (postpaid)	tcell	200	-	-	-	-
 43601	-	-	-	-	Tcell	default	3176	-	-	-	-
+43602	-	-	-	-	Tcell (postpaid)	tcell	200	-	-	-	-
 43602	-	-	-	-	Tcell	default	3177	-	-	-	-
+43603	-	-	-	-	Megafon (postpaid)	internet	200	-	-	-	-
 43603	-	-	-	-	Megafon	default	3178	-	-	-	-
+43604	-	-	-	-	Babilon Mobile (postpaid)	babilon	200	-	-	-	-
 43604	-	-	-	-	Babilon-M	default	3179	-	-	-	-
+43605	-	-	-	-	Beeline TJ (postpaid/prepaid)	internet.beeline.tj	200	beeline	beeline	-	-
 43605	-	-	-	-	Tacom	default	3181	-	-	-	-
+43610	-	-	-	-	Babilon Mobile (postpaid)	babilon	200	-	-	-	-
+43612	-	-	-	-	Tcell (postpaid)	tcell	200	-	-	-	-
 43612	-	-	-	-	Tcell	default	3182	-	-	-	-
 43701	-	-	-	-	Beeline (postpaid)	internet.beeline.kg	200	-	-	-	-
 43701	-	-	-	-	Beeline	default	3183	-	-	-	-
@@ -3233,8 +3240,11 @@
 73404	-	-	-	-	Movistar (postpaid)	internet.movistar.ve	200	-	-	-	-
 73404	-	-	-	-	Movistar INTERNET	internet.movistar.ve	4018	-	-	-	ipv4v6
 73406	-	-	-	-	Movilnet (postpaid)	int.movilnet.com.ve	200	-	-	-	-
+73601	-	-	-	-	Viva	internet.nuevatel.com	200	-	-	-	-
 73601	-	-	-	-	VIVA3G	internet.nuevatel.com	4021	-	-	pap	-
+73602	-	-	-	-	Entel (prepaid)	4g.entel	200	-	-	-	-
 73602	-	-	-	-	Entel Bolivia 4G	4g.entel	4023	-	-	none	-
+73603	-	-	-	-	Tigo (prepaid)	internet.tigo.bo	200	-	-	-	-
 73603	-	-	-	-	Tigo Internet	internet.tigo.bo	4025	-	-	none	-
 73801	-	-	-	-	DigiCel (postpaid)	internet	200	web	web	-	-
 73801	-	-	-	-	Digicel	web.digicelgy.com	4027	-	-	-	-

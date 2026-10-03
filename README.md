@@ -90,18 +90,6 @@ operators are factual and do not imply affiliation, sponsorship or endorsement.
 
 ### Reusing the database in another project
 
-The database is meant to be reusable, and there is an address for it:
-
-```
-https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/
-```
-
-It holds `providers.tsv` together with `NOTICE` and the two licence texts.
-Keep the four together when you redistribute the data: the Apache licence asks
-that a recipient be given the licence and the attribution notices themselves,
-not a link to them. The file's own header records its format, its version and
-the exact upstream revisions it was built from.
-
 Both download URLs are permanent supported interfaces:
 
 - `https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/providers.tsv`
@@ -117,6 +105,12 @@ existing order, `#` comment lines, and `-` for unspecified values. Data rows and
 comment metadata may be updated; the column order and field meanings must not
 change at these URLs. An incompatible format requires a separate versioned
 address while these endpoints keep serving compatible data.
+
+When redistributing the database, include the accompanying
+[NOTICE](https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/NOTICE),
+[Apache-2.0 licence](https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/Apache-2.0.txt)
+and [MBPI dedication](https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/MBPI-CC-PDDC.txt).
+The file header records its version, format and upstream revisions.
 
 The Pages file is extracted from the provider package in the signed feed, with
 its notices and licences. Source and Pages publication are separate steps, so a

@@ -14,6 +14,8 @@ import pathlib, sys
 p = pathlib.Path(sys.argv[1])
 expected = '# mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type'
 try:
+    if p.is_symlink() or not p.is_file():
+        raise ValueError('the download path must remain a regular file, not a symlink')
     lines = p.read_text(encoding='utf-8').splitlines()
     if '# database-format: 2' not in lines:
         raise ValueError('format must remain 2')

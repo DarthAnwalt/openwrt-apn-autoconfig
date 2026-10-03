@@ -27,6 +27,7 @@ fail() { printf 'publish-feed: %s\n' "$*" >&2; exit 1; }
 [ -d "$SITE" ] || fail "no signed repository at $SITE; run build-repository.sh first"
 [ -f "$SITE/public-key.pem" ] || fail 'the signed repository has no public key in it'
 [ -f "$SITE/install.sh" ] || fail 'the signed repository has no installer in it'
+sh "$ROOT/scripts/verify-provider-pipeline.sh" --site "$SITE"
 [ -n "${PUBLIC_FEED_TOKEN:-}" ] || fail 'PUBLIC_FEED_TOKEN is not set'
 
 # The signing key must never travel with the feed. It is written to a temporary

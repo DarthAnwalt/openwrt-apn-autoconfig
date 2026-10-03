@@ -88,6 +88,42 @@ and Certification (CC-PDDC). This is a multi-license repository: see `LICENSE`,
 scope, attribution and terms. References to upstream projects and mobile
 operators are factual and do not imply affiliation, sponsorship or endorsement.
 
+### Reusing the database in another project
+
+The database is meant to be reusable, and there is an address for it:
+
+```
+https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/
+```
+
+It holds `providers.tsv` together with `NOTICE` and the two licence texts.
+Keep the four together when you redistribute the data: the Apache licence asks
+that a recipient be given the licence and the attribution notices themselves,
+not a link to them. The file's own header records its format, its version and
+the exact upstream revisions it was built from.
+
+Both download URLs are permanent supported interfaces:
+
+- `https://darthanwalt.github.io/openwrt-apn-autoconfig/providers/providers.tsv`
+- `https://raw.githubusercontent.com/DarthAnwalt/openwrt-apn-autoconfig/main/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv`
+
+The second URL is retained indefinitely for existing consumers, including
+`luci-app-5gmodem`. Internal package or repository reorganizations must preserve
+that file on the public `main` branch and continue updating it. Consumers do not
+have to migrate. The Pages URL is an additional address, not a replacement.
+
+Both addresses serve format 2: UTF-8, twelve TAB-separated columns in the
+existing order, `#` comment lines, and `-` for unspecified values. Data rows and
+comment metadata may be updated; the column order and field meanings must not
+change at these URLs. An incompatible format requires a separate versioned
+address while these endpoints keep serving compatible data.
+
+The Pages file is extracted from the provider package in the signed feed, with
+its notices and licences. Source and Pages publication are separate steps, so a
+brief version difference during an update is possible. The
+`apn-autoconfig-providers` package offers signed, versioned updates without
+installing the rest of the application.
+
 ## Safety model
 
 - `detect` and `status` are read-only.

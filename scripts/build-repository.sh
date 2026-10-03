@@ -117,17 +117,60 @@ set -- "$FETCH_DIR"/apn-autoconfig-providers-*.apk
 cmp -s "$PROVIDER_PACKAGE" "$1" ||
 	fail 'the package fetched through packages.adb differs from the built APK'
 
+# Permanent standalone endpoint, in addition to the existing raw main URL.
+# Publish the database with the attribution and licences from the same APK.
+PROVIDERS_DIR="$SITE_DIR/providers"
+mkdir -p "$PROVIDERS_DIR"
+# Use the verified feed package, never the private checkout's older snapshot.
+PROVIDER_PAYLOAD="$WORK_DIR/provider-payload"
+mkdir -p "$PROVIDER_PAYLOAD"
+( cd "$PROVIDER_PAYLOAD" && "$APK_TOOL" extract --allow-untrusted \
+	"$FETCH_DIR/${PROVIDER_PACKAGE##*/}" >/dev/null )
+cp "$PROVIDER_PAYLOAD/usr/share/apn-autoconfig/providers.tsv" "$PROVIDERS_DIR/providers.tsv"
+for notice in NOTICE Apache-2.0.txt MBPI-CC-PDDC.txt; do
+	cp "$PROVIDER_PAYLOAD/usr/share/licenses/apn-autoconfig-providers/$notice" \
+		"$PROVIDERS_DIR/$notice"
+done
+cat >"$PROVIDERS_DIR/README.txt" <<'PROVIDERS_README'
+The apn-autoconfig provider database, published for reuse.
+
+  providers.tsv        the database; its own header records the format, the
+                       version and the exact upstream revisions it was built
+                       from
+  NOTICE               attribution for the AOSP and GNOME MBPI sources, and
+                       the changes made to them
+  Apache-2.0.txt       the licence of the AOSP-derived portion
+  MBPI-CC-PDDC.txt     the dedication covering the GNOME MBPI portion
+
+Keep these four together when you redistribute the data: the Apache licence
+asks that a recipient be given the licence and the notices, not a link to them.
+
+This directory and the existing raw GitHub URL are permanent supported
+addresses for format 2. Existing consumers do not have to migrate:
+https://raw.githubusercontent.com/DarthAnwalt/openwrt-apn-autoconfig/main/apn-autoconfig-providers/files/usr/share/apn-autoconfig/providers.tsv
+
+The data here comes from the provider package in the signed feed. For signed,
+versioned updates, install apn-autoconfig-providers from the feed.
+PROVIDERS_README
+
 touch "$SITE_DIR/.nojekyll"
 (
 	cd "$SITE_DIR"
 	sha256sum \
 		install.sh \
 		public-key.pem \
+		providers/providers.tsv \
+		providers/NOTICE \
+		providers/Apache-2.0.txt \
+		providers/MBPI-CC-PDDC.txt \
+		providers/README.txt \
 		"$OPENWRT_SERIES"/noarch/*.apk \
 		"$OPENWRT_SERIES"/noarch/packages.adb \
 		"$OPENWRT_SERIES"/noarch/packages.json >SHA256SUMS
 	sha256sum public-key.pem | awk '{ print $1 }' >public-key.sha256
 )
+
+sh "$ROOT/scripts/verify-provider-pipeline.sh" --site "$SITE_DIR"
 
 # Inspect exactly what is about to become public, including every extracted APK
 # payload, its metadata, the signed index, installer and checksum files.

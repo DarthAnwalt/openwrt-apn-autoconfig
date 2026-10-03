@@ -51,7 +51,11 @@ else
 	# The shell above is a pipeline subshell, so determine success from the tree.
 	find "$SCAN_ROOT" -mindepth 1 -print -quit | grep -q . || fail 'no APK was found to inspect'
 	# Scan the index, installer, checksums and other non-APK feed files too.
-	find "$TARGET" -type f ! -name '*.apk' -exec cp {} "$SCAN_ROOT/" \;
+	find "$TARGET" -type f ! -name '*.apk' -print | while IFS= read -r file; do
+		relative="${file#"$TARGET"/}"
+		mkdir -p "$SCAN_ROOT/feed/$(dirname "$relative")"
+		cp "$file" "$SCAN_ROOT/feed/$relative"
+	done
 fi
 
 find "$SCAN_ROOT" -type f -print | while IFS= read -r file; do
@@ -68,7 +72,7 @@ find "$SCAN_ROOT" -type f -print | while IFS= read -r file; do
 	fi
 
 	case "$relative" in
-		usr/share/apn-autoconfig/providers.tsv|*/usr/share/apn-autoconfig/providers.tsv) : ;;
+		usr/share/apn-autoconfig/providers.tsv|*/usr/share/apn-autoconfig/providers.tsv|feed/providers/providers.tsv) : ;;
 		*)
 			if grep -ohE '\b[0-9]{14,20}\b|\b[0-9]{32}\b' "$text" 2>/dev/null |
 				grep -vE '0{6}' | grep -vE '^([0-9])\1+$' | grep -q .; then

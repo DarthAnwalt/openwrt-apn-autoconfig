@@ -1,7 +1,7 @@
 {
   "credential_profiles": 885,
   "database_format": 2,
-  "database_version": "2026.09.21",
+  "database_version": "2026.10.12",
   "format": 1,
   "mccmnc": 1462,
   "mvno_specific_profiles": 440,
@@ -13,7 +13,7 @@
     },
     "mbpi": {
       "license": "CC-PDDC",
-      "revision": "1721e3538d7cdf597578e8860c875c2107ee1565"
+      "revision": "70908ea88cceaa35b5259706f192ff72c8f92b66"
     }
   },
   "stats": {

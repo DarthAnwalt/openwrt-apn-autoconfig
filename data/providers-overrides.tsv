@@ -6,3 +6,6 @@
 26201	-	-	01	Kaufland Mobil	Kaufland Mobil (Telekom DE)	internet.telekom	10	-	-	-	-
 26201	-	-	-	-	Telekom Germany	internet.telekom	20	-	-	-	-
 26202	-	-	-	-	Vodafone Germany	web.vodafone.de	10	-	-	-	-
+# Rakuten official APN settings (verified 2026-10-23):
+# https://network.mobile.rakuten.co.jp/faq/detail/00001495/
+44011	-	-	-	-	Rakuten Mobile	rakuten.jp	10	-	-	-	ipv4v6

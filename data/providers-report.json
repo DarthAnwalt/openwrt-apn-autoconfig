@@ -1,7 +1,7 @@
 {
   "credential_profiles": 885,
   "database_format": 2,
-  "database_version": "2026.10.12",
+  "database_version": "2026.10.23",
   "format": 1,
   "mccmnc": 1462,
   "mvno_specific_profiles": 440,
@@ -27,7 +27,7 @@
     "mbpi_duplicates": 80,
     "mbpi_non_internet": 360,
     "mbpi_skipped": 16,
-    "overrides_accepted": 4,
+    "overrides_accepted": 5,
     "previous_retained": 7
   },
   "unique_apns": 1044,

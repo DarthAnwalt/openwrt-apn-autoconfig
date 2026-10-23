@@ -4,7 +4,7 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.10.12
+# database-version: 2026.10.23
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
 # revisions: mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
@@ -2370,10 +2370,10 @@
 44010	-	-	-	-	OCN モバイル ONE	ocn.ne.jp	3194	mobileid@ocn	mobile	chap	ipv4
 44010	-	-	-	-	OCN モバイル ONE (LTE)	lte-d.ocn.ne.jp	3195	mobileid@ocn	mobile	chap	ipv4
 44010	-	-	-	-	TONE mobile	tone.ne.jp	3196	tone	tone	chap	-
+44011	-	-	-	-	Rakuten Mobile	rakuten.jp	10	-	-	-	ipv4v6
 44011	-	-	-	-	NTTdocomo (postpaid)	mopera.ne.jp	100	-	-	-	-
 44011	-	-	-	-	楽天モバイル	rakuten.jp	100	-	-	-	-
 44011	-	-	-	-	NTTdocomo (postpaid)	mopera.net	101	-	-	-	-
-44011	-	-	-	-	楽天(rakuten.jp)	rakuten.jp	3197	-	-	-	ipv4v6
 44012	-	-	-	-	NTTdocomo (postpaid)	mopera.ne.jp	100	-	-	-	-
 44012	-	-	-	-	NTTdocomo (postpaid)	mopera.net	101	-	-	-	-
 44013	-	-	-	-	NTTdocomo (postpaid)	mopera.ne.jp	100	-	-	-	-

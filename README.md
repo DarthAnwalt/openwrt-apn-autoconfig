@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **Development of this project has been suspended by its author indefinitely.**
+> Interested users are encouraged to use [luci-app-5gmodem by fildunsky](https://github.com/fildunsky/luci-app-5gmodem), which provides the same functionality and much more.
+
 # apn-autoconfig — OpenWrt source packages
 
 `apn-autoconfig` is a target-aware POSIX-shell APN engine for OpenWrt. This

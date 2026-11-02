@@ -4,10 +4,10 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.10.23
+# database-version: 2026.11.02
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
-# revisions: mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
+# revisions: mbpi@53850972043563d4b0ba1a4a905d3ffddd2cbac5, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 # '-' means unspecified; x in IMSI/ICCID patterns matches one decimal digit.
@@ -588,18 +588,18 @@
 24201	-	-	-	-	Happybytes (postpaid)	internet	200	-	-	-	-
 24201	-	-	-	-	Telenor (postpaid)	telenor.smart	200	-	-	-	-
 24201	-	-	-	-	Telenor Smart	telenor.smart	1131	-	-	-	ipv4v6
-24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	250200	-	-	-	-
+24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	300200	-	-	-	-
 24202	-	-	-	-	Telia (postpaid)	telia	200	-	-	-	-
 24202	-	-	-	-	Telia	telia	1135	-	-	-	ipv4v6
-24202	-	-	-	-	Chess (postpaid)	netcom	250200	chess	chess	-	-
-24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	250200	netcom	netcom	-	-
-24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	250201	-	-	-	-
+24202	-	-	-	-	Chess (postpaid)	netcom	300200	chess	chess	-	-
+24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	300200	netcom	netcom	-	-
+24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	300201	-	-	-	-
 24204	-	-	-	-	Tele2 Internet	internet.tele2.no	1139	-	-	-	-
-24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	250201	-	-	-	-
+24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	300201	-	-	-	-
 24205	-	-	-	-	OneCall	internet	200	-	-	-	-
 24205	-	-	-	-	OneCall Internet	internet	1140	-	-	pap	ipv4v6
-24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	250200	-	-	-	-
-24208	-	-	-	-	TDC (postpaid)	internet.no	250200	-	-	-	-
+24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	300200	-	-	-	-
+24208	-	-	-	-	TDC (postpaid)	internet.no	300200	-	-	-	-
 24209	-	-	-	-	Com4	com4	1144	-	-	-	-
 24213	-	-	-	-	IXT	ixt	1145	-	-	-	ipv4v6
 24214	-	-	-	-	Ice (postpaid)	ice.net	200	-	-	-	-
@@ -1144,7 +1144,9 @@
 310240	-	-	-	-	T-Mobile (postpaid)	internet3.voicestream.com	104	-	-	-	-
 310240	-	-	-	-	T-Mobile (prepaid)	mobilenet	105	-	-	-	-
 310240	-	-	-	-	Ting (postpaid)	wireless.dish.com	200	-	-	-	-
+310240	-	-	-	-	US Mobile (Light Speed)	wholesale	200	-	-	-	-
 310240	-	-	-	-	Ting (postpaid)	tethering.dish.com	202	-	-	-	-
+310240	-	-	-	-	US Mobile (Light Speed)	pwg	202	-	-	-	-
 310240	-	-	514C	-	Qlink	qlink	1623	-	-	-	-
 310240	-	-	6941	-	Tello	tello	1624	-	-	-	-
 310240	-	-	6957	-	iWireless	iwireless	1625	-	-	-	-
@@ -1165,7 +1167,7 @@
 310260	-	-	-	-	T-Mobile (postpaid)	internet3.voicestream.com	104	-	-	-	-
 310260	-	-	-	-	T-Mobile (prepaid)	mobilenet	105	-	-	-	-
 310260	-	-	-	-	Mint Mobile (prepaid)	wholesale	200	-	-	-	-
-310260	-	-	-	-	US Mobile	pwg	200	-	-	-	-
+310260	-	-	-	-	US Mobile (Light Speed)	pwg	202	-	-	-	-
 310260	-	-	514C	-	Qlink	qlink	1631	-	-	-	-
 310260	-	-	6941	-	Tello	tello	1632	-	-	-	-
 310260	-	-	6957	-	iWireless	iwireless	1633	-	-	-	-
@@ -1182,6 +1184,7 @@
 310270	-	-	-	-	T-Mobile (postpaid)	internet3.voicestream.com	104	-	-	-	-
 310270	-	-	-	-	T-Mobile (prepaid)	mobilenet	105	-	-	-	-
 310270	-	-	6D	-	MetroPCS 270	fast.metropcs.com	1641	-	-	-	ipv6
+310280	-	-	-	-	US Mobile (Dark Star)	ereseller	200	-	-	-	-
 310280	-	-	-	-	AT&T	nxtgenphone	240	-	-	-	-
 310280	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 310280	-	-	-	-	AT&T	nrphone	242	-	-	-	-
@@ -1210,6 +1213,7 @@
 310380	-	-	-	GigSky	GigSky	gigsky	1669	-	-	-	-
 310410	-	-	-	-	AweSIM (prepaid)	nxtgenphone	200	-	-	-	-
 310410	-	-	-	-	Straight Talk (prepaid)	att.mvno	200	-	-	-	-
+310410	-	-	-	-	US Mobile (Dark Star)	ereseller	200	-	-	-	-
 310410	-	-	-	-	Straight Talk (prepaid)	tfdata	201	-	-	-	-
 310410	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 310410	-	-	-	-	AT&T	nrphone	242	-	-	-	-
@@ -1347,7 +1351,7 @@
 311430	-	-	-	chatmobrsa1	Chatmobrsa1	vzwinternet	1940	-	-	-	ipv4v6
 311440	-	-	-	-	Bluegrass	vzwinternet	1947	-	-	-	ipv4v6
 311450	-	-	-	-	Ptci	vzwinternet	1954	-	-	-	ipv4v6
-311480	-	-	-	-	Verizon (postpaid)	vzwinternet	201	-	-	-	-
+311480	-	-	-	-	US Mobile (Warp)	vzwinternet	200	-	-	-	-
 311480	-	-	-	-	LTE - Verizon Internet	vzwinternet	1956	-	-	-	ipv4v6
 311481	-	-	-	-	Verizon (postpaid)	vzwinternet	201	-	-	-	-
 311482	-	-	-	-	Verizon (postpaid)	vzwinternet	201	-	-	-	-

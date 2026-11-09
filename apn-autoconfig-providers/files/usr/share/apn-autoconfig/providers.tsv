@@ -4,10 +4,10 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.11.02
+# database-version: 2026.11.09
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
-# revisions: mbpi@53850972043563d4b0ba1a4a905d3ffddd2cbac5, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
+# revisions: mbpi@c6796724e78483ee34fd999fe1532f3c12d59fa6, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@53850972043563d4b0ba1a4a905d3ffddd2cbac5, mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 # '-' means unspecified; x in IMSI/ICCID patterns matches one decimal digit.
@@ -588,18 +588,18 @@
 24201	-	-	-	-	Happybytes (postpaid)	internet	200	-	-	-	-
 24201	-	-	-	-	Telenor (postpaid)	telenor.smart	200	-	-	-	-
 24201	-	-	-	-	Telenor Smart	telenor.smart	1131	-	-	-	ipv4v6
-24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	300200	-	-	-	-
+24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	350200	-	-	-	-
 24202	-	-	-	-	Telia (postpaid)	telia	200	-	-	-	-
 24202	-	-	-	-	Telia	telia	1135	-	-	-	ipv4v6
-24202	-	-	-	-	Chess (postpaid)	netcom	300200	chess	chess	-	-
-24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	300200	netcom	netcom	-	-
-24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	300201	-	-	-	-
+24202	-	-	-	-	Chess (postpaid)	netcom	350200	chess	chess	-	-
+24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	350200	netcom	netcom	-	-
+24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	350201	-	-	-	-
 24204	-	-	-	-	Tele2 Internet	internet.tele2.no	1139	-	-	-	-
-24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	300201	-	-	-	-
+24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	350201	-	-	-	-
 24205	-	-	-	-	OneCall	internet	200	-	-	-	-
 24205	-	-	-	-	OneCall Internet	internet	1140	-	-	pap	ipv4v6
-24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	300200	-	-	-	-
-24208	-	-	-	-	TDC (postpaid)	internet.no	300200	-	-	-	-
+24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	350200	-	-	-	-
+24208	-	-	-	-	TDC (postpaid)	internet.no	350200	-	-	-	-
 24209	-	-	-	-	Com4	com4	1144	-	-	-	-
 24213	-	-	-	-	IXT	ixt	1145	-	-	-	ipv4v6
 24214	-	-	-	-	Ice (postpaid)	ice.net	200	-	-	-	-
@@ -975,6 +975,7 @@
 29702	-	-	-	-	T-Mobile Internet	tmcg-4g	1461	38267	38267	pap	-
 29703	-	-	-	-	m:tel (postpaid)	gprsinternet	200	-	-	-	-
 29703	-	-	-	-	m:tel	mtelinternet	1462	-	-	-	-
+302220	-	-	4B4F	-	Koodo (postpaid)	sp.koodo.com	200	-	-	-	-
 302220	-	-	-	-	Public Mobile (postpaid)	sp.mb.com	200	-	-	-	-
 302220	-	-	-	-	Telus Mobility (postpaid)	isp.telus.com	200	-	-	-	-
 302220	-	-	-	-	Telus Mobility (postpaid)	vpn.telus.com	201	-	-	-	-

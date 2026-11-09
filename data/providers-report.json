@@ -1,11 +1,11 @@
 {
   "credential_profiles": 885,
   "database_format": 2,
-  "database_version": "2026.11.02",
+  "database_version": "2026.11.09",
   "format": 1,
   "mccmnc": 1462,
-  "mvno_specific_profiles": 440,
-  "profiles": 3280,
+  "mvno_specific_profiles": 441,
+  "profiles": 3281,
   "sources": {
     "aosp": {
       "license": "Apache-2.0",
@@ -13,7 +13,7 @@
     },
     "mbpi": {
       "license": "CC-PDDC",
-      "revision": "53850972043563d4b0ba1a4a905d3ffddd2cbac5"
+      "revision": "c6796724e78483ee34fd999fe1532f3c12d59fa6"
     }
   },
   "stats": {
@@ -23,9 +23,9 @@
     "aosp_non_internet": 1587,
     "aosp_skipped": 86,
     "aosp_test_network": 6,
-    "mbpi_accepted": 1533,
+    "mbpi_accepted": 1534,
     "mbpi_duplicates": 81,
-    "mbpi_non_internet": 363,
+    "mbpi_non_internet": 364,
     "mbpi_skipped": 16,
     "overrides_accepted": 5,
     "previous_retained": 7

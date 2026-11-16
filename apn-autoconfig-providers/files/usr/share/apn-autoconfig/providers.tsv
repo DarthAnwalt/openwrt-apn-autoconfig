@@ -4,10 +4,10 @@
 # MBPI portion: Creative Commons Public Domain Dedication and Certification (CC-PDDC).
 # Changes: filtered, normalized, deduplicated, merged, prioritized and converted to TSV.
 # License texts and attribution: /usr/share/licenses/apn-autoconfig-providers/
-# database-version: 2026.11.09
+# database-version: 2026.11.16
 # database-format: 2
 # sources: mbpi, aosp, retained previous fallbacks, local overrides
-# revisions: mbpi@c6796724e78483ee34fd999fe1532f3c12d59fa6, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@53850972043563d4b0ba1a4a905d3ffddd2cbac5, mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
+# revisions: mbpi@643d4c80a8aefb799315fef01c34b98aa3593355, aosp@73f904fbeb872f5675cb5f18cd9dfb15856425a6, mbpi@c6796724e78483ee34fd999fe1532f3c12d59fa6, mbpi@53850972043563d4b0ba1a4a905d3ffddd2cbac5, mbpi@70908ea88cceaa35b5259706f192ff72c8f92b66, mbpi@1721e3538d7cdf597578e8860c875c2107ee1565, mbpi@515beda0f8ef9113cb0c07851bc4ef5c830bb9bc, mbpi@70bf4a223ad19d2d23a693967066da3e19494770, mbpi@73b2f9b4b9bcb230a61a0bd317fa72349f7e1527, mbpi@573dd936e6383169608a53d07b44ba1e7d4b7d89
 # TAB-separated columns:
 # mccmnc  imsi_pattern  iccid_pattern  gid1  spn  provider  apn  priority  username  password  auth  ip_type
 # '-' means unspecified; x in IMSI/ICCID patterns matches one decimal digit.
@@ -588,18 +588,18 @@
 24201	-	-	-	-	Happybytes (postpaid)	internet	200	-	-	-	-
 24201	-	-	-	-	Telenor (postpaid)	telenor.smart	200	-	-	-	-
 24201	-	-	-	-	Telenor Smart	telenor.smart	1131	-	-	-	ipv4v6
-24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	350200	-	-	-	-
+24201	-	-	-	-	Phonero (postpaid)	internet.phonero.no	400200	-	-	-	-
 24202	-	-	-	-	Telia (postpaid)	telia	200	-	-	-	-
 24202	-	-	-	-	Telia	telia	1135	-	-	-	ipv4v6
-24202	-	-	-	-	Chess (postpaid)	netcom	350200	chess	chess	-	-
-24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	350200	netcom	netcom	-	-
-24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	350201	-	-	-	-
+24202	-	-	-	-	Chess (postpaid)	netcom	400200	chess	chess	-	-
+24202	-	-	-	-	Netcom (postpaid)	internet.netcom.no	400200	netcom	netcom	-	-
+24202	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	400201	-	-	-	-
 24204	-	-	-	-	Tele2 Internet	internet.tele2.no	1139	-	-	-	-
-24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	350201	-	-	-	-
+24204	-	-	-	-	Tele2 (postpaid)	mobileinternet.tele2.no	400201	-	-	-	-
 24205	-	-	-	-	OneCall	internet	200	-	-	-	-
 24205	-	-	-	-	OneCall Internet	internet	1140	-	-	pap	ipv4v6
-24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	350200	-	-	-	-
-24208	-	-	-	-	TDC (postpaid)	internet.no	350200	-	-	-	-
+24207	-	-	-	-	Ventelo (postpaid)	internet.ventelo.no	400200	-	-	-	-
+24208	-	-	-	-	TDC (postpaid)	internet.no	400200	-	-	-	-
 24209	-	-	-	-	Com4	com4	1144	-	-	-	-
 24213	-	-	-	-	IXT	ixt	1145	-	-	-	ipv4v6
 24214	-	-	-	-	Ice (postpaid)	ice.net	200	-	-	-	-
@@ -1187,6 +1187,7 @@
 310270	-	-	6D	-	MetroPCS 270	fast.metropcs.com	1641	-	-	-	ipv6
 310280	-	-	-	-	US Mobile (Dark Star)	ereseller	200	-	-	-	-
 310280	-	-	-	-	AT&T	nxtgenphone	240	-	-	-	-
+310280	-	-	4201	-	RedPocket Mobile (prepaid)	ereseller	240	-	-	-	-
 310280	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 310280	-	-	-	-	AT&T	nrphone	242	-	-	-	-
 310280	-	-	-	-	AT&T	broadband	243	-	-	-	-
@@ -1216,6 +1217,7 @@
 310410	-	-	-	-	Straight Talk (prepaid)	att.mvno	200	-	-	-	-
 310410	-	-	-	-	US Mobile (Dark Star)	ereseller	200	-	-	-	-
 310410	-	-	-	-	Straight Talk (prepaid)	tfdata	201	-	-	-	-
+310410	-	-	4201	-	RedPocket Mobile (prepaid)	ereseller	240	-	-	-	-
 310410	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 310410	-	-	-	-	AT&T	nrphone	242	-	-	-	-
 310410	-	-	-	-	AT&T	broadband	243	-	-	-	-
@@ -1291,6 +1293,7 @@
 310920	-	-	-	-	Jamesvalley	vzwinternet	1760	-	-	-	ipv4v6
 310930	-	-	-	-	Copper Valley	vzwinternet	1767	-	-	-	ipv4v6
 310950	-	-	-	-	AT&T	nxtgenphone	240	-	-	-	-
+310950	-	-	4201	-	RedPocket Mobile (prepaid)	ereseller	240	-	-	-	-
 310950	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 310950	-	-	-	-	AT&T	nrphone	242	-	-	-	-
 310950	-	-	-	-	AT&T	broadband	243	-	-	-	-
@@ -1317,6 +1320,7 @@
 311090	-	-	-	-	AT&T	reseller	244	-	-	-	-
 311140	-	-	-	sprocket	Sprocket	vzwinternet	1835	-	-	-	ipv4v6
 311180	-	-	-	-	AT&T	nxtgenphone	240	-	-	-	-
+311180	-	-	4201	-	RedPocket Mobile (prepaid)	ereseller	240	-	-	-	-
 311180	-	-	-	-	AT&T	enhancedphone	241	-	-	-	-
 311180	-	-	-	-	AT&T	nrphone	242	-	-	-	-
 311180	-	-	-	-	AT&T	broadband	243	-	-	-	-
